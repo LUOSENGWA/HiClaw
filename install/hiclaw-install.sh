@@ -95,6 +95,10 @@ log() {
 
 error() {
     echo -e "\033[31m[HiClaw ERROR]\033[0m $1" >&2
+}
+
+die() {
+    error "$1"
     exit 1
 }
 
@@ -1152,7 +1156,7 @@ wait_manager_ready() {
     done
 
     echo ""
-    error "$(msg install.wait_ready.timeout "${timeout}" "${container}")"
+    die "$(msg install.wait_ready.timeout "${timeout}" "${container}")"
 }
 
 wait_matrix_ready() {
@@ -1173,7 +1177,7 @@ wait_matrix_ready() {
     done
 
     echo ""
-    error "$(msg install.wait_matrix.timeout "${timeout}" "${container}")"
+    die "$(msg install.wait_matrix.timeout "${timeout}" "${container}")"
 }
 
 # Read KEY=value from /data/hiclaw-secrets.env on a Docker volume (manager container not required).
@@ -1299,7 +1303,7 @@ prompt() {
             return
         elif [ "${HICLAW_NON_INTERACTIVE}" = "1" ]; then
             # Only hard-error in fully non-interactive mode, not quickstart
-            error "$(msg prompt.required "${prompt_text}")"
+            die "$(msg prompt.required "${prompt_text}")"
         fi
         # quickstart + no default: fall through to interactive prompt below
     fi
@@ -1319,7 +1323,7 @@ prompt() {
 
     value="${value:-${default_value}}"
     if [ -z "${value}" ]; then
-        error "$(msg prompt.required_empty "${prompt_text}")"
+        die "$(msg prompt.required_empty "${prompt_text}")"
     fi
 
     eval "export ${var_name}='${value}'"
@@ -1757,7 +1761,7 @@ step_existing() {
             local CONFIRM_PATH
             read -e -p "$(msg install.reinstall.confirm_path): " CONFIRM_PATH
             if [ "${CONFIRM_PATH}" != "${existing_workspace}" ]; then
-                error "$(msg install.reinstall.path_mismatch "${CONFIRM_PATH}" "${existing_workspace}")"
+                die "$(msg install.reinstall.path_mismatch "${CONFIRM_PATH}" "${existing_workspace}")"
             fi
             log "$(msg install.reinstall.confirmed)"
             ${DOCKER_CMD} stop hiclaw-manager 2>/dev/null || true
@@ -1782,7 +1786,7 @@ step_existing() {
             fi
             if [ -d "${existing_workspace}" ]; then
                 log "$(msg install.reinstall.removing_workspace "${existing_workspace}")"
-                rm -rf "${existing_workspace}" || error "$(msg install.reinstall.failed_rm_workspace)"
+                rm -rf "${existing_workspace}" || die "$(msg install.reinstall.failed_rm_workspace)"
             fi
             if [ -f "${existing_env}" ]; then
                 log "$(msg install.reinstall.removing_env "${existing_env}")"
@@ -2017,7 +2021,7 @@ step_llm() {
                         prompt_custom_model_params "${HICLAW_DEFAULT_MODEL}" || return 0
                         ;;
                     *)
-                        error "$(msg llm.alibaba.model.invalid "${ALIBABA_MODEL_CHOICE}")"
+                        die "$(msg llm.alibaba.model.invalid "${ALIBABA_MODEL_CHOICE}")"
                         ;;
                 esac
             fi
@@ -2084,7 +2088,7 @@ step_llm() {
             test_llm_connectivity "${HICLAW_OPENAI_BASE_URL}" "${HICLAW_LLM_API_KEY}" "${HICLAW_DEFAULT_MODEL}" || return 0
             ;;
         *)
-            error "$(msg llm.provider.invalid "${PROVIDER_CHOICE}")"
+            die "$(msg llm.provider.invalid "${PROVIDER_CHOICE}")"
             ;;
     esac
 
@@ -2169,7 +2173,7 @@ step_admin() {
         log "  $(msg prompt.preset "$(msg admin.password_prompt)")"
     fi
     if [ ${#HICLAW_ADMIN_PASSWORD} -lt 8 ]; then
-        error "$(msg admin.password_too_short "${#HICLAW_ADMIN_PASSWORD}")"
+        die "$(msg admin.password_too_short "${#HICLAW_ADMIN_PASSWORD}")"
     fi
     log ""
 }
@@ -2885,7 +2889,7 @@ EOF
             fi
             _attempt=$((_attempt + 1))
         done
-        error "Failed to pull ${_img} after 3 attempts"
+        die "Failed to pull ${_img} after 3 attempts"
         return 1
     }
 
@@ -3491,15 +3495,15 @@ install_worker() {
             --fs-secret)  FS_SECRET="$2"; shift 2 ;;
             --skills-api-url) SKILLS_API_URL="$2"; shift 2 ;;
             --reset)      RESET=true; shift ;;
-            *)            error "$(msg error.unknown_option "$1")" ;;
+            *)            die "$(msg error.unknown_option "$1")" ;;
         esac
     done
 
     # Validate required params
-    [ -z "${WORKER_NAME}" ] && error "$(msg error.name_required)"
-    [ -z "${FS}" ] && error "$(msg error.fs_required)"
-    [ -z "${FS_KEY}" ] && error "$(msg error.fs_key_required)"
-    [ -z "${FS_SECRET}" ] && error "$(msg error.fs_secret_required)"
+    [ -z "${WORKER_NAME}" ] && die "$(msg error.name_required)"
+    [ -z "${FS}" ] && die "$(msg error.fs_required)"
+    [ -z "${FS_KEY}" ] && die "$(msg error.fs_key_required)"
+    [ -z "${FS_SECRET}" ] && die "$(msg error.fs_secret_required)"
 
     local CONTAINER_NAME="hiclaw-worker-${WORKER_NAME}"
 
@@ -3512,7 +3516,7 @@ install_worker() {
 
     # Check for existing container
     if ${DOCKER_CMD} ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        error "$(msg worker.exists "${CONTAINER_NAME}")"
+        die "$(msg worker.exists "${CONTAINER_NAME}")"
     fi
 
     log "$(msg worker.starting "${WORKER_NAME}")"
