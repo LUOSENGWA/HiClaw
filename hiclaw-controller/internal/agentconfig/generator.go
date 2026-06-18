@@ -197,10 +197,10 @@ func (g *Generator) GenerateOpenClawConfig(req WorkerConfigRequest) ([]byte, err
 	}
 
 	// Infer supports_multimodal / supports_image from the model spec.
-	// Only for workers — the Manager (WorkerName == "manager") may run under
-	// openclaw runtime, and openclaw gateway does not understand these fields,
-	// causing CI integration tests to 300s timeout (gateway fails to start).
-	if req.WorkerName != "manager" {
+	// Only for copaw runtime agents — openclaw gateway does not understand
+	// these fields: Manager health check fails (300s timeout), Worker message
+	// processing silently drops all messages (180s no-reply in CI test-15).
+	if req.AgentRuntime == "copaw" {
 		spec := g.resolveModelSpec(modelName)
 		agents := config["agents"].(map[string]interface{})
 		defaults := agents["defaults"].(map[string]interface{})

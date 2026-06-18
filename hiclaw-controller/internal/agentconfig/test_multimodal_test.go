@@ -12,9 +12,10 @@ func TestMultimodal_VisionModel_GetsSupportsFlag(t *testing.T) {
 		AIGatewayURL:    "http://g:8080",
 	})
 	data, err := g.GenerateOpenClawConfig(WorkerConfigRequest{
-		WorkerName: "test-mm",
-		ModelName:  "qwen3.6-plus",
-		GatewayKey: "test-key",
+		WorkerName:   "test-mm",
+		ModelName:    "qwen3.6-plus",
+		GatewayKey:   "test-key",
+		AgentRuntime: "copaw",
 	})
 	if err != nil {
 		t.Fatalf("GenerateOpenClawConfig failed: %v", err)
@@ -47,9 +48,10 @@ func TestMultimodal_TextOnlyModel_NoFlag(t *testing.T) {
 		AIGatewayURL:    "http://g:8080",
 	})
 	data, err := g.GenerateOpenClawConfig(WorkerConfigRequest{
-		WorkerName: "test-txt",
-		ModelName:  "deepseek-chat",
-		GatewayKey: "test-key",
+		WorkerName:   "test-txt",
+		ModelName:    "deepseek-chat",
+		GatewayKey:   "test-key",
+		AgentRuntime: "copaw",
 	})
 	if err != nil {
 		t.Fatalf("GenerateOpenClawConfig failed: %v", err)

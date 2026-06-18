@@ -40,6 +40,7 @@ type WorkerConfigRequest struct {
 	GatewayKey     string           // worker's gateway API key
 	ModelName      string           // optional: override default model
 	AIGatewayURL   string           // per-worker AI Gateway URL override (from modelProvider)
+	AgentRuntime   string           // "copaw" or "openclaw" — only copaw gets multimodal config fields
 	TeamLeaderName string           // if non-empty, this is a team worker
 	PeerWorkers    []string         // Matrix localparts of peer workers for @mention routing
 	ChannelPolicy  *ChannelPolicy   // optional communication policy overrides

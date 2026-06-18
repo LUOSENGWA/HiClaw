@@ -206,6 +206,7 @@ func (d *Deployer) DeployWorkerConfig(ctx context.Context, req WorkerDeployReque
 		GatewayKey:     req.GatewayKey,
 		ModelName:      req.Spec.Model,
 		AIGatewayURL:   req.AIGatewayURL,
+		AgentRuntime:   req.Spec.Runtime,
 		TeamLeaderName: req.TeamLeaderName,
 		PeerWorkers:    req.PeerWorkers,
 		ChannelPolicy:  channelPolicy,
@@ -676,6 +677,7 @@ func (d *Deployer) DeployManagerConfig(ctx context.Context, req ManagerDeployReq
 		GatewayKey:   req.GatewayKey,
 		ModelName:    req.Spec.Model,
 		AIGatewayURL: req.AIGatewayURL,
+		AgentRuntime: req.Spec.Runtime,
 	})
 	if err != nil {
 		return fmt.Errorf("config generation failed: %w", err)
