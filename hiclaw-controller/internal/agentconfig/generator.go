@@ -196,15 +196,20 @@ func (g *Generator) GenerateOpenClawConfig(req WorkerConfigRequest) ([]byte, err
 		}
 	}
 
-	// Infer supports_multimodal / supports_image from the model spec
-	spec := g.resolveModelSpec(modelName)
-	agents := config["agents"].(map[string]interface{})
-	defaults := agents["defaults"].(map[string]interface{})
-	for _, inputType := range spec.Input {
-		if inputType == "image" {
-			defaults["supports_multimodal"] = true
-			defaults["supports_image"] = true
-			break
+	// Infer supports_multimodal / supports_image from the model spec.
+	// Only for workers — the Manager (WorkerName == "manager") may run under
+	// openclaw runtime, and openclaw gateway does not understand these fields,
+	// causing CI integration tests to 300s timeout (gateway fails to start).
+	if req.WorkerName != "manager" {
+		spec := g.resolveModelSpec(modelName)
+		agents := config["agents"].(map[string]interface{})
+		defaults := agents["defaults"].(map[string]interface{})
+		for _, inputType := range spec.Input {
+			if inputType == "image" {
+				defaults["supports_multimodal"] = true
+				defaults["supports_image"] = true
+				break
+			}
 		}
 	}
 
