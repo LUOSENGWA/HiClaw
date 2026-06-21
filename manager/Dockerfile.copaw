@@ -81,8 +81,7 @@ RUN pip install --no-cache-dir \
         loongsuite-distro \
         opentelemetry-exporter-otlp \
         loongsuite-instrumentation-copaw \
-        loongsuite-instrumentation-agentscope \
-        qwenpaw
+        loongsuite-instrumentation-agentscope
 
 # ---- Overlay HiClaw Matrix channel (not yet merged into CoPaw release) ----
 # Replace CoPaw's built-in Matrix channel with HiClaw-enhanced version
