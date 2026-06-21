@@ -59,7 +59,13 @@ try:
         VideoContent,
     )
 except ImportError:  # pragma: no cover
-    BaseChannel = object  # type: ignore[assignment,misc]
+    # Fallback to copaw package for environments without qwenpaw (e.g. Manager).
+    # copaw.app.channels.base.BaseChannel is a drop-in of qwenpaw's BaseChannel
+    # and ensures the copaw framework's channel loader (issubclass check) passes.
+    try:
+        from copaw.app.channels.base import BaseChannel
+    except ImportError:
+        BaseChannel = object  # type: ignore[assignment,misc]
     ContentType = None  # type: ignore[assignment]
     MessageType = None  # type: ignore[assignment]
     RunStatus = None  # type: ignore[assignment]
