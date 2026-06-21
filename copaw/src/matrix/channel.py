@@ -47,7 +47,7 @@ logger = logging.getLogger("copaw.channels.matrix")
 # qwenpaw installed (it's only executed inside a qwenpaw environment).
 # ---------------------------------------------------------------------------
 try:
-    from copaw.app.channels.base import BaseChannel
+    from qwenpaw.app.channels.base import BaseChannel
     from agentscope_runtime.engine.schemas.agent_schemas import (
         AudioContent,
         ContentType,

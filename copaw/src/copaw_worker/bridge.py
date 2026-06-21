@@ -270,6 +270,202 @@ def _write_config_json(
 # ---------------------------------------------------------------------------
 # agent.json — per-agent config (CoPaw 1.0.2+ reads this, not config.json)
 # ---------------------------------------------------------------------------
+def _derive_matrix_user_id(cfg: dict[str, Any], _in_container: bool = False) -> Any:
+    """Derive CoPaw Matrix user_id from OpenClaw config or env."""
+    m = _matrix_raw(cfg)
+    uid = m.get("userId") or m.get("user_id")
+    if uid:
+        return uid
+    domain = os.environ.get("HICLAW_MATRIX_DOMAIN") or os.environ.get("MATRIX_DOMAIN", "")
+    if not domain:
+        return _MISSING
+    local = os.environ.get("HICLAW_WORKER_NAME") or os.environ.get("WORKER_NAME", "manager")
+    return f"@{local}:{domain}"
+
+
+def _derive_heartbeat(cfg: dict[str, Any], _in_container: bool = False) -> Any:
+    """Map openclaw agents.defaults.heartbeat -> copaw heartbeat block."""
+    hb = cfg.get("agents", {}).get("defaults", {}).get("heartbeat")
+    if not isinstance(hb, dict) or not hb:
+        return _MISSING
+    out: dict[str, Any] = {"enabled": True}
+    if "every" in hb:
+        out["every"] = hb["every"]
+    if "target" in hb:
+        out["target"] = hb["target"]
+    if "activeHours" in hb:
+        out["active_hours"] = hb["activeHours"]
+    return out
+
+
+def _get_path(container: dict[str, Any], path: tuple[str, ...]) -> Any:
+    """Return value at ``path`` inside nested dicts, or ``_MISSING``."""
+    node: Any = container
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return _MISSING
+        node = node[key]
+    return node
+
+
+def _set_path(container: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
+    """Assign ``value`` at ``path``, creating intermediate dicts as needed."""
+    node = container
+    for key in path[:-1]:
+        nxt = node.get(key)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            node[key] = nxt
+        node = nxt
+    node[path[-1]] = value
+
+
+def _deep_merge_local_wins(remote: Any, local: Any) -> Any:
+    """Deep-merge two JSON trees where local leaves win over remote."""
+    if isinstance(remote, dict) and isinstance(local, dict):
+        out: dict[str, Any] = {}
+        for k in remote.keys() | local.keys():
+            if k in remote and k in local:
+                out[k] = _deep_merge_local_wins(remote[k], local[k])
+            elif k in remote:
+                out[k] = remote[k]
+            else:
+                out[k] = local[k]
+        return out
+    return local
+
+
+def _union_list(remote: list[Any] | None, local: list[Any] | None) -> list[Any]:
+    """Concat local then remote, dedup preserving order. Local entries win order."""
+    seen: set[str] = set()
+    out: list[Any] = []
+    for item in (local or []) + (remote or []):
+        try:
+            key = (
+                json.dumps(item, sort_keys=True)
+                if isinstance(item, (dict, list))
+                else repr(item)
+            )
+        except TypeError:
+            key = repr(item)
+        if key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
+def _apply_policy(
+    existing: dict[str, Any],
+    path: tuple[str, ...],
+    policy: str,
+    remote_value: Any,
+) -> None:
+    """Apply one merge policy for one path. ``remote_value == _MISSING`` skips."""
+    if remote_value is _MISSING:
+        return
+
+    if policy == "remote-wins":
+        _set_path(existing, path, remote_value)
+        return
+
+    if policy == "union":
+        local_value = _get_path(existing, path)
+        local_list = local_value if isinstance(local_value, list) else []
+        remote_list = remote_value if isinstance(remote_value, list) else []
+        _set_path(existing, path, _union_list(remote_list, local_list))
+        return
+
+    if policy == "deep-merge":
+        local_value = _get_path(existing, path)
+        if local_value is _MISSING:
+            _set_path(existing, path, remote_value)
+        else:
+            _set_path(existing, path, _deep_merge_local_wins(remote_value, local_value))
+        return
+
+    if policy == "seed":
+        local_value = _get_path(existing, path)
+        if local_value is _MISSING:
+            _set_path(existing, path, remote_value)
+        return
+
+    raise ValueError(f"unknown merge policy: {policy}")
+
+
+_PolicyDeriver = Callable[[dict[str, Any], bool], Any]
+
+
+_CONTROLLER_FIELDS: list[tuple[tuple[str, ...], str, _PolicyDeriver]] = [
+    (("channels", "matrix", "enabled"),
+     "remote-wins", lambda c, _: _matrix_raw(c).get("enabled", True)),
+    (("channels", "matrix", "homeserver"),
+     "remote-wins", lambda c, ic: _port_remap(_matrix_raw(c).get("homeserver", ""), ic)),
+    (("channels", "matrix", "access_token"),
+     "remote-wins", lambda c, _: _matrix_raw(c).get("accessToken", "")),
+    (("channels", "matrix", "user_id"),
+     "remote-wins", _derive_matrix_user_id),
+    (("channels", "matrix", "encryption"),
+     "remote-wins", lambda c, _: _matrix_raw(c).get("encryption", False)),
+    (("channels", "matrix", "dm_policy"),
+     "remote-wins", lambda c, _: _matrix_raw(c).get("dm", {}).get("policy", "allowlist")),
+    (("channels", "matrix", "group_policy"),
+     "remote-wins", lambda c, _: _matrix_raw(c).get("groupPolicy", "allowlist")),
+    (("channels", "matrix", "filter_tool_messages"),
+     "remote-wins", lambda c, _: _matrix_bool(c, "filterToolMessages", "filter_tool_messages", False)),
+    (("channels", "matrix", "filter_thinking"),
+     "remote-wins", lambda c, _: _matrix_bool(c, "filterThinking", "filter_thinking", True)),
+    (("channels", "matrix", "vision_enabled"),
+     "remote-wins", lambda c, _: _resolve_vision_enabled(c)),
+    (("channels", "matrix", "history_limit"),
+     "remote-wins",
+     lambda c, _: _resolve_history_limit(c) if _resolve_history_limit(c) is not None else _MISSING),
+    (("channels", "matrix", "allow_from"),
+     "union", lambda c, _: _matrix_raw(c).get("dm", {}).get("allowFrom", []) or []),
+    (("channels", "matrix", "group_allow_from"),
+     "union", lambda c, _: _matrix_raw(c).get("groupAllowFrom", []) or []),
+    (("channels", "matrix", "groups"),
+     "deep-merge", lambda c, _: _matrix_raw(c).get("groups", {}) or {}),
+    (("running", "max_input_length"),
+     "remote-wins",
+     lambda c, _: _resolve_context_window(c) if _resolve_context_window(c) is not None else _MISSING),
+    (("running", "embedding_config"),
+     "remote-wins",
+     lambda c, ic: _resolve_embedding_config(c, ic) if _resolve_embedding_config(c, ic) is not None else _MISSING),
+    (("heartbeat",), "seed", _derive_heartbeat),
+]
+
+
+def _apply_credential_guard(standard_dir: Path, runtime_dir: Path) -> None:
+    """Inject credagent.json paths into CoPaw's file guard config."""
+    from copaw_worker.hooks.credential_guard import apply_credential_guard
+
+    count = apply_credential_guard(standard_dir, runtime_dir)
+    if count > 0:
+        logger.info("bridge: credential guard applied %d protected paths", count)
+
+
+def _write_config_json(working_dir: Path) -> None:
+    """Install config.json from template if missing. Never overwrite."""
+    _install_from_template(working_dir / "config.json", "config.json")
+    # Ensure agents.profiles section exists (required by qwenpaw).
+    cfg_path = working_dir / "config.json"
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    cfg.setdefault("agents", {
+        "active_agent": "default",
+        "profiles": {
+            "default": {
+                "id": "default",
+                "workspace_dir": str(working_dir / "workspaces" / "default"),
+            }
+        },
+    })
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
 
 def _write_agent_json(
     cfg: dict[str, Any],
