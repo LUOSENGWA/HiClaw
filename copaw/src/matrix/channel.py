@@ -43,8 +43,10 @@ from nio.responses import JoinedMembersResponse, WhoamiResponse
 logger = logging.getLogger("copaw.channels.matrix")
 
 # ---------------------------------------------------------------------------
-# Lazy import of QwenPaw base types so this file can be syntax-checked without
-# qwenpaw installed (it's only executed inside a qwenpaw environment).
+# Lazy import of QwenPaw base types with copaw fallback.  This file is used by
+# both the Worker (copaw/Dockerfile, has qwenpaw) and Manager
+# (manager/Dockerfile.copaw, may only have copaw).  The fallback ensures the
+# channel is recognized in either environment.
 # ---------------------------------------------------------------------------
 try:
     from qwenpaw.app.channels.base import BaseChannel
