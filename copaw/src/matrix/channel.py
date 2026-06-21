@@ -66,11 +66,15 @@ except ImportError:  # pragma: no cover
     # and ensures the copaw framework's channel loader (issubclass check) passes.
     try:
         from copaw.app.channels.base import BaseChannel
+        from agentscope_runtime.engine.schemas.agent_schemas import (
+            AudioContent, ContentType, FileContent, ImageContent,
+            MessageType, RunStatus, TextContent, VideoContent,
+        )
     except ImportError:
         BaseChannel = object  # type: ignore[assignment,misc]
-    ContentType = None  # type: ignore[assignment]
-    MessageType = None  # type: ignore[assignment]
-    RunStatus = None  # type: ignore[assignment]
+        ContentType = None  # type: ignore[assignment]
+        MessageType = None  # type: ignore[assignment]
+        RunStatus = None  # type: ignore[assignment]
 
 
 CHANNEL_KEY = "matrix"
