@@ -454,15 +454,15 @@ def _write_config_json(working_dir: Path) -> None:
             cfg = json.load(f)
     except Exception:
         cfg = {}
-    cfg.setdefault("agents", {
-        "active_agent": "default",
-        "profiles": {
-            "default": {
-                "id": "default",
-                "workspace_dir": str(working_dir / "workspaces" / "default"),
-            }
-        },
-    })
+    # Nested merge: preserve existing agents fields while ensuring required keys exist.
+    cfg.setdefault("agents", {})
+    cfg["agents"].setdefault("active_agent", "default")
+    cfg["agents"].setdefault("profiles", {})
+    cfg["agents"]["profiles"].setdefault("default", {})
+    cfg["agents"]["profiles"]["default"].setdefault("id", "default")
+    cfg["agents"]["profiles"]["default"].setdefault(
+        "workspace_dir", str(working_dir / "workspaces" / "default")
+    )
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 

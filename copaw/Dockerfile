@@ -144,6 +144,9 @@ RUN STANDARD_SITE=/opt/venv/standard/lib/python3.11/site-packages/copaw_worker \
 # copaw-sync wrapper
 RUN printf '#!/bin/bash\nexec python3 "/root/.copaw-worker/${HICLAW_WORKER_NAME}/skills/file-sync/scripts/copaw-sync.py" "$@"\n' \
     > /usr/local/bin/copaw-sync && chmod +x /usr/local/bin/copaw-sync
+# CoPaw runtime CLI (make it available in PATH for skills)
+RUN ln -sf /opt/venv/standard/bin/copaw /usr/local/bin/copaw \
+    && ln -sf /opt/venv/standard/bin/qwenpaw /usr/local/bin/qwenpaw
 
 # Entrypoint script
 COPY --chmod=755 scripts/copaw-worker-entrypoint.sh /opt/hiclaw/scripts/copaw-worker-entrypoint.sh

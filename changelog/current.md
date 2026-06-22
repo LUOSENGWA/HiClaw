@@ -21,6 +21,14 @@ Record image-affecting changes to `manager/`, `worker/`, `copaw/`, `openclaw-bas
 - **modelProvider authorization boundary**: Controller reconcilers now own provider-specific AI route authorization, while provisioning keeps using the default gateway authorization path to avoid duplicate provider coupling.
 - **Matrix AppService mode**: The controller can register as a Matrix Application Service and provision/log in users with the `as_token` instead of per-user passwords (legacy password auth is preserved when disabled). Enabled by default via `HICLAW_MATRIX_APPSERVICE_ENABLED`; the install script and the Helm `runtime-env` Secret generate and persist `HICLAW_MATRIX_APPSERVICE_AS_TOKEN` / `HICLAW_MATRIX_APPSERVICE_HS_TOKEN`. Set `HICLAW_MATRIX_APPSERVICE_USER_NAMESPACE_REGEX` to narrow the exclusive user namespace when running against a shared / pre-existing homeserver.
 
+**Copaw → QwenPaw Migration**
+
+- feat(copaw): switch worker runtime entrypoint from `copaw.app._app:app` to `qwenpaw.app._app:app`, adding `QWENPAW_WORKING_DIR` env alongside `COPAW_WORKING_DIR` for proper working directory resolution.
+- feat(copaw): add `qwenpaw` CLI symlink to PATH for TeamHarness adapter compatibility.
+- fix(copaw): change `agents.profiles` injection from shallow `setdefault` to nested merge, ensuring `active_agent`, `profiles.default.id`, and `workspace_dir` are present even when `config.json` already has an `agents` section.
+- fix(copaw): add copaw `BaseChannel` fallback in `channel.py` so Manager (copaw-only) can load the Matrix channel without qwenpaw installed.
+- fix(copaw): restore `agentscope_runtime` imports in copaw fallback path to prevent empty Manager replies.
+
 **Bug Fixes**
 
 - **CoPaw worker runtime environment**: CoPaw workers now prefer AgentTeams storage/runtime environment variables while preserving legacy HiClaw fallbacks, and Qwen-style model health preflights disable thinking for lightweight readiness checks.
