@@ -444,7 +444,7 @@ def _apply_credential_guard(standard_dir: Path, runtime_dir: Path) -> None:
         logger.info("bridge: credential guard applied %d protected paths", count)
 
 
-def _write_config_json(working_dir: Path) -> None:
+def _ensure_config_json(working_dir: Path) -> None:
     """Install config.json from template if missing. Never overwrite."""
     _install_from_template(working_dir / "config.json", "config.json")
     # Ensure agents.profiles section exists (required by qwenpaw).
