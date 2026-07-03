@@ -14,7 +14,7 @@ import os
 import shutil
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 def _port_remap(url: str, is_container: bool) -> str:
