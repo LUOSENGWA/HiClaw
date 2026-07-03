@@ -67,6 +67,9 @@ type TeamReconciler struct {
 	// MemberContext.PodLabels → backend.CreateRequest.Labels. Empty in
 	// embedded mode.
 	ControllerName string
+	Namespace      string
+
+	RemoteWatchRegistrar RemoteWatchRegistrar
 
 	// ResourcePrefix scopes team-member ServiceAccount and Pod names per
 	// HiClaw tenant instance. Forwarded into MemberDeps.ResourcePrefix so
@@ -314,9 +317,12 @@ func (r *TeamReconciler) reconcileTeamNormal(ctx context.Context, t *v1beta1.Tea
 		}
 		if err := r.reconcileMember(ctx, deps, m, ms); err != nil {
 			logger.Error(err, "team member reconcile failed", "name", m.Name)
+			ms.Message = err.Error()
+			ms.Phase = computeMemberPhase(ms.Phase, ms.MatrixUserID, m.Spec.DesiredState(), ms.ContainerState, err)
 			perMemberErrors = append(perMemberErrors, fmt.Sprintf("%s: %v", m.Name, err))
 			continue
 		}
+		ms.Message = ""
 		// Record the hash only after a full reconcile success so a failed
 		// mid-phase attempt on the next pass still sees SpecChanged=true
 		// and retries the container recreation. ms.Observed was already
@@ -416,6 +422,11 @@ func (r *TeamReconciler) reconcileTeamNormal(ctx context.Context, t *v1beta1.Tea
 // see the Step 4 comment in reconcileTeamNormal for why post-infra failures
 // must not revoke observed status (token-rotation hazard).
 func (r *TeamReconciler) reconcileMember(ctx context.Context, deps MemberDeps, m MemberContext, ms *v1beta1.TeamMemberStatus) error {
+	// Validate cross-cluster deployment fields before entering phases.
+	if err := ValidateMemberDeployment(m); err != nil {
+		return err
+	}
+
 	state := &MemberState{}
 
 	// Pre-populate ExistingMatrixUserID when we've already provisioned the
@@ -447,6 +458,9 @@ func (r *TeamReconciler) reconcileMember(ctx context.Context, deps MemberDeps, m
 	if _, err := ReconcileMemberContainer(ctx, deps, m, state); err != nil {
 		return err
 	}
+	if err := ReconcileMemberService(ctx, &m, &deps); err != nil {
+		return err
+	}
 	_ = ReconcileMemberExpose(ctx, deps, m, state)
 
 	if m.Role == RoleTeamWorker {
@@ -474,13 +488,16 @@ func (r *TeamReconciler) summarizeBackendReadiness(ctx context.Context, t *v1bet
 		return false, 0
 	}
 	for _, m := range members {
-		result, err := wb.Status(ctx, m.Name)
+		mwb := resolveBackendForMember(wb, m)
+		result, err := mwb.Status(ctx, m.Name)
 		if err != nil {
 			continue
 		}
 		ready := result.Status == backend.StatusRunning || result.Status == backend.StatusReady
 		if ms := t.Status.MemberByName(m.Name); ms != nil {
 			ms.Ready = ready
+			ms.ContainerState = string(result.Status)
+			ms.Phase = computeMemberPhase(ms.Phase, ms.MatrixUserID, m.Spec.DesiredState(), ms.ContainerState, nil)
 		}
 		if m.Role == RoleTeamLeader {
 			leaderReady = ready
@@ -811,6 +828,12 @@ func buildDesiredMembers(t *v1beta1.Team, controllerName string) []MemberContext
 			Every:   every,
 		}
 	}
+
+	var leaderServiceEnabled bool
+	if t.Spec.Leader.ServiceEnabled != nil {
+		leaderServiceEnabled = *t.Spec.Leader.ServiceEnabled
+	}
+
 	members = append(members, MemberContext{
 		Name:               t.Spec.Leader.Name,
 		RuntimeName:        t.Spec.Leader.EffectiveWorkerName(),
@@ -827,11 +850,19 @@ func buildDesiredMembers(t *v1beta1.Team, controllerName string) []MemberContext
 		PodLabels:          memberLabels(RoleTeamLeader, t.Spec.Leader.Labels),
 		Owner:              t,
 		Heartbeat:          leaderHeartbeat,
+		DeployMode:         v1beta1.DeployModeLocal,
+		ServiceEnabled:     leaderServiceEnabled,
 	})
 
 	for _, w := range t.Spec.Workers {
 		workerObserved := isObserved(w.Name)
 		spec := teamWorkerSpecToWorkerSpec(t, w)
+
+		var wServiceEnabled bool
+		if w.ServiceEnabled != nil {
+			wServiceEnabled = *w.ServiceEnabled
+		}
+
 		members = append(members, MemberContext{
 			Name:               w.Name,
 			RuntimeName:        w.EffectiveWorkerName(),
@@ -847,6 +878,8 @@ func buildDesiredMembers(t *v1beta1.Team, controllerName string) []MemberContext
 			TeamCoordinatorIDs: teamCoordinatorIDs(t),
 			PodLabels:          memberLabels(RoleTeamWorker, w.Labels),
 			Owner:              t,
+			DeployMode:         v1beta1.DeployModeLocal,
+			ServiceEnabled:     wServiceEnabled,
 		})
 	}
 	return members
@@ -1130,24 +1163,50 @@ func (r *TeamReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		if wb := r.Backend.DetectWorkerBackend(context.Background()); wb != nil && wb.Name() == "k8s" {
 			bldr = bldr.Watches(
 				&corev1.Pod{},
-				handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
-					teamName := obj.GetLabels()["hiclaw.io/team"]
-					if teamName == "" {
-						return nil
-					}
-					return []reconcile.Request{
-						{NamespacedName: client.ObjectKey{
-							Name:      teamName,
-							Namespace: obj.GetNamespace(),
-						}},
-					}
-				}),
+				teamPodEventHandler(""),
 				builder.WithPredicates(podLifecyclePredicates("hiclaw.io/team", r.ControllerName)),
 			)
 		}
 	}
 
-	return bldr.Complete(r)
+	ctl, err := bldr.Build(r)
+	if err != nil {
+		return err
+	}
+	if r.RemoteWatchRegistrar != nil && r.Backend != nil {
+		if wb := r.Backend.DetectWorkerBackend(context.Background()); wb != nil && wb.Name() == "k8s" {
+			r.RemoteWatchRegistrar.RegisterWatch(
+				ctl,
+				&corev1.Pod{},
+				teamPodEventHandler(r.Namespace),
+				podLifecyclePredicates("hiclaw.io/team", r.ControllerName),
+			)
+		}
+	}
+	return nil
+}
+
+func teamPodEventHandler(localNamespace string) handler.EventHandler {
+	return handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
+		return teamPodRequests(obj, localNamespace)
+	})
+}
+
+func teamPodRequests(obj client.Object, localNamespace string) []reconcile.Request {
+	teamName := obj.GetLabels()["hiclaw.io/team"]
+	if teamName == "" {
+		return nil
+	}
+	namespace := localNamespace
+	if namespace == "" {
+		namespace = obj.GetNamespace()
+	}
+	return []reconcile.Request{
+		{NamespacedName: client.ObjectKey{
+			Name:      teamName,
+			Namespace: namespace,
+		}},
+	}
 }
 
 // --- Policy helpers (preserved from prior implementation) ---
