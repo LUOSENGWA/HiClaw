@@ -28,6 +28,7 @@ from rich.panel import Panel
 from copaw_worker.config import WorkerConfig
 from copaw_worker.health import (
     ComponentHealth,
+    check_qwenpaw_matrix_channel,
     HealthState,
     check_copaw_service,
     check_matrix_service,
@@ -363,11 +364,11 @@ class Worker:
         homeserver = _port_remap(matrix_cfg.get("homeserver", ""), _is_in_container())
         matrix = await asyncio.to_thread(check_matrix_service, homeserver)
         if matrix.healthiness == "healthy":
-            marker_ready = (
-                self._matrix_ready_marker is not None
-                and self._matrix_ready_marker.exists()
+            channel_ready = await asyncio.to_thread(
+                check_qwenpaw_matrix_channel,
+                self.config.console_port,
             )
-            if not marker_ready:
+            if not channel_ready:
                 matrix = ComponentHealth(
                     "unhealthy",
                     "Matrix channel is not ready",
