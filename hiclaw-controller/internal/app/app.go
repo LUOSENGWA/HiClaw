@@ -438,6 +438,21 @@ func (a *App) initFieldIndexers(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf("index team worker names: %w", err)
 	}
+	if err := idx.IndexField(ctx, &v1beta1.Team{}, controller.TeamWorkerMembersField, func(obj crclient.Object) []string {
+		team, ok := obj.(*v1beta1.Team)
+		if !ok {
+			return nil
+		}
+		names := make([]string, 0, len(team.Spec.WorkerMembers))
+		for _, ref := range team.Spec.WorkerMembers {
+			if ref.Name != "" {
+				names = append(names, ref.Name)
+			}
+		}
+		return names
+	}); err != nil {
+		return fmt.Errorf("index team workerMembers name: %w", err)
+	}
 	return nil
 }
 
@@ -714,7 +729,7 @@ func (a *App) startInCluster() (*rest.Config, error) {
 	logger.Info("starting in-cluster mode")
 
 	// HICLAW_CONTROLLER_NAME is mandatory in incluster mode: it drives the
-	// leader election lease name, the hiclaw.io/controller CR label
+	// leader election lease name, the agentteams.io/controller CR label
 	// selector, and the agent pod template ConfigMap name. Running with
 	// an empty value would silently collapse these three scopes onto
 	// global defaults, causing cross-instance interference in the same

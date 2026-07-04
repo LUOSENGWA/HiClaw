@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	GroupName = "hiclaw.io"
+	GroupName = "agentteams.io"
 	Version   = "v1beta1"
 )
 
@@ -17,7 +17,7 @@ const (
 // environment variable. When set, the controller's informer cache
 // filters CR events by this label so multiple controller instances in
 // the same namespace do not reconcile each other's resources.
-const LabelController = "hiclaw.io/controller"
+const LabelController = "agentteams.io/controller"
 
 // AccessEntry declares one cloud-permission grant under a logical
 // service. v1 supported services: "object-storage", "ai-gateway", "ai-registry".
@@ -173,7 +173,7 @@ type WorkerSpec struct {
 	// Merged under the four-layer priority order (see controller docs):
 	// pod-template < CR metadata.labels < CR spec.labels < controller
 	// system labels. Entries whose keys collide with controller-forced
-	// system labels (hiclaw.io/controller, hiclaw.io/worker, etc.) are
+	// system labels (agentteams.io/controller, agentteams.io/worker, etc.) are
 	// silently overridden. Must carry the omitempty tag so Teams that
 	// embed WorkerSpec-shaped hashes keep a stable spec hash when the
 	// field is absent.
@@ -265,14 +265,44 @@ type Team struct {
 }
 
 type TeamSpec struct {
-	Description   string             `json:"description,omitempty"`
-	TeamName      string             `json:"teamName,omitempty"`
-	Admin         *TeamAdminSpec     `json:"admin,omitempty"`
-	HumanMembers  []TeamMemberSpec   `json:"humanMembers,omitempty"`
-	Leader        LeaderSpec         `json:"leader"`
-	Workers       []TeamWorkerSpec   `json:"workers,omitempty"`
+	Description  string           `json:"description,omitempty"`
+	TeamName     string           `json:"teamName,omitempty"`
+	Admin        *TeamAdminSpec   `json:"admin,omitempty"`
+	HumanMembers []TeamMemberSpec `json:"humanMembers,omitempty"`
+
+	// WorkerMembers references existing Worker CRs as team members.
+	// When non-empty, the TeamReconciler uses the new path (membership
+	// validation → Matrix invite → MinIO inject → status aggregation)
+	// and ignores the deprecated Leader/Workers fields.
+	// +kubebuilder:validation:MaxItems=128
+	WorkerMembers []TeamWorkerRef `json:"workerMembers,omitempty"`
+
 	PeerMentions  *bool              `json:"peerMentions,omitempty"`  // default true
 	ChannelPolicy *ChannelPolicySpec `json:"channelPolicy,omitempty"` // team-wide overrides
+
+	// HeartbeatEvery configures the Team Leader agent's periodic heartbeat
+	// check interval. The TeamReconciler writes this value into the leader
+	// Worker's openclaw.json and coordination context AGENTS.md.
+	// Example: "30m". Empty means leader heartbeat is disabled.
+	HeartbeatEvery string `json:"heartbeatEvery,omitempty"`
+
+	// Deprecated: Leader defines the team leader's runtime configuration.
+	// Retained for backward compatibility during migration. Ignored when
+	// WorkerMembers is non-empty.
+	Leader LeaderSpec `json:"leader,omitempty"`
+	// Deprecated: Workers defines team worker runtime configurations.
+	// Retained for backward compatibility during migration. Ignored when
+	// WorkerMembers is non-empty.
+	Workers []TeamWorkerSpec `json:"workers,omitempty"`
+}
+
+// TeamWorkerRef references an existing Worker CR as a team member.
+type TeamWorkerRef struct {
+	// Name is the metadata.name of the referenced Worker CR.
+	Name string `json:"name"`
+	// Role is this member's role within the team: "team_leader" or "worker".
+	// Empty defaults to "worker".
+	Role string `json:"role,omitempty"`
 }
 
 func (s TeamSpec) EffectiveTeamName(metadataName string) string {
