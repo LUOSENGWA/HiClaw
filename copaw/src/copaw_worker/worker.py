@@ -358,17 +358,24 @@ class Worker:
 
         model = await asyncio.to_thread(check_model_service, openclaw_cfg)
         self._health.update("model", model.healthiness, model.message, model.details)
+        if model.healthiness == "healthy":
+            logger.info("readiness model check OK worker=%s", self.worker_name)
+        else:
+            logger.warning(
+                "readiness model check failed worker=%s message=%s details=%s",
+                self.worker_name, model.message, model.details,
+            )
 
         matrix_cfg = openclaw_cfg.get("channels", {}).get("matrix", {})
         from .bridge import _port_remap, _is_in_container
         homeserver = _port_remap(matrix_cfg.get("homeserver", ""), _is_in_container())
         matrix = await asyncio.to_thread(check_matrix_service, homeserver)
         if matrix.healthiness == "healthy":
-            channel_ready = await asyncio.to_thread(
-                check_qwenpaw_matrix_channel,
-                self.config.console_port,
+            marker_ready = (
+                self._matrix_ready_marker is not None
+                and self._matrix_ready_marker.exists()
             )
-            if not channel_ready:
+            if not marker_ready:
                 matrix = ComponentHealth(
                     "unhealthy",
                     "Matrix channel is not ready",
@@ -425,6 +432,61 @@ class Worker:
                 return
             await asyncio.sleep(interval)
 
+
+    async def _poll_matrix_joined_rooms(self) -> None:
+        """Poll Matrix /_matrix/client/v3/joined_rooms until DM room appears.
+
+        Writes _matrix_ready_marker when at least one room is joined.
+        """
+        import json
+        import urllib.request
+
+        openclaw_cfg = self._openclaw_cfg or {}
+        matrix_cfg = openclaw_cfg.get("channels", {}).get("matrix", {})
+        homeserver = matrix_cfg.get("homeserver", "")
+        access_token = matrix_cfg.get("accessToken", "")
+
+        if not homeserver or not access_token:
+            logger.warning(
+                "cannot poll joined_rooms: missing homeserver or token worker=%s",
+                self.worker_name,
+            )
+            return
+
+        from .bridge import _port_remap, _is_in_container
+        homeserver = _port_remap(homeserver, _is_in_container())
+        url = f"{homeserver}/_matrix/client/v3/joined_rooms"
+
+        deadline = asyncio.get_running_loop().time() + 60
+        while True:
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode())
+                rooms = data.get("joined_rooms", [])
+                if rooms:
+                    self._matrix_ready_marker.write_text("ready\\n")
+                    logger.info(
+                        "matrix channel ready: %d joined rooms worker=%s",
+                        len(rooms),
+                        self.worker_name,
+                    )
+                    return
+            except Exception as exc:
+                logger.debug("joined_rooms poll failed: %s", exc)
+
+            if asyncio.get_running_loop().time() >= deadline:
+                logger.warning(
+                    "matrix channel not ready within 60s worker=%s",
+                    self.worker_name,
+                )
+                return
+            await asyncio.sleep(2)
+
     async def _run_copaw(self) -> None:
         """Start CoPaw via FastAPI app (includes runner + channels + web console)."""
         import uvicorn
@@ -456,6 +518,10 @@ class Worker:
             startup_health_task = asyncio.create_task(
                 self._mark_copaw_startup_health(),
                 name=f"copaw-worker-{self.worker_name}-startup-health",
+            )
+            matrix_ready_task = asyncio.create_task(
+                self._poll_matrix_joined_rooms(),
+                name=f"copaw-worker-{self.worker_name}-matrix-ready",
             )
             await server.serve()
             if not server.should_exit and self._health is not None:

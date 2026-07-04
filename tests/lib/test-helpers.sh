@@ -527,6 +527,11 @@ while True:
         last_error = exc
         if time.monotonic() >= deadline:
             print(str(last_error), file=sys.stderr)
+            print("=== DEBUG: last readyz before timeout ===", file=sys.stderr)
+            try:
+                print(json.dumps(ready, ensure_ascii=False, indent=2), file=sys.stderr)
+            except Exception:
+                print("(unable to serialize last ready state)", file=sys.stderr)
             sys.exit(10)
         time.sleep(2)
 
@@ -737,7 +742,7 @@ dump_diagnostics() {
             worker)
                 local container="hiclaw-worker-${name}"
                 printf "\n--- docker logs %s (last 100 lines) ---\n" "${container}"
-                docker logs --tail 100 "${container}" 2>&1 || true
+                docker logs --tail 200 "${container}" 2>&1 || true
                 printf "\n--- container state: %s ---\n" "${container}"
                 docker inspect --format='status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}} startedAt={{.State.StartedAt}} finishedAt={{.State.FinishedAt}} error={{.State.Error}}' "${container}" 2>&1 || true
                 printf "\n--- controller logs (recent, filtered for %s) ---\n" "${name}"

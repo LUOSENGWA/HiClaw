@@ -446,27 +446,15 @@ def _max_tokens_param(model_id: str) -> str:
     return "max_tokens"
 
 
-def check_qwenpaw_matrix_channel(
-    console_port: int,
-    *,
-    timeout: float = 5,
-) -> bool:
-    """Check whether qwenpaw Matrix channel reports healthy via its config API.
+def check_qwenpaw_matrix_channel(marker_path: "str | Path") -> bool:
+    """Check whether the Matrix ready marker file exists.
 
-    Returns True when the Matrix channel has completed initial sync and is ready
-    to process messages, False otherwise. Uses the standard qwenpaw
-    ``GET /config/channels/matrix/health`` endpoint.
+    Returns True when the marker file written by the joined_rooms polling
+    task is present, signalling the qwenpaw Matrix channel has completed
+    initial sync and at least one room is joined.
     """
-    url = f"http://127.0.0.1:{console_port}/config/channels/matrix/health"
     try:
-        req = urllib.request.Request(
-            url,
-            headers={"Accept": "application/json"},
-            method="GET",
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
-        return data.get("status") == "healthy"
+        return Path(marker_path).exists()
     except Exception:
         return False
 
