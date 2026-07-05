@@ -23,7 +23,7 @@ source /opt/hiclaw/scripts/lib/hiclaw-env.sh
 WORKER_NAME="${AGENTTEAMS_WORKER_NAME:-${HICLAW_WORKER_NAME:-}}"
 [ -n "${WORKER_NAME}" ] || { echo "AGENTTEAMS_WORKER_NAME is required" >&2; exit 1; }
 INSTALL_DIR="/root/.copaw-worker"
-export QWENPAW_WORKING_DIR="${INSTALL_DIR}/${WORKER_NAME}"
+export QWENPAW_WORKING_DIR="${INSTALL_DIR}/${WORKER_NAME}/.copaw"
 CONSOLE_PORT="${AGENTTEAMS_CONSOLE_PORT:-${HICLAW_CONSOLE_PORT:-}}"
 
 log() {
