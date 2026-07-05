@@ -629,6 +629,11 @@ async def test_worker_marks_copaw_unhealthy_when_app_exits_unexpectedly(tmp_path
     monkeypatch.setitem(sys.modules, "copaw.app", types.ModuleType("copaw.app"))
     monkeypatch.setitem(sys.modules, "copaw.app.channels", types.ModuleType("copaw.app.channels"))
     monkeypatch.setitem(sys.modules, "copaw.app.channels.registry", fake_registry)
+    # Also mock qwenpaw paths (worker.py imports from qwenpaw.app)
+    monkeypatch.setitem(sys.modules, "qwenpaw", types.ModuleType("qwenpaw"))
+    monkeypatch.setitem(sys.modules, "qwenpaw.app", types.ModuleType("qwenpaw.app"))
+    monkeypatch.setitem(sys.modules, "qwenpaw.app.channels", types.ModuleType("qwenpaw.app.channels"))
+    monkeypatch.setitem(sys.modules, "qwenpaw.app.channels.registry", fake_registry)
 
     fake_hooks = types.ModuleType("copaw_worker.hooks")
     fake_hooks.install_tool_hooks = lambda: None

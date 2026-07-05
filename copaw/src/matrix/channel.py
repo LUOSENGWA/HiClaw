@@ -43,11 +43,12 @@ from nio.responses import JoinedMembersResponse, WhoamiResponse
 logger = logging.getLogger("copaw.channels.matrix")
 
 # ---------------------------------------------------------------------------
-# Lazy import of QwenPaw base types so this file can be syntax-checked without
-# qwenpaw installed (it's only executed inside a qwenpaw environment).
+# Lazy import of QwenPaw base types with copaw fallback.  This file is used
+# by both the Worker (copaw/Dockerfile, has qwenpaw) and the Manager
+# (manager/Dockerfile.copaw, may only have copaw).
 # ---------------------------------------------------------------------------
 try:
-    from copaw.app.channels.base import BaseChannel
+    from qwenpaw.app.channels.base import BaseChannel
     from agentscope_runtime.engine.schemas.agent_schemas import (
         AudioContent,
         ContentType,
@@ -59,7 +60,10 @@ try:
         VideoContent,
     )
 except ImportError:  # pragma: no cover
-    BaseChannel = object  # type: ignore[assignment,misc]
+    try:
+        from copaw.app.channels.base import BaseChannel
+    except ImportError:
+        BaseChannel = object  # type: ignore[assignment,misc]
     ContentType = None  # type: ignore[assignment]
     MessageType = None  # type: ignore[assignment]
     RunStatus = None  # type: ignore[assignment]

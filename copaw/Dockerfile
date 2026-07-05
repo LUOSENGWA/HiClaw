@@ -88,7 +88,11 @@ RUN python -m venv /opt/venv/standard \
     && /opt/venv/standard/bin/pip install --no-cache-dir \
         --index-url "${PIP_INDEX_URL}" \
         --trusted-host "$(echo ${PIP_INDEX_URL} | sed 's|https\?://||;s|/.*||')" \
-        /tmp/copaw-worker/
+        /tmp/copaw-worker/ \
+    && /opt/venv/standard/bin/pip install --no-cache-dir \
+        --index-url "${PIP_INDEX_URL}" \
+        --trusted-host "$(echo ${PIP_INDEX_URL} | sed 's|https\?://||;s|/.*||')" \
+        qwenpaw
 
 # --- Patch CoPaw 1.0.2 Matrix channel indentation bug ---
 # _sync_loop method def is indented one level too deep inside
@@ -144,6 +148,9 @@ RUN STANDARD_SITE=/opt/venv/standard/lib/python3.11/site-packages/copaw_worker \
 # copaw-sync wrapper
 RUN printf '#!/bin/bash\nexec python3 "/root/.copaw-worker/${HICLAW_WORKER_NAME}/skills/file-sync/scripts/copaw-sync.py" "$@"\n' \
     > /usr/local/bin/copaw-sync && chmod +x /usr/local/bin/copaw-sync
+# CoPaw / QwenPaw runtime CLI
+RUN ln -sf /opt/venv/standard/bin/copaw /usr/local/bin/copaw \
+    && ln -sf /opt/venv/standard/bin/qwenpaw /usr/local/bin/qwenpaw
 
 # Entrypoint script
 COPY --chmod=755 scripts/copaw-worker-entrypoint.sh /opt/hiclaw/scripts/copaw-worker-entrypoint.sh
