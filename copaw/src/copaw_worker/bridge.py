@@ -138,6 +138,7 @@ def bridge_openclaw_to_copaw(
 
     os.environ["COPAW_WORKING_DIR"] = str(working_dir)
     _patch_copaw_paths(working_dir)
+    _deploy_custom_channels(working_dir)
 
     secret_dir = _secret_dir(working_dir)
     providers_src = working_dir / "providers.json"
@@ -215,6 +216,43 @@ def _patch_copaw_paths(working_dir: Path) -> None:
         _envs._LEGACY_ENVS_JSON_CANDIDATES = (working_dir / "envs.json",)
     except (ImportError, AttributeError):
         pass
+
+
+def _deploy_custom_channels(working_dir: Path) -> None:
+    """Copy copaw_worker/matrix_channel.py → custom_channels/matrix.py.
+
+    qwenpaw's channel registry scans ``CUSTOM_CHANNELS_DIR`` (derived from
+    ``QWENPAW_WORKING_DIR`` env var) for ``.py`` files containing BaseChannel
+    subclasses.  Our custom Matrix channel overrides ``_content_has_text`` to
+    recognise plain-dict content parts that the built-in channel silently
+    discards — without it incoming DM messages are consumed but never passed
+    to the agent (test-15 symptom).
+    """
+    # qwenpaw reads CUSTOM_CHANNELS_DIR from QWENPAW_WORKING_DIR (not copaw's
+    # working_dir), so we must deploy to the same directory qwenpaw scans.
+    qwenpaw_wd = os.environ.get("QWENPAW_WORKING_DIR") or os.environ.get("COPAW_WORKING_DIR", "")
+    custom_dir = Path(qwenpaw_wd) / "custom_channels" if qwenpaw_wd else working_dir / "custom_channels"
+    custom_dir.mkdir(parents=True, exist_ok=True)
+
+    src = Path(__file__).resolve().parent / "matrix_channel.py"
+    if not src.is_file():
+        logger.warning(
+            "Custom Matrix channel not found at %s — "
+            "Worker will use qwenpaw built-in (may miss message handling fixes)",
+            src,
+        )
+        return
+
+    dst = custom_dir / "matrix.py"
+    if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
+        logger.debug("Custom Matrix channel already up-to-date at %s", dst)
+        return
+
+    shutil.copy2(src, dst)
+    logger.info(
+        "Deployed custom Matrix channel: %s -> %s (%d bytes)",
+        src, dst, src.stat().st_size,
+    )
 
 
 def _template_text(name: str) -> str:

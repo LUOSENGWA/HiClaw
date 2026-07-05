@@ -44,12 +44,26 @@ MAX_TOKEN_REFRESH_RETRIES = 3
 TOKEN_REFRESH_BACKOFF_S = 5
 
 # ---------------------------------------------------------------------------
-# Lazy import of CoPaw base types so this file can be syntax-checked without
-# copaw installed (it's only executed inside a copaw environment).
+# Lazy import of CoPaw / QwenPaw base types so this file can be
+# syntax-checked without them installed (it's only executed inside a CoPaw
+# or QwenPaw environment).
+#
+# Prefer qwenpaw's BaseChannel so that qwenpaw's _discover_custom_channels()
+# issubclass check passes.  Fall back to copaw's for environments where only
+# copaw is installed.
 # ---------------------------------------------------------------------------
 try:
-    from copaw.app.channels.base import BaseChannel
-    from copaw.app.channels.schema import ChannelType
+    from qwenpaw.app.channels.base import BaseChannel
+    from qwenpaw.app.channels.schema import ChannelType
+except ImportError:
+    try:
+        from copaw.app.channels.base import BaseChannel
+        from copaw.app.channels.schema import ChannelType
+    except ImportError:  # pragma: no cover
+        BaseChannel = object  # type: ignore[assignment,misc]
+        ChannelType = str  # type: ignore[assignment]
+
+try:
     from agentscope_runtime.engine.schemas.agent_schemas import (
         AudioContent,
         ContentType,
@@ -61,8 +75,6 @@ try:
     _COPAW_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _COPAW_AVAILABLE = False
-    BaseChannel = object  # type: ignore[assignment,misc]
-    ChannelType = str  # type: ignore[assignment]
 
 
 CHANNEL_KEY = "matrix"
