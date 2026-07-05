@@ -232,7 +232,7 @@ class Worker:
             Path("/tmp") / f"hiclaw-copaw-{self.worker_name}-matrix-ready"
         )
         self._matrix_ready_marker.unlink(missing_ok=True)
-        os.environ["HICLAW_MATRIX_CHANNEL_READY_FILE"] = str(
+        os.environ["AGENTTEAMS_MATRIX_CHANNEL_READY_FILE"] = str(
             self._matrix_ready_marker,
         )
         logger.info(
