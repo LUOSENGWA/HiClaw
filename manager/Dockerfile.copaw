@@ -88,7 +88,9 @@ RUN /opt/copaw-venv/bin/pip install --no-cache-dir \
         -i "${PIP_INDEX_URL}" \
         --trusted-host "$(echo ${PIP_INDEX_URL} | sed 's|https\?://||;s|/.*||')" \
         qwenpaw \
-    && ln -sf /opt/copaw-venv/bin/qwenpaw /usr/local/bin/qwenpaw
+    && ln -sf /opt/copaw-venv/bin/qwenpaw /usr/local/bin/qwenpaw \
+    && mv /opt/copaw-venv/bin/copaw /opt/copaw-venv/bin/copaw.orig \
+    && ln -sf /opt/copaw-venv/bin/qwenpaw /opt/copaw-venv/bin/copaw
 
 # ---- Overlay HiClaw Matrix channel (not yet merged into CoPaw release) ----
 # Replace CoPaw's built-in Matrix channel with HiClaw-enhanced version

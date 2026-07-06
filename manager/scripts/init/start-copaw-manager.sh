@@ -240,5 +240,6 @@ export COPAW_LOG_LEVEL
 # Set PYTHONPATH to include copaw_worker module
 export PYTHONPATH="/opt/hiclaw/copaw/src:${PYTHONPATH:-}"
 
-# Use uvicorn to run CoPaw FastAPI app (enables AgentConfigWatcher for hot-reload)
-exec python3 -m qwenpaw app --host 0.0.0.0 --port 18799
+# Launch QwenPaw FastAPI app via copaw shim (copaw→qwenpaw symlink,
+# so pgrep -f "copaw app" matches CI health check while running qwenpaw)
+exec copaw app --host 0.0.0.0 --port 18799
