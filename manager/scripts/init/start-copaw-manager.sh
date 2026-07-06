@@ -240,6 +240,6 @@ export COPAW_LOG_LEVEL
 # Set PYTHONPATH to include copaw_worker module
 export PYTHONPATH="/opt/hiclaw/copaw/src:${PYTHONPATH:-}"
 
-# Launch QwenPaw FastAPI app via copaw shim (copaw→qwenpaw symlink,
+# Launch QwenPaw FastAPI app via copaw wrapper (exec -a copaw forces argv[0]=copaw
 # so pgrep -f "copaw app" matches CI health check while running qwenpaw)
 exec copaw app --host 0.0.0.0 --port 18799

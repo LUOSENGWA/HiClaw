@@ -83,16 +83,6 @@ RUN pip install --no-cache-dir \
         loongsuite-instrumentation-copaw \
         loongsuite-instrumentation-agentscope
 
-# ---- QwenPaw runtime (Manager migration from copaw to qwenpaw) ----
-RUN /opt/copaw-venv/bin/pip install --no-cache-dir \
-        -i "${PIP_INDEX_URL}" \
-        --trusted-host "$(echo ${PIP_INDEX_URL} | sed 's|https\?://||;s|/.*||')" \
-        qwenpaw \
-    && ln -sf /opt/copaw-venv/bin/qwenpaw /usr/local/bin/qwenpaw \
-    && mv /opt/copaw-venv/bin/copaw /opt/copaw-venv/bin/copaw.orig \
-    && printf '#!/bin/bash\nexec -a copaw /opt/copaw-venv/bin/qwenpaw "$@"\n' > /opt/copaw-venv/bin/copaw \
-    && chmod +x /opt/copaw-venv/bin/copaw
-
 # ---- Overlay HiClaw Matrix channel (not yet merged into CoPaw release) ----
 # Replace CoPaw's built-in Matrix channel with HiClaw-enhanced version
 COPY copaw/src/matrix/ /tmp/matrix-overlay/
@@ -124,6 +114,20 @@ COPY copaw/src/ /tmp/copaw-worker/src/
 RUN SITE=/opt/copaw-venv/lib/python3.11/site-packages \
     && cp -a /tmp/copaw-worker/src/copaw_worker/* "$SITE/copaw_worker/" \
     && rm -rf /tmp/copaw-worker/
+
+# ---- QwenPaw runtime (Manager migration from copaw to qwenpaw) ----
+# MUST be installed AFTER copaw-worker to prevent agentscope downgrade:
+#   copaw==1.0.2 → agentscope 1.0.18
+#   copaw-worker install → agentscope stays 1.0.18
+#   qwenpaw install → agentscope 1.0.20 (last install wins)
+RUN /opt/copaw-venv/bin/pip install --no-cache-dir \
+        -i "${PIP_INDEX_URL}" \
+        --trusted-host "$(echo ${PIP_INDEX_URL} | sed 's|https\?://||;s|/.*||')" \
+        qwenpaw \
+    && ln -sf /opt/copaw-venv/bin/qwenpaw /usr/local/bin/qwenpaw \
+    && mv /opt/copaw-venv/bin/copaw /opt/copaw-venv/bin/copaw.orig \
+    && printf '#!/bin/bash\nexec -a copaw /opt/copaw-venv/bin/qwenpaw "$@"\n' > /opt/copaw-venv/bin/copaw \
+    && chmod +x /opt/copaw-venv/bin/copaw
 
 # ---- Copy Manager agent definitions ----
 COPY manager/agent/ /opt/hiclaw/agent/
