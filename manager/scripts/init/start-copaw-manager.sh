@@ -13,6 +13,7 @@ source /opt/hiclaw/scripts/lib/hiclaw-env.sh
 # ============================================================
 OPENCLAW_WORKSPACE="${HOME}"
 COPAW_WORKING_DIR="${HOME}/.copaw"
+export QWENPAW_WORKING_DIR="${COPAW_WORKING_DIR}"
 
 # ============================================================
 # 1. Create CoPaw directory structure
@@ -240,4 +241,4 @@ export COPAW_LOG_LEVEL
 export PYTHONPATH="/opt/hiclaw/copaw/src:${PYTHONPATH:-}"
 
 # Use uvicorn to run CoPaw FastAPI app (enables AgentConfigWatcher for hot-reload)
-exec python3 -m copaw app --host 0.0.0.0 --port 18799
+exec python3 -m qwenpaw app --host 0.0.0.0 --port 18799
