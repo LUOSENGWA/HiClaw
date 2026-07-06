@@ -90,7 +90,8 @@ RUN /opt/copaw-venv/bin/pip install --no-cache-dir \
         qwenpaw \
     && ln -sf /opt/copaw-venv/bin/qwenpaw /usr/local/bin/qwenpaw \
     && mv /opt/copaw-venv/bin/copaw /opt/copaw-venv/bin/copaw.orig \
-    && ln -sf /opt/copaw-venv/bin/qwenpaw /opt/copaw-venv/bin/copaw
+    && printf '#!/bin/bash\nexec -a copaw /opt/copaw-venv/bin/qwenpaw "$@"\n' > /opt/copaw-venv/bin/copaw \
+    && chmod +x /opt/copaw-venv/bin/copaw
 
 # ---- Overlay HiClaw Matrix channel (not yet merged into CoPaw release) ----
 # Replace CoPaw's built-in Matrix channel with HiClaw-enhanced version
