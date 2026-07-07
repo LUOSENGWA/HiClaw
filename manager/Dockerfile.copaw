@@ -124,10 +124,7 @@ RUN /opt/copaw-venv/bin/pip install --no-cache-dir \
         -i "${PIP_INDEX_URL}" \
         --trusted-host "$(echo ${PIP_INDEX_URL} | sed 's|https\?://||;s|/.*||')" \
         qwenpaw \
-    && ln -sf /opt/copaw-venv/bin/qwenpaw /usr/local/bin/qwenpaw \
-    && mv /opt/copaw-venv/bin/copaw /opt/copaw-venv/bin/copaw.orig \
-    && printf '#!/bin/bash\nexec -a copaw /opt/copaw-venv/bin/qwenpaw "$@"\n' > /opt/copaw-venv/bin/copaw \
-    && chmod +x /opt/copaw-venv/bin/copaw
+    && ln -sf /opt/copaw-venv/bin/qwenpaw /usr/local/bin/qwenpaw
 
 # ---- Copy Manager agent definitions ----
 COPY manager/agent/ /opt/hiclaw/agent/

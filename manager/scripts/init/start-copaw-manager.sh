@@ -240,6 +240,9 @@ export COPAW_LOG_LEVEL
 # Set PYTHONPATH to include copaw_worker module
 export PYTHONPATH="/opt/hiclaw/copaw/src:${PYTHONPATH:-}"
 
-# Launch QwenPaw FastAPI app via copaw wrapper (exec -a copaw forces argv[0]=copaw
-# so pgrep -f "copaw app" matches CI health check while running qwenpaw)
-exec copaw app --host 0.0.0.0 --port 18799
+# Launch QwenPaw FastAPI app. Use exec -a to set argv[0]="copaw app" so that
+# pgrep -f "copaw app" matches CI health check. Must exec python3 directly
+# (ELF binary, not a script) because the Linux kernel's shebang handler
+# (binfmt_script.c) strips the exec -a argv[0] for script targets.
+# python3 /opt/copaw-venv/bin/qwenpaw app is equivalent to qwenpaw app.
+exec -a "copaw app" python3 /opt/copaw-venv/bin/qwenpaw app --host 0.0.0.0 --port 18799
