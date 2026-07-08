@@ -168,6 +168,7 @@ type Config struct {
 	ModelContextWindow int
 	ModelMaxTokens     int
 	ModelVision        *bool // nil = use model default; overrides model-level vision capability
+	ModelReasoning     *bool // nil = use model default
 
 	// LLM provider (for Gateway initialization)
 	LLMProvider                string
@@ -382,6 +383,7 @@ func LoadConfig() *Config {
 		ModelContextWindow: envOrDefaultInt("HICLAW_MODEL_CONTEXT_WINDOW", 0),
 		ModelMaxTokens:     envOrDefaultInt("HICLAW_MODEL_MAX_TOKENS", 0),
 		ModelVision:        envOptionalBool("AGENTTEAMS_MODEL_VISION"),
+		ModelReasoning:     envOptionalBool("AGENTTEAMS_MODEL_REASONING"),
 
 		LLMProvider:                envOrDefault("HICLAW_LLM_PROVIDER", "qwen"),
 		LLMAPIKey:                  os.Getenv("HICLAW_LLM_API_KEY"),
@@ -854,6 +856,7 @@ func (c *Config) AgentConfig() agentconfig.Config {
 		ModelContextWindow: c.ModelContextWindow,
 		ModelMaxTokens:     c.ModelMaxTokens,
 		ModelVision:        c.ModelVision,
+		ModelReasoning:     c.ModelReasoning,
 		CMSTracesEnabled:   c.CMSTracesEnabled,
 		CMSMetricsEnabled:  c.CMSMetricsEnabled,
 		CMSEndpoint:        c.CMSEndpoint,
