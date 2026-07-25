@@ -223,7 +223,7 @@ def test_configure_qwenpaw_runtime_uses_workspace_teams_prompt(
     workspace = tmp_path / "agents" / "worker-a" / ".qwenpaw" / "workspaces" / "default"
     assert saved.workspace_dir == str(workspace)
     assert saved.approval_level == "AUTO"
-    assert saved.system_prompt_files == ["AGENTS.md", "SOUL.md", "TEAMS.md"]
+    assert saved.system_prompt_files == ["AGENTS.md", "SOUL.md", "TEAMS.md", "IDENTITY.md"]
     assert not any("shared" in prompt for prompt in saved.system_prompt_files)
     assert saved.running.shell_command_executable == "custom-shell"
 

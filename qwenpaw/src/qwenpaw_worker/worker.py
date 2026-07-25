@@ -436,7 +436,7 @@ class Worker:
         agent_config.workspace_dir = str(self.config.default_workspace_dir)
         agent_config.approval_level = "AUTO"
         prompt_files = list(agent_config.system_prompt_files or [])
-        for file_name in ("AGENTS.md", "SOUL.md", "TEAMS.md"):
+        for file_name in ("AGENTS.md", "SOUL.md", "TEAMS.md", "IDENTITY.md"):
             if file_name not in prompt_files:
                 prompt_files.append(file_name)
         agent_config.system_prompt_files = prompt_files

@@ -350,6 +350,10 @@ class MemberRuntimeConfig:
         )
 
     @property
+    def inline_config(self) -> Dict[str, str]:
+        return _string_fields(_section(self.desired, "inlineConfig"), ("identity", "soul", "agents"))
+
+    @property
     def model(self) -> Dict[str, Any]:
         return _section(self.desired, "model")
 
@@ -372,9 +376,10 @@ class MemberRuntimeConfig:
         return _section(self.desired, "channelPolicy")
 
     @property
-    def desired_identity(self) -> Tuple[str, str, str, str, str, str, str, str]:
+    def desired_identity(self) -> Tuple[str, str, str, str, str, str, str, str, str]:
         return (
             *self.agent_package_identity,
+            _stable_json(self.inline_config),
             _stable_json(self.model),
             _stable_json(self.mcp_servers),
             _stable_json(self.channels),
@@ -1609,6 +1614,7 @@ class RuntimeUpdater:
         self._apply_team_context_prompt(config)
 
         applied_package = self.package_manager.apply(config)
+        self._apply_inline_config(config)
 
         adapter_applied = False
         if adapter_should_apply:
@@ -1632,6 +1638,21 @@ class RuntimeUpdater:
             _duration_ms(started_at),
         )
         return ApplyResult(runtime_config=config, changed=True, agent_package_dir=applied_package)
+
+    def _apply_inline_config(self, config: MemberRuntimeConfig) -> None:
+        prompt_files = {
+            "IDENTITY.md": config.inline_config.get("identity", ""),
+            "SOUL.md": config.inline_config.get("soul", ""),
+            "AGENTS.md": config.inline_config.get("agents", ""),
+        }
+        for file_name, content in prompt_files.items():
+            if not content:
+                continue
+            path = self.config.default_workspace_dir / file_name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.tmp")
+            tmp.write_text(f"{content.rstrip()}\n", encoding="utf-8")
+            tmp.replace(path)
 
     def _sync_model_runtime_if_needed(
         self,

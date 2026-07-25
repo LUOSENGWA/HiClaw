@@ -11,7 +11,7 @@ import sys
 import types
 from urllib.parse import parse_qs, urlparse
 
-from qwenpaw_worker.update import AgentPackageManager, MemberRuntimeConfig, _strip_json_line_comments
+from qwenpaw_worker.update import AgentPackageManager, MemberRuntimeConfig, RuntimeUpdater, _strip_json_line_comments
 
 
 def _package(
@@ -133,6 +133,45 @@ desired: {}
         encoding="utf-8",
     )
     return MemberRuntimeConfig.load(path)
+
+
+def _runtime_config_with_inline_config(tmp_path: Path) -> MemberRuntimeConfig:
+    path = tmp_path / "runtime-inline.yaml"
+    path.write_text(
+        """
+kind: MemberRuntimeConfig
+metadata:
+  generation: inline
+member:
+  name: worker-a
+  runtime: qwenpaw
+desired:
+  inlineConfig:
+    identity: Frontend specialist
+    soul: Build accessible user interfaces
+    agents: Follow the project workflow
+""",
+        encoding="utf-8",
+    )
+    return MemberRuntimeConfig.load(path)
+
+
+def test_runtime_updater_applies_inline_prompt_config_to_workspace(tmp_path: Path) -> None:
+    workspace_dir = tmp_path / "workspace"
+    config = types.SimpleNamespace(
+        worker_name="worker-a",
+        qwenpaw_working_dir=tmp_path / "qwenpaw",
+        default_workspace_dir=workspace_dir,
+        runtime_config_path=tmp_path / "runtime.yaml",
+        agent_role="worker",
+    )
+    updater = RuntimeUpdater(config, model_runtime_sync=lambda _config: None)
+
+    updater.apply_once(runtime_config=_runtime_config_with_inline_config(tmp_path))
+
+    assert (workspace_dir / "IDENTITY.md").read_text(encoding="utf-8") == "Frontend specialist\n"
+    assert (workspace_dir / "SOUL.md").read_text(encoding="utf-8") == "Build accessible user interfaces\n"
+    assert (workspace_dir / "AGENTS.md").read_text(encoding="utf-8") == "Follow the project workflow\n"
 
 
 def _install_fake_qwenpaw_mcp_config(monkeypatch):

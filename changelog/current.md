@@ -19,6 +19,7 @@ Record release-facing changes here before the next release.
 
 **Bug Fixes**
 
+- **QwenPaw inline prompt compatibility**: Project Worker identity, SOUL, and AGENTS content through runtime desired state and apply it to the native QwenPaw workspace.
 - **QwenPaw local startup readiness**: Select and propagate the QwenPaw Worker image across install backends, then wait for the runtime-owned `runtime/runtime.yaml` object before creating a local Docker Worker.
 - **QwenPaw 2.0 runtime compatibility**: Adapt the QwenPaw Worker image, custom Matrix Channel, and native plugins to QwenPaw 2.0.1 startup and schema contracts.
 - **Worker storage sync I/O amplification**: Upload changed workspace files once per successful watermark, keep jq 1.7 fallback pulls alive, and limit embedded Controller mirrors to control-plane configuration. Concurrent Worker creation and large unknown workspace paths retain their existing persistence semantics without repeated whole-workspace mirrors. ([#1110](https://github.com/agentscope-ai/AgentTeams/pull/1110))
