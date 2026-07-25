@@ -14,11 +14,23 @@ PLUGIN = REPO_ROOT / "plugins" / "teamharness" / "adapters" / "qwenpaw" / "plugi
 
 
 @pytest.fixture(autouse=True)
-def _clear_agent_workspace_env():
+def _isolate_qwenpaw_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    qwenpaw_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "qwenpaw" or name.startswith("qwenpaw.")
+    }
+    for name in qwenpaw_modules:
+        sys.modules.pop(name, None)
     original = os.environ.pop("AGENT_WORKSPACE", None)
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(tmp_path / ".qwenpaw"))
     try:
         yield
     finally:
+        for name in tuple(sys.modules):
+            if name == "qwenpaw" or name.startswith("qwenpaw."):
+                sys.modules.pop(name, None)
+        sys.modules.update(qwenpaw_modules)
         if original is None:
             os.environ.pop("AGENT_WORKSPACE", None)
         else:

@@ -385,12 +385,14 @@ def sanitize_text(text: str) -> str:
 
 
 def _qwenpaw_config_path() -> Optional[Path]:
+    working_dir = _qwenpaw_working_dir()
+    if working_dir is not None and os.getenv("QWENPAW_WORKING_DIR", "").strip():
+        return working_dir / "config.json"
     try:
         from qwenpaw.config import get_config_path
 
         return Path(get_config_path())
     except Exception:
-        working_dir = _qwenpaw_working_dir()
         return working_dir / "config.json" if working_dir is not None else None
 
 
@@ -516,13 +518,14 @@ def sanitize_tool_result(result: Any) -> Dict[str, Any]:
 
 
 def _iter_qwenpaw_agents() -> List[tuple[str, Path]]:
+    workspace = os.getenv("QWENPAW_WORKSPACE_DIR", "").strip()
+    if workspace:
+        return [("default", Path(workspace).expanduser())]
     try:
         from qwenpaw.config.utils import load_config
     except ImportError:
-        workspace = os.getenv("QWENPAW_WORKSPACE_DIR", "").strip()
-        if not workspace:
-            qwenpaw_dir = os.getenv("QWENPAW_WORKING_DIR", "").strip()
-            workspace = str(Path(qwenpaw_dir) / "workspaces" / "default") if qwenpaw_dir else ""
+        qwenpaw_dir = os.getenv("QWENPAW_WORKING_DIR", "").strip()
+        workspace = str(Path(qwenpaw_dir) / "workspaces" / "default") if qwenpaw_dir else ""
         return [("default", Path(workspace))] if workspace else []
 
     root = load_config()

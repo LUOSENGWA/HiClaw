@@ -78,6 +78,10 @@ def test_build_qwenpaw_native_plugin_package(tmp_path: Path) -> None:
     assert manifest["id"] == "teamharness"
     assert manifest["version"] == version
     assert manifest["entry"]["backend"] == "plugin.py"
+    assert manifest["qwenpaw_version"] == {
+        "min": "2.0.0",
+        "max": "2.1.0",
+    }
     assert "periodic-sync" not in manifest["meta"]["features"]
 
     probe = subprocess.run(

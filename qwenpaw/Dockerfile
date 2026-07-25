@@ -24,7 +24,7 @@ FROM ${HIGRESS_REGISTRY}/higress/python:3.11-slim
 ARG APT_MIRROR=
 ARG PIP_INDEX_URL=https://pypi.org/simple/
 ARG PIP_TIMEOUT=300
-ARG QWENPAW_PIP_SPEC=qwenpaw==1.1.11
+ARG QWENPAW_PIP_SPEC=qwenpaw==2.0.0.post3
 ARG NPM_REGISTRY=https://registry.npmjs.org/
 
 RUN if [ -n "${APT_MIRROR}" ]; then \
@@ -111,11 +111,6 @@ RUN /opt/venv/qwenpaw/bin/python /tmp/install-builtin-qwenpaw-plugins.py \
         /opt/agentteams/plugins/teamharness-qwenpaw.zip \
         /opt/agentteams/plugins/workerflow-qwenpaw.zip \
     && rm -f /tmp/install-builtin-qwenpaw-plugins.py
-
-# Enable QwenPaw's native deferred MCP startup for app workspaces.
-COPY qwenpaw/scripts/patch-qwenpaw-defer-mcp-startup.py /tmp/patch-qwenpaw-defer-mcp-startup.py
-RUN /opt/venv/qwenpaw/bin/python /tmp/patch-qwenpaw-defer-mcp-startup.py && \
-    rm -f /tmp/patch-qwenpaw-defer-mcp-startup.py
 
 COPY --chmod=755 qwenpaw/scripts/qwenpaw-worker-entrypoint.sh /opt/agentteams/scripts/qwenpaw-worker-entrypoint.sh
 COPY --chmod=755 qwenpaw/scripts/qwenpaw-teamharness-plugin-reload.sh /opt/agentteams/scripts/qwenpaw-teamharness-plugin-reload.sh

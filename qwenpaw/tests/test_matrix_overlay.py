@@ -46,6 +46,13 @@ def test_matrix_overlay_is_valid_python() -> None:
     ast.parse(_overlay_source(), filename=str(OVERLAY))
 
 
+def test_matrix_overlay_uses_qwenpaw_2_streaming_schema() -> None:
+    source = _overlay_source()
+
+    assert "from qwenpaw.schemas import" in source
+    assert "agentscope_runtime.engine.schemas.agent_schemas" not in source
+
+
 def test_matrix_overlay_supports_streaming_reasoning_hooks() -> None:
     source = _overlay_source()
 
@@ -155,11 +162,8 @@ def _load_overlay_module():
         SyncError=_Dummy,
         WhoamiResponse=_Dummy,
     )
-    _install_module("agentscope_runtime")
-    _install_module("agentscope_runtime.engine")
-    _install_module("agentscope_runtime.engine.schemas")
     _install_module(
-        "agentscope_runtime.engine.schemas.agent_schemas",
+        "qwenpaw.schemas",
         AudioContent=content_class,
         ContentType=_ContentType,
         FileContent=content_class,

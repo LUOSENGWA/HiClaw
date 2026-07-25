@@ -150,6 +150,19 @@ def test_link_workspace_shared_points_to_canonical_shared(tmp_path: Path) -> Non
     assert (config.shared_dir / "tasks" / "task-1" / "workspace" / "note.txt").read_text(encoding="utf-8") == "ready\n"
 
 
+def test_builtin_qwenpaw_plugins_default_matches_image_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AGENTTEAMS_BUILTIN_QWENPAW_PLUGINS_DIR", raising=False)
+
+    worker = Worker(_config(tmp_path))
+
+    assert worker._builtin_qwenpaw_plugins_dir() == Path(
+        "/opt/agentteams/qwenpaw-builtin/plugins",
+    )
+
+
 def test_configure_qwenpaw_runtime_uses_workspace_teams_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
