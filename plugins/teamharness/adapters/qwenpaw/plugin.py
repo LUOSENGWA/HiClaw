@@ -726,6 +726,32 @@ def apply_teamharness() -> Dict[str, Any]:
     return {"ok": True, "agents": agents, "skills": skills, "mcp": mcp, "credentialGuard": credential_guard}
 
 
+def install_internal_mcp_allow_policy() -> Dict[str, Any]:
+    try:
+        from qwenpaw.drivers.adapters import mcp_legacy_config
+    except ImportError:
+        return {"ok": True, "installed": False, "reason": "qwenpaw driver API unavailable"}
+
+    allowed_clients = getattr(mcp_legacy_config, "_agentteams_allowed_mcp_clients", set())
+    allowed_clients.add(MCP_CLIENT_ID)
+    mcp_legacy_config._agentteams_allowed_mcp_clients = allowed_clients
+    if getattr(mcp_legacy_config, "_agentteams_policy_wrapper_installed", False):
+        return {"ok": True, "installed": True, "action": "updated"}
+
+    original = mcp_legacy_config.legacy_mcp_client_to_driver
+
+    def _legacy_mcp_client_to_driver(client_key, config):
+        card, credential = original(client_key, config)
+        if client_key in mcp_legacy_config._agentteams_allowed_mcp_clients:
+            card.policy.default_effect = "allow"
+            card.policy.rules = []
+        return card, credential
+
+    mcp_legacy_config.legacy_mcp_client_to_driver = _legacy_mcp_client_to_driver
+    mcp_legacy_config._agentteams_policy_wrapper_installed = True
+    return {"ok": True, "installed": True, "action": "created"}
+
+
 def install_output_sanitizer_wrapper(api: Any = None) -> Dict[str, Any]:
     try:
         from qwenpaw.agents.react_agent import QwenPawAgent
@@ -996,11 +1022,14 @@ def install_task_trace_processor() -> Dict[str, Any]:
 class TeamHarnessPlugin:
     def __init__(self) -> None:
         self.last_apply_result: Dict[str, Any] = {}
+        self.policy_result: Dict[str, Any] = {}
         self.sanitizer_result: Dict[str, Any] = {}
         self.trace_result: Dict[str, Any] = {}
 
     def _sync_runtime(self, api: Any) -> Dict[str, Any]:
+        self.policy_result = install_internal_mcp_allow_policy()
         self.last_apply_result = apply_teamharness()
+        self.last_apply_result["driverPolicy"] = self.policy_result
         self.sanitizer_result = install_output_sanitizer_wrapper(api=api)
         self.trace_result = install_task_trace_processor()
         return self.last_apply_result
@@ -1032,6 +1061,7 @@ class TeamHarnessPlugin:
             return {
                 "ok": True,
                 "lastApply": self.last_apply_result,
+                "driverPolicy": self.policy_result,
                 "sanitizer": self.sanitizer_result,
                 "trace": self.trace_result,
             }

@@ -5,7 +5,10 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
+import sys
+import types
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
@@ -66,6 +69,39 @@ class WorkerFlowQwenPawAdapterTest(unittest.TestCase):
         self.assertEqual(env["AGENTTEAMS_MATRIX_USER_ID"], "@worker:matrix.local")
         self.assertEqual(env["AGENTTEAMS_WORKER_NAME"], "worker-a")
         self.assertEqual(env["QWENPAW_WORKING_DIR"], "/root/.qwenpaw")
+
+    def test_internal_mcp_policy_allows_only_workerflow(self) -> None:
+        module = load_plugin()
+
+        def legacy_mcp_client_to_driver(_client_key, _config):
+            policy = types.SimpleNamespace(default_effect="ask", rules=["ask"])
+            return types.SimpleNamespace(policy=policy), None
+
+        qwenpaw_module = types.ModuleType("qwenpaw")
+        drivers_module = types.ModuleType("qwenpaw.drivers")
+        adapters_module = types.ModuleType("qwenpaw.drivers.adapters")
+        legacy_module = types.ModuleType("qwenpaw.drivers.adapters.mcp_legacy_config")
+        legacy_module.legacy_mcp_client_to_driver = legacy_mcp_client_to_driver
+        adapters_module.mcp_legacy_config = legacy_module
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "qwenpaw": qwenpaw_module,
+                "qwenpaw.drivers": drivers_module,
+                "qwenpaw.drivers.adapters": adapters_module,
+                "qwenpaw.drivers.adapters.mcp_legacy_config": legacy_module,
+            },
+        ):
+            result = module.install_internal_mcp_allow_policy()
+            internal, _ = legacy_module.legacy_mcp_client_to_driver("workerflow", {})
+            external, _ = legacy_module.legacy_mcp_client_to_driver("external", {})
+
+        self.assertEqual(result, {"ok": True, "installed": True, "action": "created"})
+        self.assertEqual(internal.policy.default_effect, "allow")
+        self.assertEqual(internal.policy.rules, [])
+        self.assertEqual(external.policy.default_effect, "ask")
+        self.assertEqual(external.policy.rules, ["ask"])
 
 
 if __name__ == "__main__":

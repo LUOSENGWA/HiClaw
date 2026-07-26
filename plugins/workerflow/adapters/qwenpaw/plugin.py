@@ -181,13 +181,42 @@ def apply_workerflow() -> dict[str, Any]:
     return {"ok": True, "agents": agents, "skills": skills, "mcp": mcp}
 
 
+def install_internal_mcp_allow_policy() -> dict[str, Any]:
+    try:
+        from qwenpaw.drivers.adapters import mcp_legacy_config
+    except ImportError:
+        return {"ok": True, "installed": False, "reason": "qwenpaw driver API unavailable"}
+
+    allowed_clients = getattr(mcp_legacy_config, "_agentteams_allowed_mcp_clients", set())
+    allowed_clients.add(MCP_CLIENT_ID)
+    mcp_legacy_config._agentteams_allowed_mcp_clients = allowed_clients
+    if getattr(mcp_legacy_config, "_agentteams_policy_wrapper_installed", False):
+        return {"ok": True, "installed": True, "action": "updated"}
+
+    original = mcp_legacy_config.legacy_mcp_client_to_driver
+
+    def _legacy_mcp_client_to_driver(client_key, config):
+        card, credential = original(client_key, config)
+        if client_key in mcp_legacy_config._agentteams_allowed_mcp_clients:
+            card.policy.default_effect = "allow"
+            card.policy.rules = []
+        return card, credential
+
+    mcp_legacy_config.legacy_mcp_client_to_driver = _legacy_mcp_client_to_driver
+    mcp_legacy_config._agentteams_policy_wrapper_installed = True
+    return {"ok": True, "installed": True, "action": "created"}
+
+
 class WorkerFlowPlugin:
     def __init__(self) -> None:
         self.last_apply_result: dict[str, Any] = {}
+        self.policy_result: dict[str, Any] = {}
 
     def register(self, api: Any) -> None:
         def sync() -> dict[str, Any]:
+            self.policy_result = install_internal_mcp_allow_policy()
             self.last_apply_result = apply_workerflow()
+            self.last_apply_result["driverPolicy"] = self.policy_result
             return self.last_apply_result
 
         api.register_startup_hook("workerflow_sync", sync, priority=45)
@@ -206,11 +235,17 @@ class WorkerFlowPlugin:
 
         @router.get("/status")
         def status() -> dict[str, Any]:
-            return {"ok": True, "lastApply": self.last_apply_result}
+            return {
+                "ok": True,
+                "lastApply": self.last_apply_result,
+                "driverPolicy": self.policy_result,
+            }
 
         @router.post("/sync")
         def sync_endpoint() -> dict[str, Any]:
+            self.policy_result = install_internal_mcp_allow_policy()
             self.last_apply_result = apply_workerflow()
+            self.last_apply_result["driverPolicy"] = self.policy_result
             return self.last_apply_result
 
         api.register_http_router(router, prefix="/workerflow", tags=["workerflow"])

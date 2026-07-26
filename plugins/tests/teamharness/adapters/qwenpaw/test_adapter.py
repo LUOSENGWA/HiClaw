@@ -432,11 +432,49 @@ def test_output_sanitizer_wrapper_preserves_async_tool_stream(
     assert chunks[1]["content"][0]["text"] == "safe"
 
 
+def test_internal_mcp_policy_allows_only_teamharness(monkeypatch) -> None:
+    module = _load_plugin()
+
+    def legacy_mcp_client_to_driver(_client_key, _config):
+        policy = types.SimpleNamespace(default_effect="ask", rules=["ask"])
+        return types.SimpleNamespace(policy=policy), None
+
+    qwenpaw_module = types.ModuleType("qwenpaw")
+    drivers_module = types.ModuleType("qwenpaw.drivers")
+    adapters_module = types.ModuleType("qwenpaw.drivers.adapters")
+    legacy_module = types.ModuleType("qwenpaw.drivers.adapters.mcp_legacy_config")
+    legacy_module.legacy_mcp_client_to_driver = legacy_mcp_client_to_driver
+    adapters_module.mcp_legacy_config = legacy_module
+    monkeypatch.setitem(sys.modules, "qwenpaw", qwenpaw_module)
+    monkeypatch.setitem(sys.modules, "qwenpaw.drivers", drivers_module)
+    monkeypatch.setitem(sys.modules, "qwenpaw.drivers.adapters", adapters_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "qwenpaw.drivers.adapters.mcp_legacy_config",
+        legacy_module,
+    )
+
+    result = module.install_internal_mcp_allow_policy()
+    internal, _ = legacy_module.legacy_mcp_client_to_driver("teamharness", {})
+    external, _ = legacy_module.legacy_mcp_client_to_driver("external", {})
+
+    assert result == {"ok": True, "installed": True, "action": "created"}
+    assert internal.policy.default_effect == "allow"
+    assert internal.policy.rules == []
+    assert external.policy.default_effect == "ask"
+    assert external.policy.rules == ["ask"]
+
+
 def test_teamharness_http_sync_reinstalls_runtime_hooks(monkeypatch) -> None:
     module = _load_plugin()
     calls = []
 
     monkeypatch.setattr(module, "apply_teamharness", lambda: {"ok": True, "applied": True})
+    monkeypatch.setattr(
+        module,
+        "install_internal_mcp_allow_policy",
+        lambda: calls.append(("policy", None)) or {"ok": True, "installed": True},
+    )
     monkeypatch.setattr(
         module,
         "install_output_sanitizer_wrapper",
@@ -484,8 +522,12 @@ def test_teamharness_http_sync_reinstalls_runtime_hooks(monkeypatch) -> None:
 
     result = api.routers["/teamharness"].routes[("POST", "/sync")]()
 
-    assert result == {"ok": True, "applied": True}
-    assert calls == [("sanitizer", api)]
+    assert result == {
+        "ok": True,
+        "applied": True,
+        "driverPolicy": {"ok": True, "installed": True},
+    }
+    assert calls == [("policy", None), ("sanitizer", api)]
     assert plugin.sanitizer_result == {"ok": True, "installed": True}
 
 
