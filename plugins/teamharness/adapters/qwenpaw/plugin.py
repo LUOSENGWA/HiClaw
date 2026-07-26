@@ -737,9 +737,9 @@ def install_output_sanitizer_wrapper(api: Any = None) -> Dict[str, Any]:
     original = QwenPawAgent._acting
 
     async def _acting_with_sanitizer(self, tool_call):
-        result = await original(self, tool_call)
-        sanitize_tool_result(result)
-        return result
+        async for chunk in original(self, tool_call):
+            sanitize_tool_result(chunk)
+            yield chunk
 
     QwenPawAgent._acting = _acting_with_sanitizer
     QwenPawAgent._teamharness_sanitizer_installed = True

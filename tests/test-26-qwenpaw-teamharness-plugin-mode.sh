@@ -955,10 +955,10 @@ for container in "${LEADER_CONTAINER}" "${WORKER_CONTAINER}"; do
         log_fail "${container} agent config missing AgentSpec package MCP"
     fi
 
-    if docker exec "${container}" sh -c "grep -q 'TEST26 AgentSpec Package' '${workspace}/AGENTS.md' && grep -q 'TEST26 AgentSpec Package Soul' '${workspace}/SOUL.md'" >/dev/null 2>&1; then
-        log_pass "${container} workspace includes AgentSpec package prompts"
+    if docker exec "${container}" sh -c "grep -q 'TEST26 AgentSpec Package' '${workspace}/AGENTS.md' && grep -q '${TEST_TEAM}' '${workspace}/SOUL.md'" >/dev/null 2>&1; then
+        log_pass "${container} workspace combines AgentSpec and inline prompts"
     else
-        log_fail "${container} workspace missing AgentSpec package prompts"
+        log_fail "${container} workspace missing AgentSpec or inline prompts"
     fi
 
     if docker exec "${container}" sh -c "grep -q 'TEST26 AgentSpec Package Bootstrap' '${workspace}/BOOTSTRAP.md'" >/dev/null 2>&1; then
@@ -1047,18 +1047,21 @@ active = agent.get("active_model") or {}
 if active.get("provider_id") != "agentteams-gateway" or active.get("model") != model:
     problems.append("active_model")
 
-for rel in ["mcporter-servers.json", "config/mcporter.json"]:
-    path = workspace / rel
-    if not path.is_file():
-        problems.append(f"missing:{rel}")
-        continue
+legacy_path = workspace / "mcporter-servers.json"
+if legacy_path.exists():
+    problems.append("legacy:mcporter-servers.json")
+
+path = workspace / "config" / "mcporter.json"
+if not path.is_file():
+    problems.append("missing:config/mcporter.json")
+else:
     data = json.loads(path.read_text(encoding="utf-8"))
     server = (data.get("mcpServers") or {}).get(mcp_name) or {}
     if server.get("url") != mcp_url or server.get("transport") != mcp_transport:
-        problems.append(f"mcp:{rel}")
+        problems.append("mcp:config/mcporter.json")
     authorization = (server.get("headers") or {}).get("Authorization", "")
     if not authorization.startswith("Bearer "):
-        problems.append(f"auth:{rel}")
+        problems.append("auth:config/mcporter.json")
 
 print("ok" if not problems else ";".join(problems))
 PY

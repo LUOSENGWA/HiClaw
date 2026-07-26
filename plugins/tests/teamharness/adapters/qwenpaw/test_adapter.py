@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 import os
@@ -396,6 +397,39 @@ def test_private_tool_result_wrapper_redacts_text_blocks(tmp_path: Path, monkeyp
 
     assert module.sanitize_tool_result(result)["redacted"] is True
     assert result["content"][0]["text"] == "[REDACTED]"
+
+
+def test_output_sanitizer_wrapper_preserves_async_tool_stream(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_plugin()
+    runtime_config = tmp_path / "runtime.yaml"
+    _runtime_yaml(runtime_config)
+    monkeypatch.setenv("TEAMHARNESS_RUNTIME_CONFIG", str(runtime_config))
+
+    class QwenPawAgent:
+        async def _acting(self, _tool_call):
+            yield {"content": [{"type": "text", "text": "internal-token"}]}
+            yield {"content": [{"type": "text", "text": "safe"}]}
+
+    qwenpaw_module = types.ModuleType("qwenpaw")
+    agents_module = types.ModuleType("qwenpaw.agents")
+    react_agent_module = types.ModuleType("qwenpaw.agents.react_agent")
+    react_agent_module.QwenPawAgent = QwenPawAgent
+    monkeypatch.setitem(sys.modules, "qwenpaw", qwenpaw_module)
+    monkeypatch.setitem(sys.modules, "qwenpaw.agents", agents_module)
+    monkeypatch.setitem(sys.modules, "qwenpaw.agents.react_agent", react_agent_module)
+
+    result = module.install_output_sanitizer_wrapper()
+
+    async def collect():
+        return [chunk async for chunk in QwenPawAgent()._acting({})]
+
+    chunks = asyncio.run(collect())
+    assert result == {"ok": True, "installed": True, "action": "created"}
+    assert chunks[0]["content"][0]["text"] == "[REDACTED]"
+    assert chunks[1]["content"][0]["text"] == "safe"
 
 
 def test_teamharness_http_sync_reinstalls_runtime_hooks(monkeypatch) -> None:
