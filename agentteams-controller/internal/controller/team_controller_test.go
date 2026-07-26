@@ -855,6 +855,13 @@ func TestReconcileTeamTeamReferences_RoleAwareChannelPolicy(t *testing.T) {
 		if got := refreshedTeamAccess[workerName]; got != "team-a" {
 			t.Errorf("RefreshWorkerCredentials team for %q = %q, want team-a", workerName, got)
 		}
+		var worker v1beta1.Worker
+		if err := c.Get(ctx, client.ObjectKey{Name: workerName, Namespace: "default"}, &worker); err != nil {
+			t.Fatalf("get worker %q: %v", workerName, err)
+		}
+		if got := worker.Annotations[v1beta1.AnnotationWorkerTeamName]; got != "team-a" {
+			t.Errorf("worker %q team annotation=%q, want team-a", workerName, got)
+		}
 	}
 
 	if len(deployer.Calls.SyncTeamLeaderAssets) != 1 {
@@ -921,6 +928,50 @@ func TestReconcileTeamTeamReferences_RoleAwareChannelPolicy(t *testing.T) {
 	qaPolicy := policies["qa"]
 	if !stringSliceContains(qaPolicy.GroupAllowFrom, "@dev:matrix.local") {
 		t.Errorf("qa groupAllowFrom=%v, want peer dev", qaPolicy.GroupAllowFrom)
+	}
+}
+
+func TestDetachTeamMemberRevokesPersistedTeamStorageAccess(t *testing.T) {
+	ctx := context.Background()
+	worker := &v1beta1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "worker-a",
+			Namespace: "default",
+			Annotations: map[string]string{
+				v1beta1.AnnotationWorkerTeamName: "team-a",
+			},
+		},
+	}
+	team := &v1beta1.Team{
+		ObjectMeta: metav1.ObjectMeta{Name: "team-a", Namespace: "default"},
+	}
+	scheme := runtime.NewScheme()
+	if err := v1beta1.AddToScheme(scheme); err != nil {
+		t.Fatalf("register scheme: %v", err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(worker.DeepCopy()).Build()
+	provisioner := mocks.NewMockProvisioner()
+	r := &TeamReconciler{
+		Client:      c,
+		Provisioner: provisioner,
+		Deployer:    mocks.NewMockDeployer(),
+	}
+
+	if err := r.detachTeamMember(ctx, team, worker); err != nil {
+		t.Fatalf("detachTeamMember: %v", err)
+	}
+	var updated v1beta1.Worker
+	if err := c.Get(ctx, client.ObjectKeyFromObject(worker), &updated); err != nil {
+		t.Fatalf("get worker: %v", err)
+	}
+	if got := updated.Annotations[v1beta1.AnnotationWorkerTeamName]; got != "" {
+		t.Fatalf("team annotation=%q, want empty", got)
+	}
+	if len(provisioner.Calls.RefreshWorkerCredentials) != 1 {
+		t.Fatalf("RefreshWorkerCredentials calls=%d, want 1", len(provisioner.Calls.RefreshWorkerCredentials))
+	}
+	if got := provisioner.Calls.RefreshWorkerCredentials[0].TeamName; got != "" {
+		t.Fatalf("refreshed team=%q, want empty", got)
 	}
 }
 

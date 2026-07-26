@@ -198,6 +198,10 @@ func (r *WorkerReconciler) reconcileNormal(ctx context.Context, w *v1beta1.Worke
 		return reconcile.Result{}, err
 	}
 	mctx := r.workerMemberContextWithSpec(w, effectiveSpec, resourceSpec, updateStrategy)
+	mctx.TeamName, err = r.workerTeamName(ctx, w)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
 
 	if effectiveSpec.ModelProvider != "" && r.GatewayClient != nil {
 		info, err := r.GatewayClient.ResolveModelProvider(ctx, effectiveSpec.ModelProvider)
@@ -309,6 +313,27 @@ func (r *WorkerReconciler) reconcileNormal(ctx context.Context, w *v1beta1.Worke
 
 	requeueAfter := minPositiveDuration(reconcileInterval, state.RequeueAfter)
 	return reconcile.Result{RequeueAfter: requeueAfter}, nil
+}
+
+func (r *WorkerReconciler) workerTeamName(ctx context.Context, w *v1beta1.Worker) (string, error) {
+	if teamName := w.Annotations[v1beta1.AnnotationWorkerTeamName]; teamName != "" {
+		return teamName, nil
+	}
+	var teams v1beta1.TeamList
+	if err := r.List(ctx, &teams, client.InNamespace(w.Namespace)); err != nil {
+		return "", fmt.Errorf("list teams for worker %q: %w", w.Name, err)
+	}
+	sort.Slice(teams.Items, func(i, j int) bool {
+		return teams.Items[i].Name < teams.Items[j].Name
+	})
+	for _, team := range teams.Items {
+		for _, member := range team.Spec.WorkerMembers {
+			if member.Name == w.Name {
+				return team.Spec.EffectiveTeamName(team.Name), nil
+			}
+		}
+	}
+	return "", nil
 }
 
 // reconcileDelete cleans up all infrastructure for the Worker and then removes

@@ -101,6 +101,47 @@ func newWorkerRig(t *testing.T, objs ...client.Object) *workerTestRig {
 	}
 }
 
+func TestWorkerTeamNameFindsReferencedTeam(t *testing.T) {
+	worker := &v1beta1.Worker{ObjectMeta: metav1.ObjectMeta{Name: "leader", Namespace: "agents"}}
+	team := &v1beta1.Team{
+		ObjectMeta: metav1.ObjectMeta{Name: "team-cr", Namespace: "agents"},
+		Spec: v1beta1.TeamSpec{
+			TeamName: "runtime-team",
+			WorkerMembers: []v1beta1.TeamWorkerRef{
+				{Name: "leader", Role: "team_leader"},
+			},
+		},
+	}
+	rig := newWorkerRig(t, worker, team)
+
+	got, err := rig.r.workerTeamName(context.Background(), worker)
+	if err != nil {
+		t.Fatalf("workerTeamName: %v", err)
+	}
+	if got != "runtime-team" {
+		t.Fatalf("workerTeamName=%q, want runtime-team", got)
+	}
+}
+
+func TestWorkerTeamNameUsesPersistedMembershipAnnotation(t *testing.T) {
+	worker := &v1beta1.Worker{ObjectMeta: metav1.ObjectMeta{
+		Name:      "leader",
+		Namespace: "agents",
+		Annotations: map[string]string{
+			v1beta1.AnnotationWorkerTeamName: "runtime-team",
+		},
+	}}
+	rig := newWorkerRig(t, worker)
+
+	got, err := rig.r.workerTeamName(context.Background(), worker)
+	if err != nil {
+		t.Fatalf("workerTeamName: %v", err)
+	}
+	if got != "runtime-team" {
+		t.Fatalf("workerTeamName=%q, want runtime-team", got)
+	}
+}
+
 type workerTestGateway struct {
 	modelInfo      *gateway.ModelProviderInfo
 	modelErr       error

@@ -393,7 +393,16 @@ func (r *TeamReconciler) reconcileTeam(ctx context.Context, t *v1beta1.Team, pat
 	if err := r.Deployer.EnsureTeamStorage(ctx, teamRuntimeName); err != nil {
 		logger.Error(err, "team shared storage init failed (non-fatal)", "name", t.Name, "teamName", teamRuntimeName)
 	}
-	for _, member := range members {
+	for i := range members {
+		member := &members[i]
+		if err := r.setWorkerTeamAnnotation(ctx, &member.worker, teamRuntimeName); err != nil {
+			return r.failTeam(
+				ctx,
+				t,
+				patchBase,
+				fmt.Sprintf("record team membership for %s: %v", member.runtimeName, err),
+			)
+		}
 		if _, err := r.Provisioner.RefreshWorkerCredentials(
 			ctx,
 			member.ref.Name,
@@ -535,6 +544,26 @@ func (r *TeamReconciler) reconcileTeam(ctx context.Context, t *v1beta1.Team, pat
 		"readyWorkers", readyWorkers,
 		"totalWorkers", t.Status.TotalWorkers)
 	return reconcile.Result{RequeueAfter: reconcileInterval}, nil
+}
+
+func (r *TeamReconciler) setWorkerTeamAnnotation(ctx context.Context, worker *v1beta1.Worker, teamName string) error {
+	current := ""
+	if worker.Annotations != nil {
+		current = worker.Annotations[v1beta1.AnnotationWorkerTeamName]
+	}
+	if current == teamName {
+		return nil
+	}
+	base := worker.DeepCopy()
+	if worker.Annotations == nil {
+		worker.Annotations = map[string]string{}
+	}
+	if teamName == "" {
+		delete(worker.Annotations, v1beta1.AnnotationWorkerTeamName)
+	} else {
+		worker.Annotations[v1beta1.AnnotationWorkerTeamName] = teamName
+	}
+	return r.Patch(ctx, worker, client.MergeFrom(base))
 }
 
 func (r *TeamReconciler) resolveTeamMembers(ctx context.Context, t *v1beta1.Team) ([]teamWorkerMember, []string) {
@@ -754,6 +783,12 @@ func (r *TeamReconciler) detachTeamMember(ctx context.Context, t *v1beta1.Team, 
 	logger := log.FromContext(ctx)
 	runtimeName := w.Spec.EffectiveWorkerName(w.Name)
 	runtime := backend.ResolveRuntime(w.Spec.Runtime, r.DefaultRuntime)
+	if err := r.setWorkerTeamAnnotation(ctx, w, ""); err != nil {
+		return fmt.Errorf("clear team membership annotation: %w", err)
+	}
+	if _, err := r.Provisioner.RefreshWorkerCredentials(ctx, w.Name, runtimeName, ""); err != nil {
+		return fmt.Errorf("revoke team storage access: %w", err)
+	}
 	if runtime != backend.RuntimeQwenPaw {
 		if err := r.Deployer.InjectWorkerCoordination(ctx, service.WorkerCoordinationRequest{
 			WorkerName:         runtimeName,

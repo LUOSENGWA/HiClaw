@@ -96,6 +96,30 @@ func TestValidateMemberDeploymentRejectsRemote(t *testing.T) {
 	}
 }
 
+func TestReconcileMemberInfraPreservesTeamStorageAccess(t *testing.T) {
+	prov := mocks.NewMockProvisioner()
+	state := &MemberState{}
+
+	_, err := ReconcileMemberInfra(context.Background(), MemberDeps{
+		Provisioner: prov,
+	}, MemberContext{
+		Name:                 "leader-cr",
+		RuntimeName:          "leader",
+		TeamName:             "team-a",
+		ExistingMatrixUserID: "@leader:localhost",
+		ExistingRoomID:       "!leader:localhost",
+	}, state)
+	if err != nil {
+		t.Fatalf("ReconcileMemberInfra: %v", err)
+	}
+	if len(prov.Calls.RefreshWorkerCredentials) != 1 {
+		t.Fatalf("RefreshWorkerCredentials calls=%d, want 1", len(prov.Calls.RefreshWorkerCredentials))
+	}
+	if got := prov.Calls.RefreshWorkerCredentials[0].TeamName; got != "team-a" {
+		t.Fatalf("RefreshWorkerCredentials team=%q, want team-a", got)
+	}
+}
+
 func TestResolveBackendForMember_NoBackendAvailable(t *testing.T) {
 	// An empty registry surfaces an error so callers can decide whether
 	// to skip container management or fail loudly.
