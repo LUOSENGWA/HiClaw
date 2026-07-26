@@ -19,9 +19,9 @@ Record release-facing changes here before the next release.
 
 **Bug Fixes**
 
-- **Team member shared storage access**: Refresh every referenced member's storage policy with the effective Team name before deploying Team runtime configuration.
+- **QwenPaw package and Team storage access**: Refresh every referenced member's storage policy with the effective Team name, and grant Workers read-only access to centrally uploaded AgentSpec packages.
 - **QwenPaw inline prompt compatibility**: Project Worker identity, SOUL, and AGENTS content through runtime desired state and apply it to both the native QwenPaw workspace and the Worker root storage contract.
-- **Integration failure diagnostics**: Export AgentTeams container state and timestamped logs with CI artifacts, and stop the QwenPaw TeamHarness shard after startup failures instead of hiding the cause behind cascading timeouts.
+- **Integration failure diagnostics**: Export AgentTeams container state and timestamped logs with CI artifacts, classify QwenPaw startup errors without exposing their message contents, and stop the TeamHarness shard after startup failures instead of hiding the cause behind cascading timeouts.
 - **QwenPaw local startup readiness**: Select and propagate the QwenPaw Worker image across install backends, then wait for the runtime-owned `runtime/runtime.yaml` object before creating a local Docker Worker.
 - **QwenPaw 2.0 runtime compatibility**: Adapt the QwenPaw Worker image, custom Matrix Channel, and native plugins to QwenPaw 2.0.1 startup and schema contracts.
 - **Worker storage sync I/O amplification**: Upload changed workspace files once per successful watermark, keep jq 1.7 fallback pulls alive, and limit embedded Controller mirrors to control-plane configuration. Concurrent Worker creation and large unknown workspace paths retain their existing persistence semantics without repeated whole-workspace mirrors. ([#1110](https://github.com/agentscope-ai/AgentTeams/pull/1110))

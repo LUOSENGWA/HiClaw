@@ -1111,6 +1111,7 @@ async def test_qwenpaw_config_failure_marks_qwenpaw_config_unready(
 async def test_hot_update_failure_does_not_relabel_qwenpaw_config_unready(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     config = _config(tmp_path)
     _runtime_yaml(config.runtime_config_path)
@@ -1121,9 +1122,10 @@ async def test_hot_update_failure_does_not_relabel_qwenpaw_config_unready(
     monkeypatch.setattr("qwenpaw_worker.worker.Worker._prepare_default_plugins", lambda _self: None)
 
     def fail_update(_self, runtime_config=None, force=False, reapply_adapter=True):
-        raise RuntimeError("agent package failed")
+        raise RuntimeError("fetch oss agent package failed: Access Denied secret-token-value")
 
     monkeypatch.setattr("qwenpaw_worker.update.RuntimeUpdater.apply_once", fail_update)
+    caplog.set_level(logging.INFO, logger="qwenpaw_worker.worker")
 
     worker = Worker(config)
 
@@ -1131,7 +1133,9 @@ async def test_hot_update_failure_does_not_relabel_qwenpaw_config_unready(
 
     data = json.loads((config.qwenpaw_working_dir / "heartbeat.json").read_text(encoding="utf-8"))
     assert data["status"] == "not_ready"
-    assert data["message"] == "agent package failed"
+    assert data["message"].startswith("fetch oss agent package failed")
+    assert "error_code=storage_access_denied" in caplog.text
+    assert "secret-token-value" not in caplog.text
 
 
 def test_hot_update_apply_does_not_replace_qwenpaw_process(tmp_path: Path) -> None:

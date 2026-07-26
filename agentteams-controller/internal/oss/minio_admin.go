@@ -204,6 +204,14 @@ func (c *MinIOAdminClient) buildWorkerPolicy(workerName, bucket, teamName string
 			fmt.Sprintf("arn:aws:s3:::%s/manager/", bucket),
 			fmt.Sprintf("arn:aws:s3:::%s/manager/*", bucket),
 		)
+	} else {
+		listPrefixes = append(listPrefixes,
+			"agentteams-config",
+			"agentteams-config/",
+			"agentteams-config/packages",
+			"agentteams-config/packages/",
+			"agentteams-config/packages/*",
+		)
 	}
 
 	if teamName != "" {
@@ -221,30 +229,44 @@ func (c *MinIOAdminClient) buildWorkerPolicy(workerName, bucket, teamName string
 		)
 	}
 
-	return s3Policy{
-		Version: "2012-10-17",
-		Statement: []s3PolicyStatement{
-			{
-				Effect:   "Allow",
-				Action:   []string{"s3:GetBucketLocation"},
-				Resource: []string{fmt.Sprintf("arn:aws:s3:::%s", bucket)},
-			},
-			{
-				Effect:   "Allow",
-				Action:   []string{"s3:ListBucket"},
-				Resource: []string{fmt.Sprintf("arn:aws:s3:::%s", bucket)},
-				Condition: map[string]interface{}{
-					"StringLike": map[string]interface{}{
-						"s3:prefix": listPrefixes,
-					},
+	statements := []s3PolicyStatement{
+		{
+			Effect:   "Allow",
+			Action:   []string{"s3:GetBucketLocation"},
+			Resource: []string{fmt.Sprintf("arn:aws:s3:::%s", bucket)},
+		},
+		{
+			Effect:   "Allow",
+			Action:   []string{"s3:ListBucket"},
+			Resource: []string{fmt.Sprintf("arn:aws:s3:::%s", bucket)},
+			Condition: map[string]interface{}{
+				"StringLike": map[string]interface{}{
+					"s3:prefix": listPrefixes,
 				},
 			},
-			{
-				Effect:   "Allow",
-				Action:   []string{"s3:GetObject", "s3:PutObject", "s3:DeleteObject"},
-				Resource: rwResources,
-			},
 		},
+		{
+			Effect:   "Allow",
+			Action:   []string{"s3:GetObject", "s3:PutObject", "s3:DeleteObject"},
+			Resource: rwResources,
+		},
+	}
+	if !isManager {
+		statements = append(statements,
+			s3PolicyStatement{
+				Effect: "Allow",
+				Action: []string{"s3:GetObject"},
+				Resource: []string{
+					fmt.Sprintf("arn:aws:s3:::%s/agentteams-config/packages", bucket),
+					fmt.Sprintf("arn:aws:s3:::%s/agentteams-config/packages/", bucket),
+					fmt.Sprintf("arn:aws:s3:::%s/agentteams-config/packages/*", bucket),
+				},
+			},
+		)
+	}
+	return s3Policy{
+		Version:   "2012-10-17",
+		Statement: statements,
 	}
 }
 

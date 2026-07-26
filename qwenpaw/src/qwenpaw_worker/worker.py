@@ -54,6 +54,15 @@ def _redact_url_userinfo(value: str) -> str:
     return f"{scheme}://<redacted>@{rest.split('@', 1)[1]}"
 
 
+def _safe_error_code(exc: Exception) -> str:
+    message = str(exc).lower()
+    if "access denied" in message:
+        return "storage_access_denied"
+    if "agent package" in message:
+        return "agent_package_failed"
+    return type(exc).__name__
+
+
 class Worker:
     def __init__(self, config: WorkerConfig) -> None:
         self.config = config
@@ -273,11 +282,12 @@ class Worker:
 
     def _log_worker_stage_failed(self, stage: str, started_at: float, exc: Exception, **fields: object) -> None:
         logger.warning(
-            "startup component=worker stage=%s event=failed worker=%s duration_ms=%s error_type=%s %s",
+            "startup component=worker stage=%s event=failed worker=%s duration_ms=%s error_type=%s error_code=%s %s",
             stage,
             self.config.worker_name,
             _duration_ms(started_at),
             type(exc).__name__,
+            _safe_error_code(exc),
             _log_fields(**fields),
         )
 
