@@ -1267,7 +1267,7 @@ else
 fi
 
 TASK_PROMPT=$(cat <<EOF
-Please complete this TeamHarness plugin-mode E2E request by coordinating with
+${LEADER_MXID} Please complete this TeamHarness plugin-mode E2E request by coordinating with
 the worker. Do not complete the worker task yourself.
 
 Project id: ${PROJECT_ID}
@@ -1283,10 +1283,10 @@ Required leader steps:
    using the Team Room from your TeamHarness roster facts, and the task spec
    below. This must create
    shared/tasks/${TASK_ID}/spec.md.
-4. Use the TeamHarness message tool to assign the task in the Team Room. The
-   assignment must visibly mention the worker Matrix user from your TeamHarness
-   roster facts, include ${TASK_ID}, include shared/tasks/${TASK_ID}/spec.md,
-   and tell the assignee to call taskflow ack_task before reading the spec.
+4. Reply directly in this Team Room to assign the task. The assignment must
+   visibly mention the worker Matrix user from your TeamHarness roster facts,
+   include ${TASK_ID}, include shared/tasks/${TASK_ID}/spec.md, and tell the
+   assignee to call taskflow ack_task before reading the spec.
 
 Task spec to delegate:
 # Task: Write TeamHarness plugin-mode readiness note
@@ -1314,7 +1314,7 @@ completion message.
 EOF
 )
 
-if matrix_send_message "${ADMIN_TOKEN}" "${LEADER_DM}" "${TASK_PROMPT}" >/dev/null 2>&1; then
+if matrix_send_message "${ADMIN_TOKEN}" "${TEAM_ROOM}" "${TASK_PROMPT}" >/dev/null 2>&1; then
     log_pass "Admin sent real TeamHarness task to QwenPaw leader"
 else
     log_fail "Admin failed to send task to QwenPaw leader"
