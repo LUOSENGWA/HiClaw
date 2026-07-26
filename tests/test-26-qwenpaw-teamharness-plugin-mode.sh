@@ -1298,8 +1298,12 @@ Create shared/tasks/${TASK_ID}/workspace/readiness-note.txt with this exact
 line:
 ${MARKER}
 
+Create shared/tasks/${TASK_ID}/result.md with a short completion report that
+contains ${MARKER} and lists the readiness note as a deliverable.
+
 Then call taskflow submit_task with status SUCCESS, a summary containing
-${MARKER}, and deliverable shared/tasks/${TASK_ID}/workspace/readiness-note.txt.
+${MARKER}, and both shared/tasks/${TASK_ID}/result.md and
+shared/tasks/${TASK_ID}/workspace/readiness-note.txt as deliverables.
 
 After submit_task succeeds, reply in the Team Room with exactly this completion
 line and one short summary sentence:
@@ -1332,7 +1336,7 @@ else
 fi
 
 WORKER_REPLY=$(matrix_wait_for_message_containing \
-    "${ADMIN_TOKEN}" "${TEAM_ROOM}" "${WORKER_MXID}" "${MARKER}" 720 2>/dev/null || true)
+    "${ADMIN_TOKEN}" "${TEAM_ROOM}" "${WORKER_MXID}" "${DONE_LINE}" 720 2>/dev/null || true)
 if echo "${WORKER_REPLY}" | grep -q "${DONE_LINE}"; then
     log_pass "Worker completed delegated TeamHarness task in Team Room"
 else
