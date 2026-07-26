@@ -1648,11 +1648,12 @@ class RuntimeUpdater:
         for file_name, content in prompt_files.items():
             if not content:
                 continue
-            path = self.config.default_workspace_dir / file_name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_name(f".{path.name}.tmp")
-            tmp.write_text(f"{content.rstrip()}\n", encoding="utf-8")
-            tmp.replace(path)
+            for base_dir in (self.config.default_workspace_dir, self.config.worker_home):
+                path = base_dir / file_name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_name(f".{path.name}.tmp")
+                tmp.write_text(f"{content.rstrip()}\n", encoding="utf-8")
+                tmp.replace(path)
 
     def _sync_model_runtime_if_needed(
         self,

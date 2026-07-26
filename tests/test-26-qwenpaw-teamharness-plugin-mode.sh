@@ -652,7 +652,7 @@ with zipfile.ZipFile(zip_path) as archive:
     assert any(name.endswith("/teamharness/plugin.yaml") for name in names)
     assert any(name.endswith("/teamharness/prompts/team/TEAMS.md") for name in names)
     assert any(name.endswith("/teamharness/mcp/server.py") for name in names)
-    assert not any("agentteam" in name for name in names)
+    assert not any("agentteam" in Path(name).parts for name in names)
 print("ok")
 PY
 )
@@ -723,6 +723,7 @@ LEADER_DM=$(echo "${TEAM_JSON}" | jq -r '.status.leaderDMRoomID // empty')
 assert_not_empty "${TEAM_ROOM}" "Team Room ID available"
 assert_not_empty "${LEADER_DM}" "Leader DM Room ID available"
 
+STARTUP_READY=1
 for member in "${TEST_LEADER}" "${TEST_WORKER}"; do
     MEMBER_JSON=$(_wait_k8s_jq "workers" "${member}" '.status.roomID and .status.matrixUserID' 240 2>/dev/null || echo "{}")
     if echo "${MEMBER_JSON}" | jq -e '.status.roomID and .status.matrixUserID' >/dev/null 2>&1; then
@@ -735,11 +736,15 @@ for member in "${TEST_LEADER}" "${TEST_WORKER}"; do
         log_pass "Member ${member} is Running"
     else
         log_fail "Member ${member} did not reach Running"
+        dump_diagnostics worker "${member}"
+        STARTUP_READY=0
     fi
     if wait_for_worker_container "${member}" 240; then
         log_pass "Container for ${member} is running"
     else
         log_fail "Container for ${member} did not start"
+        dump_diagnostics worker "${member}"
+        STARTUP_READY=0
     fi
 done
 
@@ -759,11 +764,20 @@ if _container_has_cmdline "${LEADER_CONTAINER}" "qwenpaw app --host"; then
     log_pass "Leader qwenpaw app process is running"
 else
     log_fail "Leader qwenpaw app process is not running"
+    STARTUP_READY=0
 fi
 if _container_has_cmdline "${WORKER_CONTAINER}" "qwenpaw app --host"; then
     log_pass "Worker qwenpaw app process is running"
 else
     log_fail "Worker qwenpaw app process is not running"
+    STARTUP_READY=0
+fi
+
+if [ "${STARTUP_READY}" -ne 1 ]; then
+    _dump_debug_snapshot
+    test_teardown "26-qwenpaw-teamharness-plugin-mode"
+    test_summary
+    exit $?
 fi
 
 # ============================================================

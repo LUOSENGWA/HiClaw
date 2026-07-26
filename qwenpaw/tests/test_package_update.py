@@ -158,8 +158,10 @@ desired:
 
 def test_runtime_updater_applies_inline_prompt_config_to_workspace(tmp_path: Path) -> None:
     workspace_dir = tmp_path / "workspace"
+    worker_home = tmp_path / "worker-home"
     config = types.SimpleNamespace(
         worker_name="worker-a",
+        worker_home=worker_home,
         qwenpaw_working_dir=tmp_path / "qwenpaw",
         default_workspace_dir=workspace_dir,
         runtime_config_path=tmp_path / "runtime.yaml",
@@ -172,6 +174,9 @@ def test_runtime_updater_applies_inline_prompt_config_to_workspace(tmp_path: Pat
     assert (workspace_dir / "IDENTITY.md").read_text(encoding="utf-8") == "Frontend specialist\n"
     assert (workspace_dir / "SOUL.md").read_text(encoding="utf-8") == "Build accessible user interfaces\n"
     assert (workspace_dir / "AGENTS.md").read_text(encoding="utf-8") == "Follow the project workflow\n"
+    assert (worker_home / "IDENTITY.md").read_text(encoding="utf-8") == "Frontend specialist\n"
+    assert (worker_home / "SOUL.md").read_text(encoding="utf-8") == "Build accessible user interfaces\n"
+    assert (worker_home / "AGENTS.md").read_text(encoding="utf-8") == "Follow the project workflow\n"
 
 
 def _install_fake_qwenpaw_mcp_config(monkeypatch):
