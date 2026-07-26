@@ -1357,7 +1357,7 @@ else
     log_fail "Task deliverable missing in shared storage"
 fi
 
-CHECK_ARGS=$(jq -nc --arg task "${TASK_ID}" '{action:"check_task", payload:{taskId:$task}}')
+CHECK_ARGS=$(jq -nc --arg task "${TASK_ID}" '{role:"leader", action:"check_task", payload:{taskId:$task}}')
 TASK_CHECK=$(_leader_mcp_call taskflow "${CHECK_ARGS}" 2>/dev/null || echo "{}")
 if echo "${TASK_CHECK}" | jq -e '.ok == true and .effective == true' >/dev/null 2>&1; then
     log_pass "Leader verified submitted worker result through taskflow"
