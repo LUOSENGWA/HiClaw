@@ -393,6 +393,21 @@ func (r *TeamReconciler) reconcileTeam(ctx context.Context, t *v1beta1.Team, pat
 	if err := r.Deployer.EnsureTeamStorage(ctx, teamRuntimeName); err != nil {
 		logger.Error(err, "team shared storage init failed (non-fatal)", "name", t.Name, "teamName", teamRuntimeName)
 	}
+	for _, member := range members {
+		if _, err := r.Provisioner.RefreshWorkerCredentials(
+			ctx,
+			member.ref.Name,
+			member.runtimeName,
+			teamRuntimeName,
+		); err != nil {
+			return r.failTeam(
+				ctx,
+				t,
+				patchBase,
+				fmt.Sprintf("refresh team storage access for %s: %v", member.runtimeName, err),
+			)
+		}
+	}
 
 	// 5. Coordination context + heartbeat injection
 	teamWorkerEntries := teamWorkerEntries(members, leaderRef.Name)

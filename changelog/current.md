@@ -19,6 +19,7 @@ Record release-facing changes here before the next release.
 
 **Bug Fixes**
 
+- **Team member shared storage access**: Refresh every referenced member's storage policy with the effective Team name before deploying Team runtime configuration.
 - **QwenPaw inline prompt compatibility**: Project Worker identity, SOUL, and AGENTS content through runtime desired state and apply it to both the native QwenPaw workspace and the Worker root storage contract.
 - **Integration failure diagnostics**: Export AgentTeams container state and timestamped logs with CI artifacts, and stop the QwenPaw TeamHarness shard after startup failures instead of hiding the cause behind cascading timeouts.
 - **QwenPaw local startup readiness**: Select and propagate the QwenPaw Worker image across install backends, then wait for the runtime-owned `runtime/runtime.yaml` object before creating a local Docker Worker.

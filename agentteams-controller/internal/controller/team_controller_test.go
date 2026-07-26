@@ -847,6 +847,16 @@ func TestReconcileTeamTeamReferences_RoleAwareChannelPolicy(t *testing.T) {
 		t.Fatalf("reconcileTeam: %v", err)
 	}
 
+	refreshedTeamAccess := map[string]string{}
+	for _, call := range provisioner.Calls.RefreshWorkerCredentials {
+		refreshedTeamAccess[call.WorkerName] = call.TeamName
+	}
+	for _, workerName := range []string{"lead", "dev", "qa"} {
+		if got := refreshedTeamAccess[workerName]; got != "team-a" {
+			t.Errorf("RefreshWorkerCredentials team for %q = %q, want team-a", workerName, got)
+		}
+	}
+
 	if len(deployer.Calls.SyncTeamLeaderAssets) != 1 {
 		t.Fatalf("SyncTeamLeaderAssets calls=%d, want 1", len(deployer.Calls.SyncTeamLeaderAssets))
 	}
