@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -17,6 +18,7 @@ import (
 type MinIOAdminClient struct {
 	config     Config
 	aliasReady bool
+	policyMu   sync.Mutex
 }
 
 // NewMinIOAdminClient creates a StorageAdminClient for managing MinIO users.
@@ -60,6 +62,9 @@ func (c *MinIOAdminClient) EnsureUser(ctx context.Context, username, password st
 }
 
 func (c *MinIOAdminClient) EnsurePolicy(ctx context.Context, req PolicyRequest) error {
+	c.policyMu.Lock()
+	defer c.policyMu.Unlock()
+
 	if err := c.ensureAlias(ctx); err != nil {
 		return err
 	}
@@ -97,20 +102,16 @@ func (c *MinIOAdminClient) EnsurePolicy(ctx context.Context, req PolicyRequest) 
 	}
 	policyFile.Close()
 
-	// Detach before remove so a worker keeps the freshly generated policy
-	// after bucket/prefix rename changes instead of an older attached policy.
-	if _, err := c.runMCAdmin(ctx, "policy", "detach", c.config.Alias, policyName, "--user", req.WorkerName); err != nil {
-		logger.Info("MinIO worker policy detach skipped", "worker", req.WorkerName, "policy", policyName, "error", err.Error())
-	}
-	if _, err := c.runMCAdmin(ctx, "policy", "remove", c.config.Alias, policyName); err != nil {
-		logger.Info("MinIO worker policy remove skipped", "worker", req.WorkerName, "policy", policyName, "error", err.Error())
-	}
+	// MinIO overwrites an existing policy with the same name. Keep it attached
+	// while replacing its document so active Workers never lose storage access.
 	if _, err := c.runMCAdmin(ctx, "policy", "create", c.config.Alias, policyName, policyFile.Name()); err != nil {
 		return fmt.Errorf("create policy %s: %w", policyName, err)
 	}
 	logger.Info("MinIO worker policy created", "worker", req.WorkerName, "policy", policyName, "bucket", bucket)
 	if _, err := c.runMCAdmin(ctx, "policy", "attach", c.config.Alias, policyName, "--user", req.WorkerName); err != nil {
-		return fmt.Errorf("attach policy %s to user %s: %w", policyName, req.WorkerName, err)
+		if !strings.Contains(strings.ToLower(err.Error()), "already attached") {
+			return fmt.Errorf("attach policy %s to user %s: %w", policyName, req.WorkerName, err)
+		}
 	}
 	logger.Info("MinIO worker policy attached", "worker", req.WorkerName, "policy", policyName, "bucket", bucket)
 	return nil

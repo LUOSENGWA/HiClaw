@@ -274,14 +274,14 @@ func TestMinIOAdminClient_BuildManagerPolicy(t *testing.T) {
 	}
 }
 
-func TestMinIOAdminClient_EnsurePolicyDetachesBeforeReplace(t *testing.T) {
+func TestMinIOAdminClient_EnsurePolicyOverwritesWithoutAccessGap(t *testing.T) {
 	dir := t.TempDir()
 	argsPath := filepath.Join(dir, "args")
 	mcPath := filepath.Join(dir, "mc")
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "$MC_ARGS_FILE"
 case "$*" in
-  "admin policy detach "*|"admin policy remove "*) exit 1 ;;
+  "admin policy attach "*) echo "Policy already attached to user" >&2; exit 1 ;;
 esac
 exit 0
 `
@@ -303,12 +303,10 @@ exit 0
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) != 4 {
-		t.Fatalf("mc calls = %v, want detach/remove/create/attach", lines)
+	if len(lines) != 2 {
+		t.Fatalf("mc calls = %v, want create/attach", lines)
 	}
 	wantPrefixes := []string{
-		"admin policy detach agentteams worker-worker-1 --user worker-1",
-		"admin policy remove agentteams worker-worker-1",
 		"admin policy create agentteams worker-worker-1 ",
 		"admin policy attach agentteams worker-worker-1 --user worker-1",
 	}
