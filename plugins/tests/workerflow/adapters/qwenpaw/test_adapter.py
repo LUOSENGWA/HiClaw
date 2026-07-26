@@ -6,6 +6,7 @@ import importlib.util
 import os
 from pathlib import Path
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -26,6 +27,8 @@ def load_plugin():
 
 class WorkerFlowQwenPawAdapterTest(unittest.TestCase):
     def setUp(self) -> None:
+        self.temp_dir_context = tempfile.TemporaryDirectory()
+        self.temp_dir = Path(self.temp_dir_context.name)
         self.env_keys = [
             "TEAMHARNESS_RUNTIME_CONFIG",
             "AGENTTEAMS_MEMBER_RUNTIME_CONFIG",
@@ -51,6 +54,7 @@ class WorkerFlowQwenPawAdapterTest(unittest.TestCase):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        self.temp_dir_context.cleanup()
 
     def test_mcp_client_env_includes_runtime_and_matrix_inputs(self) -> None:
         module = load_plugin()
@@ -72,6 +76,8 @@ class WorkerFlowQwenPawAdapterTest(unittest.TestCase):
 
     def test_internal_mcp_policy_allows_only_workerflow(self) -> None:
         module = load_plugin()
+        working_dir = self.temp_dir / ".qwenpaw"
+        os.environ["QWENPAW_WORKING_DIR"] = str(working_dir)
 
         def legacy_mcp_client_to_driver(_client_key, _config):
             policy = types.SimpleNamespace(default_effect="ask", rules=["ask"])
@@ -81,8 +87,21 @@ class WorkerFlowQwenPawAdapterTest(unittest.TestCase):
         drivers_module = types.ModuleType("qwenpaw.drivers")
         adapters_module = types.ModuleType("qwenpaw.drivers.adapters")
         legacy_module = types.ModuleType("qwenpaw.drivers.adapters.mcp_legacy_config")
+        constant_module = types.ModuleType("qwenpaw.constant")
+        storage_module = types.ModuleType("qwenpaw.drivers.storage")
+        constant_module.WORKING_DIR = working_dir
         legacy_module.legacy_mcp_client_to_driver = legacy_mcp_client_to_driver
         adapters_module.mcp_legacy_config = legacy_module
+        persisted = types.SimpleNamespace(
+            protocol="mcp",
+            policy=types.SimpleNamespace(default_effect="deny", rules=["ask"]),
+        )
+        card_path = working_dir / "workspaces" / "default" / "drivers" / "mcp" / "workerflow.yaml"
+        card_path.parent.mkdir(parents=True)
+        card_path.write_text("existing", encoding="utf-8")
+        storage_module.card_paths_for_name = lambda _cards_dir, _name: [card_path]
+        storage_module.load_card = lambda _path: persisted
+        storage_module.dump_card = lambda _card, path: path.write_text("updated", encoding="utf-8")
 
         with mock.patch.dict(
             sys.modules,
@@ -91,6 +110,8 @@ class WorkerFlowQwenPawAdapterTest(unittest.TestCase):
                 "qwenpaw.drivers": drivers_module,
                 "qwenpaw.drivers.adapters": adapters_module,
                 "qwenpaw.drivers.adapters.mcp_legacy_config": legacy_module,
+                "qwenpaw.constant": constant_module,
+                "qwenpaw.drivers.storage": storage_module,
             },
         ):
             result = module.install_internal_mcp_allow_policy()
@@ -102,6 +123,8 @@ class WorkerFlowQwenPawAdapterTest(unittest.TestCase):
         self.assertEqual(internal.policy.rules, [])
         self.assertEqual(external.policy.default_effect, "ask")
         self.assertEqual(external.policy.rules, ["ask"])
+        self.assertEqual(persisted.policy.default_effect, "allow")
+        self.assertEqual(persisted.policy.rules, [])
 
 
 if __name__ == "__main__":

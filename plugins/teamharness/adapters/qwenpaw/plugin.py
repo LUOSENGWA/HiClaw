@@ -726,6 +726,28 @@ def apply_teamharness() -> Dict[str, Any]:
     return {"ok": True, "agents": agents, "skills": skills, "mcp": mcp, "credentialGuard": credential_guard}
 
 
+def _allow_persisted_internal_mcp_policy() -> None:
+    from qwenpaw.constant import WORKING_DIR
+    from qwenpaw.drivers.storage import card_paths_for_name, dump_card, load_card
+
+    workspaces_dir = WORKING_DIR / "workspaces"
+    if not workspaces_dir.is_dir():
+        return
+    for workspace_dir in workspaces_dir.iterdir():
+        if not workspace_dir.is_dir():
+            continue
+        cards_dir = workspace_dir / "drivers"
+        for path in card_paths_for_name(cards_dir, MCP_CLIENT_ID):
+            card = load_card(path)
+            if card.protocol != "mcp":
+                continue
+            if card.policy.default_effect == "allow" and not card.policy.rules:
+                continue
+            card.policy.default_effect = "allow"
+            card.policy.rules = []
+            dump_card(card, path)
+
+
 def install_internal_mcp_allow_policy() -> Dict[str, Any]:
     try:
         from qwenpaw.drivers.adapters import mcp_legacy_config
@@ -735,6 +757,7 @@ def install_internal_mcp_allow_policy() -> Dict[str, Any]:
     allowed_clients = getattr(mcp_legacy_config, "_agentteams_allowed_mcp_clients", set())
     allowed_clients.add(MCP_CLIENT_ID)
     mcp_legacy_config._agentteams_allowed_mcp_clients = allowed_clients
+    _allow_persisted_internal_mcp_policy()
     if getattr(mcp_legacy_config, "_agentteams_policy_wrapper_installed", False):
         return {"ok": True, "installed": True, "action": "updated"}
 

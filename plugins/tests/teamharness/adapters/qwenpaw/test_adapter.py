@@ -432,7 +432,7 @@ def test_output_sanitizer_wrapper_preserves_async_tool_stream(
     assert chunks[1]["content"][0]["text"] == "safe"
 
 
-def test_internal_mcp_policy_allows_only_teamharness(monkeypatch) -> None:
+def test_internal_mcp_policy_allows_only_teamharness(tmp_path: Path, monkeypatch) -> None:
     module = _load_plugin()
 
     def legacy_mcp_client_to_driver(_client_key, _config):
@@ -443,11 +443,26 @@ def test_internal_mcp_policy_allows_only_teamharness(monkeypatch) -> None:
     drivers_module = types.ModuleType("qwenpaw.drivers")
     adapters_module = types.ModuleType("qwenpaw.drivers.adapters")
     legacy_module = types.ModuleType("qwenpaw.drivers.adapters.mcp_legacy_config")
+    constant_module = types.ModuleType("qwenpaw.constant")
+    storage_module = types.ModuleType("qwenpaw.drivers.storage")
+    constant_module.WORKING_DIR = tmp_path / ".qwenpaw"
     legacy_module.legacy_mcp_client_to_driver = legacy_mcp_client_to_driver
     adapters_module.mcp_legacy_config = legacy_module
+    persisted = types.SimpleNamespace(
+        protocol="mcp",
+        policy=types.SimpleNamespace(default_effect="deny", rules=["ask"]),
+    )
+    card_path = tmp_path / ".qwenpaw" / "workspaces" / "default" / "drivers" / "mcp" / "teamharness.yaml"
+    card_path.parent.mkdir(parents=True)
+    card_path.write_text("existing", encoding="utf-8")
+    storage_module.card_paths_for_name = lambda _cards_dir, _name: [card_path]
+    storage_module.load_card = lambda _path: persisted
+    storage_module.dump_card = lambda _card, path: path.write_text("updated", encoding="utf-8")
     monkeypatch.setitem(sys.modules, "qwenpaw", qwenpaw_module)
     monkeypatch.setitem(sys.modules, "qwenpaw.drivers", drivers_module)
     monkeypatch.setitem(sys.modules, "qwenpaw.drivers.adapters", adapters_module)
+    monkeypatch.setitem(sys.modules, "qwenpaw.constant", constant_module)
+    monkeypatch.setitem(sys.modules, "qwenpaw.drivers.storage", storage_module)
     monkeypatch.setitem(
         sys.modules,
         "qwenpaw.drivers.adapters.mcp_legacy_config",
@@ -463,6 +478,8 @@ def test_internal_mcp_policy_allows_only_teamharness(monkeypatch) -> None:
     assert internal.policy.rules == []
     assert external.policy.default_effect == "ask"
     assert external.policy.rules == ["ask"]
+    assert persisted.policy.default_effect == "allow"
+    assert persisted.policy.rules == []
 
 
 def test_teamharness_http_sync_reinstalls_runtime_hooks(monkeypatch) -> None:
