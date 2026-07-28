@@ -2,6 +2,7 @@
   "id": "default",
   "name": "Manager",
   "language": "zh",
+  "approval_level": "AUTO",
   "system_prompt_files": [
     "AGENTS.md",
     "SOUL.md",
@@ -9,8 +10,7 @@
     "TOOLS.md"
   ],
   "running": {
-    "max_iters": 200,
-    "approval_level": "AUTO"
+    "max_iters": 200
   },
   "heartbeat": {
     "enabled": true,

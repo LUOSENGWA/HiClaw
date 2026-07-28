@@ -173,6 +173,20 @@ jq --slurpfile dm_rooms "${DM_ROOMS_FILE}" \
 rm -f "${DM_ROOMS_FILE}" "${DM_ROOMS_FILE}.tmp"
 
 # ============================================================
+# 7. Disable built-in QA Agent (QwenPaw_QA_Agent_0.2)
+# ============================================================
+# Worker does this via api_client.disable_agent_if_present().
+# Manager runs QwenPaw in-process (no API client), so we set
+# enabled=false in config.json's agents.profiles before startup.
+# QwenPaw 2.0 start_all_configured_agents() skips enabled=false agents.
+CONFIG_JSON="${COPAW_WORKING_DIR}/config.json"
+if [ -f "${CONFIG_JSON}" ]; then
+    jq '.agents.profiles["QwenPaw_QA_Agent_0.2"].enabled = false' \
+        "${CONFIG_JSON}" > "${CONFIG_JSON}.tmp" && mv "${CONFIG_JSON}.tmp" "${CONFIG_JSON}"
+    log "Disabled built-in QA Agent in config.json"
+fi
+
+# ============================================================
 # 7. Configure CMS observability plugin (LoongSuite)
 # ============================================================
 # Aligned with qwenpaw Worker entrypoint: heredoc + env exports.
