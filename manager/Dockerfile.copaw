@@ -135,7 +135,7 @@ COPY plugins/agentteams-matrix-channel/ /opt/agentteams/plugins/agentteams-matri
 COPY plugins/agentteams-manager-tools/ /opt/agentteams/plugins/agentteams-manager-tools/
 
 # Copy plugins into QwenPaw's plugin discovery path.
-# WORKING_DIR = ~/.copaw (set by start-copaw-manager.sh at runtime).
+# WORKING_DIR = ~/.copaw (set by start-qwenpaw-manager.sh at runtime).
 # cp -a (not ln -sfn): QwenPaw PluginLoader._load_plugin_from_path_unlocked
 # resolves source_path vs target_dir — symlinks cause rmtree of the real dir
 # followed by copytree from the now-dead symlink target (crash).

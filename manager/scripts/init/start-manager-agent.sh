@@ -6,8 +6,11 @@
 #
 # Runtime selection:
 #   AGENTTEAMS_MANAGER_RUNTIME=openclaw (default) - OpenClaw gateway mode
-#   AGENTTEAMS_MANAGER_RUNTIME=copaw              - CoPaw workspace mode
-# (hermes runtime is supported for Workers only; Managers run openclaw or copaw.)
+#   AGENTTEAMS_MANAGER_RUNTIME=copaw|qwenpaw     - QwenPaw workspace mode
+# "copaw" is the legacy runtime identifier still used by the controller,
+# installer, and CI; "qwenpaw" is the forward-looking name. Both map to
+# the same QwenPaw 2.0 startup script.
+# (hermes runtime is supported for Workers only.)
 
 source /opt/agentteams/scripts/lib/agentteams-env.sh
 
@@ -16,8 +19,8 @@ source /opt/agentteams/scripts/lib/agentteams-env.sh
 # ============================================================
 MANAGER_RUNTIME="${AGENTTEAMS_MANAGER_RUNTIME:-openclaw}"
 case "${MANAGER_RUNTIME}" in
-    copaw)
-        log "Manager runtime: CoPaw (Python workspace)"
+    copaw|qwenpaw)
+        log "Manager runtime: QwenPaw (Python workspace, runtime=${MANAGER_RUNTIME})"
         ;;
     *)
         log "Manager runtime: OpenClaw (Node.js gateway)"
@@ -1162,9 +1165,9 @@ fi
 # ============================================================
 # Runtime-specific startup
 # ============================================================
-if [ "${MANAGER_RUNTIME}" = "copaw" ]; then
-    # Delegate to CoPaw startup script
-    exec /opt/agentteams/scripts/init/start-copaw-manager.sh
+if [ "${MANAGER_RUNTIME}" = "copaw" ] || [ "${MANAGER_RUNTIME}" = "qwenpaw" ]; then
+    # Delegate to QwenPaw startup script
+    exec /opt/agentteams/scripts/init/start-qwenpaw-manager.sh
 else
     # ── OpenClaw Runtime ─────────────────────────────────────────────────────
     log "Starting OpenClaw Manager..."

@@ -1,6 +1,6 @@
 #!/bin/bash
-# start-copaw-manager.sh - Start Manager Agent with QwenPaw 2.0 runtime
-# Called by start-manager-agent.sh when AGENTTEAMS_MANAGER_RUNTIME=copaw
+# start-qwenpaw-manager.sh - Start Manager Agent with QwenPaw 2.0 runtime
+# Called by start-manager-agent.sh when AGENTTEAMS_MANAGER_RUNTIME=copaw|qwenpaw
 #
 # This script converts an OpenClaw-style workspace to a QwenPaw-style workspace
 # and then launches the QwenPaw application.
