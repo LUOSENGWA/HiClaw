@@ -151,15 +151,24 @@ def _current_actor() -> str | None:
         return configured.strip()
 
     try:
-        from copaw.config.config import load_agent_config
-
-        agent_config = load_agent_config("default")
-        channels = _read_config_value(agent_config, "channels") or {}
-        matrix_cfg = _read_config_value(channels, "matrix") or {}
-        user_id = _read_config_value(matrix_cfg, "user_id", "userId")
-        return str(user_id).strip() if user_id else None
+        # Read agent.json directly (works in both copaw and qwenpaw venvs
+        # without importing either framework's config module).
+        working_dir = (
+            os.getenv("COPAW_WORKING_DIR")
+            or os.getenv("QWENPAW_WORKING_DIR")
+        )
+        if working_dir:
+            agent_json = Path(working_dir) / "workspaces" / "default" / "agent.json"
+            with open(agent_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            matrix_cfg = (data.get("channels") or {}).get("matrix") or {}
+            user_id = matrix_cfg.get("user_id") or matrix_cfg.get("userId")
+            if user_id:
+                return str(user_id).strip()
     except Exception:
-        return None
+        pass
+
+    return None
 
 
 def _read_config_value(obj: Any, *names: str) -> Any:

@@ -230,11 +230,17 @@ def _sanitize_session_filename(name: str) -> str:
 
 
 def _resolve_copaw_working_dir() -> Path:
-    configured = os.environ.get("COPAW_WORKING_DIR")
+    configured = (
+        os.environ.get("COPAW_WORKING_DIR")
+        or os.environ.get("QWENPAW_WORKING_DIR")
+    )
     if configured:
         return Path(configured).expanduser().resolve()
 
-    from copaw.constant import WORKING_DIR
+    try:
+        from copaw.constant import WORKING_DIR
+    except ImportError:
+        from qwenpaw.constant import WORKING_DIR
 
     return Path(WORKING_DIR).expanduser().resolve()
 
@@ -339,11 +345,24 @@ async def _record_matrix_outbound_to_session(
 
 
 def _matrix_config_for_agent(account_id: str) -> tuple[str, str, str]:
-    from copaw.config.config import load_agent_config
+    # Read agent.json directly to avoid a hard dependency on
+    # copaw.config.config, which is unavailable in the QwenPaw 2.0 venv.
+    # bridge.py writes homeserver/access_token/user_id into
+    # workspaces/<id>/agent.json regardless of runtime.
+    working_dir = _resolve_copaw_working_dir()
+    agent_json = (
+        working_dir / "workspaces" / (account_id or "default") / "agent.json"
+    )
+    try:
+        with open(agent_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise MessageToolError(
+            f"cannot read agent config at {agent_json}: {exc}",
+        )
 
-    agent_config = load_agent_config(account_id or "default")
-    channels = _read_config_value(agent_config, "channels") or {}
-    matrix_cfg = _read_config_value(channels, "matrix") or {}
+    channels = data.get("channels") or {}
+    matrix_cfg = channels.get("matrix") or {}
 
     homeserver = _read_config_value(matrix_cfg, "homeserver") or ""
     access_token = _read_config_value(matrix_cfg, "access_token", "accessToken") or ""
