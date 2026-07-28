@@ -1,9 +1,9 @@
 #!/bin/bash
-# start-copaw-manager.sh - Start Manager Agent with CoPaw runtime
+# start-copaw-manager.sh - Start Manager Agent with QwenPaw 2.0 runtime
 # Called by start-manager-agent.sh when AGENTTEAMS_MANAGER_RUNTIME=copaw
 #
-# This script converts an OpenClaw-style workspace to a CoPaw-style workspace
-# and then launches the CoPaw application.
+# This script converts an OpenClaw-style workspace to a QwenPaw-style workspace
+# and then launches the QwenPaw application.
 
 source /opt/agentteams/scripts/lib/agentteams-env.sh
 
@@ -46,8 +46,7 @@ if [ -f "${COPAW_WORKING_DIR}/config.json" ]; then
 fi
 
 log "Bridging openclaw.json -> CoPaw config (manager)..."
-PYTHONPATH="/opt/agentteams/copaw/src:${PYTHONPATH:-}" \
-    /opt/copaw-venv/bin/python3 -m copaw_worker.bridge \
+/opt/copaw-venv/bin/python3 -m copaw_worker.bridge \
         --profile manager \
         --openclaw-json "${OPENCLAW_JSON}" \
         --working-dir "${COPAW_WORKING_DIR}"
@@ -95,7 +94,26 @@ if [ -d "${OPENCLAW_WORKSPACE}/skills" ]; then
 fi
 
 # ============================================================
-# 5. DM room detection and auto-reply config (patches agent.json directly)
+# 5. Inject session file privacy policy into prompt files
+# ============================================================
+# Aligned with qwenpaw Worker (_ensure_session_file_prompt_policy):
+# prevents the agent from reading/exposing files under sessions/.
+SESSION_FILE_POLICY="Do not read, list, grep, glob, summarize, copy, or expose files under sessions/.
+Session files are runtime-private state and may contain private conversation history.
+This rule applies to all channels, users, and sessions, not only DingTalk."
+SESSION_FILE_POLICY_MARKER="Session files are runtime-private state"
+for _pf in AGENTS.md SOUL.md; do
+    _target="${WORKSPACE_DIR}/${_pf}"
+    if [ -f "${_target}" ]; then
+        if ! grep -q "${SESSION_FILE_POLICY_MARKER}" "${_target}" 2>/dev/null; then
+            printf '\n%s\n' "${SESSION_FILE_POLICY}" >> "${_target}"
+            log "  Injected session file policy into ${_pf}"
+        fi
+    fi
+done
+
+# ============================================================
+# 6. DM room detection and auto-reply config (patches agent.json directly)
 # ============================================================
 # nio room.users is always 0 after token restore, so all rooms are treated as
 # "group" (requireMention=true by default). We detect actual DM rooms via
@@ -106,7 +124,7 @@ fi
 log "Detecting DM rooms for auto-reply config..."
 AGENT_JSON="${WORKSPACE_DIR}/agent.json"
 if [ ! -f "${AGENT_JSON}" ]; then
-    log "ERROR: agent.json not found at ${AGENT_JSON} (bridge step must have failed)"
+    log "ERROR: agent.json not found at ${AGENT_JSON} (bridge steps must have failed)"
     exit 1
 fi
 MANAGER_MATRIX_TOKEN_VAL=$(jq -r '.channels.matrix.access_token // ""' "${AGENT_JSON}")
@@ -155,54 +173,36 @@ jq --slurpfile dm_rooms "${DM_ROOMS_FILE}" \
 rm -f "${DM_ROOMS_FILE}" "${DM_ROOMS_FILE}.tmp"
 
 # ============================================================
-# 8. Configure CoPaw CMS plugin (LoongSuite observability)
+# 7. Configure CMS observability plugin (LoongSuite)
 # ============================================================
+# Aligned with qwenpaw Worker entrypoint: heredoc + env exports.
 CMS_TRACES_ENABLED="$(echo "${AGENTTEAMS_CMS_TRACES_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
 if [ "${CMS_TRACES_ENABLED}" = "true" ]; then
-    log "Configuring CoPaw CMS plugin..."
+    log "Configuring CMS observability plugin..."
 
-    # Create bootstrap config directory
-    BOOTSTRAP_CONFIG_DIR="${HOME}/.loongsuite"
-    mkdir -p "${BOOTSTRAP_CONFIG_DIR}"
-    BOOTSTRAP_CONFIG="${BOOTSTRAP_CONFIG_DIR}/bootstrap-config.json"
+    LOONGSUITE_DIR="${HOME}/.loongsuite"
+    mkdir -p "${LOONGSUITE_DIR}"
 
-    # Generate bootstrap-config.json
-    python3 - "${BOOTSTRAP_CONFIG}" <<'PYEOF'
-import json
-import sys
-import os
-from pathlib import Path
-
-cfg_path = Path(sys.argv[1])
-endpoint = os.getenv("AGENTTEAMS_CMS_ENDPOINT", "")
-license_key = os.getenv("AGENTTEAMS_CMS_LICENSE_KEY", "")
-arms_project = os.getenv("AGENTTEAMS_CMS_PROJECT", "")
-cms_workspace = os.getenv("AGENTTEAMS_CMS_WORKSPACE", "")
-service_name = os.getenv("AGENTTEAMS_CMS_SERVICE_NAME", "agentteams-manager")
-protocol = "http/protobuf"  # Default OTLP protocol
-
-config = {
-    "OTEL_EXPORTER_OTLP_ENDPOINT": endpoint,
-    "OTEL_EXPORTER_OTLP_PROTOCOL": protocol,
-    "OTEL_EXPORTER_OTLP_HEADERS": f"x-arms-license-key={license_key},x-arms-project={arms_project},x-cms-workspace={cms_workspace}",
-    "OTEL_SERVICE_NAME": service_name,
-    "OTEL_SEMCONV_STABILITY_OPT_IN": "http,gen_ai_latest_experimental",
-    "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "SPAN_AND_EVENT",
-    "LOONGSUITE_PYTHON_SITE_BOOTSTRAP": "true",
+    cat > "${LOONGSUITE_DIR}/bootstrap-config.json" <<EOF
+{
+  "OTEL_EXPORTER_OTLP_ENDPOINT": "${AGENTTEAMS_CMS_ENDPOINT}",
+  "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+  "OTEL_EXPORTER_OTLP_HEADERS": "x-arms-license-key=${AGENTTEAMS_CMS_LICENSE_KEY},x-arms-project=${AGENTTEAMS_CMS_PROJECT},x-cms-workspace=${AGENTTEAMS_CMS_WORKSPACE}",
+  "OTEL_SERVICE_NAME": "${AGENTTEAMS_CMS_SERVICE_NAME:-agentteams-manager}",
+  "OTEL_SEMCONV_STABILITY_OPT_IN": "http,gen_ai_latest_experimental",
+  "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "SPAN_AND_EVENT",
+  "LOONGSUITE_PYTHON_SITE_BOOTSTRAP": "true",
+  "LOONGSUITE_PYTHON_SITE_BOOTSTRAP_LOG_SUCCESS": "false"
 }
+EOF
 
-cfg_path.parent.mkdir(parents=True, exist_ok=True)
-with open(cfg_path, "w") as f:
-    json.dump(config, f, indent=2)
-
-print(f"Bootstrap config written to: {cfg_path}")
-PYEOF
-
-    log "CoPaw CMS plugin configured at ${BOOTSTRAP_CONFIG}"
+    log "CMS observability plugin configured at ${LOONGSUITE_DIR}/bootstrap-config.json"
+    export LOONGSUITE_PYTHON_SITE_BOOTSTRAP=true
+    export LOONGSUITE_PYTHON_SITE_BOOTSTRAP_LOG_SUCCESS=false
 fi
 
 # ============================================================
-# 9. Background: watch openclaw.json for changes and re-bridge
+# 8. Background: watch openclaw.json for changes and re-bridge
 # ============================================================
 (
     _prev_hash=$(md5sum "${OPENCLAW_JSON}" 2>/dev/null | awk '{print $1}')
@@ -211,8 +211,7 @@ fi
         _curr_hash=$(md5sum "${OPENCLAW_JSON}" 2>/dev/null | awk '{print $1}')
         if [ -n "${_curr_hash}" ] && [ "${_curr_hash}" != "${_prev_hash}" ]; then
             log "openclaw.json changed, re-bridging..."
-            _bridge_out=$(PYTHONPATH="/opt/agentteams/copaw/src:${PYTHONPATH:-}" \
-                /opt/copaw-venv/bin/python3 -m copaw_worker.bridge \
+            _bridge_out=$(/opt/copaw-venv/bin/python3 -m copaw_worker.bridge \
                     --profile manager \
                     --openclaw-json "${OPENCLAW_JSON}" \
                     --working-dir "${COPAW_WORKING_DIR}" 2>&1)
@@ -228,19 +227,20 @@ fi
 log "openclaw.json watcher started (PID: $!)"
 
 # ============================================================
-# 10. Launch CoPaw Manager (app mode with hot-reload)
+# 9. Launch QwenPaw 2.0 Manager (app mode)
 # ============================================================
+# copaw is the legacy name for qwenpaw; QwenPaw 2.0 treats ~/.copaw as
+# a legacy installation and auto-uses it.  We set QWENPAW_WORKING_DIR
+# explicitly to be unambiguous.
 export COPAW_WORKING_DIR="${COPAW_WORKING_DIR}"
-# QWENPAW_WORKING_DIR points to the same directory as COPAW_WORKING_DIR (.copaw/)
-# qwenpaw reads config.json + agent.json from this path
 export QWENPAW_WORKING_DIR="${COPAW_WORKING_DIR}"
+export QWENPAW_SECRET_DIR="${QWENPAW_SECRET_DIR:-${COPAW_WORKING_DIR}.secret}"
+export QWENPAW_RUNNING_IN_CONTAINER=true
+export QWENPAW_LOG_LEVEL="${COPAW_LOG_LEVEL:-info}"
 
 log "Starting QwenPaw 2.0 Manager (app mode)..."
 COPAW_LOG_LEVEL="${COPAW_LOG_LEVEL:-info}"
 export COPAW_LOG_LEVEL
-
-# Set PYTHONPATH to include copaw_worker module
-export PYTHONPATH="/opt/agentteams/copaw/src:${PYTHONPATH:-}"
 
 # run_copaw_app.py starts qwenpaw app (tools registered via agentteams-manager-tools plugin)
 exec python3 -m copaw_worker.run_copaw_app app --host 0.0.0.0 --port 18799

@@ -8,6 +8,10 @@
     "PROFILE.md",
     "TOOLS.md"
   ],
+  "running": {
+    "max_iters": 200,
+    "approval_level": "AUTO"
+  },
   "heartbeat": {
     "enabled": true,
     "every": "30m"
@@ -25,8 +29,5 @@
       "group_allow_from": [],
       "groups": {}
     }
-  },
-  "running": {
-    "max_iters": 200
   }
 }

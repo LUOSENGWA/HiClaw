@@ -72,15 +72,18 @@ RUN pip install --no-cache-dir \
         "copaw==${COPAW_VERSION}" \
         "matrix-nio[e2e]>=0.24.0"
 
-# ---- CoPaw CMS Plugin (observability) ----
+# ---- CMS Observability Plugin ----
+# Aligned with qwenpaw Worker Dockerfile: instrumentation-qwenpaw (not -copaw)
+# + loongsuite-otel-util-genai for GenAI semantic conventions.
 RUN pip install --no-cache-dir \
         -i "${PIP_INDEX_URL}" \
         --trusted-host "$(echo ${PIP_INDEX_URL} | sed 's|https\?://||;s|/.*||')" \
         "wrapt<2.0" \
         loongsuite-site-bootstrap \
         loongsuite-distro \
+        loongsuite-otel-util-genai \
         opentelemetry-exporter-otlp \
-        loongsuite-instrumentation-copaw \
+        loongsuite-instrumentation-qwenpaw \
         loongsuite-instrumentation-agentscope
 
 # ---- CoPaw worker bridge module (for config conversion) ----
