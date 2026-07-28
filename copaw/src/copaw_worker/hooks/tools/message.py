@@ -237,10 +237,12 @@ def _resolve_copaw_working_dir() -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
 
+    # copaw is the legacy name for qwenpaw; the package was renamed.
+    # In the qwenpaw 2.0 venv only the new name exists.
     try:
-        from copaw.constant import WORKING_DIR
-    except ImportError:
         from qwenpaw.constant import WORKING_DIR
+    except ImportError:
+        from copaw.constant import WORKING_DIR
 
     return Path(WORKING_DIR).expanduser().resolve()
 
