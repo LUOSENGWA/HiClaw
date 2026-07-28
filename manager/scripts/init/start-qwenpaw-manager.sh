@@ -181,13 +181,23 @@ rm -f "${DM_ROOMS_FILE}" "${DM_ROOMS_FILE}.tmp"
 # QwenPaw 2.0 start_all_configured_agents() skips enabled=false agents.
 CONFIG_JSON="${COPAW_WORKING_DIR}/config.json"
 if [ -f "${CONFIG_JSON}" ]; then
-    jq '.agents.profiles["QwenPaw_QA_Agent_0.2"].enabled = false' \
+    # AgentProfileRef requires id + workspace_dir (both mandatory).
+    # Writing only {"enabled": false} causes a Pydantic ValidationError
+    # that _remove_bad_field() strips, then ensure_qa_agent_exists()
+    # recreates it with enabled=True — defeating the disable.
+    _QA_WD="${COPAW_WORKING_DIR}/workspaces/QwenPaw_QA_Agent_0.2"
+    jq --arg wd "${_QA_WD}" \
+       '.agents.profiles["QwenPaw_QA_Agent_0.2"] = {
+           "id": "QwenPaw_QA_Agent_0.2",
+           "workspace_dir": $wd,
+           "enabled": false
+       }' \
         "${CONFIG_JSON}" > "${CONFIG_JSON}.tmp" && mv "${CONFIG_JSON}.tmp" "${CONFIG_JSON}"
     log "Disabled built-in QA Agent in config.json"
 fi
 
 # ============================================================
-# 7. Configure CMS observability plugin (LoongSuite)
+# 8. Configure CMS observability plugin (LoongSuite)
 # ============================================================
 # Aligned with qwenpaw Worker entrypoint: heredoc + env exports.
 CMS_TRACES_ENABLED="$(echo "${AGENTTEAMS_CMS_TRACES_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
@@ -216,7 +226,7 @@ EOF
 fi
 
 # ============================================================
-# 8. Background: watch openclaw.json for changes and re-bridge
+# 9. Background: watch openclaw.json for changes and re-bridge
 # ============================================================
 (
     _prev_hash=$(md5sum "${OPENCLAW_JSON}" 2>/dev/null | awk '{print $1}')
@@ -241,7 +251,26 @@ fi
 log "openclaw.json watcher started (PID: $!)"
 
 # ============================================================
-# 9. Launch QwenPaw 2.0 Manager (app mode)
+# 10. Copy AgentTeams plugins into working dir
+# ============================================================
+# The Dockerfile copies plugins to /opt/agentteams/plugins/ (image-local).
+# /root/manager-workspace is a host-mounted volume at runtime, so
+# build-time files there are hidden. Copy plugins to the QwenPaw
+# working dir's plugins/ directory before startup so PluginLoader
+# discovers them.
+PLUGINS_TARGET="${COPAW_WORKING_DIR}/plugins"
+mkdir -p "${PLUGINS_TARGET}"
+for _plugin_src in /opt/agentteams/plugins/*/; do
+    _plugin_name=$(basename "${_plugin_src}")
+    if [ -f "${_plugin_src}plugin.json" ]; then
+        rm -rf "${PLUGINS_TARGET}/${_plugin_name}"
+        cp -a "${_plugin_src}" "${PLUGINS_TARGET}/${_plugin_name}"
+        log "Installed plugin: ${_plugin_name}"
+    fi
+done
+
+# ============================================================
+# 11. Launch QwenPaw 2.0 Manager (app mode)
 # ============================================================
 # copaw is the legacy name for qwenpaw; QwenPaw 2.0 treats ~/.copaw as
 # a legacy installation and auto-uses it.  We set QWENPAW_WORKING_DIR

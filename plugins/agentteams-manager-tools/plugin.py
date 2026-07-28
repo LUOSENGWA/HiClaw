@@ -11,10 +11,9 @@ Tool dependencies (verified against agentscope 2.0.4.post1):
   - ``agentscope.tool.ToolResponse`` ✅
   - ``copaw_worker.task / sync / hooks.message_filter`` — pure stdlib + agentscope
 
-No dependency on ``copaw`` 1.0.2 at module-import time.  Two functions
-(``taskflow``, ``message``) contain deferred ``from copaw.config.config
-import load_agent_config`` inside specific branches; those branches will
-raise ``ImportError`` if hit, but do not affect plugin loading.
+No dependency on ``copaw`` 1.0.2 at module-import time.  The message and
+taskflow tools read Matrix credentials directly from ``agent.json`` instead
+of importing ``copaw.config.config``.
 """
 
 

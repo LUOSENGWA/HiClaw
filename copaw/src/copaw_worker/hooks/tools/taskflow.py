@@ -153,12 +153,9 @@ def _current_actor() -> str | None:
     try:
         # Read agent.json directly (works in both copaw and qwenpaw venvs
         # without importing either framework's config module).
-        working_dir = (
-            os.getenv("COPAW_WORKING_DIR")
-            or os.getenv("QWENPAW_WORKING_DIR")
-        )
+        working_dir = _resolve_working_dir()
         if working_dir:
-            agent_json = Path(working_dir) / "workspaces" / "default" / "agent.json"
+            agent_json = working_dir / "workspaces" / "default" / "agent.json"
             with open(agent_json, "r", encoding="utf-8") as f:
                 data = json.load(f)
             matrix_cfg = (data.get("channels") or {}).get("matrix") or {}
@@ -169,6 +166,31 @@ def _current_actor() -> str | None:
         pass
 
     return None
+
+
+def _resolve_working_dir() -> Path | None:
+    """Resolve the QwenPaw/CoPaw working directory.
+
+    Mirrors message.py's _resolve_copaw_working_dir() so that both tools
+    use the same path resolution logic, including the qwenpaw.constant
+    fallback when env vars are not set.
+    """
+    configured = (
+        os.getenv("COPAW_WORKING_DIR")
+        or os.getenv("QWENPAW_WORKING_DIR")
+    )
+    if configured:
+        return Path(configured).expanduser().resolve()
+
+    try:
+        from qwenpaw.constant import WORKING_DIR
+    except ImportError:
+        try:
+            from copaw.constant import WORKING_DIR
+        except ImportError:
+            return None
+
+    return Path(WORKING_DIR).expanduser().resolve()
 
 
 def _read_config_value(obj: Any, *names: str) -> Any:

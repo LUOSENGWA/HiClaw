@@ -72,20 +72,6 @@ RUN pip install --no-cache-dir \
         "copaw==${COPAW_VERSION}" \
         "matrix-nio[e2e]>=0.24.0"
 
-# ---- CMS Observability Plugin ----
-# Aligned with qwenpaw Worker Dockerfile: instrumentation-qwenpaw (not -copaw)
-# + loongsuite-otel-util-genai for GenAI semantic conventions.
-RUN pip install --no-cache-dir \
-        -i "${PIP_INDEX_URL}" \
-        --trusted-host "$(echo ${PIP_INDEX_URL} | sed 's|https\?://||;s|/.*||')" \
-        "wrapt<2.0" \
-        loongsuite-site-bootstrap \
-        loongsuite-distro \
-        loongsuite-otel-util-genai \
-        opentelemetry-exporter-otlp \
-        loongsuite-instrumentation-qwenpaw \
-        loongsuite-instrumentation-agentscope
-
 # ---- CoPaw worker bridge module (for config conversion) ----
 # Stage the copaw-worker package metadata for dependency resolution
 COPY copaw/pyproject.toml copaw/README.md /tmp/copaw-worker/
@@ -124,6 +110,22 @@ RUN python3 -m venv /opt/venv/qwenpaw \
 RUN cp -a /opt/copaw-venv/lib/python3.11/site-packages/copaw_worker \
         /opt/venv/qwenpaw/lib/python3.11/site-packages/
 
+# ---- CMS Observability Plugin (in qwenpaw venv) ----
+# Aligned with qwenpaw Worker Dockerfile: installed into the runtime venv
+# (qwenpaw) so that loongsuite-site-bootstrap is active when the Manager
+# process starts.  instrumentation-qwenpaw (not -copaw) +
+# loongsuite-otel-util-genai for GenAI semantic conventions.
+RUN /opt/venv/qwenpaw/bin/pip install --no-cache-dir \
+        -i "${PIP_INDEX_URL}" \
+        --trusted-host "$(echo ${PIP_INDEX_URL} | sed 's|https\?://||;s|/.*||')" \
+        "wrapt<2.0" \
+        loongsuite-site-bootstrap \
+        loongsuite-distro \
+        loongsuite-otel-util-genai \
+        opentelemetry-exporter-otlp \
+        loongsuite-instrumentation-qwenpaw \
+        loongsuite-instrumentation-agentscope
+
 # qwenpaw CLI on PATH
 RUN ln -sf /opt/venv/qwenpaw/bin/qwenpaw /usr/local/bin/qwenpaw
 
@@ -131,19 +133,11 @@ RUN ln -sf /opt/venv/qwenpaw/bin/qwenpaw /usr/local/bin/qwenpaw
 ENV PATH="/opt/venv/qwenpaw/bin:/opt/copaw-venv/bin:${PATH}"
 
 # AgentTeams plugins: Matrix channel + Manager tools
+# Stored in image-local path (/opt/agentteams/plugins/). At runtime,
+# start-qwenpaw-manager.sh copies them into the working dir's plugins/
+# directory because /root/manager-workspace is a host-mounted volume.
 COPY plugins/agentteams-matrix-channel/ /opt/agentteams/plugins/agentteams-matrix-channel/
 COPY plugins/agentteams-manager-tools/ /opt/agentteams/plugins/agentteams-manager-tools/
-
-# Copy plugins into QwenPaw's plugin discovery path.
-# WORKING_DIR = ~/.copaw (set by start-qwenpaw-manager.sh at runtime).
-# cp -a (not ln -sfn): QwenPaw PluginLoader._load_plugin_from_path_unlocked
-# resolves source_path vs target_dir — symlinks cause rmtree of the real dir
-# followed by copytree from the now-dead symlink target (crash).
-RUN mkdir -p /root/manager-workspace/.copaw/plugins \
-    && cp -a /opt/agentteams/plugins/agentteams-matrix-channel \
-        /root/manager-workspace/.copaw/plugins/agentteams-matrix-channel \
-    && cp -a /opt/agentteams/plugins/agentteams-manager-tools \
-        /root/manager-workspace/.copaw/plugins/agentteams-manager-tools
 
 # ---- Copy Manager agent definitions ----
 COPY manager/agent/ /opt/agentteams/agent/

@@ -2,7 +2,7 @@
   "id": "agentteams-manager-tools",
   "name": "AgentTeams Manager Tools",
   "version": "0.1.0",
-  "type": "general",
+  "type": "tool",
   "description": "projectflow, taskflow, message, filesync tools for Manager",
   "author": "AgentTeams",
   "entry": {
