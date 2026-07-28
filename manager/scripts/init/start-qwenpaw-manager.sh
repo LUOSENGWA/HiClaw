@@ -185,13 +185,28 @@ if [ -f "${CONFIG_JSON}" ]; then
     # Writing only {"enabled": false} causes a Pydantic ValidationError
     # that _remove_bad_field() strips, then ensure_qa_agent_exists()
     # recreates it with enabled=True — defeating the disable.
+    #
+    # CRITICAL: must also inject the "default" profile alongside QA.
+    # If profiles contains ONLY the QA entry, QwenPaw's
+    # migrate_legacy_workspace_to_default_agent() sees len(profiles)==1
+    # and "default" not in profiles → runs legacy migration → replaces
+    # config.agents entirely → QA profile lost → ensure_qa_agent_exists()
+    # re-creates it with enabled=True.  Injecting "default" makes
+    # len(profiles)>=2 so migration is skipped.
+    _DEFAULT_WD="${COPAW_WORKING_DIR}/workspaces/default"
     _QA_WD="${COPAW_WORKING_DIR}/workspaces/QwenPaw_QA_Agent_0.2"
-    jq --arg wd "${_QA_WD}" \
-       '.agents.profiles["QwenPaw_QA_Agent_0.2"] = {
-           "id": "QwenPaw_QA_Agent_0.2",
-           "workspace_dir": $wd,
-           "enabled": false
-       }' \
+    jq --arg wd "${_QA_WD}" --arg dwd "${_DEFAULT_WD}" \
+       '.agents.profiles = ((.agents.profiles // {}) + {
+           "default": {
+               "id": "default",
+               "workspace_dir": $dwd
+           },
+           "QwenPaw_QA_Agent_0.2": {
+               "id": "QwenPaw_QA_Agent_0.2",
+               "workspace_dir": $wd,
+               "enabled": false
+           }
+       })' \
         "${CONFIG_JSON}" > "${CONFIG_JSON}.tmp" && mv "${CONFIG_JSON}.tmp" "${CONFIG_JSON}"
     log "Disabled built-in QA Agent in config.json"
 fi
