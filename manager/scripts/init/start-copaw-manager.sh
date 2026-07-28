@@ -252,6 +252,16 @@ export QWENPAW_SECRET_DIR="${QWENPAW_SECRET_DIR:-${COPAW_WORKING_DIR}.secret}"
 export QWENPAW_RUNNING_IN_CONTAINER=true
 export QWENPAW_LOG_LEVEL="${COPAW_LOG_LEVEL:-info}"
 
+# YOLO mode: AGENTTEAMS_YOLO=1 → set approval_level=OFF in agent.json
+# (QwenPaw 2.0 equivalent of OpenClaw's tools.exec.ask=off).
+# start-manager-agent.sh promotes the yolo-mode marker file to
+# AGENTTEAMS_YOLO=1 before calling this script.
+if [ "${AGENTTEAMS_YOLO:-}" = "1" ] && [ -f "${AGENT_JSON}" ]; then
+    jq '.approval_level = "OFF"' "${AGENT_JSON}" > "${AGENT_JSON}.tmp" \
+        && mv "${AGENT_JSON}.tmp" "${AGENT_JSON}"
+    log "YOLO mode: approval_level set to OFF"
+fi
+
 log "Starting QwenPaw 2.0 Manager (app mode)..."
 COPAW_LOG_LEVEL="${COPAW_LOG_LEVEL:-info}"
 export COPAW_LOG_LEVEL
