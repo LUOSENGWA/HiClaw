@@ -4,6 +4,10 @@ Record image-affecting changes to `manager/`, `worker/`, `copaw/`, `hermes/`, `o
 
 ---
 
+**What's New**
+
+- **Custom model capability overrides**: `AGENTTEAMS_MODEL_VISION` and `AGENTTEAMS_MODEL_REASONING` env vars let deployments override vision and reasoning capabilities for custom models not in the built-in presets table (e.g. local multimodal models like `qwen3.6-27b-fp8`).
+
 **Bug Fixes**
 
 - **QwenPaw MCP policy startup convergence**: Persist built-in plugin MCP policies before runtime desired-state reloads so a replacement QwenPaw workspace cannot retain the pre-policy interactive approval handler.
@@ -14,6 +18,9 @@ Record image-affecting changes to `manager/`, `worker/`, `copaw/`, `hermes/`, `o
 - **Integration failure diagnostics**: Export AgentTeams container state and timestamped logs with CI artifacts, classify QwenPaw startup errors without exposing their message contents, and stop the TeamHarness shard after startup failures instead of hiding the cause behind cascading timeouts.
 - **QwenPaw local startup readiness**: Select and propagate the QwenPaw Worker image across install backends, then wait for the runtime-owned `runtime/runtime.yaml` object before creating a local Docker Worker.
 - **QwenPaw 2.0 runtime compatibility**: Adapt the QwenPaw Worker image, custom Matrix Channel, and native plugins to QwenPaw 2.0.1 startup and schema contracts.
+- **Multimodal model image support**: Add `supports_multimodal` and `supports_image` to `agents.defaults` in generated openclaw.json when the selected model supports image input, so QwenPaw does not strip images at the framework layer. Fixes #931.
+- **Install script model env passthrough**: Pass custom model override env vars to the Controller container so that `AGENTTEAMS_MODEL_VISION` and related settings actually reach the config generator.
+- **Bridge model capability propagation**: Propagate model `input` modalities from openclaw.json through `_write_providers_json()` so QwenPaw's `ModelInfo` receives `supports_image`/`supports_video`/`supports_multimodal` flags instead of relying on fail-open defaults.
 - **Manager diagnostic loops**: Manager prompts and Worker lifecycle guidance stop repeated no-op troubleshooting commands and treat a missing Worker in `agt get workers` as the deletion boundary instead of looping on Matrix room probes. ([#975](https://github.com/agentscope-ai/AgentTeams/pull/975))
 
 ---
