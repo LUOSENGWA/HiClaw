@@ -12,14 +12,14 @@ source /opt/agentteams/scripts/lib/agentteams-env.sh
 # Note: In Manager container, HOME is set to /root/manager-workspace
 # ============================================================
 OPENCLAW_WORKSPACE="${HOME}"
-COPAW_WORKING_DIR="${HOME}/.copaw"
+QWENPAW_WORKING_DIR="${HOME}/.qwenpaw"
 
 # ============================================================
 # 1. Create CoPaw directory structure
 # ============================================================
 log "Creating CoPaw directory structure..."
-mkdir -p "${COPAW_WORKING_DIR}/custom_channels"
-mkdir -p "${COPAW_WORKING_DIR}/.secret"
+mkdir -p "${QWENPAW_WORKING_DIR}/custom_channels"
+mkdir -p "${QWENPAW_WORKING_DIR}/.secret"
 
 # ============================================================
 # 2. Bridge openclaw.json -> config.json + providers.json
@@ -34,14 +34,14 @@ fi
 # security.tool_guard.enabled=true, which overrides agent.json and causes
 # noisy approval prompts on every tool call. Archive that legacy file so
 # the bridge re-seeds a fresh one from the template (security off).
-if [ -f "${COPAW_WORKING_DIR}/config.json" ]; then
+if [ -f "${QWENPAW_WORKING_DIR}/config.json" ]; then
     if command -v jq >/dev/null 2>&1 && \
-       [ "$(jq -r '.security.tool_guard.enabled // false' "${COPAW_WORKING_DIR}/config.json")" = "true" ] && \
-       [ ! -f "${COPAW_WORKING_DIR}/.config-migrated-v2" ]; then
-        archive="${COPAW_WORKING_DIR}/config.json.legacy-$(date +%Y%m%d-%H%M%S)"
+       [ "$(jq -r '.security.tool_guard.enabled // false' "${QWENPAW_WORKING_DIR}/config.json")" = "true" ] && \
+       [ ! -f "${QWENPAW_WORKING_DIR}/.config-migrated-v2" ]; then
+        archive="${QWENPAW_WORKING_DIR}/config.json.legacy-$(date +%Y%m%d-%H%M%S)"
         log "Archiving legacy config.json (tool_guard enabled) -> $(basename "${archive}")"
-        mv "${COPAW_WORKING_DIR}/config.json" "${archive}"
-        touch "${COPAW_WORKING_DIR}/.config-migrated-v2"
+        mv "${QWENPAW_WORKING_DIR}/config.json" "${archive}"
+        touch "${QWENPAW_WORKING_DIR}/.config-migrated-v2"
     fi
 fi
 
@@ -49,17 +49,17 @@ log "Bridging openclaw.json -> CoPaw config (manager)..."
 /opt/copaw-venv/bin/python3 -m copaw_worker.bridge \
         --profile manager \
         --openclaw-json "${OPENCLAW_JSON}" \
-        --working-dir "${COPAW_WORKING_DIR}"
+        --working-dir "${QWENPAW_WORKING_DIR}"
 log "Config bridged from openclaw.json"
 
 # ============================================================
 # 3. Sync prompt files into CoPaw paths
 # ============================================================
 # Canonical AgentTeams layout is OPENCLAW_WORKSPACE ($HOME): SOUL.md, memory/, skills/ etc.
-# CoPaw reads from COPAW_WORKING_DIR/workspaces/default/; we sync into that path only.
+# CoPaw reads from QWENPAW_WORKING_DIR/workspaces/default/; we sync into that path only.
 # Use cp -u / cp -ru so we never overwrite newer files already in workspaces/default/.
 # ============================================================
-WORKSPACE_DIR="${COPAW_WORKING_DIR}/workspaces/default"
+WORKSPACE_DIR="${QWENPAW_WORKING_DIR}/workspaces/default"
 mkdir -p "${WORKSPACE_DIR}"
 
 log "Syncing prompt files (cp -u: update only if source is newer)..."
@@ -179,7 +179,7 @@ rm -f "${DM_ROOMS_FILE}" "${DM_ROOMS_FILE}.tmp"
 # Manager runs QwenPaw in-process (no API client), so we set
 # enabled=false in config.json's agents.profiles before startup.
 # QwenPaw 2.0 start_all_configured_agents() skips enabled=false agents.
-CONFIG_JSON="${COPAW_WORKING_DIR}/config.json"
+CONFIG_JSON="${QWENPAW_WORKING_DIR}/config.json"
 if [ -f "${CONFIG_JSON}" ]; then
     # AgentProfileRef requires id + workspace_dir (both mandatory).
     # Writing only {"enabled": false} causes a Pydantic ValidationError
@@ -193,8 +193,8 @@ if [ -f "${CONFIG_JSON}" ]; then
     # config.agents entirely → QA profile lost → ensure_qa_agent_exists()
     # re-creates it with enabled=True.  Injecting "default" makes
     # len(profiles)>=2 so migration is skipped.
-    _DEFAULT_WD="${COPAW_WORKING_DIR}/workspaces/default"
-    _QA_WD="${COPAW_WORKING_DIR}/workspaces/QwenPaw_QA_Agent_0.2"
+    _DEFAULT_WD="${QWENPAW_WORKING_DIR}/workspaces/default"
+    _QA_WD="${QWENPAW_WORKING_DIR}/workspaces/QwenPaw_QA_Agent_0.2"
     jq --arg wd "${_QA_WD}" --arg dwd "${_DEFAULT_WD}" \
        '.agents.profiles = ((.agents.profiles // {}) + {
            "default": {
@@ -253,7 +253,7 @@ fi
             _bridge_out=$(/opt/copaw-venv/bin/python3 -m copaw_worker.bridge \
                     --profile manager \
                     --openclaw-json "${OPENCLAW_JSON}" \
-                    --working-dir "${COPAW_WORKING_DIR}" 2>&1)
+                    --working-dir "${QWENPAW_WORKING_DIR}" 2>&1)
             if [ $? -eq 0 ]; then
                 _prev_hash="${_curr_hash}"
                 log "Re-bridge complete"
@@ -273,7 +273,7 @@ log "openclaw.json watcher started (PID: $!)"
 # build-time files there are hidden. Copy plugins to the QwenPaw
 # working dir's plugins/ directory before startup so PluginLoader
 # discovers them.
-PLUGINS_TARGET="${COPAW_WORKING_DIR}/plugins"
+PLUGINS_TARGET="${QWENPAW_WORKING_DIR}/plugins"
 mkdir -p "${PLUGINS_TARGET}"
 for _plugin_src in /opt/agentteams/plugins/*/; do
     _plugin_name=$(basename "${_plugin_src}")
@@ -285,14 +285,8 @@ for _plugin_src in /opt/agentteams/plugins/*/; do
 done
 
 # ============================================================
-# 11. Launch QwenPaw 2.0 Manager (app mode)
-# ============================================================
-# copaw is the legacy name for qwenpaw; QwenPaw 2.0 treats ~/.copaw as
-# a legacy installation and auto-uses it.  We set QWENPAW_WORKING_DIR
-# explicitly to be unambiguous.
-export COPAW_WORKING_DIR="${COPAW_WORKING_DIR}"
-export QWENPAW_WORKING_DIR="${COPAW_WORKING_DIR}"
-export QWENPAW_SECRET_DIR="${QWENPAW_SECRET_DIR:-${COPAW_WORKING_DIR}.secret}"
+export QWENPAW_WORKING_DIR="${QWENPAW_WORKING_DIR}"
+export QWENPAW_SECRET_DIR="${QWENPAW_SECRET_DIR:-${QWENPAW_WORKING_DIR}.secret}"
 export QWENPAW_RUNNING_IN_CONTAINER=true
 export QWENPAW_LOG_LEVEL="${COPAW_LOG_LEVEL:-info}"
 
