@@ -661,11 +661,19 @@ def bridge_runtime_to_standard(standard_dir):
 
 
 def sync_inner_prompt_files_to_outer(local_dir):
-    """Copy agent-edited prompt files from CoPaw workspace back to sync root."""
+    """Copy agent-edited prompt files from runtime workspace back to sync root."""
     inner_outer_files = ("AGENTS.md", "SOUL.md", "HEARTBEAT.md")
-    copaw_ws_dir = Path(local_dir) / ".copaw" / "workspaces" / "default"
+    # Detect runtime workspace dir: .qwenpaw (new) or .copaw (legacy)
+    ws_dir = None
+    for rt_dir in (".qwenpaw", ".copaw"):
+        candidate = Path(local_dir) / rt_dir / "workspaces" / "default"
+        if candidate.exists():
+            ws_dir = candidate
+            break
+    if ws_dir is None:
+        return
     for name in inner_outer_files:
-        inner = copaw_ws_dir / name
+        inner = ws_dir / name
         outer = Path(local_dir) / name
         if not inner.exists():
             continue
@@ -680,7 +688,8 @@ def sync_inner_prompt_files_to_outer(local_dir):
             if inner_content != outer_content:
                 outer.write_text(inner_content)
                 logger.debug(
-                    "Inner->Outer sync: .copaw/workspaces/default/%s -> %s",
+                    "Inner->Outer sync: %s/workspaces/default/%s -> %s",
+                    ws_dir.parent.name,
                     name,
                     name,
                 )

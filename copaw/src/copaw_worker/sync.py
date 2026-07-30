@@ -775,7 +775,7 @@ def push_local(sync: FileSync, since: float = 0) -> list[str]:
     mtime > `since` (epoch seconds), then content-compares before uploading.
     When since=0 (first run), scans all eligible files.
 
-    Excludes Manager-managed files only. AGENTS.md, SOUL.md, .copaw/sessions/
+    Excludes Manager-managed files only. AGENTS.md, SOUL.md, runtime sessions/
     are Worker-managed and are pushed (including session backup).
     """
     # Manager-managed files that should never be pushed back
@@ -787,6 +787,7 @@ def push_local(sync: FileSync, since: float = 0) -> list[str]:
     _EXCLUDE_PATHS = {
         "config/mcporter.json",
         ".copaw/workspaces/default/config/mcporter.json",
+        ".qwenpaw/workspaces/default/config/mcporter.json",
     }
     # Skip duplicate uploads through the runtime skills symlink; the canonical
     # standard-space skills/ directory is still pushed normally.
@@ -795,6 +796,9 @@ def push_local(sync: FileSync, since: float = 0) -> list[str]:
         ".copaw/workspaces/default/skills",
         ".copaw/workspaces/default/shared",
         ".copaw/workspaces/default/global-shared",
+        ".qwenpaw/workspaces/default/skills",
+        ".qwenpaw/workspaces/default/shared",
+        ".qwenpaw/workspaces/default/global-shared",
         "shared",
         "global-shared",
     )
