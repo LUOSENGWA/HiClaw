@@ -236,7 +236,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [embedded, manager, manager-copaw, worker, copaw-worker, qwenpaw-worker, hermes-worker]
+        target: [embedded, manager, manager-qwenpaw, worker, copaw-worker, qwenpaw-worker, hermes-worker]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -272,7 +272,7 @@ jobs:
         run: |
           # When openclaw-base was rebuilt from this PR's source, point manager
           # and worker builds at the local image instead of pulling :latest from
-          # the published registry. Other targets (embedded, manager-copaw,
+          # the published registry. Other targets (embedded, manager-qwenpaw,
           # copaw-worker) do not depend on openclaw-base so the override is a
           # no-op for them.
           EXTRA=""

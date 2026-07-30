@@ -1,13 +1,13 @@
 # ============================================================
-# AgentTeams Manager Agent - CoPaw Runtime
+# AgentTeams Manager Agent - QwenPaw 2.0 Runtime
 # ============================================================
-# Lightweight Manager container with Python CoPaw runtime.
+# Lightweight Manager container with Python QwenPaw 2.0 runtime.
 # Does NOT include Higress, Tuwunel, MinIO, or Element Web.
 # All infrastructure is provided by the controller (embedded)
 # or K8s Pods (incluster). AGENTTEAMS_RUNTIME env var selects mode.
 #
 # Build from project root:
-#   docker build -f manager/Dockerfile.copaw -t agentteams/manager-copaw:latest .
+#   docker build -f manager/Dockerfile.qwenpaw -t agentteams/manager-qwenpaw:latest .
 #
 # Build args:
 #   HIGRESS_REGISTRY        - base image registry (default: cn-hangzhou)
