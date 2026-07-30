@@ -620,12 +620,10 @@ msg() {
         "manager_runtime.title.en") text="--- Manager Runtime ---" ;;
         "manager_runtime.openclaw.zh") text="OpenClaw" ;;
         "manager_runtime.openclaw.en") text="OpenClaw" ;;
-        "manager_runtime.copaw.zh") text="QwenPaw (Legacy copaw)" ;;
-        "manager_runtime.copaw.en") text="QwenPaw (Legacy copaw)" ;;
         "manager_runtime.qwenpaw.zh") text="QwenPaw 2.0" ;;
         "manager_runtime.qwenpaw.en") text="QwenPaw 2.0" ;;
-        "manager_runtime.choice.zh") text="请选择 [1/2/3]" ;;
-        "manager_runtime.choice.en") text="Enter choice [1/2/3]" ;;
+        "manager_runtime.choice.zh") text="请选择 [1/2]" ;;
+        "manager_runtime.choice.en") text="Enter choice [1/2]" ;;
         "manager_runtime.selected.zh") text="Manager 运行时: %s" ;;
         "manager_runtime.selected.en") text="Manager runtime: %s" ;;
         "manager_runtime.title_short.zh") text="Manager 运行时" ;;
@@ -2728,9 +2726,16 @@ step_runtime() {
 step_manager_runtime() {
     log "$(msg manager_runtime.title)"
     echo ""
+    # Upgrade migration: copaw → qwenpaw (copaw is the legacy name,
+    # unified to QwenPaw 2.0).  This runs before any menu logic so all
+    # downstream code (image selection, health check, domain check)
+    # only sees "qwenpaw".
+    if [ "${AGENTTEAMS_MANAGER_RUNTIME}" = "copaw" ]; then
+        log "Migrating Manager runtime: copaw → qwenpaw"
+        AGENTTEAMS_MANAGER_RUNTIME="qwenpaw"
+    fi
     echo "  1) $(msg manager_runtime.qwenpaw)"
-    echo "  2) $(msg manager_runtime.copaw)"
-    echo "  3) $(msg manager_runtime.openclaw)"
+    echo "  2) $(msg manager_runtime.openclaw)"
     echo ""
     if [ "${AGENTTEAMS_NON_INTERACTIVE}" = "1" ]; then
         AGENTTEAMS_MANAGER_RUNTIME="${AGENTTEAMS_MANAGER_RUNTIME:-qwenpaw}"
@@ -2741,8 +2746,7 @@ step_manager_runtime() {
         if [ "${_runtime_choice}" = "b" ]; then STEP_RESULT="back"; return 0; fi
         if [ -n "${_runtime_choice}" ]; then
             case "${_runtime_choice}" in
-                2) AGENTTEAMS_MANAGER_RUNTIME="copaw" ;;
-                3) AGENTTEAMS_MANAGER_RUNTIME="openclaw" ;;
+                2) AGENTTEAMS_MANAGER_RUNTIME="openclaw" ;;
                 *) AGENTTEAMS_MANAGER_RUNTIME="qwenpaw" ;;
             esac
         fi
@@ -2752,8 +2756,7 @@ step_manager_runtime() {
         if [ "${_runtime_choice}" = "b" ]; then STEP_RESULT="back"; return 0; fi
         _runtime_choice="${_runtime_choice:-1}"
         case "${_runtime_choice}" in
-            2) AGENTTEAMS_MANAGER_RUNTIME="copaw" ;;
-            3) AGENTTEAMS_MANAGER_RUNTIME="openclaw" ;;
+            2) AGENTTEAMS_MANAGER_RUNTIME="openclaw" ;;
             *) AGENTTEAMS_MANAGER_RUNTIME="qwenpaw" ;;
         esac
     fi
@@ -3380,6 +3383,10 @@ install_manager() {
     fi
     AGENTTEAMS_WORKSPACE_DIR="$(cd "${AGENTTEAMS_WORKSPACE_DIR}" 2>/dev/null && pwd || echo "${AGENTTEAMS_WORKSPACE_DIR}")"
     mkdir -p "${AGENTTEAMS_WORKSPACE_DIR}"
+    # Migrate legacy copaw → qwenpaw (covers --skip and non-interactive paths)
+    if [ "${AGENTTEAMS_MANAGER_RUNTIME}" = "copaw" ]; then
+        AGENTTEAMS_MANAGER_RUNTIME="qwenpaw"
+    fi
     AGENTTEAMS_MANAGER_RUNTIME="${AGENTTEAMS_MANAGER_RUNTIME:-qwenpaw}"
     export AGENTTEAMS_MANAGER_RUNTIME
     AGENTTEAMS_DEFAULT_WORKER_RUNTIME="${AGENTTEAMS_DEFAULT_WORKER_RUNTIME:-copaw}"
@@ -3457,7 +3464,7 @@ AGENTTEAMS_PORT_CONSOLE=${AGENTTEAMS_PORT_CONSOLE}
 AGENTTEAMS_PORT_ELEMENT_WEB=${AGENTTEAMS_PORT_ELEMENT_WEB}
 AGENTTEAMS_PORT_MANAGER_CONSOLE=${AGENTTEAMS_PORT_MANAGER_CONSOLE:-18888}
 
-# Manager runtime (openclaw | copaw | qwenpaw)
+# Manager runtime (openclaw | qwenpaw; copaw is auto-migrated to qwenpaw)
 AGENTTEAMS_MANAGER_RUNTIME=${AGENTTEAMS_MANAGER_RUNTIME:-qwenpaw}
 
 # Matrix

@@ -5,12 +5,9 @@
 # In cloud/k8s mode (AGENTTEAMS_RUNTIME=aliyun|k8s) this is the container entrypoint.
 #
 # Runtime selection:
-#   AGENTTEAMS_MANAGER_RUNTIME=openclaw (default) - OpenClaw gateway mode
-#   AGENTTEAMS_MANAGER_RUNTIME=copaw|qwenpaw     - QwenPaw workspace mode
-# "copaw" is the legacy runtime identifier still used by the controller,
-# installer, and CI; "qwenpaw" is the forward-looking name. Both map to
-# the same QwenPaw 2.0 startup script.
-# (hermes runtime is supported for Workers only.)
+#   AGENTTEAMS_MANAGER_RUNTIME=qwenpaw           - QwenPaw 2.0 workspace mode (default)
+#   AGENTTEAMS_MANAGER_RUNTIME=copaw              - Legacy alias, auto-routed to QwenPaw
+#   AGENTTEAMS_MANAGER_RUNTIME=openclaw           - OpenClaw gateway mode
 
 source /opt/agentteams/scripts/lib/agentteams-env.sh
 
