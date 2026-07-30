@@ -27,7 +27,10 @@ def test_integration_workflow_runs_qwenpaw_like_copaw() -> None:
         if step.get("id") == "test-matrix"
     )
     matrix_script = matrix_step["run"]
-    assert matrix_script.count('"worker_runtime":"qwenpaw"') == 4
+    assert matrix_script.count('"worker_runtime":"qwenpaw"') == 3
+    assert '"filter_env":"SHARD_B_TESTS"' not in matrix_script
+    assert "SHARD_B_TESTS" not in workflow["env"]
+    assert "14" not in workflow["env"]["NON_GITHUB_TESTS"].split()
     assert (
         '"shard":"qwenpaw-teamharness","filter_env":"SHARD_QWENPAW_TESTS",'
         '"manager_runtime":"copaw","worker_runtime":"qwenpaw",'
