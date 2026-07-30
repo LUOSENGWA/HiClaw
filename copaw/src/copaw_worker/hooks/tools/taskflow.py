@@ -47,17 +47,21 @@ def _error(message: str, **payload: Any) -> ToolResponse:
     return _response({"ok": False, "error": message, **payload})
 
 
-def _workspace_dir() -> Path:
-    configured = os.getenv("COPAW_WORKING_DIR")
+def _working_dir() -> Path:
+    configured = os.getenv("QWENPAW_WORKING_DIR") or os.getenv("COPAW_WORKING_DIR")
     if configured:
-        return Path(configured) / "workspaces" / "default"
+        return Path(configured).expanduser().resolve()
+    # qwenpaw is the successor of copaw (renamed package).
+    # In the qwenpaw 2.0 venv the copaw package does not exist.
+    try:
+        from qwenpaw.constant import WORKING_DIR  # type: ignore[import-untyped]
+    except ImportError:
+        from copaw.constant import WORKING_DIR  # type: ignore[import-untyped]
+    return Path(WORKING_DIR).expanduser().resolve()
 
-    cwd = Path.cwd()
-    if cwd.name == "default" and cwd.parent.name == "workspaces":
-        return cwd
-    if cwd.name == ".copaw":
-        return cwd / "workspaces" / "default"
-    return cwd
+
+def _workspace_dir() -> Path:
+    return _working_dir() / "workspaces" / "default"
 
 
 def _store() -> FileSystemTaskStore:
@@ -65,16 +69,7 @@ def _store() -> FileSystemTaskStore:
 
 
 def _runtime_root() -> Path:
-    configured = os.getenv("COPAW_WORKING_DIR")
-    if configured:
-        return Path(configured).expanduser().resolve().parent
-
-    workspace = _workspace_dir().resolve()
-    if workspace.name == "default" and workspace.parent.name == "workspaces":
-        copaw_dir = workspace.parent.parent
-        if copaw_dir.name == ".copaw":
-            return copaw_dir.parent
-    return workspace
+    return _working_dir().parent
 
 
 def _strip_yaml_string(value: str) -> str:
@@ -171,26 +166,10 @@ def _current_actor() -> str | None:
 def _resolve_working_dir() -> Path | None:
     """Resolve the QwenPaw/CoPaw working directory.
 
-    Mirrors message.py's _resolve_copaw_working_dir() so that both tools
-    use the same path resolution logic, including the qwenpaw.constant
-    fallback when env vars are not set.
+    Delegates to _working_dir() which handles env vars and constant
+    fallback consistently with projectflow, filesync, and message tools.
     """
-    configured = (
-        os.getenv("COPAW_WORKING_DIR")
-        or os.getenv("QWENPAW_WORKING_DIR")
-    )
-    if configured:
-        return Path(configured).expanduser().resolve()
-
-    try:
-        from qwenpaw.constant import WORKING_DIR
-    except ImportError:
-        try:
-            from copaw.constant import WORKING_DIR
-        except ImportError:
-            return None
-
-    return Path(WORKING_DIR).expanduser().resolve()
+    return _working_dir()
 
 
 def _read_config_value(obj: Any, *names: str) -> Any:
