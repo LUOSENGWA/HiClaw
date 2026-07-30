@@ -3671,7 +3671,7 @@ EOF
     fi
 
     # Manager image is always required (select based on runtime)
-    if [ "${AGENTTEAMS_MANAGER_RUNTIME}" != "openclaw" ]; then
+    if [ "${AGENTTEAMS_MANAGER_RUNTIME}" = "copaw" ] || [ "${AGENTTEAMS_MANAGER_RUNTIME}" = "qwenpaw" ]; then
         _pull_image "${MANAGER_COPAW_IMAGE}" "install.image.exists" "install.image.pulling_manager"
     else
         _pull_image "${MANAGER_IMAGE}" "install.image.exists" "install.image.pulling_manager"
@@ -3901,7 +3901,7 @@ CREDEOF
             -e "${_ctrl_env_prefix}DEFAULT_MODEL=${AGENTTEAMS_DEFAULT_MODEL}"
             -e "${_ctrl_env_prefix}MANAGER_GATEWAY_KEY=${AGENTTEAMS_MANAGER_GATEWAY_KEY}"
             -e "${_ctrl_env_prefix}MANAGER_RUNTIME=${AGENTTEAMS_MANAGER_RUNTIME:-qwenpaw}"
-            -e "${_ctrl_env_prefix}MANAGER_IMAGE=$([ "${AGENTTEAMS_MANAGER_RUNTIME}" != "openclaw" ] && echo "${MANAGER_COPAW_IMAGE}" || echo "${MANAGER_IMAGE}")"
+            -e "${_ctrl_env_prefix}MANAGER_IMAGE=$([ "${AGENTTEAMS_MANAGER_RUNTIME}" = "copaw" ] || [ "${AGENTTEAMS_MANAGER_RUNTIME}" = "qwenpaw" ] && echo "${MANAGER_COPAW_IMAGE}" || echo "${MANAGER_IMAGE}")"
             -e "${_ctrl_env_prefix}DEFAULT_WORKER_RUNTIME=${AGENTTEAMS_DEFAULT_WORKER_RUNTIME:-copaw}"
             -e "${_ctrl_env_prefix}WORKER_IMAGE=${WORKER_IMAGE}"
             -e "${_ctrl_env_prefix}COPAW_WORKER_IMAGE=${COPAW_WORKER_IMAGE}"
@@ -4203,7 +4203,7 @@ CREDEOF
             ${WORKSPACE_MOUNT_ARGS} \
             ${HOST_SHARE_MOUNT_ARGS} \
             --restart unless-stopped \
-            "$([ "${AGENTTEAMS_MANAGER_RUNTIME}" != "openclaw" ] && echo "${MANAGER_COPAW_IMAGE}" || echo "${MANAGER_IMAGE}")"
+            "$([ "${AGENTTEAMS_MANAGER_RUNTIME}" = "copaw" ] || [ "${AGENTTEAMS_MANAGER_RUNTIME}" = "qwenpaw" ] && echo "${MANAGER_COPAW_IMAGE}" || echo "${MANAGER_IMAGE}")"
 
         # Wait for Manager agent to be ready
         wait_manager_ready "agentteams-manager"
