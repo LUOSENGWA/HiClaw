@@ -274,6 +274,33 @@ def _patch_copaw_paths(working_dir: Path) -> None:
         pass
 
 
+def _patch_qwenpaw_paths(working_dir: Path) -> None:
+    """Patch qwenpaw.constant module-level constants.
+
+    Like copaw.constant, qwenpaw.constant captures WORKING_DIR at import
+    time from the QWENPAW_WORKING_DIR env var.  If the env var was not
+    set at import time (or pointed elsewhere), we must update the live
+    module object so that ``from qwenpaw.constant import WORKING_DIR``
+    returns the correct path.
+    """
+    secret_dir = _secret_dir(working_dir)
+    try:
+        import qwenpaw.constant as _const
+        _const.WORKING_DIR = working_dir
+        if hasattr(_const, "SECRET_DIR"):
+            _const.SECRET_DIR = secret_dir
+        if hasattr(_const, "MEMORY_DIR"):
+            _const.MEMORY_DIR = working_dir / "memory"
+        if hasattr(_const, "PLUGINS_DIR"):
+            _const.PLUGINS_DIR = working_dir / "plugins"
+        if hasattr(_const, "MODELS_DIR"):
+            _const.MODELS_DIR = working_dir / "models"
+        if hasattr(_const, "DEFAULT_MEDIA_DIR"):
+            _const.DEFAULT_MEDIA_DIR = working_dir / "media"
+    except ImportError:
+        pass
+
+
 def bridge_controller_to_copaw(
     openclaw_cfg: dict[str, Any],
     working_dir: Path,
@@ -299,9 +326,11 @@ def bridge_controller_to_copaw(
     _write_providers_json(openclaw_cfg, working_dir, in_container)
 
     os.environ["COPAW_WORKING_DIR"] = str(working_dir)
+    os.environ["QWENPAW_WORKING_DIR"] = str(working_dir)
 
     # Patch module-level constants (import-time values won't reflect env change)
     _patch_copaw_paths(working_dir)
+    _patch_qwenpaw_paths(working_dir)
 
     # Copy providers.json into secret_dir — that's where copaw actually reads it
     secret_dir = _secret_dir(working_dir)

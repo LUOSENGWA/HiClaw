@@ -53,7 +53,7 @@ def _config(tmp_path):
 
 
 def _health_json(tmp_path):
-    return json.loads((tmp_path / "alice" / ".copaw" / "health.json").read_text())
+    return json.loads((tmp_path / "alice" / ".qwenpaw" / "health.json").read_text())
 
 
 def test_worker_port_defaults_to_console_port_plus_one(tmp_path):
@@ -557,7 +557,7 @@ async def test_worker_marks_matrix_unhealthy_when_startup_relogin_cannot_run(tmp
 @pytest.mark.anyio
 async def test_worker_builds_readiness_from_on_demand_checks(tmp_path, monkeypatch):
     worker = Worker(_config(tmp_path))
-    worker._copaw_working_dir = tmp_path / "alice" / ".copaw"
+    worker._copaw_working_dir = tmp_path / "alice" / ".qwenpaw"
     from copaw_worker.health import HealthState
 
     worker._health = HealthState(worker._copaw_working_dir / "health.json")
@@ -634,7 +634,7 @@ async def test_worker_liveness_is_lightweight(tmp_path):
 @pytest.mark.anyio
 async def test_worker_marks_copaw_healthy_after_startup_probe(tmp_path, monkeypatch):
     worker = Worker(_config(tmp_path))
-    worker._copaw_working_dir = tmp_path / "alice" / ".copaw"
+    worker._copaw_working_dir = tmp_path / "alice" / ".qwenpaw"
     from copaw_worker.health import HealthState
 
     worker._health = HealthState(worker._copaw_working_dir / "health.json")
@@ -692,7 +692,7 @@ async def test_worker_marks_copaw_unhealthy_when_app_exits_unexpectedly(tmp_path
     monkeypatch.setitem(sys.modules, "copaw_worker.hooks", fake_hooks)
 
     worker = Worker(_config(tmp_path))
-    worker._copaw_working_dir = tmp_path / "alice" / ".copaw"
+    worker._copaw_working_dir = tmp_path / "alice" / ".qwenpaw"
     from copaw_worker.health import HealthState
 
     worker._health = HealthState(worker._copaw_working_dir / "health.json")

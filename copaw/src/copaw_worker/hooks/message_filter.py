@@ -173,8 +173,8 @@ def _strip_yaml_string(value: str) -> str:
 
 
 def _runtime_root() -> Path:
-    configured = os.environ.get("COPAW_WORKING_DIR") or os.environ.get(
-        "QWENPAW_WORKING_DIR"
+    configured = os.environ.get("QWENPAW_WORKING_DIR") or os.environ.get(
+        "COPAW_WORKING_DIR"
     )
     if configured:
         path = Path(configured).expanduser().resolve()

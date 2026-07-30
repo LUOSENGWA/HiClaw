@@ -289,23 +289,32 @@ done
 # ============================================================
 # PR #1077 Controller drops .copaw directory compatibility.
 # Existing Manager upgrades from copaw 1.0.2 to QwenPaw 2.0
-# must carry forward runtime state (sessions, memory, history).
+# must carry forward ALL runtime state (sessions, memory, history,
+# config, channels, plugins, credentials).
 LEGACY_COPAW_DIR="${HOME}/.copaw"
 LEGACY_COPAW_SECRET="${HOME}/.copaw.secret"
 MIGRATION_FLAG="${QWENPAW_WORKING_DIR}/.copaw-migrated"
 if [ -d "${LEGACY_COPAW_DIR}" ] && [ ! -f "${MIGRATION_FLAG}" ]; then
     log "Migrating runtime state from ${LEGACY_COPAW_DIR} to ${QWENPAW_WORKING_DIR}..."
 
-    # State files that exist in copaw 1.0.2 and are forward-compatible
-    for _state in chats.json history.db memory digest; do
+    # Top-level state files (chats.json, history.db, memory/, digest/)
+    for _state in chats.json history.db memory digest config.json; do
         _src="${LEGACY_COPAW_DIR}/${_state}"
         if [ -e "${_src}" ]; then
-            # cp -an: never overwrite existing files (idempotent)
             cp -an "${_src}" "${QWENPAW_WORKING_DIR}/" 2>/dev/null || true
         fi
     done
 
-    # Secret directory (sibling of working dir: ~/.copaw.secret -> ~/.qwenpaw.secret)
+    # Directories that contain runtime state
+    for _subdir in custom_channels plugins models sessions; do
+        _src="${LEGACY_COPAW_DIR}/${_subdir}"
+        if [ -d "${_src}" ]; then
+            mkdir -p "${QWENPAW_WORKING_DIR}/${_subdir}"
+            cp -an "${_src}/." "${QWENPAW_WORKING_DIR}/${_subdir}/" 2>/dev/null || true
+        fi
+    done
+
+    # Secret directory (sibling: ~/.copaw.secret -> ~/.qwenpaw.secret)
     # Contains master_key, providers.json, envs.json — critical for credentials
     _target_secret="${QWENPAW_SECRET_DIR:-${QWENPAW_WORKING_DIR}.secret}"
     mkdir -p "${_target_secret}"
@@ -313,15 +322,11 @@ if [ -d "${LEGACY_COPAW_DIR}" ] && [ ! -f "${MIGRATION_FLAG}" ]; then
         cp -an "${LEGACY_COPAW_SECRET}/." "${_target_secret}/" 2>/dev/null || true
     fi
 
-    # Workspace prompt/project files (SOUL.md, AGENTS.md, skills/)
-    # that may have been modified by the Manager at runtime.
+    # Workspace files (SOUL.md, AGENTS.md, skills/, agent.json, etc.)
     _legacy_ws="${LEGACY_COPAW_DIR}/workspaces/default"
     if [ -d "${_legacy_ws}" ]; then
-        for _f in "${_legacy_ws}"/*; do
-            [ -e "${_f}" ] || continue
-            _name=$(basename "${_f}")
-            cp -an "${_f}" "${WORKSPACE_DIR}/" 2>/dev/null || true
-        done
+        mkdir -p "${WORKSPACE_DIR}"
+        cp -an "${_legacy_ws}/." "${WORKSPACE_DIR}/" 2>/dev/null || true
     fi
 
     touch "${MIGRATION_FLAG}"
@@ -333,11 +338,10 @@ fi
 # ============================================================
 export QWENPAW_WORKING_DIR="${QWENPAW_WORKING_DIR}"
 export QWENPAW_SECRET_DIR="${QWENPAW_SECRET_DIR:-${QWENPAW_WORKING_DIR}.secret}"
-# Also export COPAW_WORKING_DIR for modules that still read the legacy env var
-# (message_filter._runtime_root, sync.FileSync, etc.).  These modules are
-# imported by the manager tools but have not been updated to read
-# QWENPAW_WORKING_DIR.  Pointing both env vars at the same path is safe and
-# ensures consistent path resolution across all code paths.
+# COPAW_WORKING_DIR is set by bridge.py alongside QWENPAW_WORKING_DIR
+# (both point to the same ~/.qwenpaw). It is kept for copaw_worker modules
+# that still read the legacy env var (sync.FileSync, message_filter).
+# bridge.py now sets BOTH env vars and patches BOTH constant modules.
 export COPAW_WORKING_DIR="${QWENPAW_WORKING_DIR}"
 export QWENPAW_RUNNING_IN_CONTAINER=true
 export QWENPAW_LOG_LEVEL="${COPAW_LOG_LEVEL:-info}"
