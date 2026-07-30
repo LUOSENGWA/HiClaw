@@ -231,8 +231,8 @@ def _sanitize_session_filename(name: str) -> str:
 
 def _resolve_copaw_working_dir() -> Path:
     configured = (
-        os.environ.get("COPAW_WORKING_DIR")
-        or os.environ.get("QWENPAW_WORKING_DIR")
+        os.environ.get("QWENPAW_WORKING_DIR")
+        or os.environ.get("COPAW_WORKING_DIR")
     )
     if configured:
         return Path(configured).expanduser().resolve()

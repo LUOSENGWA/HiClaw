@@ -291,18 +291,27 @@ done
 # Existing Manager upgrades from copaw 1.0.2 to QwenPaw 2.0
 # must carry forward runtime state (sessions, memory, history).
 LEGACY_COPAW_DIR="${HOME}/.copaw"
+LEGACY_COPAW_SECRET="${HOME}/.copaw.secret"
 MIGRATION_FLAG="${QWENPAW_WORKING_DIR}/.copaw-migrated"
 if [ -d "${LEGACY_COPAW_DIR}" ] && [ ! -f "${MIGRATION_FLAG}" ]; then
     log "Migrating runtime state from ${LEGACY_COPAW_DIR} to ${QWENPAW_WORKING_DIR}..."
 
     # State files that exist in copaw 1.0.2 and are forward-compatible
-    for _state in chats.json history.db memory digest .secret; do
+    for _state in chats.json history.db memory digest; do
         _src="${LEGACY_COPAW_DIR}/${_state}"
         if [ -e "${_src}" ]; then
             # cp -an: never overwrite existing files (idempotent)
             cp -an "${_src}" "${QWENPAW_WORKING_DIR}/" 2>/dev/null || true
         fi
     done
+
+    # Secret directory (sibling of working dir: ~/.copaw.secret -> ~/.qwenpaw.secret)
+    # Contains master_key, providers.json, envs.json — critical for credentials
+    _target_secret="${QWENPAW_SECRET_DIR:-${QWENPAW_WORKING_DIR}.secret}"
+    mkdir -p "${_target_secret}"
+    if [ -d "${LEGACY_COPAW_SECRET}" ]; then
+        cp -an "${LEGACY_COPAW_SECRET}/." "${_target_secret}/" 2>/dev/null || true
+    fi
 
     # Workspace prompt/project files (SOUL.md, AGENTS.md, skills/)
     # that may have been modified by the Manager at runtime.
@@ -324,6 +333,12 @@ fi
 # ============================================================
 export QWENPAW_WORKING_DIR="${QWENPAW_WORKING_DIR}"
 export QWENPAW_SECRET_DIR="${QWENPAW_SECRET_DIR:-${QWENPAW_WORKING_DIR}.secret}"
+# Also export COPAW_WORKING_DIR for modules that still read the legacy env var
+# (message_filter._runtime_root, sync.FileSync, etc.).  These modules are
+# imported by the manager tools but have not been updated to read
+# QWENPAW_WORKING_DIR.  Pointing both env vars at the same path is safe and
+# ensures consistent path resolution across all code paths.
+export COPAW_WORKING_DIR="${QWENPAW_WORKING_DIR}"
 export QWENPAW_RUNNING_IN_CONTAINER=true
 export QWENPAW_LOG_LEVEL="${COPAW_LOG_LEVEL:-info}"
 
