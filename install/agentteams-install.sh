@@ -606,8 +606,8 @@ msg() {
         "worker_runtime.title.en") text="--- Default Worker Runtime ---" ;;
         "worker_runtime.openclaw.zh") text="OpenClaw" ;;
         "worker_runtime.openclaw.en") text="OpenClaw" ;;
-        "worker_runtime.copaw.zh") text="QwenPaw" ;;
-        "worker_runtime.copaw.en") text="QwenPaw" ;;
+        "worker_runtime.qwenpaw.zh") text="QwenPaw 2.0" ;;
+        "worker_runtime.qwenpaw.en") text="QwenPaw 2.0" ;;
         "worker_runtime.hermes.zh") text="Hermes" ;;
         "worker_runtime.hermes.en") text="Hermes" ;;
         "worker_runtime.choice.zh") text="请选择 [1/2/3]" ;;
@@ -2680,14 +2680,20 @@ step_dashboard() {
 step_runtime() {
     log "$(msg worker_runtime.title)"
     echo ""
-    echo "  1) $(msg worker_runtime.copaw)"
+    # Upgrade migration: copaw → qwenpaw (copaw is the legacy name,
+    # unified to QwenPaw 2.0).
+    if [ "${AGENTTEAMS_DEFAULT_WORKER_RUNTIME}" = "copaw" ]; then
+        log "Migrating default Worker runtime: copaw → qwenpaw"
+        AGENTTEAMS_DEFAULT_WORKER_RUNTIME="qwenpaw"
+    fi
+    echo "  1) $(msg worker_runtime.qwenpaw)"
     echo "  2) $(msg worker_runtime.openclaw)"
     if ! _ver_lt "${AGENTTEAMS_VERSION}" "v1.1.0"; then
         echo "  3) $(msg worker_runtime.hermes)"
     fi
     echo ""
     if [ "${AGENTTEAMS_NON_INTERACTIVE}" = "1" ]; then
-        AGENTTEAMS_DEFAULT_WORKER_RUNTIME="${AGENTTEAMS_DEFAULT_WORKER_RUNTIME:-copaw}"
+        AGENTTEAMS_DEFAULT_WORKER_RUNTIME="${AGENTTEAMS_DEFAULT_WORKER_RUNTIME:-qwenpaw}"
     elif [ "${AGENTTEAMS_UPGRADE}" = "1" ] && [ -n "${AGENTTEAMS_DEFAULT_WORKER_RUNTIME}" ]; then
         log "$(msg prompt.upgrade_keep "$(msg worker_runtime.title_short)" "${AGENTTEAMS_DEFAULT_WORKER_RUNTIME}")"
         local _runtime_choice
@@ -2699,9 +2705,9 @@ step_runtime() {
                 3) if ! _ver_lt "${AGENTTEAMS_VERSION}" "v1.1.0"; then
                        AGENTTEAMS_DEFAULT_WORKER_RUNTIME="hermes"
                    else
-                       AGENTTEAMS_DEFAULT_WORKER_RUNTIME="copaw"
+                       AGENTTEAMS_DEFAULT_WORKER_RUNTIME="qwenpaw"
                    fi ;;
-                *) AGENTTEAMS_DEFAULT_WORKER_RUNTIME="copaw" ;;
+                *) AGENTTEAMS_DEFAULT_WORKER_RUNTIME="qwenpaw" ;;
             esac
         fi
     elif [ -z "${AGENTTEAMS_DEFAULT_WORKER_RUNTIME+x}" ]; then
@@ -2714,9 +2720,9 @@ step_runtime() {
             3) if ! _ver_lt "${AGENTTEAMS_VERSION}" "v1.1.0"; then
                    AGENTTEAMS_DEFAULT_WORKER_RUNTIME="hermes"
                else
-                   AGENTTEAMS_DEFAULT_WORKER_RUNTIME="copaw"
+                   AGENTTEAMS_DEFAULT_WORKER_RUNTIME="qwenpaw"
                fi ;;
-            *) AGENTTEAMS_DEFAULT_WORKER_RUNTIME="copaw" ;;
+            *) AGENTTEAMS_DEFAULT_WORKER_RUNTIME="qwenpaw" ;;
         esac
     fi
     export AGENTTEAMS_DEFAULT_WORKER_RUNTIME
@@ -3389,7 +3395,11 @@ install_manager() {
     fi
     AGENTTEAMS_MANAGER_RUNTIME="${AGENTTEAMS_MANAGER_RUNTIME:-qwenpaw}"
     export AGENTTEAMS_MANAGER_RUNTIME
-    AGENTTEAMS_DEFAULT_WORKER_RUNTIME="${AGENTTEAMS_DEFAULT_WORKER_RUNTIME:-copaw}"
+    # Migrate legacy copaw → qwenpaw (covers --skip and non-interactive paths)
+    if [ "${AGENTTEAMS_DEFAULT_WORKER_RUNTIME}" = "copaw" ]; then
+        AGENTTEAMS_DEFAULT_WORKER_RUNTIME="qwenpaw"
+    fi
+    AGENTTEAMS_DEFAULT_WORKER_RUNTIME="${AGENTTEAMS_DEFAULT_WORKER_RUNTIME:-qwenpaw}"
     AGENTTEAMS_MATRIX_E2EE="${AGENTTEAMS_MATRIX_E2EE:-0}"
     export AGENTTEAMS_MATRIX_E2EE
     AGENTTEAMS_WORKER_IDLE_TIMEOUT="${AGENTTEAMS_WORKER_IDLE_TIMEOUT:-720}"
@@ -3512,8 +3522,8 @@ AGENTTEAMS_COPAW_WORKER_IMAGE=${COPAW_WORKER_IMAGE}
 AGENTTEAMS_QWENPAW_WORKER_IMAGE=${QWENPAW_WORKER_IMAGE}
 AGENTTEAMS_HERMES_WORKER_IMAGE=${HERMES_WORKER_IMAGE}
 
-# Default Worker runtime (openclaw | copaw | qwenpaw | hermes)
-AGENTTEAMS_DEFAULT_WORKER_RUNTIME=${AGENTTEAMS_DEFAULT_WORKER_RUNTIME:-copaw}
+# Default Worker runtime (openclaw | qwenpaw | hermes; copaw is auto-migrated to qwenpaw)
+AGENTTEAMS_DEFAULT_WORKER_RUNTIME=${AGENTTEAMS_DEFAULT_WORKER_RUNTIME:-qwenpaw}
 
 # Matrix E2EE (0=disabled, 1=enabled; default: 0)
 AGENTTEAMS_MATRIX_E2EE=${AGENTTEAMS_MATRIX_E2EE:-0}
@@ -3909,7 +3919,7 @@ CREDEOF
             -e "${_ctrl_env_prefix}MANAGER_GATEWAY_KEY=${AGENTTEAMS_MANAGER_GATEWAY_KEY}"
             -e "${_ctrl_env_prefix}MANAGER_RUNTIME=${AGENTTEAMS_MANAGER_RUNTIME:-qwenpaw}"
             -e "${_ctrl_env_prefix}MANAGER_IMAGE=$([ "${AGENTTEAMS_MANAGER_RUNTIME}" = "copaw" ] || [ "${AGENTTEAMS_MANAGER_RUNTIME}" = "qwenpaw" ] && echo "${MANAGER_COPAW_IMAGE}" || echo "${MANAGER_IMAGE}")"
-            -e "${_ctrl_env_prefix}DEFAULT_WORKER_RUNTIME=${AGENTTEAMS_DEFAULT_WORKER_RUNTIME:-copaw}"
+            -e "${_ctrl_env_prefix}DEFAULT_WORKER_RUNTIME=${AGENTTEAMS_DEFAULT_WORKER_RUNTIME:-qwenpaw}"
             -e "${_ctrl_env_prefix}WORKER_IMAGE=${WORKER_IMAGE}"
             -e "${_ctrl_env_prefix}COPAW_WORKER_IMAGE=${COPAW_WORKER_IMAGE}"
             -e "${_ctrl_env_prefix}QWENPAW_WORKER_IMAGE=${QWENPAW_WORKER_IMAGE}"
