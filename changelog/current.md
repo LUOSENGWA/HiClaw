@@ -17,6 +17,8 @@ Record release-facing changes here before the next release.
 
 - **Optional AgentTeams Dashboard**: Local installation can deploy the AgentTeams Dashboard for visual Worker, Team, Human, Manager, and Matrix management. Dashboard versioning remains independent from the AgentTeams release. ([#1075](https://github.com/agentscope-ai/AgentTeams/pull/1075), [#1081](https://github.com/agentscope-ai/AgentTeams/pull/1081))
 
+- **QwenPaw 2.0 Manager runtime**: Migrate the Manager container from copaw 1.0.2 to QwenPaw 2.0.1 with a separate venv to avoid agentscope version conflicts, register projectflow/taskflow/message/filesync tools through a QwenPaw plugin instead of monkey-patching CoPawAgent, replace the physical Matrix channel overlay with the QwenPaw plugin system, read Matrix credentials directly from agent.json so the manager tools work without importing copaw at runtime, align CMS observability packages and env vars with the Worker image, inject session-file privacy policy into prompt files, set approval_level=AUTO in the agent template, bridge YOLO mode to QwenPaw approval_level=OFF, disable the built-in QA Agent, rename start-copaw-manager.sh to start-qwenpaw-manager.sh with dual copaw|qwenpaw runtime value support, and remove dead PYTHONPATH entries.
+
 **Bug Fixes**
 
 - **QwenPaw MCP policy startup convergence**: Persist built-in plugin MCP policies before runtime desired-state reloads so a replacement QwenPaw workspace cannot retain the pre-policy interactive approval handler.
