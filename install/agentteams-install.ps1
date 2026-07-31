@@ -563,7 +563,7 @@ $script:Messages = @{
     "success.higress_console" = @{ zh = "  Higress 控制台: http://localhost:{0}（用户名: {1} / 密码: {2}）"; en = "  Higress Console: http://localhost:{0} (Username: {1} / Password: {2})" }
     "success.manager_console" = @{ zh = "  Manager 控制台（本地）: http://localhost:{0}（无需登录）"; en = "  Manager Console (local): http://localhost:{0} (no login required)" }
     "success.manager_console_gateway" = @{ zh = "  Manager 控制台（网关）: http://console-local.agentteams.io（用户名: {0} / 密码: {1}）"; en = "  Manager Console (gateway): http://console-local.agentteams.io (Username: {0} / Password: {1})" }
-    "success.copaw_console" = @{ zh = "  QwenPaw 控制台（本地）: http://localhost:{0}（无需登录）"; en = "  QwenPaw Console (local): http://localhost:{0} (no login required)" }
+    "success.copaw_console" = @{ zh = "  CoPaw 控制台（本地）: http://localhost:{0}（无需登录）"; en = "  CoPaw Console (local): http://localhost:{0} (no login required)" }
     "success.switch_llm.title" = @{ zh = "--- 切换 LLM 提供商 ---"; en = "--- Switch LLM Providers ---" }
     "success.switch_llm.hint" = @{ zh = "  您可以通过 Higress 控制台切换到其他 LLM 提供商（OpenAI、Anthropic 等）。"; en = "  You can switch to other LLM providers (OpenAI, Anthropic, etc.) via Higress Console." }
     "success.switch_llm.docs" = @{ zh = "  详细说明请参阅:"; en = "  For detailed instructions, see:" }
@@ -2880,7 +2880,14 @@ function Install-Manager {
     }
 
     # Pull all worker runtime images (workers may use any runtime regardless of the default)
-    foreach ($workerImg in @($script:WORKER_IMAGE, $script:COPAW_WORKER_IMAGE, $script:QWENPAW_WORKER_IMAGE, $script:HERMES_WORKER_IMAGE)) {
+    $workerImages = @(
+        $script:WORKER_IMAGE
+        $script:COPAW_WORKER_IMAGE
+        # Temporarily disabled until the QwenPaw worker image is published.
+        # $script:QWENPAW_WORKER_IMAGE
+        $script:HERMES_WORKER_IMAGE
+    )
+    foreach ($workerImg in $workerImages) {
         if ($workerImg -match $LocalImagePattern) {
             if (Test-LocalImage $workerImg) {
                 Write-Log (Get-Msg "install.image.worker_exists" -f $workerImg)
