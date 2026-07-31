@@ -46,7 +46,7 @@ if [ -f "${QWENPAW_WORKING_DIR}/config.json" ]; then
 fi
 
 log "Bridging openclaw.json -> CoPaw config (manager)..."
-/opt/copaw-venv/bin/python3 -m copaw_worker.bridge \
+/opt/venv/qwenpaw/bin/python3 -m copaw_worker.bridge \
         --profile manager \
         --openclaw-json "${OPENCLAW_JSON}" \
         --working-dir "${QWENPAW_WORKING_DIR}"
@@ -250,7 +250,7 @@ fi
         _curr_hash=$(md5sum "${OPENCLAW_JSON}" 2>/dev/null | awk '{print $1}')
         if [ -n "${_curr_hash}" ] && [ "${_curr_hash}" != "${_prev_hash}" ]; then
             log "openclaw.json changed, re-bridging..."
-            _bridge_out=$(/opt/copaw-venv/bin/python3 -m copaw_worker.bridge \
+            _bridge_out=$(/opt/venv/qwenpaw/bin/python3 -m copaw_worker.bridge \
                     --profile manager \
                     --openclaw-json "${OPENCLAW_JSON}" \
                     --working-dir "${QWENPAW_WORKING_DIR}" 2>&1)
@@ -358,11 +358,6 @@ fi
 # ============================================================
 export QWENPAW_WORKING_DIR="${QWENPAW_WORKING_DIR}"
 export QWENPAW_SECRET_DIR="${QWENPAW_SECRET_DIR:-${QWENPAW_WORKING_DIR}.secret}"
-# COPAW_WORKING_DIR is set by bridge.py alongside QWENPAW_WORKING_DIR
-# (both point to the same ~/.qwenpaw). It is kept for copaw_worker modules
-# that still read the legacy env var (sync.FileSync, message_filter).
-# bridge.py now sets BOTH env vars and patches BOTH constant modules.
-export COPAW_WORKING_DIR="${QWENPAW_WORKING_DIR}"
 export QWENPAW_RUNNING_IN_CONTAINER=true
 export QWENPAW_LOG_LEVEL="${COPAW_LOG_LEVEL:-info}"
 

@@ -1,6 +1,6 @@
 """
-Bridge: translate openclaw.json (AgentTeams Worker config) into CoPaw's
-config.json + providers.json, then set COPAW_WORKING_DIR so CoPaw
+Bridge: translate openclaw.json (AgentTeams Worker config) into QwenPaw's
+config.json + providers.json, then set QWENPAW_WORKING_DIR so the runtime
 picks up the right workspace.
 """
 from __future__ import annotations
@@ -212,78 +212,20 @@ def _secret_dir(working_dir: Path) -> Path:
     return Path(str(working_dir) + ".secret")
 
 
-def _patch_copaw_paths(working_dir: Path) -> None:
-    """Patch copaw's module-level path constants to point at working_dir.
-
-    copaw.constant captures WORKING_DIR / SECRET_DIR at import time from
-    env vars, so setting COPAW_WORKING_DIR after import has no effect.
-    We must update the live module objects directly.
-    """
-    secret_dir = _secret_dir(working_dir)
-    secret_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        import copaw.constant as _const
-        _const.WORKING_DIR = working_dir
-        _const.SECRET_DIR = secret_dir
-        _const.ACTIVE_SKILLS_DIR = (
-            working_dir / "workspaces" / "default" / "skills"
-        )
-        _const.CUSTOMIZED_SKILLS_DIR = working_dir / "customized_skills"
-        _const.MEMORY_DIR = working_dir / "memory"
-        _const.CUSTOM_CHANNELS_DIR = working_dir / "custom_channels"
-        _const.MODELS_DIR = working_dir / "models"
-    except ImportError:
-        pass
-
-    try:
-        import copaw.providers.store as _store
-        _store._PROVIDERS_JSON = secret_dir / "providers.json"
-        _store._LEGACY_PROVIDERS_JSON_CANDIDATES = (
-            Path(__file__).resolve().parent / "providers.json",
-            working_dir / "providers.json",
-        )
-    except ImportError:
-        pass
-
-    try:
-        import copaw.envs.store as _envs
-        _envs._BOOTSTRAP_WORKING_DIR = working_dir
-        _envs._BOOTSTRAP_SECRET_DIR = secret_dir
-        _envs._ENVS_JSON = secret_dir / "envs.json"
-        _envs._LEGACY_ENVS_JSON_CANDIDATES = (working_dir / "envs.json",)
-    except (ImportError, AttributeError):
-        pass
-
-    # copaw.app.channels.registry binds CUSTOM_CHANNELS_DIR via
-    # `from ...constant import CUSTOM_CHANNELS_DIR` at import time, so it keeps
-    # a STALE copy of the default path even after we patch copaw.constant above.
-    # _discover_custom_channels() / register_custom_channel_routes() read this
-    # module global at CALL time, so rebinding it here (before ChannelManager
-    # starts) makes them see our working_dir/custom_channels regardless of
-    # import order. Without this the patched matrix_channel.py is never
-    # discovered and copaw falls back to its builtin (broken) Matrix channel.
-    try:
-        import copaw.app.channels.registry as _channels_registry
-        _channels_registry.CUSTOM_CHANNELS_DIR = working_dir / "custom_channels"
-        logger.info(
-            "bridge: patched channels registry CUSTOM_CHANNELS_DIR -> %s",
-            _channels_registry.CUSTOM_CHANNELS_DIR,
-        )
-    except ImportError:
-        pass
-
-
 def _patch_qwenpaw_paths(working_dir: Path) -> None:
     """Patch qwenpaw.constant module-level constants.
 
-    Like copaw.constant, qwenpaw.constant captures WORKING_DIR at import
-    time from the QWENPAW_WORKING_DIR env var.  If the env var was not
-    set at import time (or pointed elsewhere), we must update the live
-    module object so that ``from qwenpaw.constant import WORKING_DIR``
-    returns the correct path.
+    qwenpaw.constant captures WORKING_DIR at import time from the
+    QWENPAW_WORKING_DIR env var.  If the env var was not set at import
+    time (or pointed elsewhere), we must update the live module object
+    so that ``from qwenpaw.constant import WORKING_DIR`` returns the
+    correct path.
+
+    Also patches qwenpaw.envs.store, which captures WORKING_DIR /
+    SECRET_DIR at import time from qwenpaw.constant.
     """
     secret_dir = _secret_dir(working_dir)
+    secret_dir.mkdir(parents=True, exist_ok=True)
     try:
         import qwenpaw.constant as _const
         _const.WORKING_DIR = working_dir
@@ -300,6 +242,18 @@ def _patch_qwenpaw_paths(working_dir: Path) -> None:
     except ImportError:
         pass
 
+    # qwenpaw.envs.store captures WORKING_DIR / SECRET_DIR from
+    # qwenpaw.constant at import time.  Rebind after patching constant
+    # so envs.json lands in the right place.
+    try:
+        import qwenpaw.envs.store as _envs
+        _envs._BOOTSTRAP_WORKING_DIR = working_dir
+        _envs._BOOTSTRAP_SECRET_DIR = secret_dir
+        _envs._ENVS_JSON = secret_dir / "envs.json"
+        _envs._LEGACY_ENVS_JSON_CANDIDATES = (working_dir / "envs.json",)
+    except (ImportError, AttributeError):
+        pass
+
 
 def bridge_controller_to_copaw(
     openclaw_cfg: dict[str, Any],
@@ -312,11 +266,10 @@ def bridge_controller_to_copaw(
       - <working_dir>/config.json          (global config)
       - <working_dir>/workspaces/default/agent.json (per-agent config)
       - <working_dir>/providers.json       (LLM credentials, for reference)
-      - <working_dir>.secret/providers.json (where copaw actually reads from)
+      - <working_dir>.secret/providers.json (where QwenPaw reads from)
 
-    Also sets COPAW_WORKING_DIR env var and patches copaw's module-level
-    path constants so the running process uses the correct directory.
-
+    Also sets QWENPAW_WORKING_DIR env var and patches qwenpaw's
+    module-level path constants so the runtime uses the correct directory.
     """
     working_dir.mkdir(parents=True, exist_ok=True)
     in_container = _is_in_container()
@@ -325,14 +278,17 @@ def bridge_controller_to_copaw(
     _write_agent_json(openclaw_cfg, working_dir, in_container, profile=profile)
     _write_providers_json(openclaw_cfg, working_dir, in_container)
 
-    os.environ["COPAW_WORKING_DIR"] = str(working_dir)
     os.environ["QWENPAW_WORKING_DIR"] = str(working_dir)
+    # COPAW_WORKING_DIR is still needed by the legacy copaw runtime
+    # (copaw 1.0.2 reads this env var at import time).  Setting it
+    # does not require importing copaw — the env var is read by
+    # copaw.constant when the legacy Worker starts.
+    os.environ["COPAW_WORKING_DIR"] = str(working_dir)
 
     # Patch module-level constants (import-time values won't reflect env change)
-    _patch_copaw_paths(working_dir)
     _patch_qwenpaw_paths(working_dir)
 
-    # Copy providers.json into secret_dir — that's where copaw actually reads it
+    # Copy providers.json into secret_dir — that's where QwenPaw reads it
     secret_dir = _secret_dir(working_dir)
     providers_src = working_dir / "providers.json"
     if providers_src.exists():
