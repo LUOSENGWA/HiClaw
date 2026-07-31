@@ -402,7 +402,7 @@ $script:Messages = @{
     "worker_runtime.copaw" = @{ zh = "CoPaw (旧版)"; en = "CoPaw (legacy)" }
     "worker_runtime.qwenpaw" = @{ zh = "QwenPaw 2.0"; en = "QwenPaw 2.0" }
     "worker_runtime.hermes" = @{ zh = "Hermes"; en = "Hermes" }
-    "worker_runtime.choice" = @{ zh = "请选择 [1/2/3/4]"; en = "Enter choice [1/2/3/4]" }
+    "worker_runtime.choice" = @{ zh = "请选择 [1/2/3]"; en = "Enter choice [1/2/3]" }
     "worker_runtime.selected" = @{ zh = "默认 Worker 运行时: {0}"; en = "Default Worker runtime: {0}" }
     "worker_runtime.title_short" = @{ zh = "默认 Worker 运行时"; en = "Default Worker Runtime" }
 
@@ -411,7 +411,7 @@ $script:Messages = @{
     "manager_runtime.openclaw" = @{ zh = "OpenClaw"; en = "OpenClaw" }
     "manager_runtime.qwenpaw" = @{ zh = "QwenPaw 2.0"; en = "QwenPaw 2.0" }
     "manager_runtime.copaw" = @{ zh = "CoPaw (旧版)"; en = "CoPaw (legacy)" }
-    "manager_runtime.choice" = @{ zh = "请选择 [1/2/3]"; en = "Enter choice [1/2/3]" }
+    "manager_runtime.choice" = @{ zh = "请选择 [1/2]"; en = "Enter choice [1/2]" }
     "manager_runtime.selected" = @{ zh = "Manager 运行时: {0}"; en = "Manager runtime: {0}" }
     "manager_runtime.title_short" = @{ zh = "Manager 运行时"; en = "Manager Runtime" }
 
@@ -1072,10 +1072,10 @@ AGENTTEAMS_COPAW_WORKER_IMAGE=$($Config.COPAW_WORKER_IMAGE)
 AGENTTEAMS_QWENPAW_WORKER_IMAGE=$($Config.QWENPAW_WORKER_IMAGE)
 AGENTTEAMS_HERMES_WORKER_IMAGE=$($Config.HERMES_WORKER_IMAGE)
 
-# Manager runtime (openclaw | copaw | qwenpaw)
+# Manager runtime (openclaw | qwenpaw)
 AGENTTEAMS_MANAGER_RUNTIME=$($Config.MANAGER_RUNTIME)
 
-# Default Worker runtime (openclaw | copaw | hermes)
+# Default Worker runtime (openclaw | qwenpaw | hermes)
 AGENTTEAMS_DEFAULT_WORKER_RUNTIME=$($Config.DEFAULT_WORKER_RUNTIME)
 
 # Matrix E2EE (0=disabled, 1=enabled; default: 0)
@@ -2216,32 +2216,42 @@ function Step-Workspace {
 }
 
 function Step-Runtime {
+    # Upgrade migration: copaw → qwenpaw (copaw is the legacy name,
+    # unified to QwenPaw 2.0).  This runs before any menu logic so all
+    # downstream code only sees "qwenpaw".
+    if ($script:config.DEFAULT_WORKER_RUNTIME -eq "copaw") {
+        Write-Log "Migrating Worker runtime: copaw -> qwenpaw"
+        $script:config.DEFAULT_WORKER_RUNTIME = "qwenpaw"
+    }
     Write-Log (Get-Msg "worker_runtime.title")
     Write-Host ""
     Write-Host "  1) $(Get-Msg 'worker_runtime.qwenpaw')"
     Write-Host "  2) $(Get-Msg 'worker_runtime.openclaw')"
     Write-Host "  3) $(Get-Msg 'worker_runtime.hermes')"
-    Write-Host "  4) $(Get-Msg 'worker_runtime.copaw')"
     Write-Host ""
 
     if ($script:AGENTTEAMS_NON_INTERACTIVE) {
         $script:config.DEFAULT_WORKER_RUNTIME = if ($env:AGENTTEAMS_DEFAULT_WORKER_RUNTIME) { $env:AGENTTEAMS_DEFAULT_WORKER_RUNTIME } else { "qwenpaw" }
+        # Auto-migrate copaw in non-interactive mode too
+        if ($script:config.DEFAULT_WORKER_RUNTIME -eq "copaw") { $script:config.DEFAULT_WORKER_RUNTIME = "qwenpaw" }
     } elseif ($script:AGENTTEAMS_UPGRADE -and $env:AGENTTEAMS_DEFAULT_WORKER_RUNTIME) {
-        Write-Log (Get-Msg "prompt.upgrade_keep" -f (Get-Msg "worker_runtime.title_short"), $env:AGENTTEAMS_DEFAULT_WORKER_RUNTIME)
+        $existingRuntime = $env:AGENTTEAMS_DEFAULT_WORKER_RUNTIME
+        if ($existingRuntime -eq "copaw") { $existingRuntime = "qwenpaw" }
+        Write-Log (Get-Msg "prompt.upgrade_keep" -f (Get-Msg "worker_runtime.title_short"), $existingRuntime)
         $rtChoice = Read-Host (Get-Msg "worker_runtime.choice")
         if ($rtChoice -eq "b") { $script:StepResult = "back"; return }
         if ($rtChoice) {
             $script:config.DEFAULT_WORKER_RUNTIME = switch ($rtChoice) {
                 "2" { "openclaw" }
                 "3" { "hermes" }
-                "4" { "copaw" }
                 default { "qwenpaw" }
             }
         } else {
-            $script:config.DEFAULT_WORKER_RUNTIME = $env:AGENTTEAMS_DEFAULT_WORKER_RUNTIME
+            $script:config.DEFAULT_WORKER_RUNTIME = $existingRuntime
         }
     } elseif ($env:AGENTTEAMS_DEFAULT_WORKER_RUNTIME) {
         $script:config.DEFAULT_WORKER_RUNTIME = $env:AGENTTEAMS_DEFAULT_WORKER_RUNTIME
+        if ($script:config.DEFAULT_WORKER_RUNTIME -eq "copaw") { $script:config.DEFAULT_WORKER_RUNTIME = "qwenpaw" }
     } else {
         $rtChoice = Read-Host (Get-Msg "worker_runtime.choice")
         if ($rtChoice -eq "b") { $script:StepResult = "back"; return }
@@ -2249,7 +2259,6 @@ function Step-Runtime {
         $script:config.DEFAULT_WORKER_RUNTIME = switch ($rtChoice) {
             "2" { "openclaw" }
             "3" { "hermes" }
-            "4" { "copaw" }
             default { "qwenpaw" }
         }
     }
@@ -2257,37 +2266,46 @@ function Step-Runtime {
 }
 
 function Step-ManagerRuntime {
+    # Upgrade migration: copaw → qwenpaw (copaw is the legacy name,
+    # unified to QwenPaw 2.0).  This runs before any menu logic so all
+    # downstream code (image selection, health check, domain check)
+    # only sees "qwenpaw".
+    if ($script:config.MANAGER_RUNTIME -eq "copaw") {
+        Write-Log "Migrating Manager runtime: copaw -> qwenpaw"
+        $script:config.MANAGER_RUNTIME = "qwenpaw"
+    }
     Write-Log (Get-Msg "manager_runtime.title")
     Write-Host ""
     Write-Host "  1) $(Get-Msg 'manager_runtime.qwenpaw')"
     Write-Host "  2) $(Get-Msg 'manager_runtime.openclaw')"
-    Write-Host "  3) $(Get-Msg 'manager_runtime.copaw')"
     Write-Host ""
 
     if ($script:AGENTTEAMS_NON_INTERACTIVE) {
         $script:config.MANAGER_RUNTIME = if ($env:AGENTTEAMS_MANAGER_RUNTIME) { $env:AGENTTEAMS_MANAGER_RUNTIME } else { "qwenpaw" }
+        if ($script:config.MANAGER_RUNTIME -eq "copaw") { $script:config.MANAGER_RUNTIME = "qwenpaw" }
     } elseif ($script:AGENTTEAMS_UPGRADE -and $env:AGENTTEAMS_MANAGER_RUNTIME) {
-        Write-Log (Get-Msg "prompt.upgrade_keep" -f (Get-Msg "manager_runtime.title_short"), $env:AGENTTEAMS_MANAGER_RUNTIME)
+        $existingRuntime = $env:AGENTTEAMS_MANAGER_RUNTIME
+        if ($existingRuntime -eq "copaw") { $existingRuntime = "qwenpaw" }
+        Write-Log (Get-Msg "prompt.upgrade_keep" -f (Get-Msg "manager_runtime.title_short"), $existingRuntime)
         $mrChoice = Read-Host (Get-Msg "manager_runtime.choice")
         if ($mrChoice -eq "b") { $script:StepResult = "back"; return }
         if ($mrChoice) {
             $script:config.MANAGER_RUNTIME = switch ($mrChoice) {
                 "2" { "openclaw" }
-                "3" { "copaw" }
                 default { "qwenpaw" }
             }
         } else {
-            $script:config.MANAGER_RUNTIME = $env:AGENTTEAMS_MANAGER_RUNTIME
+            $script:config.MANAGER_RUNTIME = $existingRuntime
         }
     } elseif ($env:AGENTTEAMS_MANAGER_RUNTIME) {
         $script:config.MANAGER_RUNTIME = $env:AGENTTEAMS_MANAGER_RUNTIME
+        if ($script:config.MANAGER_RUNTIME -eq "copaw") { $script:config.MANAGER_RUNTIME = "qwenpaw" }
     } else {
         $mrChoice = Read-Host (Get-Msg "manager_runtime.choice")
         if ($mrChoice -eq "b") { $script:StepResult = "back"; return }
         $mrChoice = if ($mrChoice) { $mrChoice } else { "1" }
         $script:config.MANAGER_RUNTIME = switch ($mrChoice) {
             "2" { "openclaw" }
-            "3" { "copaw" }
             default { "qwenpaw" }
         }
     }
@@ -2653,7 +2671,7 @@ function Install-Manager {
         Write-Log (Get-Msg "workspace.dir_label" -f $script:config.WORKSPACE_DIR)
     }
     if (-not $script:config.DEFAULT_WORKER_RUNTIME) {
-        $script:config.DEFAULT_WORKER_RUNTIME = if ($env:AGENTTEAMS_DEFAULT_WORKER_RUNTIME) { $env:AGENTTEAMS_DEFAULT_WORKER_RUNTIME } else { "copaw" }
+        $script:config.DEFAULT_WORKER_RUNTIME = if ($env:AGENTTEAMS_DEFAULT_WORKER_RUNTIME) { $env:AGENTTEAMS_DEFAULT_WORKER_RUNTIME } else { "qwenpaw" }
         Write-Log (Get-Msg "worker_runtime.selected" -f $script:config.DEFAULT_WORKER_RUNTIME)
     }
     if (-not $script:config.MATRIX_E2EE) {
@@ -2669,7 +2687,7 @@ function Install-Manager {
         $script:config.LOCAL_ONLY = if ($env:AGENTTEAMS_LOCAL_ONLY) { $env:AGENTTEAMS_LOCAL_ONLY } else { "1" }
     }
     if (-not $script:config.MANAGER_RUNTIME) {
-        $script:config.MANAGER_RUNTIME = if ($env:AGENTTEAMS_MANAGER_RUNTIME) { $env:AGENTTEAMS_MANAGER_RUNTIME } else { "copaw" }
+        $script:config.MANAGER_RUNTIME = if ($env:AGENTTEAMS_MANAGER_RUNTIME) { $env:AGENTTEAMS_MANAGER_RUNTIME } else { "qwenpaw" }
     }
     if (-not $script:config.PORT_GATEWAY) {
         $script:config.PORT_GATEWAY = if ($env:AGENTTEAMS_PORT_GATEWAY) { $env:AGENTTEAMS_PORT_GATEWAY } else { "18080" }
