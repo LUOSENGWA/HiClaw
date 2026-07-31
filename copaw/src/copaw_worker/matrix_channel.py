@@ -595,7 +595,7 @@ class MatrixChannel(BaseChannel):
     @staticmethod
     def _sync_token_path() -> Optional[Path]:
         """Return the file path for persisting the Matrix sync token."""
-        wd = os.environ.get("COPAW_WORKING_DIR")
+        wd = os.environ.get("QWENPAW_WORKING_DIR") or os.environ.get("COPAW_WORKING_DIR")
         if wd:
             return Path(wd) / "matrix_sync_token"
         return None
