@@ -14,7 +14,7 @@ source /opt/agentteams/scripts/lib/agentteams-env.sh
 # ============================================================
 # Runtime selection
 # ============================================================
-MANAGER_RUNTIME="${AGENTTEAMS_MANAGER_RUNTIME:-openclaw}"
+MANAGER_RUNTIME="${AGENTTEAMS_MANAGER_RUNTIME:-qwenpaw}"
 case "${MANAGER_RUNTIME}" in
     copaw|qwenpaw)
         log "Manager runtime: QwenPaw (Python workspace, runtime=${MANAGER_RUNTIME})"

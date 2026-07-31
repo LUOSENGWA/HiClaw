@@ -97,8 +97,8 @@ if [ "$SKIP_BUILD" = "0" ]; then
             -f "${PROJECT_ROOT}/manager/Dockerfile" "${PROJECT_ROOT}"
     fi
 
-    # CoPaw Manager (lightweight Python image with copaw_worker for bridge/sync)
-    log "Building CoPaw manager image..."
+    # QwenPaw Manager (lightweight Python image with copaw_worker for bridge/sync)
+    log "Building QwenPaw manager image..."
     docker build -t "$QWENPAW_MANAGER_IMAGE" \
         --build-arg AGENTTEAMS_CONTROLLER_IMAGE="$CONTROLLER_IMAGE" \
         -f "${PROJECT_ROOT}/manager/Dockerfile.qwenpaw" "${PROJECT_ROOT}"

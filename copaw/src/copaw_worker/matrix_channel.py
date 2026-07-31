@@ -1,8 +1,9 @@
 """
 MatrixChannel: CoPaw BaseChannel implementation for Matrix (via matrix-nio).
 
-This file is installed into ~/.copaw/custom_channels/ at worker startup
-so CoPaw's channel registry picks it up automatically.
+This file is installed into the runtime working dir's custom_channels/
+(~/.qwenpaw/custom_channels/ by default) at worker startup so the channel
+registry picks it up automatically.
 """
 from __future__ import annotations
 
