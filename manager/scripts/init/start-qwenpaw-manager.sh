@@ -329,8 +329,28 @@ if [ -d "${LEGACY_COPAW_DIR}" ] && [ ! -f "${MIGRATION_FLAG}" ]; then
         cp -an "${_legacy_ws}/." "${WORKSPACE_DIR}/" 2>/dev/null || true
     fi
 
-    touch "${MIGRATION_FLAG}"
-    log "Migration complete (flag: ${MIGRATION_FLAG})"
+    # ---- Verification: only write marker if critical artifacts exist ----
+    # chats.json is the canonical session ledger; its presence (or the
+    # absence of any legacy source) is a reliable signal that migration
+    # either succeeded or had nothing to migrate.
+    _critical_missing=false
+    for _src in "${LEGACY_COPAW_DIR}/chats.json" "${LEGACY_COPAW_DIR}/history.db"; do
+        if [ -e "${_src}" ]; then
+            _name=$(basename "${_src}")
+            if [ ! -e "${QWENPAW_WORKING_DIR}/${_name}" ]; then
+                log "WARNING: ${_name} not copied — migration incomplete, will retry"
+                _critical_missing=true
+                break
+            fi
+        fi
+    done
+
+    if [ "${_critical_missing}" = "false" ]; then
+        touch "${MIGRATION_FLAG}"
+        log "Migration complete (flag: ${MIGRATION_FLAG})"
+    else
+        log "Migration will retry on next startup"
+    fi
 elif [ -d "${LEGACY_COPAW_DIR}" ] && [ -f "${MIGRATION_FLAG}" ]; then
     log "Migration already completed, skipping"
 fi
