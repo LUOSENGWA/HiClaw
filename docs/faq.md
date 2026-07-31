@@ -646,10 +646,10 @@ Manager will use the worker-management skill to trigger a container recreation. 
 `QwenPaw` is the user-facing name of the Python runtime that was previously
 called `CoPaw`. The runtime value has been unified to `qwenpaw` — the
 installer and controller default to `qwenpaw`, and `copaw` is auto-migrated
-to `qwenpaw` on upgrade. Some image names such as `agentteams-copaw-worker`
-and `agentteams-manager-copaw` retain the legacy `copaw` prefix for backward
-compatibility with existing installations and image pull paths; the images
-themselves run QwenPaw 2.0.
+to `qwenpaw` on upgrade. The Worker image name `agentteams-copaw-worker`
+retains the legacy `copaw` prefix for backward compatibility with existing
+installations and image pull paths; the Manager image was renamed to
+`agentteams-manager-qwenpaw`. Both images run QwenPaw 2.0.
 
 ---
 

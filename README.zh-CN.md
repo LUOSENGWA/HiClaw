@@ -216,7 +216,7 @@ helm install agentteams higress.io/agentteams \
   --set gateway.publicURL=http://localhost:18080
 ```
 
-各组件镜像会根据运行时自动选择（Manager: `agentteams-manager` / `agentteams-manager-copaw`；Worker: `agentteams-worker` / `agentteams-copaw-worker` / `agentteams-hermes-worker`）。
+各组件镜像会根据运行时自动选择（Manager: `agentteams-manager` / `agentteams-manager-qwenpaw`；Worker: `agentteams-worker` / `agentteams-copaw-worker` / `agentteams-hermes-worker`）。
 
 </details>
 

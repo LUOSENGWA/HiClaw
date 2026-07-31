@@ -10,6 +10,15 @@ test_setup "27-qwenpaw-manager-startup"
 
 _AGENT_CTR="${TEST_AGENT_CONTAINER:-${TEST_CONTROLLER_CONTAINER:-agentteams-controller}}"
 
+# Guard: skip if Manager is not QwenPaw (e.g., openclaw shard)
+_MANAGER_RUNTIME=$(docker exec "${_AGENT_CTR}" printenv AGENTTEAMS_MANAGER_RUNTIME 2>/dev/null || echo "openclaw")
+if [ "${_MANAGER_RUNTIME}" != "qwenpaw" ] && [ "${_MANAGER_RUNTIME}" != "copaw" ]; then
+    log_info "Manager runtime is ${_MANAGER_RUNTIME} — skipping QwenPaw-specific test"
+    test_teardown "27-qwenpaw-manager-startup"
+    test_summary
+    exit 0
+fi
+
 # ---- QWENPAW_WORKING_DIR ----
 log_section "QWENPAW_WORKING_DIR"
 
