@@ -99,7 +99,7 @@ async def test_notify_task_assignment_normalizes_room_id_at_matrix_boundary(
         task=task,
         room_id="room:!team-room:matrix.local",
         spec="Do the work.",
-        txn_id="delegate:st-01",
+        txn_id="delegate-st-01",
     )
 
     assert result["sent"] is True
@@ -111,7 +111,7 @@ async def test_notify_task_assignment_normalizes_room_id_at_matrix_boundary(
     for call in calls:
         assert call["room_id"] == "!team-room:matrix.local"
     # Stable txn_id reached the send boundary.
-    assert calls[1]["txn_id"] == "delegate:st-01"
+    assert calls[1]["txn_id"] == "delegate-st-01"
     # m.mentions preserved in the sent content.
     assert calls[1]["content"]["m.mentions"] == {
         "user_ids": ["@worker-a:matrix.local"],

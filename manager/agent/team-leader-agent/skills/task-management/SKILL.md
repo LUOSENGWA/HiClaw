@@ -187,8 +187,7 @@ After delegation:
 
 1. `delegate_task` auto-pushes `shared/tasks/{task-id}/`. Do not call `filesync push` for the task directory.
 2. Publish `shared/projects/{project-id}/`, because the plan marker changed.
-3. Use `communication`, then call `message` to @mention the assigned Worker in the assignment room. For Team work, this must be the Team Room, not the Leader DM and not the Worker's private room.
-4. Include only the task ID, title, and instruction to start.
+3. The `delegate_task` auto-notification already @mentions the assigned Worker in the assignment room (Team Room for Team work). Do **not** call `message` for the assignment — a second message duplicates it and can trigger the Worker twice.
 
 Do not prescribe Worker-internal acknowledgement, push, submit, or planning steps.
 

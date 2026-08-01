@@ -3971,7 +3971,7 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         title=task_title or task_id,
                         assignee=assignment_mxid,
                         spec=spec,
-                        txn_id=f"delegate:{task_id}",
+                        txn_id=f"delegate-{task_id}",
                     )
                 except Exception as exc:
                     notification = {

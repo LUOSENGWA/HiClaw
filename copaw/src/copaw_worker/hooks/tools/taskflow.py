@@ -486,7 +486,7 @@ async def taskflow(
                 task=task,
                 room_id=room_id,
                 spec=spec,
-                txn_id=f"delegate:{task_id}",
+                txn_id=f"delegate-{task_id}",
             )
             if not notification.get("sent"):
                 return _error(

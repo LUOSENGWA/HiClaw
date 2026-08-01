@@ -1652,7 +1652,7 @@ async def test_delegate_task_retry_after_notification_failure_sends_txn_id(
 
     The first attempt fails at the notification boundary. The retry
     detects the prepared meta, skips re-claiming, sends with the same
-    ``delegate:{task_id}`` txn_id (idempotent), records the event_id,
+    ``delegate-{task_id}`` txn_id (idempotent), records the event_id,
     and marks the task assigned.
     """
     working_dir = tmp_path / "worker" / ".copaw"
@@ -1717,7 +1717,7 @@ async def test_delegate_task_retry_after_notification_failure_sends_txn_id(
     assert retry["task"]["status"] == "assigned"
     assert retry["task"]["event_id"] == "$retry-event"
     # Stable txn_id was passed to the send boundary on both attempts.
-    assert sent.get("txn_id") == "delegate:st-01"
+    assert sent.get("txn_id") == "delegate-st-01"
     # The task dir was pushed at least twice (prepared + assigned).
     assert mock.push_shared_path.call_count >= 2
 
