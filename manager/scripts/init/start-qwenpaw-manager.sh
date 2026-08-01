@@ -291,123 +291,17 @@ done
 # Existing Manager upgrades from copaw 1.0.2 to QwenPaw 2.0
 # must carry forward ALL runtime state (sessions, memory, history,
 # config, channels, plugins, credentials).
-LEGACY_COPAW_DIR="${HOME}/.copaw"
-LEGACY_COPAW_SECRET="${HOME}/.copaw.secret"
-MIGRATION_FLAG="${QWENPAW_WORKING_DIR}/.copaw-migrated"
-if [ -d "${LEGACY_COPAW_DIR}" ] && [ ! -f "${MIGRATION_FLAG}" ]; then
-    log "Migrating runtime state from ${LEGACY_COPAW_DIR} to ${QWENPAW_WORKING_DIR}..."
-
-    # ---- Migration is a copy-then-verify flow. Every critical artifact
-    #      that exists in the legacy location MUST be verified in the
-    #      target before the marker is written. A partial copy (missing
-    #      credentials or sessions) must NOT be marked complete, otherwise
-    #      the upgrade permanently loses runtime state and retries never run.
-    _migration_failed=false
-
-    _migrate_file() {
-        _src="$1"
-        _dst_dir="$2"
-        if [ ! -e "${_src}" ]; then
-            return 0
-        fi
-        _name=$(basename "${_src}")
-        if ! cp -an "${_src}" "${_dst_dir}/" 2>/dev/null; then
-            log "WARNING: failed to copy ${_src} — migration incomplete, will retry"
-            _migration_failed=true
-            return 1
-        fi
-        if [ ! -e "${_dst_dir}/${_name}" ]; then
-            log "WARNING: ${_name} missing after copy — migration incomplete, will retry"
-            _migration_failed=true
-            return 1
-        fi
-        return 0
-    }
-
-    _migrate_dir() {
-        _src="$1"
-        _dst_dir="$2"
-        if [ ! -d "${_src}" ]; then
-            return 0
-        fi
-        mkdir -p "${_dst_dir}"
-        if ! cp -an "${_src}/." "${_dst_dir}/" 2>/dev/null; then
-            log "WARNING: failed to copy directory ${_src} — migration incomplete, will retry"
-            _migration_failed=true
-            return 1
-        fi
-        # Verify at least one entry arrived (empty legacy dir is a no-op).
-        if [ -n "$(ls -A "${_src}")" ] && [ -z "$(ls -A "${_dst_dir}")" ]; then
-            log "WARNING: ${_src} copied nothing — migration incomplete, will retry"
-            _migration_failed=true
-            return 1
-        fi
-        return 0
-    }
-
-    # Top-level state files (chats.json, history.db, config.json)
-    for _state in chats.json history.db config.json; do
-        _src="${LEGACY_COPAW_DIR}/${_state}"
-        if [ -e "${_src}" ]; then
-            _migrate_file "${_src}" "${QWENPAW_WORKING_DIR}"
-        fi
-    done
-
-    # Top-level state directories (memory/, digest/)
-    for _state in memory digest; do
-        _src="${LEGACY_COPAW_DIR}/${_state}"
-        if [ -d "${_src}" ]; then
-            _migrate_dir "${_src}" "${QWENPAW_WORKING_DIR}/${_state}"
-        fi
-    done
-
-    # Directories that contain runtime state
-    for _subdir in custom_channels plugins models sessions; do
-        _src="${LEGACY_COPAW_DIR}/${_subdir}"
-        if [ -d "${_src}" ]; then
-            _migrate_dir "${_src}" "${QWENPAW_WORKING_DIR}/${_subdir}"
-        fi
-    done
-
-    # Secret directory (sibling: ~/.copaw.secret -> ~/.qwenpaw.secret)
-    # Contains master_key, providers.json, envs.json — critical for credentials
-    _target_secret="${QWENPAW_SECRET_DIR:-${QWENPAW_WORKING_DIR}.secret}"
-    mkdir -p "${_target_secret}"
-    if [ -d "${LEGACY_COPAW_SECRET}" ]; then
-        for _secret_file in master_key providers.json envs.json; do
-            _src_secret="${LEGACY_COPAW_SECRET}/${_secret_file}"
-            if [ -e "${_src_secret}" ]; then
-                _migrate_file "${_src_secret}" "${_target_secret}"
-            fi
-        done
-    fi
-
-    # Workspace files (SOUL.md, AGENTS.md, skills/, agent.json, etc.)
-    _legacy_ws="${LEGACY_COPAW_DIR}/workspaces/default"
-    if [ -d "${_legacy_ws}" ]; then
-        mkdir -p "${WORKSPACE_DIR}"
-        if ! cp -an "${_legacy_ws}/." "${WORKSPACE_DIR}/" 2>/dev/null; then
-            log "WARNING: failed to copy workspace ${_legacy_ws} — migration incomplete, will retry"
-            _migration_failed=true
-        fi
-        # Verify critical workspace artifacts arrived.
-        for _ws_file in SOUL.md AGENTS.md agent.json; do
-            if [ -e "${_legacy_ws}/${_ws_file}" ] && [ ! -e "${WORKSPACE_DIR}/${_ws_file}" ]; then
-                log "WARNING: workspace ${_ws_file} missing after copy — migration incomplete, will retry"
-                _migration_failed=true
-            fi
-        done
-    fi
-
-    if [ "${_migration_failed}" = "false" ]; then
-        touch "${MIGRATION_FLAG}"
-        log "Migration complete (flag: ${MIGRATION_FLAG})"
-    else
-        log "Migration will retry on next startup"
-    fi
-elif [ -d "${LEGACY_COPAW_DIR}" ] && [ -f "${MIGRATION_FLAG}" ]; then
-    log "Migration already completed, skipping"
-fi
+#
+# Delegate to the standalone migration script so CI can E2E-test
+# the legacy CoPaw upgrade path directly (test-28-migration-e2e.sh).
+# The script is copy-then-verify: it only writes .copaw-migrated
+# after every critical artifact (including .copaw.secret credentials)
+# is verified in the target; a partial copy is NOT marked complete
+# and retries on the next startup.
+export QWENPAW_WORKING_DIR="${QWENPAW_WORKING_DIR}"
+export QWENPAW_SECRET_DIR="${QWENPAW_SECRET_DIR:-${QWENPAW_WORKING_DIR}.secret}"
+export WORKSPACE_DIR="${WORKSPACE_DIR:-${QWENPAW_WORKING_DIR}/workspaces/default}"
+bash /opt/agentteams/scripts/init/migrate-copaw-state.sh || true
 
 # ============================================================
 export QWENPAW_WORKING_DIR="${QWENPAW_WORKING_DIR}"
