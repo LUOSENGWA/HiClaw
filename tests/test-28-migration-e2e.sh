@@ -2,7 +2,7 @@
 # test-28-migration-e2e.sh
 # E2E-validates the legacy CoPaw → QwenPaw runtime-state migration.
 #
-# Background: existing installs of HiClaw/AgentTeams that use CoPaw as the
+# Background: existing installs of AgentTeams that use CoPaw as the
 # Manager runtime keep runtime state in ~/.copaw and ~/.copaw.secret
 # (master_key, providers.json, envs.json). On upgrade to QwenPaw 2.0 the
 # Manager must migrate ALL of that state without data loss. The migration
@@ -285,9 +285,171 @@ else
 fi
 
 # ------------------------------------------------------------
+# Production startup order (shiyiyue1102 review regression):
+# legacy migration MUST run BEFORE the bridge, then the bridge
+# re-overlays Controller-owned values (NEW Matrix token / user ID),
+# the QA-disable injection (§7) re-disables the QA profile, and the
+# plugin re-install (§10) keeps current plugins. Upgraded Manager
+# must NOT boot with a stale legacy token (which would prevent it
+# from replying / collaborating with the Team).
+#
+# Simulated order mirrors start-qwenpaw-manager.sh:
+#   §1 mkdir → §1b migrate → §2 bridge → §7 QA disable → §10 plugins
+# Full QwenPaw boot + Matrix reply + Team collaboration need a live
+# Matrix server; this section verifies their startup prerequisites
+# (correct token, QA disabled, current plugins, user data migrated).
+# ------------------------------------------------------------
+log_section "Production Startup Order"
+
+_PROD_HOME="/tmp/mig-e2e-prod"
+_MIG_ENV_PROD=(
+    -e HOME="${_PROD_HOME}"
+    -e QWENPAW_WORKING_DIR="${_PROD_HOME}/.qwenpaw"
+    -e QWENPAW_SECRET_DIR="${_PROD_HOME}/.qwenpaw.secret"
+    -e WORKSPACE_DIR="${_PROD_HOME}/.qwenpaw/workspaces/default"
+)
+
+# --- Setup: legacy .copaw (OLD token) + current openclaw.json (NEW token) ---
+docker exec "${_AGENT_CTR}" bash -c '
+set -e
+HOME_DIR=/tmp/mig-e2e-prod
+rm -rf "${HOME_DIR}"
+mkdir -p "${HOME_DIR}/.copaw/workspaces/default" \
+         "${HOME_DIR}/.copaw/sessions" \
+         "${HOME_DIR}/.copaw/memory" \
+         "${HOME_DIR}/.copaw/plugins/teamharness" \
+         "${HOME_DIR}/.copaw.secret"
+# legacy CoPaw runtime state (stale token, old QA state, user data)
+echo "{\"channels\":{\"matrix\":{\"access_token\":\"OLD_MATRIX_TOKEN\",\"user_id\":\"@manager-old:test\"}},\"config\":true}" > "${HOME_DIR}/.copaw/config.json"
+echo "{\"id\":\"default\",\"channels\":{\"matrix\":{\"access_token\":\"OLD_MATRIX_TOKEN\",\"user_id\":\"@manager-old:test\"}}}" > "${HOME_DIR}/.copaw/workspaces/default/agent.json"
+echo "# SOUL legacy" > "${HOME_DIR}/.copaw/workspaces/default/SOUL.md"
+echo "MASTER_KEY_TEST_123" > "${HOME_DIR}/.copaw.secret/master_key"
+echo "{\"providers\":[{\"id\":\"legacy-llm\"}]}" > "${HOME_DIR}/.copaw.secret/providers.json"
+echo "{\"envs\":{\"KEY\":\"VALUE\"}}" > "${HOME_DIR}/.copaw.secret/envs.json"
+echo "session-data" > "${HOME_DIR}/.copaw/sessions/user1.jsonl"
+echo "memory-note" > "${HOME_DIR}/.copaw/memory/2026-08-01.md"
+echo "{\"plugin\":\"legacy\"}" > "${HOME_DIR}/.copaw/plugins/teamharness/plugin.json"
+# current Controller config (NEW token) — what bridge reads
+cat > "${HOME_DIR}/openclaw.json" <<EOF2
+{
+  "channels": {
+    "matrix": {
+      "enabled": true,
+      "homeserver": "https://matrix.test",
+      "accessToken": "NEW_MATRIX_TOKEN",
+      "userId": "@manager-new:test",
+      "dm": {"policy": "allowlist", "allowFrom": ["@luo:test"]},
+      "groupPolicy": "allowlist",
+      "groupAllowFrom": ["@luo:test"]
+    }
+  },
+  "models": {
+    "providers": {
+      "test-llm": {
+        "baseUrl": "http://llm:8000/v1",
+        "apiKey": "NEW_LLM_KEY",
+        "models": [{"id": "qwen3.6-27b", "name": "Qwen 3.6 27B"}]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {"model": {"primary": "test-llm/qwen3.6-27b"}}
+  }
+}
+EOF2
+# current plugins (what §10 re-installs after migration)
+mkdir -p "${HOME_DIR}/current-plugins/teamharness"
+echo "{\"plugin\":\"current\"}" > "${HOME_DIR}/current-plugins/teamharness/plugin.json"
+echo "PROD_SETUP_OK"
+' > /tmp/test28-prod-setup.txt 2>&1
+_PROD_SETUP_RC=$?
+
+if [ "${_PROD_SETUP_RC}" -ne 0 ]; then
+    log_fail "Production startup order setup failed (rc=${_PROD_SETUP_RC}): $(cat /tmp/test28-prod-setup.txt | head -3)"
+else
+    log_pass "Production upgrade scenario setup complete"
+fi
+
+# --- Execute production startup order ---
+docker exec "${_MIG_ENV_PROD[@]}" "${_AGENT_CTR}" bash -c '
+set -e
+QW="${QWENPAW_WORKING_DIR}"
+SECRET="${QWENPAW_SECRET_DIR}"
+# §1 mkdir
+mkdir -p "${QW}/custom_channels" "${QW}/.secret"
+# §1b migrate legacy .copaw state FIRST (before bridge)
+bash /opt/agentteams/scripts/init/migrate-copaw-state.sh >/dev/null 2>&1
+# §2 bridge re-overlays Controller-owned values
+/opt/venv/qwenpaw/bin/python3 -m copaw_worker.bridge \
+    --profile manager \
+    --openclaw-json "${HOME}/openclaw.json" \
+    --working-dir "${QW}" >/dev/null 2>&1
+# §7 QA disable injection (must also inject default profile)
+_DEFAULT_WD="${QW}/workspaces/default"
+_QA_WD="${QW}/workspaces/QwenPaw_QA_Agent_0.2"
+jq --arg wd "${_QA_WD}" --arg dwd "${_DEFAULT_WD}" \
+   ".agents.profiles = ((.agents.profiles // {}) + {
+       \"default\": {\"id\": \"default\", \"workspace_dir\": \$dwd},
+       \"QwenPaw_QA_Agent_0.2\": {\"id\": \"QwenPaw_QA_Agent_0.2\", \"workspace_dir\": \$wd, \"enabled\": false}
+   })" \
+   "${QW}/config.json" > "${QW}/config.json.tmp" && mv "${QW}/config.json.tmp" "${QW}/config.json"
+# §10 re-install current plugins (overwrites legacy plugin of same name)
+rm -rf "${QW}/plugins/teamharness"
+cp -a "${HOME}/current-plugins/teamharness" "${QW}/plugins/teamharness"
+echo "PROD_ORDER_EXECUTED"
+' > /tmp/test28-prod-exec.txt 2>&1
+_PROD_EXEC_RC=$?
+
+if [ "${_PROD_EXEC_RC}" -ne 0 ]; then
+    log_fail "Production startup order execution failed (rc=${_PROD_EXEC_RC}): $(cat /tmp/test28-prod-exec.txt | head -3)"
+else
+    log_pass "Production startup order executed (mkdir → migrate → bridge → QA → plugins)"
+fi
+
+# --- Verify production startup order invariants ---
+docker exec "${_MIG_ENV_PROD[@]}" "${_AGENT_CTR}" bash -c '
+set -e
+QW="${QWENPAW_WORKING_DIR}"
+SECRET="${QWENPAW_SECRET_DIR}"
+# 1. NEW Matrix token preserved (bridge re-overlay beats legacy migration)
+CFG_TOKEN=$(jq -r ".channels.matrix.access_token // \"\"" "${QW}/config.json")
+AGENT_TOKEN=$(jq -r ".channels.matrix.access_token // \"\"" "${QW}/workspaces/default/agent.json")
+if [ "${CFG_TOKEN}" != "NEW_MATRIX_TOKEN" ]; then echo "FAIL:config_token=${CFG_TOKEN}"; exit 1; fi
+if [ "${AGENT_TOKEN}" != "NEW_MATRIX_TOKEN" ]; then echo "FAIL:agent_token=${AGENT_TOKEN}"; exit 1; fi
+# 2. QA profile disabled + default profile present (prevents legacy migration)
+QA_ENABLED=$(jq -r ".agents.profiles[\"QwenPaw_QA_Agent_0.2\"].enabled // \"missing\"" "${QW}/config.json")
+DEFAULT_ID=$(jq -r ".agents.profiles[\"default\"].id // \"missing\"" "${QW}/config.json")
+if [ "${QA_ENABLED}" != "false" ]; then echo "FAIL:qa_enabled=${QA_ENABLED}"; exit 1; fi
+if [ "${DEFAULT_ID}" != "default" ]; then echo "FAIL:default_profile=${DEFAULT_ID}"; exit 1; fi
+# 3. legacy user data migrated (master_key / envs / sessions / memory / SOUL)
+if [ "$(cat "${SECRET}/master_key")" != "MASTER_KEY_TEST_123" ]; then echo "FAIL:master_key"; exit 1; fi
+if [ ! -f "${SECRET}/envs.json" ]; then echo "FAIL:envs_missing"; exit 1; fi
+#   NOTE: providers.json is Controller-owned — the bridge re-writes it
+#   with the current openclaw.json LLM config (active_llm), so verify
+#   the bridge output, NOT the legacy content.
+if ! jq -e '.active_llm.provider_id == "test-llm" and .active_llm.model == "qwen3.6-27b"' "${SECRET}/providers.json" >/dev/null 2>&1; then echo "FAIL:providers"; exit 1; fi
+if [ "$(cat "${QW}/sessions/user1.jsonl")" != "session-data" ]; then echo "FAIL:sessions"; exit 1; fi
+if [ "$(cat "${QW}/memory/2026-08-01.md")" != "memory-note" ]; then echo "FAIL:memory"; exit 1; fi
+if [ "$(cat "${QW}/workspaces/default/SOUL.md")" != "# SOUL legacy" ]; then echo "FAIL:soul"; exit 1; fi
+# 4. current plugins win over migrated legacy plugin of the same name
+if [ "$(cat "${QW}/plugins/teamharness/plugin.json")" != "{\"plugin\":\"current\"}" ]; then echo "FAIL:plugins"; exit 1; fi
+# 5. marker written (idempotent upgrade)
+if [ ! -f "${QW}/.copaw-migrated" ]; then echo "FAIL:marker"; exit 1; fi
+echo "PROD_ORDER_OK"
+' > /tmp/test28-prod-verify.txt 2>&1
+_PROD_VERIFY_RC=$?
+
+if [ "${_PROD_VERIFY_RC}" -eq 0 ] && grep -q "PROD_ORDER_OK" /tmp/test28-prod-verify.txt; then
+    log_pass "Production startup order: NEW token preserved, QA disabled, legacy data migrated, current plugins kept"
+else
+    log_fail "Production startup order invariant broken (rc=${_PROD_VERIFY_RC}): $(cat /tmp/test28-prod-verify.txt | head -5)"
+fi
+
+# ------------------------------------------------------------
 # Cleanup throwaway HOME
 # ------------------------------------------------------------
 docker exec "${_AGENT_CTR}" rm -rf "${TEST_HOME}" >/dev/null 2>&1
+docker exec "${_AGENT_CTR}" rm -rf "${_PROD_HOME}" >/dev/null 2>&1
 
 test_teardown "28-migration-e2e"
 test_summary

@@ -3,7 +3,7 @@
 #
 # Extracted from start-qwenpaw-manager.sh §10b so that CI can E2E-test the
 # legacy CoPaw upgrade path directly. Supports an existing legacy install
-# (HiClaw/AgentTeams with CoPaw runtime) upgrading in place to QwenPaw 2.0
+# (AgentTeams with CoPaw runtime) upgrading in place to QwenPaw 2.0
 # WITHOUT losing runtime state (sessions, memory, history, config, channels,
 # plugins, credentials).
 #

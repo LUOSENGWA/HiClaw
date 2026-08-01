@@ -22,6 +22,32 @@ mkdir -p "${QWENPAW_WORKING_DIR}/custom_channels"
 mkdir -p "${QWENPAW_WORKING_DIR}/.secret"
 
 # ============================================================
+# 1b. Migrate legacy .copaw state to .qwenpaw (idempotent)
+# ============================================================
+# MUST run BEFORE the bridge (§2) and the startup overlay steps.
+# Upgrade contract (shiyiyue1102 review):
+#   * Legacy user data (master_key, providers.json, envs.json, sessions,
+#     memory, digest, models, custom_channels) is carried forward.
+#   * Controller-owned values are re-overlaid AFTER migration by the
+#     bridge (§2: Matrix access_token / user_id, providers.json), the
+#     prompt sync (§3-§4), the agent.json patch (§6) and the QA disable
+#     (§7) — so the current openclaw.json token and QA-disable config
+#     always win.
+#   * Running migration AFTER the bridge would let legacy .copaw files
+#     (old token, old QA state) clobber the Controller values just
+#     written — stale Matrix token, Manager cannot reply or collaborate.
+# Delegate to the standalone migration script so CI can E2E-test
+# the legacy CoPaw upgrade path directly (test-28-migration-e2e.sh).
+# The script is copy-then-verify: it only writes .copaw-migrated
+# after every critical artifact (including .copaw.secret credentials)
+# is verified in the target; a partial copy is NOT marked complete
+# and retries on the next startup.
+export QWENPAW_WORKING_DIR="${QWENPAW_WORKING_DIR}"
+export QWENPAW_SECRET_DIR="${QWENPAW_SECRET_DIR:-${QWENPAW_WORKING_DIR}.secret}"
+export WORKSPACE_DIR="${WORKSPACE_DIR:-${QWENPAW_WORKING_DIR}/workspaces/default}"
+bash /opt/agentteams/scripts/init/migrate-copaw-state.sh || true
+
+# ============================================================
 # 2. Bridge openclaw.json -> config.json + providers.json
 # ============================================================
 OPENCLAW_JSON="${OPENCLAW_WORKSPACE}/openclaw.json"
@@ -283,25 +309,6 @@ for _plugin_src in /opt/agentteams/plugins/*/; do
         log "Installed plugin: ${_plugin_name}"
     fi
 done
-
-# ============================================================
-# 10b. Migrate legacy .copaw state to .qwenpaw (idempotent)
-# ============================================================
-# PR #1077 Controller drops .copaw directory compatibility.
-# Existing Manager upgrades from copaw 1.0.2 to QwenPaw 2.0
-# must carry forward ALL runtime state (sessions, memory, history,
-# config, channels, plugins, credentials).
-#
-# Delegate to the standalone migration script so CI can E2E-test
-# the legacy CoPaw upgrade path directly (test-28-migration-e2e.sh).
-# The script is copy-then-verify: it only writes .copaw-migrated
-# after every critical artifact (including .copaw.secret credentials)
-# is verified in the target; a partial copy is NOT marked complete
-# and retries on the next startup.
-export QWENPAW_WORKING_DIR="${QWENPAW_WORKING_DIR}"
-export QWENPAW_SECRET_DIR="${QWENPAW_SECRET_DIR:-${QWENPAW_WORKING_DIR}.secret}"
-export WORKSPACE_DIR="${WORKSPACE_DIR:-${QWENPAW_WORKING_DIR}/workspaces/default}"
-bash /opt/agentteams/scripts/init/migrate-copaw-state.sh || true
 
 # ============================================================
 export QWENPAW_WORKING_DIR="${QWENPAW_WORKING_DIR}"
