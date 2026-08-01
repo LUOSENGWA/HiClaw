@@ -3803,6 +3803,81 @@ def _update_project_task(arguments: dict[str, Any], project_id: str, task_id: st
         _write_project_plan(_project_dir(arguments, project_id), project)
 
 
+def _send_delegate_notification(
+    arguments: dict[str, Any],
+    *,
+    room_id: str,
+    task_id: str,
+    title: str,
+    assignee: str,
+    spec: str,
+    txn_id: str,
+) -> dict[str, Any]:
+    """Send the automatic Worker assignment notification for delegate_task.
+
+    Publishes the assignment to the Task room with ``m.mentions`` using the
+    same Matrix HTTP send path as the message tool. The transaction ID is
+    stable per task so a retry cannot produce a duplicate assignment.
+    Returns the Matrix ``eventId`` on success.
+    """
+    homeserver = os.getenv("AGENTTEAMS_MATRIX_URL", "").rstrip("/")
+    token = os.getenv("AGENTTEAMS_WORKER_MATRIX_TOKEN", "")
+    if not homeserver or not token:
+        return {
+            "sent": False,
+            "error": "AGENTTEAMS_MATRIX_URL and AGENTTEAMS_WORKER_MATRIX_TOKEN are required",
+        }
+
+    matrix_room_id = str(room_id or "").strip()
+    if matrix_room_id.startswith("room:"):
+        matrix_room_id = matrix_room_id[len("room:") :].strip()
+    if not matrix_room_id.startswith("!"):
+        return {"sent": False, "error": f"invalid Matrix room target: {room_id}"}
+
+    spec_preview = (spec or "")[:500]
+    if len(spec or "") > 500:
+        spec_preview += "..."
+    notification_text = (
+        f"{assignee} You are assigned task **{task_id}**: {title}\n\n"
+        f"{spec_preview}"
+    )
+    mentions = [assignee]
+    content = _matrix_content(notification_text, mentions)
+
+    room_enc = urllib.parse.quote(matrix_room_id, safe="")
+    txn = urllib.parse.quote(f"delegate-{task_id}", safe="")
+    url = f"{homeserver}/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/{txn}"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(content).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8") or "{}")
+        event_id = str(data.get("event_id") or "").strip()
+        if not event_id:
+            return {"sent": False, "error": "Matrix send returned no event_id"}
+        return {
+            "sent": True,
+            "eventId": event_id,
+            "roomId": matrix_room_id,
+            "assignee": assignee,
+        }
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:200]
+        return {
+            "sent": False,
+            "error": f"Matrix API error: HTTP {exc.code}: {body}",
+        }
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return {"sent": False, "error": f"Matrix API error: {exc}"}
+
+
 def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
     action = str(arguments.get("action") or "").strip()
     payload = _payload(arguments)
@@ -3864,12 +3939,55 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             if assigned_to:
                 project_task_updates["assigned_to"] = assigned_to
             _update_project_task(arguments, project_id, task_id, **project_task_updates)
+            synced = _sync_task(arguments, task_id)
+
+            # Automatic Worker notification: delegate_task publishes the
+            # task files to shared storage FIRST, then sends the assignment
+            # message with m.mentions to the Task room. The Leader must NOT
+            # send a second assignment message (that would trigger the
+            # Worker twice). A stable transaction ID makes a retry
+            # idempotent.
+            notification: dict[str, Any] = {
+                "sent": False,
+                "error": "notification skipped",
+            }
+            assignment_mxid = str(assigned_to or "").strip()
+            task_title = str(payload.get("title") or "").strip()
+            if not task_title:
+                for item in project.get("tasks", []):
+                    if isinstance(item, dict) and item.get("task_id") == task_id:
+                        task_title = str(item.get("title") or "").strip()
+                        break
+            has_matrix_env = bool(
+                (os.getenv("AGENTTEAMS_MATRIX_URL", "").strip())
+                and (os.getenv("AGENTTEAMS_WORKER_MATRIX_TOKEN", "").strip())
+            )
+            if assignment_mxid and _role(arguments) == "leader" and has_matrix_env:
+                try:
+                    notification = _send_delegate_notification(
+                        arguments,
+                        room_id=room_id,
+                        task_id=task_id,
+                        title=task_title or task_id,
+                        assignee=assignment_mxid,
+                        spec=spec,
+                        txn_id=f"delegate:{task_id}",
+                    )
+                except Exception as exc:
+                    notification = {
+                        "sent": False,
+                        "error": f"automatic notification failed: {exc}",
+                    }
+            task["notification"] = notification
+            if notification.get("eventId"):
+                task["eventId"] = notification["eventId"]
             return {
                 "ok": True,
                 "tool": "taskflow",
                 "action": action,
                 "task": task,
-                "synced": _sync_task(arguments, task_id),
+                "synced": synced,
+                "notification": notification,
                 "notificationNeeded": _notification_needed(
                     "delegate_task",
                     project or {"project_id": project_id},

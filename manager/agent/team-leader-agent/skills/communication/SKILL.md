@@ -19,11 +19,13 @@ Hard rule: do not call the `message` tool to send a message back into the curren
 
 ## Task Assignment Room
 
-Send normal task assignment notifications to the team room, not to a Worker's private room, Leader DM, or Leader Room. Include the assigned Worker's full Matrix ID as a visible @mention so the Worker is addressed while the assignment context stays visible to the team.
+`taskflow(delegate_task)` delivers the Worker assignment automatically: it
+publishes task files, then sends a Team Room message that visibly @mentions
+the assigned Worker's full Matrix ID and returns the Matrix `eventId`. Do
+NOT send a second assignment message after a successful `delegate_task` —
+that duplicates the assignment and can trigger the Worker twice.
 
-If the current room is Leader DM or Leader Room, the Team Room assignment is cross-room. Use the `message` tool with `target` set to `room:<Team Room ID>` from your team context. Do not directly reply in the current room for Worker task assignment just because the Worker Matrix ID appears in the message text.
-
-An assignment intent sentence is not an assignment. Do not send same-room text such as "I need to delegate this", "I will assign this to the dev worker", "now delegate the first ready node", or "the dev worker should start" as a substitute for the Team Room assignment. The Worker is not notified until the `message` tool sends a Team Room message that visibly @mentions the Worker's full Matrix ID and gives a concrete task to start.
+An assignment intent sentence is not an assignment. Do not send same-room text such as "I need to delegate this", "I will assign this to the dev worker", "now delegate the first ready node", or "the dev worker should start" as a substitute for the Team Room assignment. The Worker is notified by the `delegate_task` auto-notification that visibly @mentions the Worker's full Matrix ID and gives a concrete task to start.
 
 Use a Worker private room only for exceptional follow-up that should not be team-visible, such as sensitive clarification or direct recovery/debugging.
 

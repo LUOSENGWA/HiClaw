@@ -386,22 +386,39 @@ def _matrix_config_for_agent(account_id: str) -> tuple[str, str, str]:
     return str(homeserver), str(access_token), str(user_id)
 
 
+def _normalize_room_id(room_id: str) -> str:
+    """Strip a ``room:`` prefix at the Matrix API boundary.
+
+    Matrix-nio's ``joined_members``/``room_send`` require the raw
+    ``!room:domain`` ID. Callers may pass the documented
+    ``room:!room:domain`` target form; normalize here so every nio call
+    uses the raw form.
+    """
+    text = (room_id or "").strip()
+    if text.startswith("room:"):
+        return text[len("room:") :].strip()
+    return text
+
+
 async def _send_matrix_room_message(
     *,
     room_id: str,
     content: dict[str, Any],
     account_id: str,
+    txn_id: str | None = None,
 ) -> str | None:
     from nio import AsyncClient
 
+    matrix_room_id = _normalize_room_id(room_id)
     homeserver, access_token, user_id = _matrix_config_for_agent(account_id)
     client = AsyncClient(homeserver, user=user_id)
     client.access_token = access_token
     try:
         response = await client.room_send(
-            room_id,
+            matrix_room_id,
             "m.room.message",
             content,
+            tx_id=txn_id,
             ignore_unverified_devices=True,
         )
         event_id = getattr(response, "event_id", None)

@@ -1530,7 +1530,10 @@ async def test_delegate_task_pushes_after_creation(tmp_path, monkeypatch):
     assert payload["ok"] is True
     assert payload["task"]["status"] == "assigned"
     assert payload["synced"] is True
-    mock.push_shared_path.assert_called_once_with("shared/tasks/tp-push-01/")
+    # Task dir pushed at least twice: once before notification (prepared
+    # files visible to Worker) and once after commit (assigned + event_id).
+    assert mock.push_shared_path.call_count >= 2
+    assert mock.push_shared_path.call_args_list[0].args == ("shared/tasks/tp-push-01/",)
 
 
 @pytest.mark.asyncio
@@ -1567,10 +1570,16 @@ async def test_ack_task_missing_spec_does_not_write_in_progress(tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_delegate_task_notification_failure_leaves_task_pending(
+async def test_delegate_task_notification_failure_leaves_task_prepared(
     tmp_path, monkeypatch,
 ):
-    """When notification fails, delegate_task must not record state."""
+    """When notification fails, delegate_task keeps the task prepared.
+
+    The node is claimed (plan delegated, meta.json written with status
+    ``prepared``) so files are visible to Workers, but no event_id is
+    recorded — a retry re-sends with a stable txn_id and only then
+    marks the task assigned.
+    """
     working_dir = tmp_path / "worker" / ".copaw"
     workspace = working_dir / "workspaces" / "default"
     monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
@@ -1613,11 +1622,93 @@ async def test_delegate_task_notification_failure_leaves_task_pending(
     payload = _response_json(response)
     assert payload["ok"] is False
     assert "not in room" in payload["error"]
-    # Task must NOT be recorded — still pending in the plan
+    assert payload["retryable"] is True
+    # Node is claimed: plan marked delegated ([~] marker), task files
+    # written with status=prepared, but NO event_id yet (notification
+    # never sent).
     plan = (workspace / "shared" / "projects" / "tp-01" / "plan.md").read_text()
-    assert "delegated" not in plan
-    # No task meta written
-    assert not (workspace / "shared" / "tasks" / "st-01" / "meta.json").exists()
+    assert "[~]" in plan
+    meta = json.loads((workspace / "shared" / "tasks" / "st-01" / "meta.json").read_text())
+    assert meta["status"] == "prepared"
+    assert meta.get("event_id") is None
+
+
+@pytest.mark.asyncio
+async def test_delegate_task_retry_after_notification_failure_sends_txn_id(
+    tmp_path, monkeypatch,
+):
+    """Retry of a prepared task re-sends with the stable txn_id and commits.
+
+    The first attempt fails at the notification boundary. The retry
+    detects the prepared meta, skips re-claiming, sends with the same
+    ``delegate:{task_id}`` txn_id (idempotent), records the event_id,
+    and marks the task assigned.
+    """
+    working_dir = tmp_path / "worker" / ".copaw"
+    workspace = working_dir / "workspaces" / "default"
+    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    _set_actor(monkeypatch, "@lead:domain")
+    mock = _mock_sync(monkeypatch)
+
+    sent: dict[str, Any] = {}
+
+    async def flaky_notify(**kwargs):
+        sent["txn_id"] = kwargs.get("txn_id")
+        if not sent.get("ok"):
+            return {"sent": False, "error": "worker not in room"}
+        return {
+            "sent": True,
+            "eventId": "$retry-event",
+            "roomId": kwargs.get("room_id", ""),
+            "assignee": "@worker-a:domain",
+        }
+
+    monkeypatch.setattr(taskflow_tool, "_notify_task_assignment", flaky_notify)
+
+    await projectflow(
+        action="create_project",
+        payload={"projectId": "tp-01", "title": "Test"},
+    )
+    await projectflow(
+        action="plan_dag",
+        payload={
+            "projectId": "tp-01",
+            "tasks": [
+                {
+                    "taskId": "st-01",
+                    "title": "Do stuff",
+                    "assignedTo": "@worker-a:domain",
+                    "dependsOn": [],
+                },
+            ],
+        },
+    )
+
+    payload_dict = {
+        "projectId": "tp-01",
+        "taskId": "st-01",
+        "roomId": "room:!team-room:domain",
+        "spec": "Do the stuff.",
+    }
+
+    first = _response_json(
+        await taskflow(action="delegate_task", payload=payload_dict),
+    )
+    assert first["ok"] is False
+    assert first["retryable"] is True
+
+    sent["ok"] = True
+    retry = _response_json(
+        await taskflow(action="delegate_task", payload=payload_dict),
+    )
+    assert retry["ok"] is True
+    assert retry["notification"]["eventId"] == "$retry-event"
+    assert retry["task"]["status"] == "assigned"
+    assert retry["task"]["event_id"] == "$retry-event"
+    # Stable txn_id was passed to the send boundary on both attempts.
+    assert sent.get("txn_id") == "delegate:st-01"
+    # The task dir was pushed at least twice (prepared + assigned).
+    assert mock.push_shared_path.call_count >= 2
 
 
 @pytest.mark.asyncio

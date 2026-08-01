@@ -77,9 +77,9 @@ Do not call `check_active_tasks` from heartbeat or routine recovery checks for n
 
 `taskflow` handles file sync internally: `delegate_task` auto-pushes the task directory, `check_task` auto-pulls the task directory. Use `filesync` separately only for project-level files or non-task shared files.
 
-delegate_task does not send Matrix messages. A task is not actually assigned to the Worker until you send a visible Team Room message that @mentions the assigned Worker's full Matrix ID. Do not start polling the task, tell the requester that the Worker is working, or wait for results before this Team Room notification has been sent.
+delegate_task automatically sends the Worker assignment: it publishes the task directory, validates the Worker's room membership, sends a visible Team Room message that @mentions the assigned Worker's full Matrix ID, and returns the Matrix `eventId`. do NOT send a second assignment message after a successful `delegate_task` — the auto-notification is the assignment, and a second message duplicates it and can trigger the Worker twice. Do not start polling the task, tell the requester that the Worker is working, or wait for results until the tool returns `ok: true` with a `notification.eventId`.
 
-Mandatory next action after `delegate_task`: use `communication`, then send the Team Room assignment with the `message` tool. Do not output a same-room sentence describing your intent to delegate, such as "I need to delegate the first ready node" or "I will assign this to the dev worker". That text is not a Worker notification and leaves the task unassigned from the Worker's perspective.
+No extra action after `delegate_task`: the tool's auto-notification is the assignment. Do not output a same-room sentence describing your intent to delegate, such as "I need to delegate the first ready node" or "I will assign this to the dev worker". That text is not a Worker notification and leaves the task unassigned from the Worker's perspective.
 
 ## Task Spec Language
 

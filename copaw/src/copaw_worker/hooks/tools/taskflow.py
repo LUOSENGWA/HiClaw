@@ -24,8 +24,9 @@ from copaw_worker.task import (
     ack_task,
     canonical_worker_id,
     check_task,
-    delegate_task,
+    commit_task_assignment,
     is_effective_result,
+    prepare_task,
     submit_task,
     validate_delegate_task,
     validate_task_result,
@@ -306,7 +307,7 @@ async def _check_room_membership(room_id: str, user_id: str) -> bool:
     client = AsyncClient(homeserver, user=client_user_id)
     client.access_token = access_token
     try:
-        response = await client.joined_members(room_id)
+        response = await client.joined_members(_normalize_room_id(room_id))
         members = getattr(response, "members", None)
         if members is None:
             return False
@@ -320,6 +321,7 @@ async def _notify_task_assignment(
     task: DagTask,
     room_id: str,
     spec: str,
+    txn_id: str | None = None,
 ) -> dict[str, Any]:
     """Send a Matrix notification for a task assignment.
 
@@ -376,6 +378,7 @@ async def _notify_task_assignment(
             room_id=room_id,
             content=content,
             account_id="default",
+            txn_id=txn_id,
         )
     except Exception as exc:
         return {"sent": False, "error": f"Matrix send failed: {exc}"}
@@ -383,7 +386,7 @@ async def _notify_task_assignment(
     return {
         "sent": True,
         "eventId": event_id,
-        "roomId": room_id,
+        "roomId": _normalize_room_id(room_id),
         "assignee": assignee_matrix_id,
     }
 
@@ -412,19 +415,78 @@ async def taskflow(
                     projectId=project_id,
                     taskId=task_id,
                 )
-            # Validate delegation preconditions before any side effects.
-            task = validate_delegate_task(
-                store,
-                project_id=project_id,
-                task_id=task_id,
-                spec=spec,
-            )
-            # Atomic: send Matrix notification BEFORE recording state.
-            # If notification fails, the task stays pending and retryable.
+            task_path = f"shared/tasks/{task_id}/"
+            sync = create_sync()
+
+            # 0. Detect retry state. After a partial failure the task may
+            #    already be prepared (files written, no event recorded) or
+            #    fully assigned (event recorded). Reading meta here makes
+            #    the whole flow idempotent and retry-safe.
+            try:
+                existing_meta = store.read_task_meta(task_id)
+            except TaskflowError:
+                existing_meta = None
+
+            if existing_meta is not None and existing_meta.status == "assigned":
+                # Already fully assigned (event_id recorded). Nothing to do.
+                sync.push_shared_path(task_path)
+                return _ok(
+                    action=action,
+                    task=asdict(existing_meta),
+                    synced=True,
+                    notification={
+                        "sent": True,
+                        "eventId": existing_meta.event_id,
+                        "roomId": _normalize_room_id(room_id),
+                        "assignee": canonical_worker_id(existing_meta.assigned_to),
+                        "reused": True,
+                    },
+                )
+
+            if existing_meta is None:
+                # 1. Fresh delegation: validate preconditions (CAS: task
+                #    must be pending), then claim the node — write
+                #    meta.json (status=prepared) + spec.md and mark the
+                #    plan node delegated so ready-node queries stop
+                #    returning it. Files become visible to Workers BEFORE
+                #    the Matrix notification arrives.
+                task = validate_delegate_task(
+                    store,
+                    project_id=project_id,
+                    task_id=task_id,
+                    spec=spec,
+                )
+                meta = prepare_task(
+                    store,
+                    project_id=project_id,
+                    task_id=task_id,
+                    spec=spec,
+                    room_id=room_id,
+                )
+            else:
+                # 2. Retry of a prepared task after notification failed.
+                #    The plan node is already delegated; rebuild the DAG
+                #    task from the recorded meta and skip validate/prepare.
+                task = DagTask(
+                    task_id=existing_meta.task_id,
+                    title=existing_meta.task_title,
+                    assigned_to=existing_meta.assigned_to,
+                    depends_on=existing_meta.depends_on,
+                    status="delegated",
+                )
+                meta = existing_meta
+
+            # 3. Publish task files to shared storage first so a Worker
+            #    that receives the notification can read spec.md/metadata.
+            sync.push_shared_path(task_path)
+
+            # 4. Retry-safe notification. Use a stable transaction ID so
+            #    re-sending after a partial failure is idempotent.
             notification = await _notify_task_assignment(
                 task=task,
                 room_id=room_id,
                 spec=spec,
+                txn_id=f"delegate:{task_id}",
             )
             if not notification.get("sent"):
                 return _error(
@@ -433,17 +495,21 @@ async def taskflow(
                     projectId=project_id,
                     taskId=task_id,
                     notification=notification,
+                    task=asdict(meta),
+                    retryable=True,
                 )
-            # Record state only after successful notification.
-            meta = delegate_task(
+            # 5. Record event_id and mark assigned only after the send
+            #    succeeded, so a retry cannot produce a duplicate
+            #    notification.
+            meta = commit_task_assignment(
                 store,
                 project_id=project_id,
                 task_id=task_id,
-                spec=spec,
-                room_id=room_id,
+                event_id=notification.get("eventId"),
             )
-            task_path = f"shared/tasks/{task_id}/"
-            sync = create_sync()
+
+            # 6. Re-push so the assigned status/event_id is visible
+            #    remotely.
             sync.push_shared_path(task_path)
             return _ok(
                 action=action,

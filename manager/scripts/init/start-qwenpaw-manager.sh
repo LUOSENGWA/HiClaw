@@ -297,11 +297,67 @@ MIGRATION_FLAG="${QWENPAW_WORKING_DIR}/.copaw-migrated"
 if [ -d "${LEGACY_COPAW_DIR}" ] && [ ! -f "${MIGRATION_FLAG}" ]; then
     log "Migrating runtime state from ${LEGACY_COPAW_DIR} to ${QWENPAW_WORKING_DIR}..."
 
-    # Top-level state files (chats.json, history.db, memory/, digest/)
-    for _state in chats.json history.db memory digest config.json; do
+    # ---- Migration is a copy-then-verify flow. Every critical artifact
+    #      that exists in the legacy location MUST be verified in the
+    #      target before the marker is written. A partial copy (missing
+    #      credentials or sessions) must NOT be marked complete, otherwise
+    #      the upgrade permanently loses runtime state and retries never run.
+    _migration_failed=false
+
+    _migrate_file() {
+        _src="$1"
+        _dst_dir="$2"
+        if [ ! -e "${_src}" ]; then
+            return 0
+        fi
+        _name=$(basename "${_src}")
+        if ! cp -an "${_src}" "${_dst_dir}/" 2>/dev/null; then
+            log "WARNING: failed to copy ${_src} — migration incomplete, will retry"
+            _migration_failed=true
+            return 1
+        fi
+        if [ ! -e "${_dst_dir}/${_name}" ]; then
+            log "WARNING: ${_name} missing after copy — migration incomplete, will retry"
+            _migration_failed=true
+            return 1
+        fi
+        return 0
+    }
+
+    _migrate_dir() {
+        _src="$1"
+        _dst_dir="$2"
+        if [ ! -d "${_src}" ]; then
+            return 0
+        fi
+        mkdir -p "${_dst_dir}"
+        if ! cp -an "${_src}/." "${_dst_dir}/" 2>/dev/null; then
+            log "WARNING: failed to copy directory ${_src} — migration incomplete, will retry"
+            _migration_failed=true
+            return 1
+        fi
+        # Verify at least one entry arrived (empty legacy dir is a no-op).
+        if [ -n "$(ls -A "${_src}")" ] && [ -z "$(ls -A "${_dst_dir}")" ]; then
+            log "WARNING: ${_src} copied nothing — migration incomplete, will retry"
+            _migration_failed=true
+            return 1
+        fi
+        return 0
+    }
+
+    # Top-level state files (chats.json, history.db, config.json)
+    for _state in chats.json history.db config.json; do
         _src="${LEGACY_COPAW_DIR}/${_state}"
         if [ -e "${_src}" ]; then
-            cp -an "${_src}" "${QWENPAW_WORKING_DIR}/" 2>/dev/null || true
+            _migrate_file "${_src}" "${QWENPAW_WORKING_DIR}"
+        fi
+    done
+
+    # Top-level state directories (memory/, digest/)
+    for _state in memory digest; do
+        _src="${LEGACY_COPAW_DIR}/${_state}"
+        if [ -d "${_src}" ]; then
+            _migrate_dir "${_src}" "${QWENPAW_WORKING_DIR}/${_state}"
         fi
     done
 
@@ -309,8 +365,7 @@ if [ -d "${LEGACY_COPAW_DIR}" ] && [ ! -f "${MIGRATION_FLAG}" ]; then
     for _subdir in custom_channels plugins models sessions; do
         _src="${LEGACY_COPAW_DIR}/${_subdir}"
         if [ -d "${_src}" ]; then
-            mkdir -p "${QWENPAW_WORKING_DIR}/${_subdir}"
-            cp -an "${_src}/." "${QWENPAW_WORKING_DIR}/${_subdir}/" 2>/dev/null || true
+            _migrate_dir "${_src}" "${QWENPAW_WORKING_DIR}/${_subdir}"
         fi
     done
 
@@ -319,33 +374,32 @@ if [ -d "${LEGACY_COPAW_DIR}" ] && [ ! -f "${MIGRATION_FLAG}" ]; then
     _target_secret="${QWENPAW_SECRET_DIR:-${QWENPAW_WORKING_DIR}.secret}"
     mkdir -p "${_target_secret}"
     if [ -d "${LEGACY_COPAW_SECRET}" ]; then
-        cp -an "${LEGACY_COPAW_SECRET}/." "${_target_secret}/" 2>/dev/null || true
+        for _secret_file in master_key providers.json envs.json; do
+            _src_secret="${LEGACY_COPAW_SECRET}/${_secret_file}"
+            if [ -e "${_src_secret}" ]; then
+                _migrate_file "${_src_secret}" "${_target_secret}"
+            fi
+        done
     fi
 
     # Workspace files (SOUL.md, AGENTS.md, skills/, agent.json, etc.)
     _legacy_ws="${LEGACY_COPAW_DIR}/workspaces/default"
     if [ -d "${_legacy_ws}" ]; then
         mkdir -p "${WORKSPACE_DIR}"
-        cp -an "${_legacy_ws}/." "${WORKSPACE_DIR}/" 2>/dev/null || true
+        if ! cp -an "${_legacy_ws}/." "${WORKSPACE_DIR}/" 2>/dev/null; then
+            log "WARNING: failed to copy workspace ${_legacy_ws} — migration incomplete, will retry"
+            _migration_failed=true
+        fi
+        # Verify critical workspace artifacts arrived.
+        for _ws_file in SOUL.md AGENTS.md agent.json; do
+            if [ -e "${_legacy_ws}/${_ws_file}" ] && [ ! -e "${WORKSPACE_DIR}/${_ws_file}" ]; then
+                log "WARNING: workspace ${_ws_file} missing after copy — migration incomplete, will retry"
+                _migration_failed=true
+            fi
+        done
     fi
 
-    # ---- Verification: only write marker if critical artifacts exist ----
-    # chats.json is the canonical session ledger; its presence (or the
-    # absence of any legacy source) is a reliable signal that migration
-    # either succeeded or had nothing to migrate.
-    _critical_missing=false
-    for _src in "${LEGACY_COPAW_DIR}/chats.json" "${LEGACY_COPAW_DIR}/history.db"; do
-        if [ -e "${_src}" ]; then
-            _name=$(basename "${_src}")
-            if [ ! -e "${QWENPAW_WORKING_DIR}/${_name}" ]; then
-                log "WARNING: ${_name} not copied — migration incomplete, will retry"
-                _critical_missing=true
-                break
-            fi
-        fi
-    done
-
-    if [ "${_critical_missing}" = "false" ]; then
+    if [ "${_migration_failed}" = "false" ]; then
         touch "${MIGRATION_FLAG}"
         log "Migration complete (flag: ${MIGRATION_FLAG})"
     else
