@@ -607,6 +607,17 @@ async def test_delegate_task_accepts_team_leader_team_room(tmp_path, monkeypatch
 
     assert payload["ok"] is True
     assert payload["task"]["room_id"] == "room:!team:domain"
+    # Auto-notification path (PR #1095): delegate_task sends the Matrix
+    # notification itself with a stable txn_id, then records event_id and
+    # marks the task assigned. No notificationRequired/nextAction handoff.
+    assert payload["notification"] == {
+        "sent": True,
+        "eventId": "$fake-event-id",
+        "roomId": "room:!team:domain",
+        "assignee": "@worker:domain",
+    }
+    assert payload["task"]["status"] == "assigned"
+    assert payload["task"]["event_id"] == "$fake-event-id"
 
 
 @pytest.mark.asyncio
