@@ -9,10 +9,15 @@
 #
 # Migration is a copy-then-verify flow:
 #   * Every critical artifact that exists in the legacy location MUST be
-#     verified in the target before the marker is written.
-#   * A partial copy (missing credentials or sessions) must NOT be marked
-#     complete, otherwise the upgrade permanently loses runtime state and
-#     retries never run.
+#     verified in the target (content-equality via cmp) before the marker
+#     is written.
+#   * Conflict policy: the legacy location is authoritative on upgrade, so
+#     legacy artifacts OVERWRITE any pre-existing target file (cp -a, not
+#     cp -an — no-clobber would silently skip a pre-existing target and
+#     permanently lose the legacy value).
+#   * A partial copy (missing credentials or sessions, or a content
+#     mismatch) must NOT be marked complete, otherwise the upgrade
+#     permanently loses runtime state and retries never run.
 #   * Idempotent: once .copaw-migrated exists, migration is skipped.
 #
 # Usage (environment overrides make this directly testable):
@@ -58,6 +63,11 @@ mkdir -p "${QWENPAW_WORKING_DIR}"
 
 _migration_failed=false
 
+# Conflict policy: on upgrade the legacy location is the authoritative
+# source of user data, so state/secret artifacts OVERWRITE any pre-existing
+# target file (cp -a, not cp -an — no-clobber would silently skip a
+# pre-existing target and permanently lose the legacy value). Every copied
+# artifact is then content-verified with cmp before the marker is written.
 _migrate_file() {
     _src="$1"
     _dst_dir="$2"
@@ -65,13 +75,13 @@ _migrate_file() {
         return 0
     fi
     _name=$(basename "${_src}")
-    if ! cp -an "${_src}" "${_dst_dir}/" 2>/dev/null; then
+    if ! cp -a "${_src}" "${_dst_dir}/" 2>/dev/null; then
         log "WARNING: failed to copy ${_src} — migration incomplete, will retry"
         _migration_failed=true
         return 1
     fi
-    if [ ! -e "${_dst_dir}/${_name}" ]; then
-        log "WARNING: ${_name} missing after copy — migration incomplete, will retry"
+    if ! cmp -s "${_src}" "${_dst_dir}/${_name}"; then
+        log "WARNING: ${_name} content mismatch after copy — migration incomplete, will retry"
         _migration_failed=true
         return 1
     fi
@@ -85,16 +95,26 @@ _migrate_dir() {
         return 0
     fi
     mkdir -p "${_dst_dir}"
-    if ! cp -an "${_src}/." "${_dst_dir}/" 2>/dev/null; then
+    if ! cp -a "${_src}/." "${_dst_dir}/" 2>/dev/null; then
         log "WARNING: failed to copy directory ${_src} — migration incomplete, will retry"
         _migration_failed=true
         return 1
     fi
-    # Verify at least one entry arrived (empty legacy dir is a no-op).
-    if [ -n "$(ls -A "${_src}")" ] && [ -z "$(ls -A "${_dst_dir}")" ]; then
-        log "WARNING: ${_src} copied nothing — migration incomplete, will retry"
+    # Verify every source entry arrived with identical content. A no-clobber
+    # or partial copy must not be marked complete.
+    _missing=0
+    while IFS= read -r -d '' _f; do
+        _rel="${_f#"${_src}"/}"
+        if [ ! -e "${_dst_dir}/${_rel}" ]; then
+            log "WARNING: ${_rel} missing after copy — migration incomplete, will retry"
+            _missing=1
+        elif [ -f "${_src}/${_rel}" ] && ! cmp -s "${_src}/${_rel}" "${_dst_dir}/${_rel}"; then
+            log "WARNING: ${_rel} content mismatch after copy — migration incomplete, will retry"
+            _missing=1
+        fi
+    done < <(find "${_src}" -type f -print0)
+    if [ "${_missing}" = "1" ]; then
         _migration_failed=true
-        return 1
     fi
     return 0
 }
@@ -136,18 +156,25 @@ if [ -d "${LEGACY_COPAW_SECRET}" ]; then
 fi
 
 # Workspace files (SOUL.md, AGENTS.md, skills/, agent.json, etc.)
+# Same conflict policy: legacy workspace is authoritative on upgrade, so
+# overwrite and verify content.
 _legacy_ws="${LEGACY_COPAW_DIR}/workspaces/default"
 if [ -d "${_legacy_ws}" ]; then
     mkdir -p "${WORKSPACE_DIR}"
-    if ! cp -an "${_legacy_ws}/." "${WORKSPACE_DIR}/" 2>/dev/null; then
+    if ! cp -a "${_legacy_ws}/." "${WORKSPACE_DIR}/" 2>/dev/null; then
         log "WARNING: failed to copy workspace ${_legacy_ws} — migration incomplete, will retry"
         _migration_failed=true
     fi
-    # Verify critical workspace artifacts arrived.
+    # Verify critical workspace artifacts arrived with identical content.
     for _ws_file in SOUL.md AGENTS.md agent.json; do
-        if [ -e "${_legacy_ws}/${_ws_file}" ] && [ ! -e "${WORKSPACE_DIR}/${_ws_file}" ]; then
-            log "WARNING: workspace ${_ws_file} missing after copy — migration incomplete, will retry"
-            _migration_failed=true
+        if [ -e "${_legacy_ws}/${_ws_file}" ]; then
+            if [ ! -e "${WORKSPACE_DIR}/${_ws_file}" ]; then
+                log "WARNING: workspace ${_ws_file} missing after copy — migration incomplete, will retry"
+                _migration_failed=true
+            elif ! cmp -s "${_legacy_ws}/${_ws_file}" "${WORKSPACE_DIR}/${_ws_file}"; then
+                log "WARNING: workspace ${_ws_file} content mismatch after copy — migration incomplete, will retry"
+                _migration_failed=true
+            fi
         fi
     done
 fi

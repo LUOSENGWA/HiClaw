@@ -201,6 +201,45 @@ else
 fi
 
 # ------------------------------------------------------------
+# Pre-existing target conflict: legacy is authoritative and must
+# overwrite a pre-existing target file (no-clobber would silently
+# skip and permanently lose legacy credentials).
+# ------------------------------------------------------------
+log_section "Pre-existing Target Conflict"
+
+docker exec "${_MIG_ENV[@]}" "${_AGENT_CTR}" bash -c '
+set -e
+QW="${QWENPAW_WORKING_DIR}"
+SECRET="${QWENPAW_SECRET_DIR}"
+rm -f "${QW}/.copaw-migrated"
+# pre-existing target values that DIFFER from legacy
+echo "preexisting-key" > "${SECRET}/master_key"
+echo "preexisting-provider" > "${SECRET}/providers.json"
+bash /opt/agentteams/scripts/init/migrate-copaw-state.sh >/dev/null 2>&1
+# legacy values must win (legacy is authoritative on upgrade)
+if [ "$(cat "${SECRET}/master_key")" != "MASTER_KEY_TEST_123" ]; then
+    echo "FAIL: legacy master_key did not overwrite pre-existing target"
+    exit 1
+fi
+if [ "$(cat "${SECRET}/providers.json")" != "{\"providers\":[{\"id\":\"test\"}]}" ]; then
+    echo "FAIL: legacy providers.json did not overwrite pre-existing target"
+    exit 1
+fi
+if [ ! -f "${QW}/.copaw-migrated" ]; then
+    echo "FAIL: marker not written after conflict overwrite"
+    exit 1
+fi
+echo "CONFLICT_OVERWRITE_OK"
+' > /tmp/test28-conflict.txt 2>&1
+_CONFLICT_RC=$?
+
+if [ "${_CONFLICT_RC}" -eq 0 ] && grep -q "CONFLICT_OVERWRITE_OK" /tmp/test28-conflict.txt; then
+    log_pass "Pre-existing target overwritten by legacy (conflict policy)"
+else
+    log_fail "Pre-existing target conflict handling broken (rc=${_CONFLICT_RC}): $(cat /tmp/test28-conflict.txt | head -3)"
+fi
+
+# ------------------------------------------------------------
 # Failure path: partial copy → marker NOT written → retry succeeds
 # ------------------------------------------------------------
 log_section "Failure Retry Semantics"
@@ -212,9 +251,10 @@ rm -f "${QW}/.copaw-migrated"
 rm -rf "${QW}/memory"
 # make the memory destination un-creatable: a regular file occupies the path
 touch "${QW}/memory"
-bash /opt/agentteams/scripts/init/migrate-copaw-state.sh >/dev/null 2>&1
-RC1=$?
-if [ "${RC1}" -eq 0 ]; then
+# The expected failure must be captured with if/else — under set -e the
+# shell would exit at the failing command and the assertions below would
+# never run.
+if bash /opt/agentteams/scripts/init/migrate-copaw-state.sh >/dev/null 2>&1; then
     echo "FAIL: migration should have failed"
     exit 1
 fi
