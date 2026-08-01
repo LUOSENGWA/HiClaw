@@ -35,6 +35,20 @@ def _mock_sync(monkeypatch) -> MagicMock:
     return mock
 
 
+def _mock_notify(monkeypatch) -> None:
+    """Patch _notify_task_assignment to return a success result."""
+
+    async def fake_notify(**kwargs):
+        return {
+            "sent": True,
+            "eventId": "$fake-event-id",
+            "roomId": kwargs.get("room_id", ""),
+            "assignee": "@worker:domain",
+        }
+
+    monkeypatch.setattr(taskflow_tool, "_notify_task_assignment", fake_notify)
+
+
 def _write_team_leader_runtime_config(base_dir: Path) -> None:
     runtime_dir = base_dir / "runtime"
     runtime_dir.mkdir(parents=True)
@@ -55,6 +69,7 @@ async def test_taskflow_project_assignment_and_completion(tmp_path, monkeypatch)
     monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker-a:domain")
     _mock_sync(monkeypatch)
+    _mock_notify(monkeypatch)
 
     response = await projectflow(
         action="create_project",
@@ -148,6 +163,7 @@ async def test_projectflow_check_active_tasks_reports_idle_worker(tmp_path, monk
     monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@leader:domain")
     _mock_sync(monkeypatch)
+    _mock_notify(monkeypatch)
 
     response = await projectflow(
         action="create_project",
@@ -216,6 +232,7 @@ async def test_projectflow_check_active_tasks_ignores_running_worker(tmp_path, m
     monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@leader:domain")
     _mock_sync(monkeypatch)
+    _mock_notify(monkeypatch)
 
     assert _response_json(
         await projectflow(
@@ -276,6 +293,7 @@ async def test_projectflow_check_active_tasks_reports_pending_result(tmp_path, m
     monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@leader:domain")
     _mock_sync(monkeypatch)
+    _mock_notify(monkeypatch)
 
     assert _response_json(
         await projectflow(
@@ -551,6 +569,7 @@ async def test_delegate_task_accepts_team_leader_team_room(tmp_path, monkeypatch
     monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@leader:domain")
     _mock_sync(monkeypatch)
+    _mock_notify(monkeypatch)
 
     assert _response_json(
         await projectflow(
@@ -950,6 +969,7 @@ async def test_loop_task_submission_waits_for_leader_acceptance(tmp_path, monkey
     monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@writer:domain")
     _mock_sync(monkeypatch)
+    _mock_notify(monkeypatch)
 
     assert _response_json(
         await projectflow(
@@ -1231,6 +1251,7 @@ async def test_projectflow_ready_nodes_rejects_ineffective_dependency(tmp_path, 
     monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     _mock_sync(monkeypatch)
+    _mock_notify(monkeypatch)
 
     response = await projectflow(
         action="create_project",
@@ -1471,6 +1492,7 @@ async def test_delegate_task_pushes_after_creation(tmp_path, monkeypatch):
     monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@leader:domain")
     mock = _mock_sync(monkeypatch)
+    _mock_notify(monkeypatch)
 
     response = await projectflow(
         action="create_project",
@@ -1542,3 +1564,148 @@ async def test_ack_task_missing_spec_does_not_write_in_progress(tmp_path, monkey
     assert "spec" in payload["error"]
     meta = json.loads((task_dir / "meta.json").read_text())
     assert meta["status"] == "assigned"
+
+
+@pytest.mark.asyncio
+async def test_delegate_task_notification_failure_leaves_task_pending(
+    tmp_path, monkeypatch,
+):
+    """When notification fails, delegate_task must not record state."""
+    working_dir = tmp_path / "worker" / ".copaw"
+    workspace = working_dir / "workspaces" / "default"
+    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    _set_actor(monkeypatch, "@lead:domain")
+    _mock_sync(monkeypatch)
+
+    async def failing_notify(**kwargs):
+        return {"sent": False, "error": "worker not in room"}
+
+    monkeypatch.setattr(taskflow_tool, "_notify_task_assignment", failing_notify)
+
+    await projectflow(
+        action="create_project",
+        payload={"projectId": "tp-01", "title": "Test"},
+    )
+    await projectflow(
+        action="plan_dag",
+        payload={
+            "projectId": "tp-01",
+            "tasks": [
+                {
+                    "taskId": "st-01",
+                    "title": "Do stuff",
+                    "assignedTo": "@worker-a:domain",
+                    "dependsOn": [],
+                },
+            ],
+        },
+    )
+
+    response = await taskflow(
+        action="delegate_task",
+        payload={
+            "projectId": "tp-01",
+            "taskId": "st-01",
+            "roomId": "room:!team-room:domain",
+            "spec": "Do the stuff.",
+        },
+    )
+    payload = _response_json(response)
+    assert payload["ok"] is False
+    assert "not in room" in payload["error"]
+    # Task must NOT be recorded — still pending in the plan
+    plan = (workspace / "shared" / "projects" / "tp-01" / "plan.md").read_text()
+    assert "delegated" not in plan
+    # No task meta written
+    assert not (workspace / "shared" / "tasks" / "st-01" / "meta.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_delegate_task_notification_success_records_event_id(
+    tmp_path, monkeypatch,
+):
+    """Successful notification includes eventId in the response."""
+    working_dir = tmp_path / "worker" / ".copaw"
+    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    _set_actor(monkeypatch, "@lead:domain")
+    _mock_sync(monkeypatch)
+    _mock_notify(monkeypatch)
+
+    await projectflow(
+        action="create_project",
+        payload={"projectId": "tp-01", "title": "Test"},
+    )
+    await projectflow(
+        action="plan_dag",
+        payload={
+            "projectId": "tp-01",
+            "tasks": [
+                {
+                    "taskId": "st-01",
+                    "title": "Do stuff",
+                    "assignedTo": "@worker-a:domain",
+                    "dependsOn": [],
+                },
+            ],
+        },
+    )
+
+    response = await taskflow(
+        action="delegate_task",
+        payload={
+            "projectId": "tp-01",
+            "taskId": "st-01",
+            "roomId": "room:!team-room:domain",
+            "spec": "Do the stuff.",
+        },
+    )
+    payload = _response_json(response)
+    assert payload["ok"] is True
+    assert payload["notification"]["sent"] is True
+    assert payload["notification"]["eventId"] == "$fake-event-id"
+    assert payload["task"]["status"] == "assigned"
+
+
+@pytest.mark.asyncio
+async def test_validate_delegate_task_returns_task_without_writing(
+    tmp_path, monkeypatch,
+):
+    """validate_delegate_task returns the DagTask without side effects."""
+    from copaw_worker.task import validate_delegate_task
+
+    working_dir = tmp_path / "worker" / ".copaw"
+    workspace = working_dir / "workspaces" / "default"
+    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+
+    await projectflow(
+        action="create_project",
+        payload={"projectId": "tp-01", "title": "Test"},
+    )
+    await projectflow(
+        action="plan_dag",
+        payload={
+            "projectId": "tp-01",
+            "tasks": [
+                {
+                    "taskId": "st-01",
+                    "title": "Do stuff",
+                    "assignedTo": "@worker-a:domain",
+                    "dependsOn": [],
+                },
+            ],
+        },
+    )
+
+    store = FileSystemTaskStore(workspace)
+    task = validate_delegate_task(
+        store,
+        project_id="tp-01",
+        task_id="st-01",
+        spec="Do the stuff.",
+    )
+    assert task.task_id == "st-01"
+    assert task.assigned_to == "@worker-a:domain"
+    # No state written
+    assert not (workspace / "shared" / "tasks" / "st-01" / "meta.json").exists()
+    plan = (workspace / "shared" / "projects" / "tp-01" / "plan.md").read_text()
+    assert "delegated" not in plan

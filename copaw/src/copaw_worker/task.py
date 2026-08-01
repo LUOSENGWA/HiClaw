@@ -431,15 +431,18 @@ def ready_nodes(store: TaskStore, *, project_id: str) -> list[DagTask]:
     ]
 
 
-def delegate_task(
+def validate_delegate_task(
     store: TaskStore,
     *,
     project_id: str,
     task_id: str,
     spec: str,
-    room_id: str | None = None,
-) -> TaskMeta:
-    """Create task meta/spec for a ready DAG node and mark it delegated."""
+) -> DagTask:
+    """Validate delegation preconditions without writing state.
+
+    Returns the validated DagTask so callers can inspect assignment
+    details (e.g. for Matrix notification) before committing.
+    """
     if not spec or not spec.strip():
         raise TaskflowError("spec is required")
     meta = store.read_project_meta(project_id)
@@ -459,6 +462,26 @@ def delegate_task(
     missing = [dep for dep in task.depends_on if dep not in effective]
     if missing:
         raise TaskflowError(f"task {task_id} is blocked by: {', '.join(missing)}")
+    return task
+
+
+def delegate_task(
+    store: TaskStore,
+    *,
+    project_id: str,
+    task_id: str,
+    spec: str,
+    room_id: str | None = None,
+) -> TaskMeta:
+    """Create task meta/spec for a ready DAG node and mark it delegated."""
+    task = validate_delegate_task(
+        store,
+        project_id=project_id,
+        task_id=task_id,
+        spec=spec,
+    )
+    plan = store.read_project_plan(project_id)
+    tasks = parse_loop_tasks(plan) if parse_plan_type(plan) == "loop" else parse_dag_tasks(plan)
 
     meta = TaskMeta(
         task_id=task.task_id,

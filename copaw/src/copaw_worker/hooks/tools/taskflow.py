@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
+import logging
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 from agentscope.message import TextBlock
@@ -13,6 +15,7 @@ from agentscope.tool import ToolResponse
 
 from copaw_worker.hooks.tools.filesync import create_sync
 from copaw_worker.task import (
+    DagTask,
     FileSystemTaskStore,
     RESULT_STATUSES,
     TaskMeta,
@@ -24,7 +27,14 @@ from copaw_worker.task import (
     delegate_task,
     is_effective_result,
     submit_task,
+    validate_delegate_task,
     validate_task_result,
+)
+
+logger = logging.getLogger(__name__)
+
+_MATRIX_USER_ID_RE = re.compile(
+    r"@[a-zA-Z0-9._=+/\-]+:[a-zA-Z0-9.\-]+(?::\d+)?",
 )
 
 
@@ -254,6 +264,130 @@ def _require_ack_preconditions(meta: TaskMeta, actor: str | None) -> None:
         raise TaskflowError(f"task {meta.task_id} is missing room_id")
 
 
+# ------------------------------------------------------------------
+# Task assignment notification (atomic with state recording)
+# ------------------------------------------------------------------
+
+
+def _resolve_worker_matrix_id(worker_name: str) -> str | None:
+    """Resolve a canonical worker name to a full Matrix user ID via AGENTS.md."""
+    agents_path = _runtime_root() / "AGENTS.md"
+    try:
+        lines = agents_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+
+    in_workers = False
+    for line in lines:
+        if line.strip() == "- **Team Workers**:":
+            in_workers = True
+            continue
+        if not in_workers:
+            continue
+        if not line.startswith("  - "):
+            break
+        match = _MATRIX_USER_ID_RE.search(line)
+        if not match:
+            continue
+        matrix_id = match.group(0)
+        localpart = matrix_id.split(":", 1)[0].removeprefix("@")
+        if localpart == worker_name:
+            return matrix_id
+    return None
+
+
+async def _check_room_membership(room_id: str, user_id: str) -> bool:
+    """Check if a user is a joined member of a Matrix room."""
+    from nio import AsyncClient
+
+    from copaw_worker.hooks.tools.message import _matrix_config_for_agent
+
+    homeserver, access_token, client_user_id = _matrix_config_for_agent("default")
+    client = AsyncClient(homeserver, user=client_user_id)
+    client.access_token = access_token
+    try:
+        response = await client.joined_members(room_id)
+        members = getattr(response, "members", None)
+        if members is None:
+            return False
+        return any(m.user_id == user_id for m in members)
+    finally:
+        await client.close()
+
+
+async def _notify_task_assignment(
+    *,
+    task: DagTask,
+    room_id: str,
+    spec: str,
+) -> dict[str, Any]:
+    """Send a Matrix notification for a task assignment.
+
+    Validates room membership, sends a message with m.mentions,
+    and returns the event_id on success.
+    """
+    assignee_matrix_id = _resolve_worker_matrix_id(
+        canonical_worker_id(task.assigned_to),
+    )
+    if not assignee_matrix_id:
+        return {
+            "sent": False,
+            "error": (
+                f"cannot resolve Matrix ID for worker "
+                f"'{canonical_worker_id(task.assigned_to)}' in AGENTS.md"
+            ),
+        }
+
+    try:
+        membership_ok = await _check_room_membership(room_id, assignee_matrix_id)
+    except Exception as exc:
+        return {"sent": False, "error": f"room membership check failed: {exc}"}
+    if not membership_ok:
+        return {
+            "sent": False,
+            "error": (
+                f"worker {assignee_matrix_id} is not a joined member "
+                f"of room {room_id}"
+            ),
+        }
+
+    try:
+        from copaw_worker.hooks.tools.message import (
+            _send_matrix_room_message,
+            build_matrix_text_content,
+        )
+    except ImportError:
+        return {
+            "sent": False,
+            "error": "message tool dependencies not available",
+        }
+
+    spec_preview = spec[:500] + ("..." if len(spec) > 500 else "")
+    notification_text = (
+        f"{assignee_matrix_id} "
+        f"You are assigned task **{task.task_id}**: {task.title}\n\n"
+        f"{spec_preview}"
+    )
+    mentions = [assignee_matrix_id]
+    content = build_matrix_text_content(notification_text, mentions)
+
+    try:
+        event_id = await _send_matrix_room_message(
+            room_id=room_id,
+            content=content,
+            account_id="default",
+        )
+    except Exception as exc:
+        return {"sent": False, "error": f"Matrix send failed: {exc}"}
+
+    return {
+        "sent": True,
+        "eventId": event_id,
+        "roomId": room_id,
+        "assignee": assignee_matrix_id,
+    }
+
+
 async def taskflow(
     action: str,
     payload: dict[str, Any] | str | None = None,
@@ -278,6 +412,29 @@ async def taskflow(
                     projectId=project_id,
                     taskId=task_id,
                 )
+            # Validate delegation preconditions before any side effects.
+            task = validate_delegate_task(
+                store,
+                project_id=project_id,
+                task_id=task_id,
+                spec=spec,
+            )
+            # Atomic: send Matrix notification BEFORE recording state.
+            # If notification fails, the task stays pending and retryable.
+            notification = await _notify_task_assignment(
+                task=task,
+                room_id=room_id,
+                spec=spec,
+            )
+            if not notification.get("sent"):
+                return _error(
+                    notification.get("error", "notification failed"),
+                    action=action,
+                    projectId=project_id,
+                    taskId=task_id,
+                    notification=notification,
+                )
+            # Record state only after successful notification.
             meta = delegate_task(
                 store,
                 project_id=project_id,
@@ -288,7 +445,12 @@ async def taskflow(
             task_path = f"shared/tasks/{task_id}/"
             sync = create_sync()
             sync.push_shared_path(task_path)
-            return _ok(action=action, task=asdict(meta), synced=True)
+            return _ok(
+                action=action,
+                task=asdict(meta),
+                synced=True,
+                notification=notification,
+            )
 
         if action == "check_task":
             task_id = _required_str(payload_data, "taskId")
