@@ -136,9 +136,7 @@ jobs:
             {"shard":"controller-cr","filter_env":"SHARD_C_TESTS","manager_runtime":"copaw","worker_runtime":"hermes","requires_secret":false}
           ]'
           if [ "$UNTRUSTED_PR" = "true" ]; then
-            MATRIX=$(echo "$MATRIX" | jq -c '[.[] | select(.requires_secret == false) | del(.requires_secret)]')
-          else
-            MATRIX=$(echo "$MATRIX" | jq -c '[.[] | del(.requires_secret)]')
+            MATRIX=$(echo "$MATRIX" | jq -c '[.[] | select(.requires_secret == false)]')
           fi
           echo "matrix={\"include\":$MATRIX}" >> "$GITHUB_OUTPUT"
 
@@ -370,6 +368,10 @@ jobs:
           # invalidate the parallel-runtime coverage we set up above.
           AGENTTEAMS_DEFAULT_WORKER_RUNTIME: ${{ matrix.worker_runtime }}
         run: |
+          if [ -z "${AGENTTEAMS_LLM_API_KEY}" ] && [ "${{ matrix.requires_secret }}" = "false" ]; then
+            export AGENTTEAMS_LLM_API_KEY="ci-no-llm-placeholder"
+            export AGENTTEAMS_CI_NO_LLM=1
+          fi
           FILTER="${{ github.event.inputs.test_filter }}"
           if [ -z "$FILTER" ]; then
             FILTER="${{ env[matrix.filter_env] }}"
