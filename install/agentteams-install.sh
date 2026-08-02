@@ -2681,11 +2681,11 @@ step_runtime() {
     log "$(msg worker_runtime.title)"
     echo ""
     # Upgrade migration: copaw → qwenpaw (copaw is the legacy name,
-    # unified to QwenPaw 2.0). Only applied during upgrades — a fresh
-    # install that explicitly requests AGENTTEAMS_DEFAULT_WORKER_RUNTIME=copaw
-    # keeps the copaw runtime (CI uses this to exercise the copaw worker
-    # dimension; the default worker runtime for fresh installs is qwenpaw).
-    if [ "${AGENTTEAMS_DEFAULT_WORKER_RUNTIME}" = "copaw" ] && [ "${AGENTTEAMS_UPGRADE}" = "1" ]; then
+    # unified to QwenPaw 2.0). The redirect is unconditional so fresh
+    # installs never default new Workers to the legacy copaw runtime;
+    # CI's copaw-copaw shard exercises the real copaw worker by passing an
+    # explicit spec.runtime / manifest runtime in the test itself.
+    if [ "${AGENTTEAMS_DEFAULT_WORKER_RUNTIME}" = "copaw" ]; then
         log "Migrating default Worker runtime: copaw → qwenpaw"
         AGENTTEAMS_DEFAULT_WORKER_RUNTIME="qwenpaw"
     fi
@@ -3398,10 +3398,8 @@ install_manager() {
     fi
     AGENTTEAMS_MANAGER_RUNTIME="${AGENTTEAMS_MANAGER_RUNTIME:-qwenpaw}"
     export AGENTTEAMS_MANAGER_RUNTIME
-    # Migrate legacy copaw → qwenpaw (covers --skip and non-interactive paths).
-    # Only applied during upgrades; fresh installs keep an explicit copaw
-    # request so CI can exercise the copaw worker runtime dimension.
-    if [ "${AGENTTEAMS_DEFAULT_WORKER_RUNTIME}" = "copaw" ] && [ "${AGENTTEAMS_UPGRADE}" = "1" ]; then
+    # Migrate legacy copaw → qwenpaw (covers --skip and non-interactive paths)
+    if [ "${AGENTTEAMS_DEFAULT_WORKER_RUNTIME}" = "copaw" ]; then
         AGENTTEAMS_DEFAULT_WORKER_RUNTIME="qwenpaw"
     fi
     AGENTTEAMS_DEFAULT_WORKER_RUNTIME="${AGENTTEAMS_DEFAULT_WORKER_RUNTIME:-qwenpaw}"

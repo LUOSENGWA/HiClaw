@@ -81,7 +81,7 @@ _minio_worker_yaml() {
 # ============================================================
 log_section "Create Worker ${TEST_WORKER}"
 
-CREATE_OUTPUT=$(exec_in_agent agt create worker --name "${TEST_WORKER}" --no-wait 2>&1)
+CREATE_OUTPUT=$(exec_in_agent agt create worker --name "${TEST_WORKER}" --runtime "${TEST_WORKER_RUNTIME}" --no-wait 2>&1)
 CREATE_EXIT=$?
 if [ "${CREATE_EXIT}" -eq 0 ]; then
     log_pass "agt create worker accepted"
@@ -225,7 +225,7 @@ fi
 # ============================================================
 log_section "Reuse Name After Delete"
 
-RECREATE_OUTPUT=$(exec_in_agent agt create worker --name "${TEST_WORKER}" --no-wait 2>&1)
+RECREATE_OUTPUT=$(exec_in_agent agt create worker --name "${TEST_WORKER}" --runtime "${TEST_WORKER_RUNTIME}" --no-wait 2>&1)
 RECREATE_EXIT=$?
 if [ "${RECREATE_EXIT}" -eq 0 ]; then
     log_pass "Recreate with same name accepted"
