@@ -76,7 +76,7 @@ Use the `message` tool only when the target room is not the current room, or whe
 
 Resolve the recipient Matrix ID and target room from `agt` CLI immediately before sending.
 
-For Team work, the Worker assignment is delivered by the `taskflow(delegate_task)` auto-notification in the Team Room; do not send it again with `message`. Use the `message` tool only for a requester status update when the requester is in a different room than the current session:
+For Team work, the Worker assignment is delivered by the `taskflow(delegate_task)` auto-notification in the Team Room; do not send it again with `message`. Use the `message` tool only for explicit cross-room sends — a requester status update when the requester is in a different room than the current session:
 
 ```json
 {

@@ -841,6 +841,10 @@ test_summary() {
 
 # Check if LLM API key is configured (required for tests that need Manager Agent responses)
 require_llm_key() {
+    if [ "${AGENTTEAMS_CI_NO_LLM:-0}" = "1" ]; then
+        log_info "SKIP: CI no-LLM mode (placeholder key cannot reach the model)"
+        return 1
+    fi
     if [ -z "${AGENTTEAMS_LLM_API_KEY}" ]; then
         log_info "SKIP: No LLM API key configured (set AGENTTEAMS_LLM_API_KEY). This test requires Manager Agent LLM responses."
         return 1
