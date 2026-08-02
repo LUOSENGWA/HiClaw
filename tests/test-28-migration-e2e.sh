@@ -417,7 +417,7 @@ AGENT_TOKEN=$(jq -r ".channels.matrix.access_token // \"\"" "${QW}/workspaces/de
 if [ "${CFG_TOKEN}" != "NEW_MATRIX_TOKEN" ]; then echo "FAIL:config_token=${CFG_TOKEN}"; exit 1; fi
 if [ "${AGENT_TOKEN}" != "NEW_MATRIX_TOKEN" ]; then echo "FAIL:agent_token=${AGENT_TOKEN}"; exit 1; fi
 # 2. QA profile disabled + default profile present (prevents legacy migration)
-QA_ENABLED=$(jq -r ".agents.profiles[\"QwenPaw_QA_Agent_0.2\"].enabled // \"missing\"" "${QW}/config.json")
+QA_ENABLED=$(jq -r ".agents.profiles[\"QwenPaw_QA_Agent_0.2\"].enabled | tostring" "${QW}/config.json")
 DEFAULT_ID=$(jq -r ".agents.profiles[\"default\"].id // \"missing\"" "${QW}/config.json")
 if [ "${QA_ENABLED}" != "false" ]; then echo "FAIL:qa_enabled=${QA_ENABLED}"; exit 1; fi
 if [ "${DEFAULT_ID}" != "default" ]; then echo "FAIL:default_profile=${DEFAULT_ID}"; exit 1; fi
@@ -427,7 +427,7 @@ if [ ! -f "${SECRET}/envs.json" ]; then echo "FAIL:envs_missing"; exit 1; fi
 #   NOTE: providers.json is Controller-owned — the bridge re-writes it
 #   with the current openclaw.json LLM config (active_llm), so verify
 #   the bridge output, NOT the legacy content.
-if ! jq -e '.active_llm.provider_id == "test-llm" and .active_llm.model == "qwen3.6-27b"' "${SECRET}/providers.json" >/dev/null 2>&1; then echo "FAIL:providers"; exit 1; fi
+if ! jq -e ".active_llm.provider_id == \"test-llm\" and .active_llm.model == \"qwen3.6-27b\"" "${SECRET}/providers.json" >/dev/null 2>&1; then echo "FAIL:providers"; exit 1; fi
 if [ "$(cat "${QW}/sessions/user1.jsonl")" != "session-data" ]; then echo "FAIL:sessions"; exit 1; fi
 if [ "$(cat "${QW}/memory/2026-08-01.md")" != "memory-note" ]; then echo "FAIL:memory"; exit 1; fi
 if [ "$(cat "${QW}/workspaces/default/SOUL.md")" != "# SOUL legacy" ]; then echo "FAIL:soul"; exit 1; fi
