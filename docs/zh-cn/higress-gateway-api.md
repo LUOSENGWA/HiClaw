@@ -28,19 +28,32 @@ Console API（**控制面**）。
 
 ### 1. LLM OpenAI 兼容 API
 
-AI 路由 `default-ai-route`（路径前缀 `/v1`，上游由 `AGENTTEAMS_LLM_PROVIDER` 决定）暴露
-OpenAI 兼容的 LLM 端点。请求必须携带调用方的 Consumer key。
+AI 路由 `default-ai-route`（路径前缀 `/v1`，上游由 `AGENTTEAMS_LLM_PROVIDER` 决定）通过
+Higress 的 `ai-proxy` 插件暴露 OpenAI 兼容的 LLM 端点。请求必须携带调用方的 Consumer key。
 
 ```
-POST /v1/chat/completions
-GET  /v1/models
+POST /v1/chat/completions   # 对话补全（支持流式）
+POST /v1/embeddings         # 向量化（配置 memorySearch 时使用）
 ```
 
-示例（在 Worker 容器内执行）：
+`GET /v1/models` 在 Higress 中并不是完整的 OpenAI 模型列表端点——`ai-proxy` 插件只匹配
+`/v1/chat/completions` 和 `/v1/embeddings` 路径。从 Worker 执行 `curl /v1/models` 仍有
+价值，它是**认证/连通性检查**——`401`/`403` 说明 Consumer key 或 `allowedConsumers`
+配置有误，`404` 说明该路径不是 ai-proxy 路由（见 Worker 指南的故障排查章节）。
+
+`/v1/chat/completions` 也是 controller 在 Manager/Worker 上线前验证其 Consumer 是否
+已被 AI 路由授权的就绪探测端点（`agentteams-controller/internal/service/provisioner.go`
+中的 `IsManagerLLMAuthReady`）。
+
+示例——验证 Consumer 是否已被 AI 路由授权（在 Worker 容器内执行，探测体与 controller 的
+`IsManagerLLMAuthReady` 一致）：
 
 ```bash
-curl -sf http://aigw-local.agentteams.io:8080/v1/models \
-  -H "Authorization: Bearer ${AGENTTEAMS_WORKER_GATEWAY_KEY}"
+# 200 = 已授权；401 = key 错误；403 = 不在 allowedConsumers；404 = 路径错误
+curl -s -o /dev/null -w '%{http_code}\n' http://aigw-local.agentteams.io:8080/v1/chat/completions \
+  -H "Authorization: Bearer ${AGENTTEAMS_WORKER_GATEWAY_KEY}" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"<model>\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with only one word: ok\"}]}"
 ```
 
 认证方式为按身份区分的 **key-auth**（Bearer）。每个 Manager/Worker Consumer 都以自己的
@@ -52,6 +65,7 @@ AI 路由。该授权由 controller 通过 `AuthorizeAIRoutes` / `DeauthorizeAIR
 
 每个注册到 Higress 的 MCP Server 都暴露在 AI 网关域名的 `/mcp-servers/{name}/mcp` 下。
 `name` 是 MCP Server 名称——对于内置 GitHub MCP Server，它是 `mcp-github`。
+`transport: http`（Streamable HTTP）对应此 URL；mcporter 默认使用。
 
 ```
 POST /mcp-servers/{name}/mcp
@@ -81,7 +95,9 @@ controller（嵌入式栈）或旧版 `setup-higress.sh` / `setup-mcp-server.sh`
 worker-{name}-{port}-local.agentteams.io
 ```
 
-示例：Worker `alice` 暴露端口 `8080` → `http://worker-alice-8080-local.agentteams.io`。
+示例：Worker `alice` 暴露端口 `8080` 后，可从 `agentteams-net` 网络内通过
+`http://worker-alice-8080-local.agentteams.io:8080` 访问（宿主机上为 `:18080`，与网关
+发布端口一致）。域名绑定在网关端口上，因此访问端口是网关端口，而不是 Worker 的内部端口。
 
 暴露的路由**不启用认证**（设计如此，公开访问）；controller 在 reconcile 过程中创建
 Higress 的 domain、service source 和 route（`agentteams-controller/internal/service/provisioner_expose.go`
@@ -100,6 +116,20 @@ Higress 的 domain、service source 和 route（`agentteams-controller/internal/
 
 这些资源在首次启动时由 `setup-higress.sh`（非幂等，受 marker 保护）或嵌入式栈的
 controller initializer 创建。
+
+## 认证方式汇总
+
+| 接口 | 机制 | 凭据 |
+|------|------|------|
+| LLM AI 路由（`/v1/*`） | key-auth WASM（Bearer） | Consumer `GatewayKey`（`Authorization: Bearer <key>`） |
+| MCP 端点（`/mcp-servers/*`） | key-auth（Bearer），经 `consumerAuthInfo` | Consumer `GatewayKey` |
+| 暴露的 Worker 端口 | 无（公开） | — |
+| OpenClaw Console 路由 | basic-auth | `AGENTTEAMS_ADMIN_USER` / `AGENTTEAMS_ADMIN_PASSWORD` |
+| Higress Console API | session cookie | `POST /session/login` |
+
+Consumer key 由 controller 按 Manager/Worker 分别生成，并注入为
+`AGENTTEAMS_MANAGER_GATEWAY_KEY` / `AGENTTEAMS_WORKER_GATEWAY_KEY`。AI 路由上的授权
+通过 `authConfig.allowedConsumers` 按 Consumer 隔离。
 
 ## 控制面 —— Higress Console API
 
@@ -124,6 +154,7 @@ controller 和旧版脚本通过 Higress Console REST API（容器内 `http://12
 | `/v1/service-sources/{name}` | PUT, DELETE | 更新 / 删除服务源 |
 | `/v1/routes` | GET, POST | 列出 / 创建经典路由 |
 | `/v1/routes/{name}` | PUT, DELETE | 更新 / 删除经典路由 |
+| `/v1/routes/{name}/plugin-instances/{plugin}` | PUT | 启用 / 配置路由插件（如 OpenClaw Console 路由上的 `basic-auth`） |
 | `/v1/mcpServer` | GET, PUT | 列出 / 覆盖 MCP Server |
 | `/v1/mcpServer/consumers` | GET, PUT | 查询 / 授权 MCP Server 上的 Consumer |
 | `/system/higress-config` | GET, PUT | 读取 / 修改网关配置（如 stream `idleTimeout`） |

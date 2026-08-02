@@ -31,19 +31,34 @@ gateway (the **control plane**).
 ### 1. LLM OpenAI-compatible API
 
 The AI route `default-ai-route` (path prefix `/v1`, upstream selected by
-`AGENTTEAMS_LLM_PROVIDER`) exposes the OpenAI-compatible LLM endpoints. Requests must
-carry the caller's consumer key.
+`AGENTTEAMS_LLM_PROVIDER`) exposes OpenAI-compatible LLM endpoints through Higress's
+`ai-proxy` plugin. Requests must carry the caller's consumer key.
 
 ```
-POST /v1/chat/completions
-GET  /v1/models
+POST /v1/chat/completions   # chat completions (streaming supported)
+POST /v1/embeddings         # embeddings (used by memorySearch when configured)
 ```
 
-Example (run inside a Worker container):
+`GET /v1/models` is not a full OpenAI models-list endpoint in Higress; the
+`ai-proxy` plugin matches `/v1/chat/completions` and `/v1/embeddings` paths only.
+A `curl /v1/models` probe is still useful from a Worker as an **auth/connectivity
+check** — a `401`/`403` proves the consumer key or `allowedConsumers` is wrong,
+while a `404` means the path simply isn't an ai-proxy route (see the Worker Guide
+troubleshooting section).
+
+`/v1/chat/completions` is also the readiness probe the controller uses to verify a
+Manager/Worker consumer is authorized on the AI route before onboarding
+(`IsManagerLLMAuthReady` in `agentteams-controller/internal/service/provisioner.go`).
+
+Example — verify a consumer is authorized on the AI route (run inside a Worker container,
+using the same probe shape as the controller's `IsManagerLLMAuthReady`):
 
 ```bash
-curl -sf http://aigw-local.agentteams.io:8080/v1/models \
-  -H "Authorization: Bearer ${AGENTTEAMS_WORKER_GATEWAY_KEY}"
+# 200 = authorized; 401 = bad key; 403 = not on allowedConsumers; 404 = wrong path
+curl -s -o /dev/null -w '%{http_code}\n' http://aigw-local.agentteams.io:8080/v1/chat/completions \
+  -H "Authorization: Bearer ${AGENTTEAMS_WORKER_GATEWAY_KEY}" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"<model>\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with only one word: ok\"}]}"
 ```
 
 Authentication is per-identity **key-auth** (Bearer). Each Manager/Worker consumer is
@@ -56,7 +71,8 @@ list it in `authConfig.allowedConsumers`. This is managed by the controller thro
 
 Each MCP server registered in Higress is exposed under `/mcp-servers/{name}/mcp` on the
 AI Gateway domain. The name is the MCP server name — for the bundled GitHub MCP server
-this is `mcp-github`.
+this is `mcp-github`. `transport: http` (Streamable HTTP) maps to this URL; mcporter
+uses it by default.
 
 ```
 POST /mcp-servers/{name}/mcp
@@ -87,7 +103,11 @@ Auto-generated domain pattern:
 worker-{name}-{port}-local.agentteams.io
 ```
 
-Example: worker `alice` exposing port `8080` → `http://worker-alice-8080-local.agentteams.io`.
+Example: worker `alice` exposing port `8080` becomes reachable at
+`http://worker-alice-8080-local.agentteams.io:8080` from inside the
+`agentteams-net` network (or `:18080` on the host, matching the gateway publish
+port). The domain is bound on the gateway, so the port is the gateway port, not
+the worker's internal port.
 
 Exposed routes have **no authentication** (public access by design); the controller
 creates the Higress domain, service source, and route during reconciliation
@@ -107,6 +127,20 @@ The installer also registers routes for the services bundled with the embedded s
 
 These are created once on first boot by `setup-higress.sh` (non-idempotent, marker
 protected) or by the controller initializer on embedded stacks.
+
+## Authentication summary
+
+| Interface | Mechanism | Credential |
+|-----------|-----------|------------|
+| LLM AI route (`/v1/*`) | key-auth WASM (Bearer) | Consumer `GatewayKey` (`Authorization: Bearer <key>`) |
+| MCP endpoints (`/mcp-servers/*`) | key-auth (Bearer) via `consumerAuthInfo` | Consumer `GatewayKey` |
+| Exposed Worker ports | none (public) | — |
+| OpenClaw Console route | basic-auth | `AGENTTEAMS_ADMIN_USER` / `AGENTTEAMS_ADMIN_PASSWORD` |
+| Higress Console API | session cookie | `POST /session/login` |
+
+Consumer keys are generated per Manager/Worker by the controller and injected as
+`AGENTTEAMS_MANAGER_GATEWAY_KEY` / `AGENTTEAMS_WORKER_GATEWAY_KEY`. Authorization on
+AI routes is scoped per consumer through `authConfig.allowedConsumers`.
 
 ## Control plane — Higress Console API
 
@@ -131,6 +165,7 @@ bootstraps the admin account, `POST /session/login` obtains the cookie.
 | `/v1/service-sources/{name}` | PUT, DELETE | Update / remove a service source |
 | `/v1/routes` | GET, POST | List / create classic routes |
 | `/v1/routes/{name}` | PUT, DELETE | Update / remove a classic route |
+| `/v1/routes/{name}/plugin-instances/{plugin}` | PUT | Enable / configure a route plugin (e.g. `basic-auth` on the OpenClaw Console route) |
 | `/v1/mcpServer` | GET, PUT | List / upsert MCP servers |
 | `/v1/mcpServer/consumers` | GET, PUT | Query / authorize consumers on an MCP server |
 | `/system/higress-config` | GET, PUT | Read / patch gateway config (e.g. stream `idleTimeout`) |
