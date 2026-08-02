@@ -18,7 +18,7 @@ gateway (the **control plane**).
 | Higress Console API | (controller-internal) | `8001` | `18001` (`AGENTTEAMS_PORT_CONSOLE`) |
 | Matrix homeserver | `matrix-local.agentteams.io` | `8080` | `18080` |
 | Element Web | `matrix-client-local.agentteams.io` | `8080` (via gateway) / `8088` (direct) | `18080` (via gateway) / `18088` (direct, `AGENTTEAMS_PORT_ELEMENT_WEB`) |
-| MinIO file system | `fs-local.agentteams.io` | `9000` (MinIO S3 API, **not** gateway `8080`) | via gateway (`18080`); no direct host mapping |
+| MinIO file system | `fs-local.agentteams.io` | `9000` (MinIO S3 API, **not** gateway `8080`; controller rewrites `:8080` → `:9000`) | no direct host mapping |
 | OpenClaw Console | `console-local.agentteams.io` | `8080` (via gateway) / `18888` (direct) | `18080` (via gateway) / `18888` (direct) |
 
 > **Port note**: inside the `agentteams-net` Docker network (i.e. from a Worker or

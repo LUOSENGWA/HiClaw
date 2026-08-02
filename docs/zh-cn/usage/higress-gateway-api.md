@@ -17,7 +17,7 @@ Console API（**控制面**）。
 | Higress Console API | （Controller 内部） | `8001` | `18001`（`AGENTTEAMS_PORT_CONSOLE`） |
 | Matrix 服务器 | `matrix-local.agentteams.io` | `8080` | `18080` |
 | Element Web | `matrix-client-local.agentteams.io` | `8080`（经网关）/ `8088`（直连） | `18080`（经网关）/ `18088`（直连，`AGENTTEAMS_PORT_ELEMENT_WEB`） |
-| MinIO 文件系统 | `fs-local.agentteams.io` | `9000`（MinIO S3 API，**不是**网关 `8080`） | 经网关（`18080`）；无独立宿主映射 |
+| MinIO 文件系统 | `fs-local.agentteams.io` | `9000`（MinIO S3 API，**不是**网关 `8080`；controller 会把 `:8080` 重写为 `:9000`） | 无独立宿主映射 |
 | OpenClaw Console | `console-local.agentteams.io` | `8080`（经网关）/ `18888`（直连） | `18080`（经网关）/ `18888`（直连） |
 
 > **端口说明**：在 `agentteams-net` Docker 网络内（即从 Worker 或 Manager 容器内访问），
