@@ -288,7 +288,7 @@ POST http://aigw-local.agentteams.io:8080/mcp-servers/mcp-github/mcp
 Authorization: Bearer {GatewayKey}
 ```
 
-Central MCP registration + per-Consumer `allowedConsumers` + mcporter config pointing at Gateway endpoints. See the [Higress Gateway API reference](higress-gateway-api.md) for the full list of externally callable endpoints and ports.
+Central MCP registration + per-Consumer `allowedConsumers` + mcporter config pointing at Gateway endpoints. See the [Higress Gateway API reference](../usage/higress-gateway-api.md) for the full list of externally callable endpoints and ports.
 
 #### Fine-grained control
 
