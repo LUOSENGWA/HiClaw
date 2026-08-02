@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASH_INSTALLER="${ROOT_DIR}/install/agentteams-install.sh"
 POWERSHELL_INSTALLER="${ROOT_DIR}/install/agentteams-install.ps1"
+INTEGRATION_WORKFLOW="${ROOT_DIR}/.github/workflows/test-integration.yml"
 
 fail() {
     echo "FAIL: $*" >&2
@@ -77,5 +78,11 @@ for manager_crd in \
     grep -Eq 'enum: \[[^]]*copaw[^]]*\]' "${manager_crd}" ||
         fail "Manager CRD must keep accepting CoPaw while the installer defaults to CoPaw: ${manager_crd}"
 done
+
+# Fork CI must exercise the PR-built QwenPaw Manager explicitly without
+# changing the public installer's CoPaw default or registry pull behavior.
+grep -Fq 'AGENTTEAMS_INSTALL_MANAGER_COPAW_IMAGE: agentteams/manager-qwenpaw:latest' \
+    "${INTEGRATION_WORKFLOW}" ||
+    fail "Integration CI must explicitly map the CoPaw compatibility label to the PR-built QwenPaw Manager image"
 
 echo "PASS: installers keep QwenPaw behind the release gate"

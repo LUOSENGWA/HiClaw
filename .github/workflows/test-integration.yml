@@ -360,6 +360,10 @@ jobs:
           AGENTTEAMS_LLM_PROVIDER: qwen
           AGENTTEAMS_DEFAULT_MODEL: ${{ inputs.model || 'qwen3.6-plus' }}
           AGENTTEAMS_MANAGER_RUNTIME: ${{ matrix.manager_runtime }}
+          # Keep the public installer on CoPaw until release, while exercising
+          # this PR's QwenPaw Manager through the existing CoPaw compatibility
+          # runtime label in integration CI.
+          AGENTTEAMS_INSTALL_MANAGER_COPAW_IMAGE: agentteams/manager-qwenpaw:latest
           # Propagate the worker runtime to worker-creating tests too. Without
           # this the apply-zip path (test-15) silently falls back to openclaw
           # on the copaw and hermes matrix entries because the controller's
