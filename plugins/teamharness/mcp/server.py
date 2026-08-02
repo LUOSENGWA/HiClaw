@@ -2248,7 +2248,7 @@ def _runtime_leader_dm_admin_user_id(config: dict[str, Any]) -> str:
     return ""
 
 
-def _matrix_room_member_user_ids(room_id: str) -> list[str]:
+def _matrix_room_member_user_ids(room_id: str, memberships: set[str] | None = None) -> list[str]:
     homeserver, token = _matrix_env("roomflow")
     encoded_room = urllib.parse.quote(room_id, safe="")
     request = urllib.request.Request(
@@ -2257,6 +2257,7 @@ def _matrix_room_member_user_ids(room_id: str) -> list[str]:
     )
     with urllib.request.urlopen(request, timeout=10) as response:
         data = json.loads(response.read().decode("utf-8") or "{}")
+    allowed = memberships or {"join", "invite"}
     members: list[str] = []
     for event in data.get("chunk", []):
         if not isinstance(event, dict):
@@ -2264,7 +2265,7 @@ def _matrix_room_member_user_ids(room_id: str) -> list[str]:
         user_id = str(event.get("state_key") or "").strip()
         content = event.get("content") if isinstance(event.get("content"), dict) else {}
         membership = str(content.get("membership") or "").strip()
-        if user_id and membership in {"join", "invite"}:
+        if user_id and membership in allowed:
             members.append(user_id)
     return members
 
@@ -3824,7 +3825,7 @@ def _validate_assignee_membership(room_id: str, assignee: str) -> dict[str, Any]
     if not assignee_mxid.startswith("@"):
         return {"ok": True, "skipped": f"assignee is a display name, not an mxid: {assignee}"}
     try:
-        members = _matrix_room_member_user_ids(matrix_room_id)
+        members = _matrix_room_member_user_ids(matrix_room_id, {"join"})
     except (ValueError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         return {"ok": False, "error": f"cannot verify room membership: {exc}"}
     if assignee_mxid in members:
@@ -3947,7 +3948,9 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
 
             # Idempotent retry of a fully assigned task: the automatic
             # notification was already delivered (event_id recorded) - return
-            # the existing assignment instead of sending a duplicate.
+            # the existing assignment instead of sending a duplicate. The
+            # assigned state must still reach shared storage: if the sync
+            # fails, return a retryable failure so a later retry finishes it.
             if str(existing_task.get("status") or "") == "assigned" and existing_task.get("eventId"):
                 notification_reused = {
                     "sent": True,
@@ -3957,12 +3960,30 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     "reused": True,
                 }
                 existing_task["notification"] = notification_reused
+                synced = _sync_task(arguments, task_id)
+                if not synced:
+                    return {
+                        "ok": False,
+                        "tool": "taskflow",
+                        "action": action,
+                        "task": existing_task,
+                        "synced": False,
+                        "error": "task is assigned but shared-storage sync failed",
+                        "retryable": True,
+                        "notification": notification_reused,
+                        "notificationNeeded": _notification_needed(
+                            "delegate_task",
+                            project or {"project_id": project_id},
+                            existing_task,
+                            summary=f"delegate_task: {task_id} assigned to {assigned_to}",
+                        ),
+                    }
                 return {
                     "ok": True,
                     "tool": "taskflow",
                     "action": action,
                     "task": existing_task,
-                    "synced": _sync_task(arguments, task_id),
+                    "synced": True,
                     "notification": notification_reused,
                     "notificationNeeded": _notification_needed(
                         "delegate_task",
@@ -4013,8 +4034,28 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 task["source_room_id"] = source_room_id
             _write_task(arguments, task)
             # Publish task files to shared storage FIRST so a Worker that
-            # receives the notification can read spec.md/meta.json.
+            # receives the notification can read spec.md/meta.json. If the
+            # publish fails, keep the task prepared and do NOT send the Matrix
+            # notification - a Worker must never receive a reference to files
+            # that were not published. A retry re-publishes (idempotent) and
+            # only then proceeds to notify.
             synced = _sync_task(arguments, task_id)
+            if not synced:
+                return {
+                    "ok": False,
+                    "tool": "taskflow",
+                    "action": action,
+                    "task": task,
+                    "synced": False,
+                    "error": "failed to publish task files to shared storage",
+                    "retryable": True,
+                    "notificationNeeded": _notification_needed(
+                        "delegate_task",
+                        project or {"project_id": project_id},
+                        task,
+                        summary=f"delegate_task: {task_id} files pending publish",
+                    ),
+                }
 
             task_title = str(payload.get("title") or "").strip()
             if not task_title:
@@ -4077,12 +4118,34 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 project_task_updates["source_room_id"] = source_room_id
             _update_project_task(arguments, project_id, task_id, **project_task_updates)
             synced = _sync_task(arguments, task_id)
+            if not synced:
+                # The assignment was committed locally and the notification
+                # was sent, but the assigned state did not reach shared
+                # storage. Return a retryable failure instead of reporting
+                # success: the idempotent retry (assigned + eventId) finishes
+                # the sync without sending a duplicate notification.
+                return {
+                    "ok": False,
+                    "tool": "taskflow",
+                    "action": action,
+                    "task": task,
+                    "synced": False,
+                    "error": "task assigned but shared-storage sync failed; retry to complete",
+                    "retryable": True,
+                    "notification": notification,
+                    "notificationNeeded": _notification_needed(
+                        "delegate_task",
+                        project or {"project_id": project_id},
+                        task,
+                        summary=f"delegate_task: {task_id} assigned to {assigned_to}",
+                    ),
+                }
             return {
                 "ok": True,
                 "tool": "taskflow",
                 "action": action,
                 "task": task,
-                "synced": synced,
+                "synced": True,
                 "notification": notification,
                 "notificationNeeded": _notification_needed(
                     "delegate_task",

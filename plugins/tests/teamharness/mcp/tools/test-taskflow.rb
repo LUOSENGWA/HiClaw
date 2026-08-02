@@ -117,6 +117,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
                 members = [
                     {"state_key": "@worker-a:example.test", "content": {"membership": "join"}},
                     {"state_key": "@worker-remote:example.test", "content": {"membership": "join"}},
+                    {"state_key": "@worker-invited:example.test", "content": {"membership": "invite"}},
                     {"state_key": "@admin:example.test", "content": {"membership": "join"}},
                 ]
                 payload = {"chunk": members}
@@ -612,6 +613,54 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     after_events = len(matrix["events"])
     if after_events != before_events:
         raise AssertionError("idempotent re-delegation must not send another notification")
+
+    # --- Room membership must be strictly "join": delegating to an
+    #     invited-but-not-joined Worker returns a retryable error, sends no
+    #     notification, and never assigns the task.
+    invite_project_id = "invite-project"
+    invite_task_id = "invite-task"
+    payload("projectflow", {
+        "action": "create_project",
+        "payload": {
+            "projectId": invite_project_id,
+            "title": "Invited Only Project",
+        },
+    })
+    payload("projectflow", {
+        "action": "plan_dag",
+        "payload": {
+            "projectId": invite_project_id,
+            "tasks": [{
+                "taskId": invite_task_id,
+                "title": "Invited but not joined",
+                "assignedTo": "@worker-invited:example.test",
+                "dependsOn": [],
+            }],
+        },
+    })
+    before_invite_events = len(matrix["events"])
+    invited_delegate = payload("taskflow", {
+        "role": "leader",
+        "action": "delegate_task",
+        "payload": {
+            "projectId": invite_project_id,
+            "taskId": invite_task_id,
+            "roomId": "room:!team:example.test",
+            "spec": "Invited worker cannot be delegated.",
+        },
+    })
+    if invited_delegate.get("ok") or not invited_delegate.get("retryable"):
+        raise AssertionError(f"delegation to an invited-but-not-joined Worker should be retryable: {invited_delegate!r}")
+    if "not a joined member" not in invited_delegate.get("error", ""):
+        raise AssertionError(f"membership error should mention the join requirement: {invited_delegate!r}")
+    after_invite_events = len(matrix["events"])
+    if after_invite_events != before_invite_events:
+        raise AssertionError("delegation to an invited Worker must not send a notification")
+    invite_meta_path = pathlib.Path("#{workspace}") / f"shared/tasks/{invite_task_id}/meta.json"
+    if invite_meta_path.exists():
+        invite_meta = json.loads(invite_meta_path.read_text(encoding="utf-8"))
+        if invite_meta.get("status") == "assigned":
+            raise AssertionError(f"delegation to an invited Worker must not assign the task: {invite_meta!r}")
 
     checked = payload("taskflow", {
         "role": "leader",
