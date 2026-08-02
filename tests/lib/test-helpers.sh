@@ -209,7 +209,12 @@ wait_for_manager_agent_ready() {
     while [ "${elapsed}" -lt "${timeout}" ]; do
         case "${manager_runtime}" in
             copaw|qwenpaw)
-                if docker exec "${agent_container}" pgrep -f "copaw(_worker\\.run_copaw_app)? app" >/dev/null 2>&1 && \
+                # Both runtimes launch QwenPaw 2.0 in the same image; the process
+                # cmdline may be "copaw" (run_copaw_app.py via runpy) or "qwenpaw"
+                # (direct python3 -m qwenpaw app) — accept both (mirrors
+                # test-01-manager-boot.sh).
+                if { docker exec "${agent_container}" pgrep -f "copaw(_worker\\.run_copaw_app)? app" >/dev/null 2>&1 || \
+                     docker exec "${agent_container}" pgrep -f "qwenpaw app" >/dev/null 2>&1; } && \
                    docker exec "${agent_container}" curl -sf http://127.0.0.1:18799/ >/dev/null 2>&1; then
                     runtime_ready=true
                     break

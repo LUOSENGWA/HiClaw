@@ -3811,7 +3811,6 @@ def _send_delegate_notification(
     title: str,
     assignee: str,
     spec: str,
-    txn_id: str,
 ) -> dict[str, Any]:
     """Send the automatic Worker assignment notification for delegate_task.
 
@@ -3971,7 +3970,6 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         title=task_title or task_id,
                         assignee=assignment_mxid,
                         spec=spec,
-                        txn_id=f"delegate-{task_id}",
                     )
                 except Exception as exc:
                     notification = {
