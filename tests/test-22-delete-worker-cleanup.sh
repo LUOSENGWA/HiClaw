@@ -23,6 +23,7 @@ source "${SCRIPT_DIR}/lib/higress-client.sh"
 test_setup "22-delete-worker-cleanup"
 
 TEST_WORKER="test-del-$$"
+TEST_WORKER_RUNTIME="${AGENTTEAMS_DEFAULT_WORKER_RUNTIME:-openclaw}"
 STORAGE_PREFIX="${STORAGE_PREFIX:-${TEST_STORAGE_PREFIX:-agentteams/agentteams-storage}}"
 
 _cleanup() {
