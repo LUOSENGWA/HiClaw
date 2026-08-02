@@ -3803,6 +3803,38 @@ def _update_project_task(arguments: dict[str, Any], project_id: str, task_id: st
         _write_project_plan(_project_dir(arguments, project_id), project)
 
 
+def _validate_assignee_membership(room_id: str, assignee: str) -> dict[str, Any]:
+    """Validate that the assignee is a joined member of the target Matrix room.
+
+    Strict when the Matrix environment is configured and the assignee is a
+    Matrix mxid (``@user:server``): a missing membership is a retryable
+    failure so delegation never marks a task assigned when the Worker cannot
+    receive the automatic notification. Skipped when the Matrix environment is
+    unavailable (the notification would be skipped anyway) or the assignee is a
+    display name (there is no mxid to verify).
+    """
+    homeserver = os.getenv("AGENTTEAMS_MATRIX_URL", "").strip()
+    token = os.getenv("AGENTTEAMS_WORKER_MATRIX_TOKEN", "").strip()
+    if not homeserver or not token:
+        return {"ok": True, "skipped": "matrix env unavailable"}
+    matrix_room_id = _canonical_room_id(room_id)
+    if not matrix_room_id.startswith("!"):
+        return {"ok": True, "skipped": f"non-Matrix room target: {room_id}"}
+    assignee_mxid = str(assignee or "").strip()
+    if not assignee_mxid.startswith("@"):
+        return {"ok": True, "skipped": f"assignee is a display name, not an mxid: {assignee}"}
+    try:
+        members = _matrix_room_member_user_ids(matrix_room_id)
+    except (ValueError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        return {"ok": False, "error": f"cannot verify room membership: {exc}"}
+    if assignee_mxid in members:
+        return {"ok": True, "member": True}
+    return {
+        "ok": False,
+        "error": f"assignee {assignee_mxid} is not a joined member of room {matrix_room_id}",
+    }
+
+
 def _send_delegate_notification(
     arguments: dict[str, Any],
     *,
@@ -3911,6 +3943,58 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     if isinstance(item, dict) and item.get("task_id") == task_id:
                         assigned_to = str(item.get("assigned_to") or "").strip()
                         break
+            assignment_mxid = str(assigned_to or "").strip()
+
+            # Idempotent retry of a fully assigned task: the automatic
+            # notification was already delivered (event_id recorded) - return
+            # the existing assignment instead of sending a duplicate.
+            if str(existing_task.get("status") or "") == "assigned" and existing_task.get("eventId"):
+                notification_reused = {
+                    "sent": True,
+                    "eventId": existing_task["eventId"],
+                    "roomId": room_id,
+                    "assignee": assignment_mxid,
+                    "reused": True,
+                }
+                existing_task["notification"] = notification_reused
+                return {
+                    "ok": True,
+                    "tool": "taskflow",
+                    "action": action,
+                    "task": existing_task,
+                    "synced": _sync_task(arguments, task_id),
+                    "notification": notification_reused,
+                    "notificationNeeded": _notification_needed(
+                        "delegate_task",
+                        project or {"project_id": project_id},
+                        existing_task,
+                        summary=f"delegate_task: {task_id} assigned to {assigned_to}",
+                    ),
+                }
+
+            # Atomicity contract: never mark a task assigned until the Worker
+            # can actually receive it. Validate room membership first; then
+            # prepare (status="prepared", files published); then send the
+            # notification with a stable txn id; only commit
+            # status="assigned" + eventId after the send succeeded. A send
+            # failure returns a retryable error and leaves the task prepared.
+            membership = _validate_assignee_membership(room_id, assignment_mxid)
+            if not membership.get("ok"):
+                return {
+                    "ok": False,
+                    "tool": "taskflow",
+                    "action": action,
+                    "task": existing_task,
+                    "error": membership.get("error", "room membership validation failed"),
+                    "retryable": True,
+                    "notificationNeeded": _notification_needed(
+                        "delegate_task",
+                        project or {"project_id": project_id},
+                        existing_task,
+                        summary=f"delegate_task: {task_id} blocked before assignment",
+                    ),
+                }
+
             task_dir = _task_dir(arguments, task_id)
             task_dir.mkdir(parents=True, exist_ok=True)
             spec = str(payload.get("spec") or "")
@@ -3920,37 +4004,18 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 "task_id": task_id,
                 "project_id": project_id,
                 "room_id": room_id,
-                "status": "assigned",
+                "status": "prepared",
                 "spec_path": f"shared/tasks/{task_id}/spec.md",
             }
             if assigned_to:
                 task["assigned_to"] = assigned_to
             if source_room_id:
                 task["source_room_id"] = source_room_id
-            if assigned_to:
-                task["assigned_to"] = assigned_to
             _write_task(arguments, task)
-            project_task_updates: dict[str, Any] = {"status": "assigned"}
-            if assigned_to:
-                project_task_updates["assigned_to"] = assigned_to
-            if source_room_id:
-                project_task_updates["source_room_id"] = source_room_id
-            if assigned_to:
-                project_task_updates["assigned_to"] = assigned_to
-            _update_project_task(arguments, project_id, task_id, **project_task_updates)
+            # Publish task files to shared storage FIRST so a Worker that
+            # receives the notification can read spec.md/meta.json.
             synced = _sync_task(arguments, task_id)
 
-            # Automatic Worker notification: delegate_task publishes the
-            # task files to shared storage FIRST, then sends the assignment
-            # message with m.mentions to the Task room. The Leader must NOT
-            # send a second assignment message (that would trigger the
-            # Worker twice). A stable transaction ID makes a retry
-            # idempotent.
-            notification: dict[str, Any] = {
-                "sent": False,
-                "error": "notification skipped",
-            }
-            assignment_mxid = str(assigned_to or "").strip()
             task_title = str(payload.get("title") or "").strip()
             if not task_title:
                 for item in project.get("tasks", []):
@@ -3961,6 +4026,10 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 (os.getenv("AGENTTEAMS_MATRIX_URL", "").strip())
                 and (os.getenv("AGENTTEAMS_WORKER_MATRIX_TOKEN", "").strip())
             )
+            notification: dict[str, Any] = {
+                "sent": False,
+                "error": "notification skipped",
+            }
             if assignment_mxid and _role(arguments) == "leader" and has_matrix_env:
                 try:
                     notification = _send_delegate_notification(
@@ -3977,8 +4046,37 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         "error": f"automatic notification failed: {exc}",
                     }
             task["notification"] = notification
-            if notification.get("eventId"):
-                task["eventId"] = notification["eventId"]
+            if not notification.get("sent"):
+                # Retryable failure: the task stays prepared (not assigned),
+                # so a retry cannot produce a duplicate assignment.
+                return {
+                    "ok": False,
+                    "tool": "taskflow",
+                    "action": action,
+                    "task": task,
+                    "synced": synced,
+                    "notification": notification,
+                    "retryable": True,
+                    "notificationNeeded": _notification_needed(
+                        "delegate_task",
+                        project or {"project_id": project_id},
+                        task,
+                        summary=f"delegate_task: {task_id} notification pending",
+                    ),
+                }
+
+            # Send succeeded - commit the assignment atomically with the
+            # recorded event_id, then re-push the assigned state.
+            task["status"] = "assigned"
+            task["eventId"] = notification["eventId"]
+            _write_task(arguments, task)
+            project_task_updates: dict[str, Any] = {"status": "assigned"}
+            if assigned_to:
+                project_task_updates["assigned_to"] = assigned_to
+            if source_room_id:
+                project_task_updates["source_room_id"] = source_room_id
+            _update_project_task(arguments, project_id, task_id, **project_task_updates)
+            synced = _sync_task(arguments, task_id)
             return {
                 "ok": True,
                 "tool": "taskflow",
@@ -3993,7 +4091,6 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     summary=f"delegate_task: {task_id} assigned to {assigned_to}",
                 ),
             }
-
         if action == "ack_task":
             if role not in {"worker", "remote-member"}:
                 raise ValueError("ack_task requires worker or remote-member role")
