@@ -146,6 +146,14 @@ func (h *ResourceHandler) GetWorker(w http.ResponseWriter, r *http.Request) {
 		} else if ok {
 			h.applyTeamMember(&resp, team, member)
 		}
+		// Scoped readers (team leaders or L2 humans) may only fetch workers
+		// in the teams they control; standalone workers are hidden.
+		if caller := authpkg.CallerFromContext(r.Context()); caller != nil &&
+			(caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) &&
+			!caller.TeamMatches(resp.Team) {
+			httputil.WriteError(w, http.StatusForbidden, "team-leader cannot access worker outside team")
+			return
+		}
 		httputil.WriteJSON(w, http.StatusOK, resp)
 		return
 	case !apierrors.IsNotFound(err):
@@ -352,6 +360,15 @@ func (h *ResourceHandler) GetTeam(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if name == "" {
 		httputil.WriteError(w, http.StatusBadRequest, "team name is required")
+		return
+	}
+
+	// Scoped readers (team leaders or L2 humans) may only fetch the teams
+	// they control.
+	if caller := authpkg.CallerFromContext(r.Context()); caller != nil &&
+		(caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) &&
+		!caller.TeamMatches(name) {
+		httputil.WriteError(w, http.StatusForbidden, "team-leader cannot access team outside scope")
 		return
 	}
 
