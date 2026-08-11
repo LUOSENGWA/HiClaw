@@ -46,6 +46,7 @@ type projectMeta struct {
 	PlanType        string            `json:"plan_type"`
 	TeamID          string            `json:"team_id"`
 	Mode            string            `json:"mode"`
+	Source          string            `json:"source,omitempty"`
 	Tasks           []projectTaskMeta `json:"tasks"`
 	Loop            *loopMeta         `json:"loop,omitempty"`
 	Requester       string            `json:"requester,omitempty"`
@@ -82,6 +83,7 @@ type workflowResponse struct {
 	PlanType        string              `json:"plan_type"`
 	TeamID          string              `json:"team_id"`
 	Mode            string              `json:"mode"`
+	Source          string              `json:"source,omitempty"`
 	Nodes           []workflowNode      `json:"nodes"`
 	Edges           []workflowEdge      `json:"edges"`
 	Next            []string            `json:"next"`
@@ -493,6 +495,7 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta) *workflowResponse {
 		PlanType:   meta.PlanType,
 		TeamID:     meta.TeamID,
 		Mode:       meta.Mode,
+		Source:     meta.Source,
 		Nodes:      nodes,
 		Edges:      edges,
 		Next:       next,

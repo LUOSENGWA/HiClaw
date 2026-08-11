@@ -785,3 +785,35 @@ func TestGetProjectWorkflow_NextOnlyPlannedAssigned(t *testing.T) {
 		t.Fatalf("next=%v, want [t1] only (empty/unknown statuses are not ready)", wf.Next)
 	}
 }
+
+// TestGetProjectWorkflow_SourceField guards O8: the workflow response must
+// expose the project source label (matrix/dingtalk/wechat...) that TeamHarness
+// writes into meta.json — humans need to know which channel a project came from.
+func TestGetProjectWorkflow_SourceField(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"team_id": "alpha-team", "source": "dingtalk",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "planned", "depends_on": []string{}},
+		},
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var wf workflowResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &wf); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if wf.Source != "dingtalk" {
+		t.Fatalf("source=%q, want dingtalk", wf.Source)
+	}
+}
