@@ -154,12 +154,12 @@ func (a *Authorizer) authorizeWorkerSelfAction(caller *CallerIdentity, req Authz
 }
 
 func (a *Authorizer) requireSameTeam(caller *CallerIdentity, req AuthzRequest) error {
-	if caller.Team == "" {
+	if caller.Team == "" && len(caller.Teams) == 0 {
 		return fmt.Errorf("authorization denied: team-leader %q has no team", caller.Username)
 	}
-	if req.ResourceTeam != "" && req.ResourceTeam != caller.Team {
-		return fmt.Errorf("authorization denied: team-leader %q (team %s) cannot access resource in team %s",
-			caller.Username, caller.Team, req.ResourceTeam)
+	if req.ResourceTeam != "" && !caller.TeamMatches(req.ResourceTeam) {
+		return fmt.Errorf("authorization denied: team-leader %q cannot access resource in team %s",
+			caller.Username, req.ResourceTeam)
 	}
 	return nil
 }

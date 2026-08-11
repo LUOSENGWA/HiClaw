@@ -817,3 +817,85 @@ func TestGetProjectWorkflow_SourceField(t *testing.T) {
 		t.Fatalf("source=%q, want dingtalk", wf.Source)
 	}
 }
+
+// TestListProjects_L2HumanAggregatesTeams guards the multi-tenant L2 path: a
+// human with AccessibleTeams [alpha, beta] sees projects from BOTH teams in a
+// single list (no per-team SA switching).
+func TestListProjects_L2HumanAggregatesTeams(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/pa/meta.json", map[string]any{
+		"project_id": "pa", "title": "PA", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	putProject(store, "teams/beta-team/shared/projects/pb/meta.json", map[string]any{
+		"project_id": "pb", "title": "PB", "status": "active", "plan_type": "dag", "team_id": "beta-team",
+	})
+	putProject(store, "teams/gamma-team/shared/projects/pc/meta.json", map[string]any{
+		"project_id": "pc", "title": "PC", "status": "active", "plan_type": "dag", "team_id": "gamma-team",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"), team("beta-team"), team("gamma-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	// L2 human with two accessible teams (Human CR accessibleTeams = CR names).
+	req = withCaller(req, &authpkg.CallerIdentity{
+		Role: authpkg.RoleTeamLeader, Username: "maizong", Teams: []string{"alpha-team", "beta-team"},
+	})
+	rec := httptest.NewRecorder()
+	h.ListProjects(rec, req)
+
+	var resp struct {
+		Projects []map[string]any `json:"projects"`
+		Total    int              `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Total != 2 {
+		t.Fatalf("total=%d, want 2 (alpha+beta only, gamma hidden); got %+v", resp.Total, resp.Projects)
+	}
+	ids := map[string]bool{}
+	for _, p := range resp.Projects {
+		ids[p["project_id"].(string)] = true
+	}
+	if !ids["pa"] || !ids["pb"] || ids["pc"] {
+		t.Fatalf("projects=%v, want pa+pb, no pc", ids)
+	}
+}
+
+// TestGetProjectWorkflow_L2HumanAnyAccessibleTeam guards the multi-tenant L2
+// read path: an L2 human can read a workflow from any accessible team but is
+// denied projects outside their accessible set.
+func TestGetProjectWorkflow_L2HumanAnyAccessibleTeam(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/pa/meta.json", map[string]any{
+		"project_id": "pa", "title": "PA", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+		"tasks": []map[string]any{{"task_id": "t1", "title": "T1", "status": "planned", "depends_on": []string{}}},
+	})
+	putProject(store, "teams/gamma-team/shared/projects/pc/meta.json", map[string]any{
+		"project_id": "pc", "title": "PC", "status": "active", "plan_type": "dag", "team_id": "gamma-team",
+		"tasks": []map[string]any{{"task_id": "t1", "title": "T1", "status": "planned", "depends_on": []string{}}},
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"), team("gamma-team"))
+	l2 := &authpkg.CallerIdentity{
+		Role: authpkg.RoleTeamLeader, Username: "maizong", Teams: []string{"alpha-team"},
+	}
+
+	// Accessible team -> OK.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/pa/workflow", nil)
+	req.SetPathValue("id", "pa")
+	req = withCaller(req, l2)
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("accessible team status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Non-accessible team -> 403.
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/projects/pc/workflow", nil)
+	req2.SetPathValue("id", "pc")
+	req2 = withCaller(req2, l2)
+	rec2 := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec2, req2)
+	if rec2.Code != http.StatusForbidden {
+		t.Fatalf("non-accessible team status=%d, want 403", rec2.Code)
+	}
+}

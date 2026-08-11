@@ -155,6 +155,12 @@ type Client interface {
 	// VerifyAccessToken checks whether a user access token is still valid
 	// by calling GET /_matrix/client/v3/account/whoami. Returns nil if valid.
 	VerifyAccessToken(ctx context.Context, accessToken string) error
+
+	// Whoami validates a user access token via GET /_matrix/client/v3/account/whoami
+	// and returns the owning user id (e.g. "@maizong:matrix.local"). This is
+	// used by Matrix-token authentication (L2 human identities) to map a token
+	// back to the Matrix account.
+	Whoami(ctx context.Context, accessToken string) (string, error)
 }
 
 type MessageEvent struct {
@@ -465,6 +471,28 @@ func (c *TuwunelClient) VerifyAccessToken(ctx context.Context, accessToken strin
 		return fmt.Errorf("verify access token: HTTP %d: %s", statusCode, truncate(respBody, 200))
 	}
 	return nil
+}
+
+// Whoami validates a user access token and returns the owning user id.
+func (c *TuwunelClient) Whoami(ctx context.Context, accessToken string) (string, error) {
+	statusCode, respBody, err := c.doJSON(ctx, http.MethodGet,
+		"/_matrix/client/v3/account/whoami", accessToken, nil, nil)
+	if err != nil {
+		return "", fmt.Errorf("whoami: %w", err)
+	}
+	if statusCode != http.StatusOK {
+		return "", fmt.Errorf("whoami: HTTP %d: %s", statusCode, truncate(respBody, 200))
+	}
+	var resp struct {
+		UserID string `json:"user_id"`
+	}
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return "", fmt.Errorf("whoami: decode response: %w", err)
+	}
+	if resp.UserID == "" {
+		return "", fmt.Errorf("whoami: empty user_id in response")
+	}
+	return resp.UserID, nil
 }
 func (c *TuwunelClient) SetDisplayName(ctx context.Context, userID, accessToken, displayName string) error {
 	path := fmt.Sprintf("/_matrix/client/v3/profile/%s/displayname", url.PathEscape(userID))

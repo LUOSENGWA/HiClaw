@@ -255,22 +255,56 @@ func teamFromPrefix(prefix string) string {
 }
 
 // checkProjectAccess performs the handler-side team check for team leaders.
-// Team leaders may only access projects owned by their team (team-scoped
+// Team leaders may only access projects owned by their team(s) (team-scoped
 // prefix). Global projects and other teams' projects are denied.
-// caller.Team is the Team CR name; crToEffective translates it to the
-// effective storage team name (spec.teamName may differ from the CR name).
+//
+// caller.Team is the legacy single Team CR name; caller.Teams is the L2 human
+// multi-team set (Human CR accessibleTeams, CR names). crToEffective
+// translates each to the effective storage team name (spec.teamName may
+// differ from the CR name), so both the CR name and the effective name match.
 func (h *ProjectHandler) checkProjectAccess(caller *authpkg.CallerIdentity, team string, crToEffective map[string]string) error {
 	if caller == nil || caller.Role != authpkg.RoleTeamLeader {
 		return nil
 	}
-	effective := caller.Team
-	if mapped, ok := crToEffective[caller.Team]; ok {
-		effective = mapped
+	teams := caller.Teams
+	if len(teams) == 0 && caller.Team != "" {
+		teams = []string{caller.Team}
 	}
-	if team == "" || effective == "" || team != effective {
-		return &accessDeniedError{msg: "team-leader cannot access project outside team " + caller.Team}
+	for _, t := range teams {
+		eff := t
+		if mapped, ok := crToEffective[t]; ok && mapped != "" {
+			eff = mapped
+		}
+		if eff == team {
+			return nil
+		}
 	}
-	return nil
+	return &accessDeniedError{msg: "team-leader cannot access project outside team " + caller.Team}
+}
+
+// callerAccessiblePrefixes expands a team leader's accessible teams (legacy
+// single Team or L2 human multi-team set) into the set of project prefixes
+// they may read. Projects live under the effective storage name
+// (TeamSpec.EffectiveTeamName via EnsureTeamStorage), so each accessible CR
+// name maps to its effective prefix; an unresolvable team falls back to its
+// own name.
+func callerAccessiblePrefixes(caller *authpkg.CallerIdentity, crToEffective map[string]string) map[string]bool {
+	if caller == nil || caller.Role != authpkg.RoleTeamLeader {
+		return nil
+	}
+	teams := caller.Teams
+	if len(teams) == 0 && caller.Team != "" {
+		teams = []string{caller.Team}
+	}
+	out := make(map[string]bool, len(teams))
+	for _, t := range teams {
+		eff := t
+		if mapped, ok := crToEffective[t]; ok && mapped != "" {
+			eff = mapped
+		}
+		out["teams/"+eff+"/shared/projects/"] = true
+	}
+	return out
 }
 
 type accessDeniedError struct{ msg string }
@@ -301,19 +335,14 @@ func (h *ProjectHandler) ListProjects(w http.ResponseWriter, r *http.Request) {
 	projects := make([]projectSummary, 0)
 	seen := map[string]bool{}
 
+	// Team leaders (legacy single-team SA or L2 human multi-team) only scan
+	// their accessible prefixes. The caller's Teams are Team CR names;
+	// crToEffective expands to the effective storage names too.
+	accessible := callerAccessiblePrefixes(caller, crToEffective)
+
 	for _, prefix := range prefixes {
-		// Team leaders only see their own team's prefix. The caller's Team
-		// field is the Team CR name; translate it to the effective storage
-		// name (spec.teamName may differ from the CR name).
-		if caller != nil && caller.Role == authpkg.RoleTeamLeader {
-			effective := caller.Team
-			if mapped, ok := crToEffective[caller.Team]; ok {
-				effective = mapped
-			}
-			own := "teams/" + effective + "/shared/projects/"
-			if caller.Team == "" || prefix != own {
-				continue
-			}
+		if accessible != nil && !accessible[prefix] {
+			continue
 		}
 		// ?team= filter: skip prefixes that cannot hold the requested team
 		// before hitting OSS (O2). teamFromPrefix("shared/projects/") is ""
