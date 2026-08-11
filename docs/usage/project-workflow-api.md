@@ -1,0 +1,152 @@
+# Project / Workflow Inspection API
+
+> Added by the project workflow inspection PR (agentteams/AgentTeams#1169).
+
+The controller exposes two read-only endpoints that surface TeamHarness
+project state (`shared/projects/{id}/meta.json`) as a LangGraph-aligned
+workflow view. They are the data source for human-facing views (dashboard,
+QwenPaw console plugin) and are consumed by `agt get projects`.
+
+## Endpoints
+
+### `GET /api/v1/projects`
+
+List projects across all teams (and the global `shared/projects/` prefix).
+
+Query parameters:
+
+| Param | Meaning |
+|:--|:--|
+| `team` | Return only projects whose team matches. Team leaders are already scoped to their own team(s); standalone projects (empty team) only match when no filter is set. |
+
+Response `200 OK`:
+
+```json
+{
+  "projects": [
+    {
+      "project_id": "demo-project-001",
+      "title": "Demo project",
+      "status": "active",
+      "plan_type": "dag",
+      "team_id": "biz-team",
+      "mode": "project"
+    }
+  ],
+  "total": 1
+}
+```
+
+* `status` is the raw project status written by TeamHarness:
+  `active` | `paused` | `completed`.
+* Projects are sorted by `project_id`. Duplicate ids across prefixes are
+  de-duplicated (meta.json may be mirrored under both the effective team name
+  and the CR name prefix).
+* Projects with a missing or malformed `meta.json` are skipped (the directory
+  may exist while the file is mid-write upstream).
+
+### `GET /api/v1/projects/{id}/workflow`
+
+Return the LangGraph-aligned workflow for one project.
+
+Response `200 OK`:
+
+```json
+{
+  "project_id": "demo-project-001",
+  "title": "Demo project",
+  "status": "active",
+  "plan_type": "dag",
+  "team_id": "biz-team",
+  "mode": "project",
+  "source": "dingtalk",
+  "nodes": [
+    {"id": "t1", "name": "Task 1", "status": "completed", "assignee": "@w1:matrix.local"},
+    {"id": "t2", "name": "Task 2", "status": "delegated", "assignee": "@w2:matrix.local"}
+  ],
+  "edges": [
+    {"source": "t1", "target": "t2", "conditional": false}
+  ],
+  "next": ["t2"],
+  "interrupts": [
+    {"id": "t3", "value": "blocked"},
+    {"id": "loop", "value": "waiting for human decision"}
+  ],
+  "values": {
+    "project_id": "demo-project-001",
+    "title": "Demo project",
+    "status": "active",
+    "plan_type": "dag",
+    "team_id": "biz-team",
+    "mode": "project",
+    "task_count": {"completed": 1, "delegated": 1}
+  },
+  "loop": null,
+  "requester": "dingtalk:user:session",
+  "source_room_id": "!room:matrix.local"
+}
+```
+
+Node statuses are normalized to a frontend-friendly enum:
+
+| API value | Raw TeamHarness status |
+|:--|:--|
+| `pending` | `planned` |
+| `delegated` | `assigned` |
+| `in-progress` | `in_progress`, `submitted` |
+| `completed` | `completed` |
+| `revision` | `revision` |
+| `blocked` | `blocked`, `cancelled` |
+
+Semantics (mirror upstream `_ready_nodes` / `_ready_loop_nodes`):
+
+* `next` — ready nodes: tasks whose raw status is `planned`/`assigned` and
+  whose dependencies are all `completed`. Empty when the project is not active
+  or a loop is `waiting_user` / `blocked` / `completed`.
+* `interrupts` — human-decision waiting points: a blocked task, or a loop in
+  `waiting_user` / `blocked` state.
+* `values.task_count` — node counts per normalized status.
+
+Error responses:
+
+| Code | Meaning |
+|:--|:--|
+| `400` | Missing project id. |
+| `403` | Team leader (or L2 human) outside the project's team. |
+| `404` | Project not found (no meta.json under any scanned prefix). |
+| `500` | K8s or object-store failure. |
+
+## Authentication & authorization
+
+Two bearer-token paths are accepted (composite authenticator):
+
+1. **Kubernetes service-account token** (TokenReview): admin / manager /
+   worker. Team leaders (worker with `team_leader` role) see only their own
+   team's projects.
+2. **Matrix access token** (L2 humans): the token is validated with
+   `GET /_matrix/client/v3/account/whoami`; the owning Matrix localpart is
+   matched to a `Human` CR with `permissionLevel: 2` (Team). The human's
+   `accessibleTeams` set is used as the multi-team scope — every team they
+   control is aggregated into a single list/read view. Non-L2 humans
+   (permissionLevel 1 or 3) are rejected.
+
+Authorization matrix:
+
+| Caller | List | Get workflow |
+|:--|:--|:--|
+| admin / manager | all teams | any project |
+| team-leader (SA) | own team only | own team only |
+| L2 human (Matrix) | all `accessibleTeams` | any accessible team |
+| worker | denied | denied |
+
+## `agt` CLI
+
+`agt get projects [name]` wraps both endpoints:
+
+```bash
+agt get projects                      # list all
+agt get projects --team biz-team      # filter by team
+agt get projects demo-project-001     # workflow detail
+agt get projects demo-project-001 -o json
+agt get projects demo-project-001 --mermaid   # render DAG as mermaid
+```

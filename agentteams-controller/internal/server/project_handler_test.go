@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -34,10 +35,15 @@ func newProjectTestScheme(t *testing.T) *runtime.Scheme {
 type mcLikeOSS struct {
 	*ossfake.Memory
 	listCalls int
+	failList  bool
+	failGet   bool
 }
 
 func (m *mcLikeOSS) ListObjects(_ context.Context, prefix string) ([]string, error) {
 	m.listCalls++
+	if m.failList {
+		return nil, errors.New("oss list failed")
+	}
 	keys, err := m.Memory.ListObjects(context.Background(), prefix)
 	if err != nil {
 		return nil, err
@@ -898,4 +904,51 @@ func TestGetProjectWorkflow_L2HumanAnyAccessibleTeam(t *testing.T) {
 	if rec2.Code != http.StatusForbidden {
 		t.Fatalf("non-accessible team status=%d, want 403", rec2.Code)
 	}
+}
+
+// TestListProjects_OSSErrorReturns500 guards the explicit-failure path: an
+// object-store failure surfaces as 500 (never a silently truncated list).
+func TestListProjects_OSSErrorReturns500(t *testing.T) {
+	store := ossfake.NewMemory()
+	m := &mcLikeOSS{Memory: store, failList: true}
+	scheme := newProjectTestScheme(t)
+	k8s := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(team("alpha-team")).Build()
+	h := NewProjectHandler(k8s, "default", m)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ListProjects(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500 on OSS failure", rec.Code)
+	}
+}
+
+// TestGetProjectWorkflow_K8sErrorReturns500 guards the K8s failure path:
+// TeamList resolution errors surface as 500, not a false 404.
+func TestGetProjectWorkflow_K8sErrorReturns500(t *testing.T) {
+	store := ossfake.NewMemory()
+	scheme := newProjectTestScheme(t)
+	k8s := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(team("alpha-team")).Build()
+	failing := &failingListClient{Client: k8s}
+	var o oss.StorageClient = &mcLikeOSS{Memory: store}
+	h := NewProjectHandler(failing, "default", o)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500 on K8s failure", rec.Code)
+	}
+}
+
+// failingListClient fails every K8s List call.
+type failingListClient struct {
+	client.Client
+}
+
+func (f *failingListClient) List(_ context.Context, _ client.ObjectList, _ ...client.ListOption) error {
+	return errors.New("k8s list failed")
 }
