@@ -150,3 +150,8 @@ agt get projects demo-project-001     # workflow detail
 agt get projects demo-project-001 -o json
 agt get projects demo-project-001 --mermaid   # render DAG as mermaid
 ```
+
+The CLI forwards whatever bearer token is configured (`AGENTTEAMS_AUTH_TOKEN`
+or `AGENTTEAMS_AUTH_TOKEN_FILE`) verbatim, so an L2 human can also use it by
+pointing either variable at their own Matrix access token — no separate CLI
+auth mode is needed.

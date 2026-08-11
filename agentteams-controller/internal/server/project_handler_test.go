@@ -66,6 +66,13 @@ func (m *mcLikeOSS) ListObjects(_ context.Context, prefix string) ([]string, err
 	return out, nil
 }
 
+func (m *mcLikeOSS) GetObject(ctx context.Context, key string) ([]byte, error) {
+	if m.failGet {
+		return nil, errors.New("oss get failed")
+	}
+	return m.Memory.GetObject(ctx, key)
+}
+
 // newProjectTestHandler builds a ProjectHandler with an in-memory OSS store and
 // a fake K8s client containing the given Teams.
 func newProjectTestHandler(t *testing.T, store *ossfake.Memory, teams ...*v1beta1.Team) *ProjectHandler {
@@ -951,4 +958,107 @@ type failingListClient struct {
 
 func (f *failingListClient) List(_ context.Context, _ client.ObjectList, _ ...client.ListOption) error {
 	return errors.New("k8s list failed")
+}
+
+// TestGetProjectWorkflow_GetObjectErrorReturns500 guards the meta read
+// failure path: a non-NotFound GetObject error surfaces as 500 (not a
+// silently skipped project / false 404).
+func TestGetProjectWorkflow_GetObjectErrorReturns500(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	m := &mcLikeOSS{Memory: store, failGet: true}
+	scheme := newProjectTestScheme(t)
+	k8s := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(team("alpha-team")).Build()
+	h := NewProjectHandler(k8s, "default", m)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500 on GetObject failure", rec.Code)
+	}
+}
+
+// TestGetProjectWorkflow_ProjectInLaterPrefix guards multi-prefix resolution:
+// resolveProjectMeta scans prefixes in order and finds the project when it
+// lives under a later team prefix (alpha empty, beta holds it).
+func TestGetProjectWorkflow_ProjectInLaterPrefix(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/beta-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "beta-team",
+		"tasks": []map[string]any{{"task_id": "t1", "title": "T1", "status": "planned", "depends_on": []string{}}},
+	})
+	m := &mcLikeOSS{Memory: store}
+	scheme := newProjectTestScheme(t)
+	k8s := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(team("alpha-team"), team("beta-team")).Build()
+	h := NewProjectHandler(k8s, "default", m)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 (project found in later prefix); body=%s", rec.Code, rec.Body.String())
+	}
+	var wf workflowResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &wf); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if wf.TeamID != "beta-team" {
+		t.Fatalf("team_id=%q, want beta-team", wf.TeamID)
+	}
+}
+
+// TestListProjects_L2HumanTeamFilter guards the L2 + ?team= combination: an
+// L2 human aggregating two teams can narrow to one of their own teams; asking
+// for a team outside the accessible set returns nothing (never leaks).
+func TestListProjects_L2HumanTeamFilter(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/pa/meta.json", map[string]any{
+		"project_id": "pa", "title": "PA", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	putProject(store, "teams/beta-team/shared/projects/pb/meta.json", map[string]any{
+		"project_id": "pb", "title": "PB", "status": "active", "plan_type": "dag", "team_id": "beta-team",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"), team("beta-team"))
+	l2 := &authpkg.CallerIdentity{
+		Role: authpkg.RoleTeamLeader, Username: "maizong", Teams: []string{"alpha-team", "beta-team"},
+	}
+
+	// Narrow to one accessible team.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects?team=alpha-team", nil)
+	req = withCaller(req, l2)
+	rec := httptest.NewRecorder()
+	h.ListProjects(rec, req)
+	var resp struct {
+		Projects []map[string]any `json:"projects"`
+		Total    int              `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Total != 1 || resp.Projects[0]["project_id"] != "pa" {
+		t.Fatalf("team filter (own team) wrong: %+v", resp.Projects)
+	}
+
+	// Ask for a team outside the accessible set -> nothing.
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/projects?team=gamma-team", nil)
+	req2 = withCaller(req2, l2)
+	rec2 := httptest.NewRecorder()
+	h.ListProjects(rec2, req2)
+	var resp2 struct {
+		Projects []map[string]any `json:"projects"`
+		Total    int              `json:"total"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp2.Total != 0 {
+		t.Fatalf("team filter (outside accessible) leaked %d projects: %+v", resp2.Total, resp2.Projects)
+	}
 }
