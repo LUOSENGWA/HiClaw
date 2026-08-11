@@ -1141,4 +1141,14 @@ func TestProjectHTTP_L2AuthChain(t *testing.T) {
 	if rec3.Code != http.StatusUnauthorized {
 		t.Fatalf("no token status=%d, want 401", rec3.Code)
 	}
+
+	// L2 human reads a workflow via the same HTTP chain (accessible team).
+	req4 := httptest.NewRequest(http.MethodGet, "/api/v1/projects/pa/workflow", nil)
+	req4.SetPathValue("id", "pa")
+	req4.Header.Set("Authorization", "Bearer matrix-token")
+	rec4 := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec4, req4)
+	if rec4.Code != http.StatusOK {
+		t.Fatalf("L2 workflow status=%d, want 200; body=%s", rec4.Code, rec4.Body.String())
+	}
 }
