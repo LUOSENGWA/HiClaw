@@ -50,11 +50,49 @@ func (a *Authorizer) Authorize(caller *CallerIdentity, req AuthzRequest) error {
 	case RoleTeamLeader:
 		return a.authorizeTeamLeader(caller, req)
 
+	case RoleHuman:
+		return a.authorizeHuman(caller, req)
+
 	case RoleWorker:
 		return a.authorizeWorker(caller, req)
 
 	default:
 		return fmt.Errorf("authorization denied: unknown role %q", caller.Role)
+	}
+}
+
+// authorizeHuman is the read-only permission matrix for L2 humans (Human CR
+// permissionLevel=2, authenticated by Matrix token). Humans view the teams
+// and workers in their accessibleTeams scope; they must NOT manage workers,
+// refresh credentials, or mutate projects. The handler filters list results
+// by caller.Teams (accessibleTeams).
+func (a *Authorizer) authorizeHuman(caller *CallerIdentity, req AuthzRequest) error {
+	switch req.ResourceKind {
+	case "status":
+		return nil // read-only cluster info
+
+	case "project":
+		switch req.Action {
+		case ActionList, ActionGet:
+			return nil // handler filters by accessibleTeams
+		default:
+			return deny(caller, req)
+		}
+
+	case "team":
+		if req.Action == ActionGet || req.Action == ActionList {
+			return nil // handler filters by accessibleTeams
+		}
+		return deny(caller, req)
+
+	case "worker":
+		if req.Action == ActionGet || req.Action == ActionList {
+			return nil // handler filters by accessibleTeams
+		}
+		return deny(caller, req)
+
+	default:
+		return deny(caller, req)
 	}
 }
 

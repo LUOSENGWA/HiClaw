@@ -850,7 +850,7 @@ func TestListProjects_L2HumanAggregatesTeams(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
 	// L2 human with two accessible teams (Human CR accessibleTeams = CR names).
 	req = withCaller(req, &authpkg.CallerIdentity{
-		Role: authpkg.RoleTeamLeader, Username: "maizong", Teams: []string{"alpha-team", "beta-team"},
+		Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team", "beta-team"},
 	})
 	rec := httptest.NewRecorder()
 	h.ListProjects(rec, req)
@@ -889,7 +889,7 @@ func TestGetProjectWorkflow_L2HumanAnyAccessibleTeam(t *testing.T) {
 	})
 	h := newProjectTestHandler(t, store, team("alpha-team"), team("gamma-team"))
 	l2 := &authpkg.CallerIdentity{
-		Role: authpkg.RoleTeamLeader, Username: "maizong", Teams: []string{"alpha-team"},
+		Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"},
 	}
 
 	// Accessible team -> OK.
@@ -1027,7 +1027,7 @@ func TestListProjects_L2HumanTeamFilter(t *testing.T) {
 	})
 	h := newProjectTestHandler(t, store, team("alpha-team"), team("beta-team"))
 	l2 := &authpkg.CallerIdentity{
-		Role: authpkg.RoleTeamLeader, Username: "maizong", Teams: []string{"alpha-team", "beta-team"},
+		Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team", "beta-team"},
 	}
 
 	// Narrow to one accessible team.

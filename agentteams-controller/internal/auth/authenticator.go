@@ -18,6 +18,11 @@ const (
 	RoleManager    = "manager"
 	RoleTeamLeader = "team-leader"
 	RoleWorker     = "worker"
+	// RoleHuman is an L2 human (Human CR permissionLevel=2) authenticated by
+	// Matrix token. It is a read-only viewer scoped to accessibleTeams —
+	// deliberately NOT RoleTeamLeader, which would grant worker management
+	// (create/update/wake) and credential refresh.
+	RoleHuman = "human"
 )
 
 // DefaultAudience is the SA token audience used by TokenReview when a caller

@@ -175,9 +175,9 @@ func (h *ResourceHandler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 		} else if ok {
 			h.applyTeamMember(&resp, team, member)
 		}
-		// Team leaders (SA single-team or L2 multi-team humans) only see the
-		// workers in the teams they control; standalone workers are hidden.
-		if caller != nil && caller.Role == authpkg.RoleTeamLeader && !caller.TeamMatches(resp.Team) {
+		// Scoped readers (team leaders or L2 humans) only see the workers in
+		// the teams they control; standalone workers are hidden.
+		if caller != nil && (caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) && !caller.TeamMatches(resp.Team) {
 			continue
 		}
 		if teamFilter != "" && resp.Team != teamFilter {
@@ -374,9 +374,9 @@ func (h *ResourceHandler) ListTeams(w http.ResponseWriter, r *http.Request) {
 
 	teams := make([]TeamResponse, 0, len(list.Items))
 	for i := range list.Items {
-		// Team leaders (SA single-team or L2 multi-team humans) only see the
-		// teams they control; admin/manager see everything.
-		if caller != nil && caller.Role == authpkg.RoleTeamLeader && !caller.TeamMatches(list.Items[i].Name) {
+		// Scoped readers (team leaders or L2 humans) only see the teams they
+		// control; admin/manager see everything.
+		if caller != nil && (caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) && !caller.TeamMatches(list.Items[i].Name) {
 			continue
 		}
 		teams = append(teams, teamToResponse(&list.Items[i]))

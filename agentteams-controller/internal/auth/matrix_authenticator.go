@@ -24,9 +24,14 @@ type MatrixWhoami interface {
 //
 // Chain (direction A2): the caller presents a Matrix access token obtained by
 // logging into the homeserver; we validate it with whoami, map the localpart
-// to a Human CR (username / metadata.name), and build a team-leader identity
-// whose Teams set is the Human's accessibleTeams. This lets an L2 user view
-// every team they control with a single token — no per-team SA switching.
+// to a Human CR (username / metadata.name), and build a read-only human
+// identity whose Teams set is the Human's accessibleTeams. This lets an L2
+// user view every team they control with a single token — no per-team SA
+// switching.
+//
+// The identity role is RoleHuman (read-only), NOT RoleTeamLeader: team leaders
+// are coordinating workers and may manage their team's workers; an L2 human is
+// a viewer and must not get worker-management or credential-refresh powers.
 //
 // Human permission levels: 2 = Team (L2, the supported case). Level 1 (admin)
 // and 3 (worker) humans are not resolved here; level-1 humans should use the
@@ -118,7 +123,7 @@ func (a *MatrixTokenAuthenticator) resolveHuman(ctx context.Context, userID stri
 		teams := make([]string, len(h.Spec.AccessibleTeams))
 		copy(teams, h.Spec.AccessibleTeams)
 		return &CallerIdentity{
-			Role:     RoleTeamLeader,
+			Role:     RoleHuman,
 			Username: h.Name,
 			Teams:    teams,
 		}, nil

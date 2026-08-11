@@ -902,7 +902,7 @@ func TestListTeams_L2Scoped(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/teams", nil)
 	req = req.WithContext(context.WithValue(req.Context(), authpkg.CallerKeyForTest(), &authpkg.CallerIdentity{
-		Role: authpkg.RoleTeamLeader, Username: "maizong", Teams: []string{"alpha-team"},
+		Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"},
 	}))
 	rec := httptest.NewRecorder()
 	handler.ListTeams(rec, req)
@@ -957,7 +957,7 @@ func TestListWorkers_L2Scoped(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/workers", nil)
 	req = req.WithContext(context.WithValue(req.Context(), authpkg.CallerKeyForTest(), &authpkg.CallerIdentity{
-		Role: authpkg.RoleTeamLeader, Username: "maizong", Teams: []string{"alpha-team"},
+		Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"},
 	}))
 	rec := httptest.NewRecorder()
 	handler.ListWorkers(rec, req)

@@ -23,6 +23,46 @@ func TestAuthorizer_ManagerAllowsEverything(t *testing.T) {
 	}
 }
 
+// TestAuthorizer_HumanReadOnly guards the L2 security boundary: an L2 human
+// (RoleHuman) may read projects/teams/workers in scope but must NOT manage
+// workers, refresh credentials, or mutate projects/teams.
+func TestAuthorizer_HumanReadOnly(t *testing.T) {
+	az := NewAuthorizer()
+	caller := &CallerIdentity{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}}
+
+	allowed := []AuthzRequest{
+		{Action: ActionList, ResourceKind: "project"},
+		{Action: ActionGet, ResourceKind: "project"},
+		{Action: ActionList, ResourceKind: "team"},
+		{Action: ActionGet, ResourceKind: "team"},
+		{Action: ActionList, ResourceKind: "worker"},
+		{Action: ActionGet, ResourceKind: "worker"},
+		{Action: ActionGet, ResourceKind: "status"},
+	}
+	for _, req := range allowed {
+		if err := az.Authorize(caller, req); err != nil {
+			t.Errorf("L2 human should be allowed %s %s, got: %v", req.Action, req.ResourceKind, err)
+		}
+	}
+
+	denied := []AuthzRequest{
+		{Action: ActionCreate, ResourceKind: "worker"},
+		{Action: ActionUpdate, ResourceKind: "worker"},
+		{Action: ActionWake, ResourceKind: "worker"},
+		{Action: ActionSleep, ResourceKind: "worker"},
+		{Action: ActionRefreshMatrixToken, ResourceKind: "credentials"},
+		{Action: ActionSTS, ResourceKind: "credentials"},
+		{Action: ActionUpdate, ResourceKind: "project"},
+		{Action: ActionCreate, ResourceKind: "team"},
+		{Action: ActionDelete, ResourceKind: "team"},
+	}
+	for _, req := range denied {
+		if err := az.Authorize(caller, req); err == nil {
+			t.Errorf("L2 human must be denied %s %s, got nil error", req.Action, req.ResourceKind)
+		}
+	}
+}
+
 func TestAuthorizer_TeamLeaderOwnTeam(t *testing.T) {
 	az := NewAuthorizer()
 	caller := &CallerIdentity{Role: RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"}

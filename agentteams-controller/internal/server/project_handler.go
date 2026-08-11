@@ -254,16 +254,17 @@ func teamFromPrefix(prefix string) string {
 	return ""
 }
 
-// checkProjectAccess performs the handler-side team check for team leaders.
-// Team leaders may only access projects owned by their team(s) (team-scoped
-// prefix). Global projects and other teams' projects are denied.
+// checkProjectAccess performs the handler-side team check for scoped readers
+// (team leaders and L2 humans). They may only access projects owned by their
+// team(s) (team-scoped prefix). Global projects and other teams' projects are
+// denied.
 //
 // caller.Team is the legacy single Team CR name; caller.Teams is the L2 human
 // multi-team set (Human CR accessibleTeams, CR names). crToEffective
 // translates each to the effective storage team name (spec.teamName may
 // differ from the CR name), so both the CR name and the effective name match.
 func (h *ProjectHandler) checkProjectAccess(caller *authpkg.CallerIdentity, team string, crToEffective map[string]string) error {
-	if caller == nil || caller.Role != authpkg.RoleTeamLeader {
+	if caller == nil || (caller.Role != authpkg.RoleTeamLeader && caller.Role != authpkg.RoleHuman) {
 		return nil
 	}
 	teams := caller.Teams
@@ -282,14 +283,14 @@ func (h *ProjectHandler) checkProjectAccess(caller *authpkg.CallerIdentity, team
 	return &accessDeniedError{msg: "team-leader cannot access project outside team " + caller.Team}
 }
 
-// callerAccessiblePrefixes expands a team leader's accessible teams (legacy
+// callerAccessiblePrefixes expands a scoped reader's accessible teams (legacy
 // single Team or L2 human multi-team set) into the set of project prefixes
 // they may read. Projects live under the effective storage name
 // (TeamSpec.EffectiveTeamName via EnsureTeamStorage), so each accessible CR
 // name maps to its effective prefix; an unresolvable team falls back to its
 // own name.
 func callerAccessiblePrefixes(caller *authpkg.CallerIdentity, crToEffective map[string]string) map[string]bool {
-	if caller == nil || caller.Role != authpkg.RoleTeamLeader {
+	if caller == nil || (caller.Role != authpkg.RoleTeamLeader && caller.Role != authpkg.RoleHuman) {
 		return nil
 	}
 	teams := caller.Teams

@@ -61,8 +61,8 @@ func TestMatrixAuthenticator_ResolvesL2Human(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	if id.Role != RoleTeamLeader {
-		t.Fatalf("role=%q, want team-leader", id.Role)
+	if id.Role != RoleHuman {
+		t.Fatalf("role=%q, want human (read-only L2, not team-leader)", id.Role)
 	}
 	if id.Username != "sunzong" {
 		t.Fatalf("username=%q, want sunzong", id.Username)
