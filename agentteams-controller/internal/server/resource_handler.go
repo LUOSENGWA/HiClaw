@@ -157,6 +157,7 @@ func (h *ResourceHandler) GetWorker(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ResourceHandler) ListWorkers(w http.ResponseWriter, r *http.Request) {
+	caller := authpkg.CallerFromContext(r.Context())
 	teamFilter := r.URL.Query().Get("team")
 
 	workers := make([]WorkerResponse, 0)
@@ -173,6 +174,11 @@ func (h *ResourceHandler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 			return
 		} else if ok {
 			h.applyTeamMember(&resp, team, member)
+		}
+		// Team leaders (SA single-team or L2 multi-team humans) only see the
+		// workers in the teams they control; standalone workers are hidden.
+		if caller != nil && caller.Role == authpkg.RoleTeamLeader && !caller.TeamMatches(resp.Team) {
+			continue
 		}
 		if teamFilter != "" && resp.Team != teamFilter {
 			continue
@@ -359,6 +365,7 @@ func (h *ResourceHandler) GetTeam(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ResourceHandler) ListTeams(w http.ResponseWriter, r *http.Request) {
+	caller := authpkg.CallerFromContext(r.Context())
 	var list v1beta1.TeamList
 	if err := h.client.List(r.Context(), &list, client.InNamespace(h.namespace)); err != nil {
 		writeK8sError(w, "list teams", err)
@@ -367,6 +374,11 @@ func (h *ResourceHandler) ListTeams(w http.ResponseWriter, r *http.Request) {
 
 	teams := make([]TeamResponse, 0, len(list.Items))
 	for i := range list.Items {
+		// Team leaders (SA single-team or L2 multi-team humans) only see the
+		// teams they control; admin/manager see everything.
+		if caller != nil && caller.Role == authpkg.RoleTeamLeader && !caller.TeamMatches(list.Items[i].Name) {
+			continue
+		}
 		teams = append(teams, teamToResponse(&list.Items[i]))
 	}
 
