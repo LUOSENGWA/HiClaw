@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+<<<<<<< HEAD
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,14 @@ import (
 	"sync"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver; read-only queries here
+=======
+	"encoding/json"
+	"errors"
+	"net/http"
+	"os"
+	"sort"
+	"strings"
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
@@ -55,19 +64,25 @@ type projectMeta struct {
 	PlanType        string            `json:"plan_type"`
 	TeamID          string            `json:"team_id"`
 	Mode            string            `json:"mode"`
+<<<<<<< HEAD
 	Source          string            `json:"source,omitempty"`
+=======
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	Tasks           []projectTaskMeta `json:"tasks"`
 	Loop            *loopMeta         `json:"loop,omitempty"`
 	Requester       string            `json:"requester,omitempty"`
 	RequesterReport map[string]any    `json:"requester_report,omitempty"`
 	ReplyRoute      map[string]any    `json:"reply_route,omitempty"`
 	SourceRoomID    string            `json:"source_room_id,omitempty"`
+<<<<<<< HEAD
 	// W2: human-intervention audit fields (written by W-PR-2 Controller API;
 	// tolerated by json.Unmarshal when absent, and passed through here so
 	// consumers can show who paused/resumed and why).
 	UpdatedBy   string `json:"updated_by,omitempty"`
 	UpdatedAt   string `json:"updated_at,omitempty"`
 	PauseReason string `json:"pause_reason,omitempty"`
+=======
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 }
 
 type projectTaskMeta struct {
@@ -98,7 +113,10 @@ type workflowResponse struct {
 	PlanType        string              `json:"plan_type"`
 	TeamID          string              `json:"team_id"`
 	Mode            string              `json:"mode"`
+<<<<<<< HEAD
 	Source          string              `json:"source,omitempty"`
+=======
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	Nodes           []workflowNode      `json:"nodes"`
 	Edges           []workflowEdge      `json:"edges"`
 	Next            []string            `json:"next"`
@@ -109,6 +127,7 @@ type workflowResponse struct {
 	RequesterReport map[string]any      `json:"requester_report,omitempty"`
 	ReplyRoute      map[string]any      `json:"reply_route,omitempty"`
 	SourceRoomID    string              `json:"source_room_id,omitempty"`
+<<<<<<< HEAD
 	// TasksDetail is populated only when ?includeTasks=true; otherwise it is
 	// omitted so the default workflow response stays lightweight.
 	TasksDetail []taskDetail `json:"tasks_detail,omitempty"`
@@ -116,6 +135,8 @@ type workflowResponse struct {
 	UpdatedBy   string `json:"updated_by,omitempty"`
 	UpdatedAt   string `json:"updated_at,omitempty"`
 	PauseReason string `json:"pause_reason,omitempty"`
+=======
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 }
 
 // workflowValues is the current state summary (LangGraph StateSnapshot.values
@@ -148,6 +169,7 @@ type workflowInterrupt struct {
 	Value string `json:"value"`
 }
 
+<<<<<<< HEAD
 // taskDetail is the per-task detail payload returned when
 // ?includeTasks=true. It surfaces TaskMeta (shared/tasks/{id}/meta.json)
 // fields that are not part of the project-level tasks[] node summary: the
@@ -169,6 +191,8 @@ type taskDetail struct {
 	CancelReason string `json:"cancel_reason,omitempty"`
 }
 
+=======
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 // normalizeTaskStatus maps ProjectMeta task status to the frontend-friendly
 // enum: pending | delegated | in-progress | completed | revision | blocked.
 //
@@ -243,6 +267,7 @@ func metaKeyFromListResult(prefix, child string) (string, bool) {
 	return prefix + child + "meta.json", true
 }
 
+<<<<<<< HEAD
 // projectMatch is one project id resolved at a specific storage prefix.
 type projectMatch struct {
 	meta *projectMeta
@@ -278,6 +303,19 @@ func (h *ProjectHandler) resolveProjectMeta(ctx context.Context, projectID strin
 		children, err := h.oss.ListObjects(ctx, prefix)
 		if err != nil {
 			return nil, err
+=======
+// resolveProjectMeta locates and reads a project's meta.json across all prefixes.
+// Returns the meta and the owning team ("" for global shared/ projects).
+func (h *ProjectHandler) resolveProjectMeta(ctx context.Context, projectID string) (*projectMeta, string, error) {
+	prefixes, _, err := h.teamProjectPrefixes(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	for _, prefix := range prefixes {
+		children, err := h.oss.ListObjects(ctx, prefix)
+		if err != nil {
+			return nil, "", err
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 		}
 		for _, child := range children {
 			key, ok := metaKeyFromListResult(prefix, child)
@@ -289,7 +327,11 @@ func (h *ProjectHandler) resolveProjectMeta(ctx context.Context, projectID strin
 				if errors.Is(err, os.ErrNotExist) {
 					continue // project dir exists but meta.json not yet written
 				}
+<<<<<<< HEAD
 				return nil, err
+=======
+				return nil, "", err
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 			}
 			var meta projectMeta
 			if err := json.Unmarshal(data, &meta); err != nil {
@@ -302,6 +344,7 @@ func (h *ProjectHandler) resolveProjectMeta(ctx context.Context, projectID strin
 			if meta.TeamID == "" {
 				meta.TeamID = team
 			}
+<<<<<<< HEAD
 			// The same team may be reachable under both its CR name and its
 			// effective name (teamProjectPrefixes emits both); dedupe by the
 			// team recorded in the meta so one project never looks like two.
@@ -329,6 +372,12 @@ func (h *ProjectHandler) resolveSingleProject(w http.ResponseWriter, matches []p
 		httputil.WriteError(w, http.StatusConflict, "project id is ambiguous across teams; retry with ?team=")
 		return nil, "", false
 	}
+=======
+			return &meta, team, nil
+		}
+	}
+	return nil, "", nil
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 }
 
 // teamFromPrefix extracts the team name from a project prefix, or "" for the
@@ -343,6 +392,7 @@ func teamFromPrefix(prefix string) string {
 	return ""
 }
 
+<<<<<<< HEAD
 // checkProjectAccess performs the handler-side team check for scoped readers
 // (team leaders and L2 humans). They may only access projects owned by their
 // team(s) (team-scoped prefix). Global projects and other teams' projects are
@@ -395,6 +445,25 @@ func callerAccessiblePrefixes(caller *authpkg.CallerIdentity, crToEffective map[
 		out["teams/"+eff+"/shared/projects/"] = true
 	}
 	return out
+=======
+// checkProjectAccess performs the handler-side team check for team leaders.
+// Team leaders may only access projects owned by their team (team-scoped
+// prefix). Global projects and other teams' projects are denied.
+// caller.Team is the Team CR name; crToEffective translates it to the
+// effective storage team name (spec.teamName may differ from the CR name).
+func (h *ProjectHandler) checkProjectAccess(caller *authpkg.CallerIdentity, team string, crToEffective map[string]string) error {
+	if caller == nil || caller.Role != authpkg.RoleTeamLeader {
+		return nil
+	}
+	effective := caller.Team
+	if mapped, ok := crToEffective[caller.Team]; ok {
+		effective = mapped
+	}
+	if team == "" || effective == "" || team != effective {
+		return &accessDeniedError{msg: "team-leader cannot access project outside team " + caller.Team}
+	}
+	return nil
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 }
 
 type accessDeniedError struct{ msg string }
@@ -425,6 +494,7 @@ func (h *ProjectHandler) ListProjects(w http.ResponseWriter, r *http.Request) {
 	projects := make([]projectSummary, 0)
 	seen := map[string]bool{}
 
+<<<<<<< HEAD
 	// Team leaders (legacy single-team SA or L2 human multi-team) only scan
 	// their accessible prefixes. The caller's Teams are Team CR names;
 	// crToEffective expands to the effective storage names too.
@@ -449,6 +519,21 @@ func (h *ProjectHandler) ListProjects(w http.ResponseWriter, r *http.Request) {
 		// to the meta-level filter below, so this is a pure early-exit.
 		if teamFilter != "" && teamFromPrefix(prefix) != teamFilter {
 			continue
+=======
+	for _, prefix := range prefixes {
+		// Team leaders only see their own team's prefix. The caller's Team
+		// field is the Team CR name; translate it to the effective storage
+		// name (spec.teamName may differ from the CR name).
+		if caller != nil && caller.Role == authpkg.RoleTeamLeader {
+			effective := caller.Team
+			if mapped, ok := crToEffective[caller.Team]; ok {
+				effective = mapped
+			}
+			own := "teams/" + effective + "/shared/projects/"
+			if caller.Team == "" || prefix != own {
+				continue
+			}
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 		}
 		children, err := h.oss.ListObjects(r.Context(), prefix)
 		if err != nil {
@@ -460,6 +545,7 @@ func (h *ProjectHandler) ListProjects(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				continue
 			}
+<<<<<<< HEAD
 			cands = append(cands, candidate{prefix: prefix, key: key})
 		}
 	}
@@ -528,6 +614,43 @@ func (h *ProjectHandler) ListProjects(w http.ResponseWriter, r *http.Request) {
 			TeamID:    meta.TeamID,
 			Mode:      meta.Mode,
 		})
+=======
+			data, err := h.oss.GetObject(r.Context(), key)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					continue // project dir without meta.json yet; skip, not 500
+				}
+				writeK8sError(w, "list projects: read meta", err)
+				return
+			}
+			var meta projectMeta
+			if err := json.Unmarshal(data, &meta); err != nil {
+				continue // skip malformed meta instead of failing the whole list
+			}
+			if meta.ProjectID == "" || seen[meta.ProjectID] {
+				continue
+			}
+			seen[meta.ProjectID] = true
+			team := teamFromPrefix(prefix)
+			if meta.TeamID == "" {
+				meta.TeamID = team
+			}
+			// Optional ?team= filter (mirrors ListWorkers). Team leaders are
+			// already scoped by their own prefix; standalone projects have an
+			// empty team and are only matched when no filter is set.
+			if teamFilter != "" && meta.TeamID != teamFilter {
+				continue
+			}
+			projects = append(projects, projectSummary{
+				ProjectID: meta.ProjectID,
+				Title:     meta.Title,
+				Status:    meta.Status,
+				PlanType:  meta.PlanType,
+				TeamID:    meta.TeamID,
+				Mode:      meta.Mode,
+			})
+		}
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	}
 
 	// Deterministic ordering across prefixes.
@@ -544,6 +667,7 @@ func (h *ProjectHandler) GetProjectWorkflow(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	caller := authpkg.CallerFromContext(r.Context())
+<<<<<<< HEAD
 	includeTasks := r.URL.Query().Get("includeTasks") == "true"
 	teamFilter := r.URL.Query().Get("team")
 
@@ -554,10 +678,15 @@ func (h *ProjectHandler) GetProjectWorkflow(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	matches, err := h.resolveProjectMeta(r.Context(), projectID, prefixes, teamFilter, caller, crToEffective)
+=======
+
+	meta, team, err := h.resolveProjectMeta(r.Context(), projectID)
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	if err != nil {
 		writeK8sError(w, "get project workflow", err)
 		return
 	}
+<<<<<<< HEAD
 	meta, team, ok := h.resolveSingleProject(w, matches)
 	if !ok {
 		return
@@ -573,10 +702,23 @@ func (h *ProjectHandler) GetProjectWorkflow(w http.ResponseWriter, r *http.Reque
 			httputil.WriteError(w, http.StatusNotFound, "project not found")
 			return
 		}
+=======
+	if meta == nil {
+		httputil.WriteError(w, http.StatusNotFound, "project not found")
+		return
+	}
+	_, crToEffective, terr := h.teamProjectPrefixes(r.Context())
+	if terr != nil {
+		writeK8sError(w, "get project workflow: resolve prefixes", terr)
+		return
+	}
+	if err := h.checkProjectAccess(caller, team, crToEffective); err != nil {
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 		httputil.WriteError(w, http.StatusForbidden, err.Error())
 		return
 	}
 
+<<<<<<< HEAD
 	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, team, includeTasks))
 }
 
@@ -584,6 +726,13 @@ func (h *ProjectHandler) GetProjectWorkflow(w http.ResponseWriter, r *http.Reque
 // When includeTasks is true it additionally reads per-task TaskMeta from
 // shared storage and attaches tasks_detail.
 func (h *ProjectHandler) buildWorkflow(meta *projectMeta, team string, includeTasks bool) *workflowResponse {
+=======
+	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta))
+}
+
+// buildWorkflow converts project meta into the LangGraph-aligned response.
+func (h *ProjectHandler) buildWorkflow(meta *projectMeta) *workflowResponse {
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	nodes := make([]workflowNode, 0, len(meta.Tasks))
 	edges := make([]workflowEdge, 0)
 	next := make([]string, 0)
@@ -626,12 +775,17 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta, team string, includeTa
 	}
 	if !loopBlocked && (meta.Status == "" || meta.Status == "active") {
 		for _, t := range graphTasks {
+<<<<<<< HEAD
 			// Mirror upstream _ready_nodes/_ready_loop_nodes exactly: only
 			// tasks whose raw status is planned/assigned can be ready.
 			// Checking the raw status (not the normalized output) avoids
 			// treating "" or unknown statuses as pending — upstream skips
 			// those, so a consumer must not see them as executable.
 			if t.Status != "planned" && t.Status != "assigned" {
+=======
+			norm := normalizeTaskStatus(t.Status)
+			if norm != "pending" && norm != "delegated" {
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 				continue
 			}
 			allDone := true
@@ -657,6 +811,7 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta, team string, includeTa
 		}
 	}
 
+<<<<<<< HEAD
 	// W1: a paused project is a human interrupt in LangGraph terms — the
 	// workflow is suspended awaiting a human decision (resume). Surfacing it
 	// as an interrupt (in addition to status=paused) lets consumers show
@@ -665,12 +820,15 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta, team string, includeTa
 		interrupts = append(interrupts, workflowInterrupt{ID: "project", Value: "paused"})
 	}
 
+=======
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	// values: current state summary (LangGraph StateSnapshot.values analog).
 	taskCount := map[string]int{}
 	for _, n := range nodes {
 		taskCount[n.Status]++
 	}
 
+<<<<<<< HEAD
 	// includeTasks: read per-task TaskMeta (shared/tasks/{id}/meta.json)
 	// from the same dual-prefix layout as projects and attach tasks_detail.
 	// Tasks without a TaskMeta file are skipped (the node summary remains
@@ -681,6 +839,8 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta, team string, includeTa
 		tasksDetail = h.readTasksDetail(meta, team)
 	}
 
+=======
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	return &workflowResponse{
 		ProjectID:  meta.ProjectID,
 		Title:      meta.Title,
@@ -688,7 +848,10 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta, team string, includeTa
 		PlanType:   meta.PlanType,
 		TeamID:     meta.TeamID,
 		Mode:       meta.Mode,
+<<<<<<< HEAD
 		Source:     meta.Source,
+=======
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 		Nodes:      nodes,
 		Edges:      edges,
 		Next:       next,
@@ -707,6 +870,7 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta, team string, includeTa
 		RequesterReport: meta.RequesterReport,
 		ReplyRoute:      meta.ReplyRoute,
 		SourceRoomID:    meta.SourceRoomID,
+<<<<<<< HEAD
 		TasksDetail:     tasksDetail,
 		UpdatedBy:       meta.UpdatedBy,
 		UpdatedAt:       meta.UpdatedAt,
@@ -1679,3 +1843,7 @@ func (h *ProjectHandler) GetProjectSpawnMessages(w http.ResponseWriter, r *http.
 	}
 	httputil.WriteJSON(w, http.StatusOK, resp)
 }
+=======
+	}
+}
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)

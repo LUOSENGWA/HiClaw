@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+<<<<<<< HEAD
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -10,19 +11,30 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+=======
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	"sort"
 	"strings"
 	"testing"
 
+<<<<<<< HEAD
 	_ "modernc.org/sqlite"
 
+=======
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss/ossfake"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+<<<<<<< HEAD
 	"sigs.k8s.io/controller-runtime/pkg/client"
+=======
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -40,6 +52,7 @@ func newProjectTestScheme(t *testing.T) *runtime.Scheme {
 // in-memory fake, which itself returns full object keys.
 type mcLikeOSS struct {
 	*ossfake.Memory
+<<<<<<< HEAD
 	listCalls int
 	failList  bool
 	failGet   bool
@@ -50,6 +63,11 @@ func (m *mcLikeOSS) ListObjects(_ context.Context, prefix string) ([]string, err
 	if m.failList {
 		return nil, errors.New("oss list failed")
 	}
+=======
+}
+
+func (m *mcLikeOSS) ListObjects(_ context.Context, prefix string) ([]string, error) {
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	keys, err := m.Memory.ListObjects(context.Background(), prefix)
 	if err != nil {
 		return nil, err
@@ -72,6 +90,7 @@ func (m *mcLikeOSS) ListObjects(_ context.Context, prefix string) ([]string, err
 	return out, nil
 }
 
+<<<<<<< HEAD
 func (m *mcLikeOSS) GetObject(ctx context.Context, key string) ([]byte, error) {
 	if m.failGet {
 		return nil, errors.New("oss get failed")
@@ -79,6 +98,8 @@ func (m *mcLikeOSS) GetObject(ctx context.Context, key string) ([]byte, error) {
 	return m.Memory.GetObject(ctx, key)
 }
 
+=======
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 // newProjectTestHandler builds a ProjectHandler with an in-memory OSS store and
 // a fake K8s client containing the given Teams.
 func newProjectTestHandler(t *testing.T, store *ossfake.Memory, teams ...*v1beta1.Team) *ProjectHandler {
@@ -449,6 +470,7 @@ func TestHTTPServer_RegistersProjectRoutes(t *testing.T) {
 		t.Fatalf("expected p1 in workflow, got %s", rec2.Body.String())
 	}
 
+<<<<<<< HEAD
 	// GET /api/v1/projects/p1/tasks/t1/artifact (route registered; no task
 	// meta/artifact stored → 404 rather than 405/404-for-unmatched)
 	putProject(store, "shared/tasks/t1/meta.json", map[string]any{
@@ -461,6 +483,8 @@ func TestHTTPServer_RegistersProjectRoutes(t *testing.T) {
 		t.Fatalf("GET artifact status=%d, want 404 (no result_path)", recArt.Code)
 	}
 
+=======
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	// Unmatched route should 404 (no wildcard shadowing)
 	req3 := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/nope", nil)
 	rec3 := httptest.NewRecorder()
@@ -668,6 +692,7 @@ func TestGetProjectWorkflow_NotFound(t *testing.T) {
 	}
 }
 
+<<<<<<< HEAD
 // TestGetProjectWorkflow_PausedInterrupt guards W1: a paused project surfaces
 // as a human interrupt (LangGraph semantics) in addition to status=paused.
 func TestGetProjectWorkflow_PausedInterrupt(t *testing.T) {
@@ -739,6 +764,8 @@ func TestListProjects_SkipGetObjectFailure(t *testing.T) {
 	}
 }
 
+=======
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 func TestGetProjectWorkflow_TeamLeaderCrossTeamDenied(t *testing.T) {
 	store := ossfake.NewMemory()
 	putProject(store, "teams/beta-team/shared/projects/p2/meta.json", map[string]any{
@@ -752,8 +779,13 @@ func TestGetProjectWorkflow_TeamLeaderCrossTeamDenied(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.GetProjectWorkflow(rec, req)
 
+<<<<<<< HEAD
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status=%d, want 404 for cross-team access (W4: hide project existence)", rec.Code)
+=======
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status=%d, want 403 for cross-team access", rec.Code)
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	}
 }
 
@@ -770,6 +802,7 @@ func TestGetProjectWorkflow_TeamLeaderStandaloneDenied(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.GetProjectWorkflow(rec, req)
 
+<<<<<<< HEAD
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status=%d, want 404 for standalone project (W4: hide existence from team leader)", rec.Code)
 	}
@@ -2828,5 +2861,9 @@ func TestGetProjectSpawnMessages_SessionNotFound(t *testing.T) {
 	rec := spawnMessagesRequest(h, humanCaller(), "p1", "sub-unknown", "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status=%d, want 404 (session not owned by any worker)", rec.Code)
+=======
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status=%d, want 403 for standalone project (no team scope)", rec.Code)
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	}
 }

@@ -112,9 +112,12 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	projectNameFn := func(r *http.Request) string { return r.PathValue("id") }
 	mux.Handle("GET /api/v1/projects", mw.RequireAuthz(authpkg.ActionList, "project", nil)(http.HandlerFunc(projh.ListProjects)))
 	mux.Handle("GET /api/v1/projects/{id}/workflow", mw.RequireAuthz(authpkg.ActionGet, "project", projectNameFn)(http.HandlerFunc(projh.GetProjectWorkflow)))
+<<<<<<< HEAD
 	mux.Handle("GET /api/v1/projects/{id}/tasks/{taskId}/artifact", mw.RequireAuthz(authpkg.ActionGet, "project", projectNameFn)(http.HandlerFunc(projh.GetTaskArtifact)))
 	mux.Handle("GET /api/v1/projects/{id}/spawns", mw.RequireAuthz(authpkg.ActionGet, "project", projectNameFn)(http.HandlerFunc(projh.GetProjectSpawns)))
 	mux.Handle("GET /api/v1/projects/{id}/spawns/{sessionId}/messages", mw.RequireAuthz(authpkg.ActionGet, "project", projectNameFn)(http.HandlerFunc(projh.GetProjectSpawnMessages)))
+=======
+>>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 
 	// --- Gateway ---
 	gh := NewGatewayHandler(deps.Gateway)
