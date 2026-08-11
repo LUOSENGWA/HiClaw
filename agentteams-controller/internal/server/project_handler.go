@@ -198,13 +198,14 @@ func metaKeyFromListResult(prefix, child string) (string, bool) {
 	return prefix + child + "meta.json", true
 }
 
-// resolveProjectMeta locates and reads a project's meta.json across all prefixes.
-// Returns the meta and the owning team ("" for global shared/ projects).
-func (h *ProjectHandler) resolveProjectMeta(ctx context.Context, projectID string) (*projectMeta, string, error) {
-	prefixes, _, err := h.teamProjectPrefixes(ctx)
-	if err != nil {
-		return nil, "", err
-	}
+// resolveProjectMeta locates and reads a project's meta.json across the given
+// prefixes. Returns the meta and the owning team ("" for global shared/
+// projects).
+//
+// prefixes must come from teamProjectPrefixes so callers that also need the
+// crToEffective map (e.g. for access checks) can share a single K8s List call
+// instead of paying two round-trips per request.
+func (h *ProjectHandler) resolveProjectMeta(ctx context.Context, projectID string, prefixes []string) (*projectMeta, string, error) {
 	for _, prefix := range prefixes {
 		children, err := h.oss.ListObjects(ctx, prefix)
 		if err != nil {
@@ -312,6 +313,13 @@ func (h *ProjectHandler) ListProjects(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
+		// ?team= filter: skip prefixes that cannot hold the requested team
+		// before hitting OSS (O2). teamFromPrefix("shared/projects/") is ""
+		// and standalone projects only match when no filter is set — identical
+		// to the meta-level filter below, so this is a pure early-exit.
+		if teamFilter != "" && teamFromPrefix(prefix) != teamFilter {
+			continue
+		}
 		children, err := h.oss.ListObjects(r.Context(), prefix)
 		if err != nil {
 			writeK8sError(w, "list projects", err)
@@ -374,18 +382,19 @@ func (h *ProjectHandler) GetProjectWorkflow(w http.ResponseWriter, r *http.Reque
 	}
 	caller := authpkg.CallerFromContext(r.Context())
 
-	meta, team, err := h.resolveProjectMeta(r.Context(), projectID)
+	// Single K8s List for both meta resolution and the access check (O1).
+	prefixes, crToEffective, err := h.teamProjectPrefixes(r.Context())
+	if err != nil {
+		writeK8sError(w, "get project workflow: resolve prefixes", err)
+		return
+	}
+	meta, team, err := h.resolveProjectMeta(r.Context(), projectID, prefixes)
 	if err != nil {
 		writeK8sError(w, "get project workflow", err)
 		return
 	}
 	if meta == nil {
 		httputil.WriteError(w, http.StatusNotFound, "project not found")
-		return
-	}
-	_, crToEffective, terr := h.teamProjectPrefixes(r.Context())
-	if terr != nil {
-		writeK8sError(w, "get project workflow: resolve prefixes", terr)
 		return
 	}
 	if err := h.checkProjectAccess(caller, team, crToEffective); err != nil {
@@ -440,8 +449,12 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta) *workflowResponse {
 	}
 	if !loopBlocked && (meta.Status == "" || meta.Status == "active") {
 		for _, t := range graphTasks {
-			norm := normalizeTaskStatus(t.Status)
-			if norm != "pending" && norm != "delegated" {
+			// Mirror upstream _ready_nodes/_ready_loop_nodes exactly: only
+			// tasks whose raw status is planned/assigned can be ready.
+			// Checking the raw status (not the normalized output) avoids
+			// treating "" or unknown statuses as pending — upstream skips
+			// those, so a consumer must not see them as executable.
+			if t.Status != "planned" && t.Status != "assigned" {
 				continue
 			}
 			allDone := true

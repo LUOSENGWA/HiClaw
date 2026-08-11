@@ -15,6 +15,7 @@ import (
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss/ossfake"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -32,9 +33,11 @@ func newProjectTestScheme(t *testing.T) *runtime.Scheme {
 // in-memory fake, which itself returns full object keys.
 type mcLikeOSS struct {
 	*ossfake.Memory
+	listCalls int
 }
 
 func (m *mcLikeOSS) ListObjects(_ context.Context, prefix string) ([]string, error) {
+	m.listCalls++
 	keys, err := m.Memory.ListObjects(context.Background(), prefix)
 	if err != nil {
 		return nil, err
@@ -667,5 +670,118 @@ func TestGetProjectWorkflow_TeamLeaderStandaloneDenied(t *testing.T) {
 
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status=%d, want 403 for standalone project (no team scope)", rec.Code)
+	}
+}
+
+// countingClient wraps the fake client to count K8s List round-trips.
+type countingClient struct {
+	client.Client
+	listCalls int
+}
+
+func (c *countingClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	c.listCalls++
+	return c.Client.List(ctx, list, opts...)
+}
+
+// TestGetProjectWorkflow_SingleK8sList guards O1: a workflow request must pay
+// exactly one K8s TeamList round-trip — shared between meta resolution and the
+// team-leader access check — not two.
+func TestGetProjectWorkflow_SingleK8sList(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	scheme := newProjectTestScheme(t)
+	k8s := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(team("alpha-team")).Build()
+	cc := &countingClient{Client: k8s}
+	var o oss.StorageClient = &mcLikeOSS{Memory: store}
+	h := NewProjectHandler(cc, "default", o)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if cc.listCalls != 1 {
+		t.Fatalf("K8s List calls=%d, want 1 (single list shared between meta resolution and access check)", cc.listCalls)
+	}
+}
+
+// TestListProjects_TeamFilterSkipsOtherPrefixes guards O2: a ?team= filter
+// must skip non-matching prefixes before hitting OSS (ListObjects), not scan
+// every prefix and filter afterwards.
+func TestListProjects_TeamFilterSkipsOtherPrefixes(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p2/meta.json", map[string]any{
+		"project_id": "p2", "title": "P2", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	putProject(store, "teams/beta-team/shared/projects/p3/meta.json", map[string]any{
+		"project_id": "p3", "title": "P3", "status": "active", "plan_type": "dag", "team_id": "beta-team",
+	})
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+	})
+	m := &mcLikeOSS{Memory: store}
+	scheme := newProjectTestScheme(t)
+	k8s := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(team("alpha-team"), team("beta-team")).Build()
+	h := NewProjectHandler(k8s, "default", m)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects?team=alpha-team", nil)
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ListProjects(rec, req)
+
+	var resp struct {
+		Projects []map[string]any `json:"projects"`
+		Total    int              `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Total != 1 || resp.Projects[0]["project_id"] != "p2" {
+		t.Fatalf("team filter result wrong: %+v", resp.Projects)
+	}
+	// alpha-team prefix only — beta-team and shared prefixes must not be listed.
+	if m.listCalls != 1 {
+		t.Fatalf("ListObjects calls=%d, want 1 (only the alpha-team prefix scanned)", m.listCalls)
+	}
+}
+
+// TestGetProjectWorkflow_NextOnlyPlannedAssigned guards O5: only tasks whose
+// raw status is planned/assigned can appear in next — empty or unknown
+// statuses must not (upstream _ready_nodes skips them), even when their
+// dependencies are all completed.
+func TestGetProjectWorkflow_NextOnlyPlannedAssigned(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "planned", "depends_on": []string{}},
+			{"task_id": "t2", "title": "T2", "status": "", "depends_on": []string{}},
+			{"task_id": "t3", "title": "T3", "status": "weird", "depends_on": []string{}},
+		},
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var wf workflowResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &wf); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(wf.Next) != 1 || wf.Next[0] != "t1" {
+		t.Fatalf("next=%v, want [t1] only (empty/unknown statuses are not ready)", wf.Next)
 	}
 }
