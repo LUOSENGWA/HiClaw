@@ -461,16 +461,11 @@ func (c *TuwunelClient) doJSONWithASToken(ctx context.Context, method, path stri
 
 // VerifyAccessToken checks whether a user access token is still valid
 // by calling GET /_matrix/client/v3/account/whoami.
+// VerifyAccessToken checks whether a user access token is still valid
+// by calling GET /_matrix/client/v3/account/whoami. Returns nil if valid.
 func (c *TuwunelClient) VerifyAccessToken(ctx context.Context, accessToken string) error {
-	statusCode, respBody, err := c.doJSON(ctx, http.MethodGet,
-		"/_matrix/client/v3/account/whoami", accessToken, nil, nil)
-	if err != nil {
-		return fmt.Errorf("verify access token: %w", err)
-	}
-	if statusCode != http.StatusOK {
-		return fmt.Errorf("verify access token: HTTP %d: %s", statusCode, truncate(respBody, 200))
-	}
-	return nil
+	_, err := c.Whoami(ctx, accessToken)
+	return err
 }
 
 // Whoami validates a user access token and returns the owning user id.
