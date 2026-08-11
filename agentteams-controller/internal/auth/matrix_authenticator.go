@@ -75,12 +75,11 @@ func (a *MatrixTokenAuthenticator) Authenticate(ctx context.Context, token strin
 	if err != nil {
 		return nil, fmt.Errorf("matrix whoami: %w", err)
 	}
-	localpart := localpartFromUserID(userID)
-	if localpart == "" {
+	if localpartFromUserID(userID) == "" {
 		return nil, fmt.Errorf("matrix whoami returned invalid user id %q", userID)
 	}
 
-	identity, err := a.resolveHuman(ctx, localpart)
+	identity, err := a.resolveHuman(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -89,16 +88,28 @@ func (a *MatrixTokenAuthenticator) Authenticate(ctx context.Context, token strin
 	return identity, nil
 }
 
-// resolveHuman looks up the Human CR whose effective username matches the
-// Matrix localpart and builds the L2 team-leader identity.
-func (a *MatrixTokenAuthenticator) resolveHuman(ctx context.Context, localpart string) (*CallerIdentity, error) {
+// resolveHuman looks up the Human CR whose Matrix identity matches the token
+// owner and builds the L2 team-leader identity.
+//
+// Matching is by the authoritative Matrix user id when the Human has been
+// reconciled (Status.MatrixUserID — the id derived by the identity source,
+// which for external_sso is a deterministic hash of issuer+subject and may
+// differ from spec.username). Humans that have not been reconciled yet (no
+// Status.MatrixUserID) fall back to the effective-username localpart, which
+// matches the legacy_password identity source.
+func (a *MatrixTokenAuthenticator) resolveHuman(ctx context.Context, userID string) (*CallerIdentity, error) {
+	localpart := localpartFromUserID(userID)
 	var humans v1beta1.HumanList
 	if err := a.k8s.List(ctx, &humans, client.InNamespace(a.namespace)); err != nil {
 		return nil, fmt.Errorf("list humans: %w", err)
 	}
 	for i := range humans.Items {
 		h := &humans.Items[i]
-		if h.Spec.EffectiveUsername(h.Name) != localpart {
+		if h.Status.MatrixUserID != "" {
+			if h.Status.MatrixUserID != userID {
+				continue
+			}
+		} else if localpart == "" || h.Spec.EffectiveUsername(h.Name) != localpart {
 			continue
 		}
 		if h.Spec.PermissionLevel != 2 {
@@ -112,7 +123,7 @@ func (a *MatrixTokenAuthenticator) resolveHuman(ctx context.Context, localpart s
 			Teams:    teams,
 		}, nil
 	}
-	return nil, fmt.Errorf("no L2 human matches matrix user %q", localpart)
+	return nil, fmt.Errorf("no L2 human matches matrix user %q", userID)
 }
 
 func (a *MatrixTokenAuthenticator) getFromCache(key [32]byte) *CallerIdentity {

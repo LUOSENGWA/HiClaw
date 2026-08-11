@@ -133,3 +133,31 @@ func TestCompositeAuthenticator_AllFail(t *testing.T) {
 		t.Fatal("expected error when all authenticators fail")
 	}
 }
+
+// TestMatrixAuthenticator_SSOHumanMatchesMatrixUserID guards the external_sso
+// identity path: a reconciled SSO human has Status.MatrixUserID that may
+// differ from spec.username (deterministic hash of issuer+subject), so
+// matching must use the authoritative Matrix user id.
+func TestMatrixAuthenticator_SSOHumanMatchesMatrixUserID(t *testing.T) {
+	sso := newHuman("maizong", "maizong", 2, "market-team")
+	sso.Status.MatrixUserID = "@3f9a2b:matrix.local" // derived from issuer+subject hash
+	auth, fw := newMatrixAuthTest(t, sso)
+
+	// Token belongs to the SSO-derived Matrix user id, NOT the localpart.
+	fw.userID = "@3f9a2b:matrix.local"
+	id, err := auth.Authenticate(context.Background(), "matrix-token")
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if id.Username != "maizong" || len(id.Teams) != 1 || id.Teams[0] != "market-team" {
+		t.Fatalf("identity=%+v, want maizong/market-team", id)
+	}
+
+	// A token for a localpart-only match must NOT match the reconciled SSO
+	// human (its authoritative id is the hash, not the username).
+	auth2, fw2 := newMatrixAuthTest(t, sso)
+	fw2.userID = "@maizong:matrix.local"
+	if _, err := auth2.Authenticate(context.Background(), "matrix-token"); err == nil {
+		t.Fatal("expected error: reconciled SSO human must not match by localpart")
+	}
+}
