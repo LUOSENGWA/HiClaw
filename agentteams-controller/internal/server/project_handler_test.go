@@ -1062,3 +1062,83 @@ func TestListProjects_L2HumanTeamFilter(t *testing.T) {
 		t.Fatalf("team filter (outside accessible) leaked %d projects: %+v", resp2.Total, resp2.Projects)
 	}
 }
+
+// staticWhoami implements authpkg.MatrixWhoami for the HTTP auth-chain test.
+type staticWhoami struct {
+	validToken string
+	userID     string
+}
+
+func (s *staticWhoami) Whoami(_ context.Context, token string) (string, error) {
+	if token != s.validToken {
+		return "", errors.New("invalid matrix token")
+	}
+	return s.userID, nil
+}
+
+// alwaysFailAuth always fails (simulates SA TokenReview rejecting a Matrix token).
+type alwaysFailAuth struct{}
+
+func (a *alwaysFailAuth) Authenticate(_ context.Context, _ string) (*authpkg.CallerIdentity, error) {
+	return nil, errors.New("SA token review failed")
+}
+
+// TestProjectHTTP_L2AuthChain exercises the full HTTP chain — bearer token
+// extraction, composite authentication (SA fails, Matrix whoami succeeds),
+// identity enrichment, authorization, and the project handler — for the L2
+// human path.
+func TestProjectHTTP_L2AuthChain(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/pa/meta.json", map[string]any{
+		"project_id": "pa", "title": "PA", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	scheme := newProjectTestScheme(t)
+	human := &v1beta1.Human{
+		ObjectMeta: metav1.ObjectMeta{Name: "maizong", Namespace: "default"},
+		Spec:       v1beta1.HumanSpec{Username: "maizong", PermissionLevel: 2, AccessibleTeams: []string{"alpha-team"}},
+	}
+	k8s := fake.NewClientBuilder().WithScheme(scheme).
+		WithRuntimeObjects(human, team("alpha-team")).Build()
+
+	matrixAuth := authpkg.NewMatrixTokenAuthenticator(k8s, "default", &staticWhoami{validToken: "matrix-token", userID: "@maizong:matrix.local"})
+	composite := authpkg.NewCompositeAuthenticator(&alwaysFailAuth{}, matrixAuth)
+	enricher := authpkg.NewCREnricher(k8s, "default")
+	mw := authpkg.NewMiddleware(composite, enricher, authpkg.NewAuthorizer(), k8s, "default")
+
+	var ossStore oss.StorageClient = &mcLikeOSS{Memory: store}
+	srv := NewHTTPServer(":0", ServerDeps{
+		Client:    k8s,
+		Namespace: "default",
+		OSS:       ossStore,
+		AuthMw:    mw,
+	})
+
+	// L2 human with Matrix token -> aggregated list for accessible team.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	req.Header.Set("Authorization", "Bearer matrix-token")
+	rec := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("L2 list status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"project_id":"pa"`) {
+		t.Fatalf("expected pa in L2 list, got %s", rec.Body.String())
+	}
+
+	// Invalid token -> 401.
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	req2.Header.Set("Authorization", "Bearer bad-token")
+	rec2 := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("bad token status=%d, want 401", rec2.Code)
+	}
+
+	// No token -> 401.
+	req3 := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	rec3 := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusUnauthorized {
+		t.Fatalf("no token status=%d, want 401", rec3.Code)
+	}
+}
