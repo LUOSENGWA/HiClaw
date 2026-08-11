@@ -24,7 +24,7 @@ const (
 // AuthzRequest describes the resource being accessed.
 type AuthzRequest struct {
 	Action       Action
-	ResourceKind string // "worker" | "team" | "human" | "manager" | "gateway" | "status" | "credentials"
+	ResourceKind string // "worker" | "team" | "human" | "manager" | "gateway" | "status" | "credentials" | "project"
 	ResourceName string // target resource name (empty for list operations)
 	ResourceTeam string // target resource's team (resolved by handler/middleware)
 }
@@ -81,6 +81,19 @@ func (a *Authorizer) authorizeTeamLeader(caller *CallerIdentity, req AuthzReques
 			return nil
 		}
 		return deny(caller, req)
+
+	case "project":
+		// Projects live under teams/{team}/shared/projects/ (team-scoped) or the
+		// global shared/projects/ prefix. Team leaders may list projects and read
+		// workflow detail for their own team only.
+		switch req.Action {
+		case ActionList:
+			return nil // handler filters by team prefix
+		case ActionGet, ActionUpdate:
+			return a.requireSameTeam(caller, req)
+		default:
+			return deny(caller, req)
+		}
 
 	default:
 		return deny(caller, req)

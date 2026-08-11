@@ -180,3 +180,43 @@ func TestAuthorizer_NilCaller(t *testing.T) {
 		t.Error("nil caller should be denied")
 	}
 }
+
+func TestAuthorizer_TeamLeaderProjectAccess(t *testing.T) {
+	az := NewAuthorizer()
+	caller := &CallerIdentity{Role: RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"}
+
+	allowed := []AuthzRequest{
+		{Action: ActionList, ResourceKind: "project"},
+		{Action: ActionGet, ResourceKind: "project", ResourceName: "p1", ResourceTeam: "alpha-team"},
+		{Action: ActionUpdate, ResourceKind: "project", ResourceName: "p1", ResourceTeam: "alpha-team"},
+	}
+	for _, req := range allowed {
+		if err := az.Authorize(caller, req); err != nil {
+			t.Errorf("team-leader should be allowed %s %s, got: %v", req.Action, req.ResourceKind, err)
+		}
+	}
+
+	denied := []AuthzRequest{
+		{Action: ActionGet, ResourceKind: "project", ResourceName: "p2", ResourceTeam: "beta-team"},
+		{Action: ActionUpdate, ResourceKind: "project", ResourceName: "p2", ResourceTeam: "beta-team"},
+		{Action: ActionDelete, ResourceKind: "project", ResourceName: "p1", ResourceTeam: "alpha-team"},
+	}
+	for _, req := range denied {
+		if err := az.Authorize(caller, req); err == nil {
+			t.Errorf("team-leader %s %s should be denied", req.Action, req.ResourceKind)
+		}
+	}
+}
+
+func TestAuthorizer_WorkerProjectDenied(t *testing.T) {
+	az := NewAuthorizer()
+	caller := &CallerIdentity{Role: RoleWorker, Username: "alpha-dev", Team: "alpha-team"}
+	for _, req := range []AuthzRequest{
+		{Action: ActionList, ResourceKind: "project"},
+		{Action: ActionGet, ResourceKind: "project", ResourceName: "p1", ResourceTeam: "alpha-team"},
+	} {
+		if err := az.Authorize(caller, req); err == nil {
+			t.Errorf("worker %s %s should be denied", req.Action, req.ResourceKind)
+		}
+	}
+}
