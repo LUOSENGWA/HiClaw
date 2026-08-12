@@ -146,6 +146,29 @@ Controller 提供两个只读端点，把 TeamHarness 项目状态
 | `404` | 项目不存在（所有扫描前缀下都无 meta.json）——**或**调用者是限定读者（团队 leader / L2 人类）且不拥有该项目（隐藏存在性以防 id 枚举）。 |
 | `500` | K8s 或对象存储故障。 |
 
+### `GET /api/v1/projects/{id}/tasks/{taskId}/artifact`
+
+下载一个任务的一个产物，为 dashboard 和 console 插件补全「交付物 → 下载 → 审 → 接受」闭环。
+
+可选查询参数：
+
+| 参数 | 含义 |
+|:--|:--|
+| `path` | 要下载的产物路径。必须是任务**已声明**的产物之一——`result_path`、`spec_path` 或 `deliverables` 的某一项（均从 TaskMeta 读取）。省略时默认提供 `result_path`（已发布结果）。 |
+
+不带 `?path=` 时下载任务的 `result_path`（已发布结果）。带 `?path=` 时，请求路径必须是任务已声明的产物之一——`result_path`、`spec_path`（任务规格书）或 `deliverables` 的某一项。随后路径通过严格白名单校验：必须位于 `shared/tasks/{taskId}/` 或 `shared/projects/{projectId}/` 之下，且不得包含 `..` 或以 `/` 开头。由于**白名单 + 已声明产物**双重校验，被攻破的 Worker 无法构造读取任意 MinIO 对象的路径，客户端也无法下载恰好位于任务目录但未声明的文件。
+
+文件以 `Content-Disposition: attachment`（文件名为 basename，非 ASCII 名用 RFC 5987 `filename*=utf-8''...` 编码——中文文件名可正确下载）返回，`Content-Type` 由扩展名推断。
+
+错误响应：
+
+| 状态码 | 含义 |
+|:--|:--|
+| `400` | 缺少项目 id 或任务 id。 |
+| `403` | 已认证但该角色完全不能读取项目（如 Worker）。 |
+| `404` | 项目不存在 / 调用者不拥有它（隐藏存在性）/ 任务不在项目图中 / 任务没有已发布产物 / 请求路径不是已声明产物 / 产物文件缺失 / 产物路径被拒绝。 |
+| `500` | K8s 或对象存储故障。 |
+
 ## 认证与授权
 
 接受两种 bearer 令牌路径（复合认证器）：

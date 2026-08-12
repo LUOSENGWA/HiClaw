@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"os"
+	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -775,6 +778,259 @@ func keyForTaskID(key string, taskIDs []string) string {
 		}
 	}
 	return ""
+}
+
+// GetTaskArtifact serves the result artifact of one task.
+//
+// GET /api/v1/projects/{id}/tasks/{taskId}/artifact
+//
+// The artifact path is NOT taken from the client: it is read from the task's
+// TaskMeta (shared/tasks/{id}/meta.json) `result_path` field, which is written
+// by TeamHarness submit_task when the worker publishes a result. This keeps
+// the endpoint read-only and prevents callers from downloading arbitrary
+// objects. The path is then validated against a strict allowlist of prefixes
+// so a malicious/compromised worker cannot craft a path that escapes the
+// project/task storage area (path traversal / arbitrary file read).
+func (h *ProjectHandler) GetTaskArtifact(w http.ResponseWriter, r *http.Request) {
+	projectID := r.PathValue("id")
+	taskID := r.PathValue("taskId")
+	if projectID == "" || taskID == "" {
+		httputil.WriteError(w, http.StatusBadRequest, "project id and task id are required")
+		return
+	}
+	caller := authpkg.CallerFromContext(r.Context())
+	requestedPath := r.URL.Query().Get("path")
+
+	// Single K8s List for both meta resolution and the access check (O1
+	// pattern). Reuse the same dual-prefix layout as GetProjectWorkflow.
+	prefixes, crToEffective, err := h.teamProjectPrefixes(r.Context())
+	if err != nil {
+		writeK8sError(w, "get task artifact: resolve prefixes", err)
+		return
+	}
+	meta, team, err := h.resolveProjectMeta(r.Context(), projectID, prefixes)
+	if err != nil {
+		writeK8sError(w, "get task artifact", err)
+		return
+	}
+	if meta == nil {
+		httputil.WriteError(w, http.StatusNotFound, "project not found")
+		return
+	}
+	// W4: hide project existence from scoped callers who do not own this
+	// project (L2 / team leader). Same 404 semantics as GetProjectWorkflow.
+	if err := h.checkProjectAccess(caller, team, crToEffective); err != nil {
+		if _, ok := err.(*accessDeniedError); ok {
+			httputil.WriteError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		httputil.WriteError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
+	// The task must belong to this project's graph (project.tasks, or
+	// loop.tasks for loop plans). This prevents downloading a result from a
+	// task id that exists in shared storage but belongs to another project.
+	graphTasks := meta.Tasks
+	if meta.PlanType == "loop" && meta.Loop != nil {
+		graphTasks = meta.Loop.Tasks
+	}
+	belongsToProject := false
+	for _, t := range graphTasks {
+		if t.TaskID == taskID {
+			belongsToProject = true
+			break
+		}
+	}
+	if !belongsToProject {
+		httputil.WriteError(w, http.StatusNotFound, "task not found")
+		return
+	}
+
+	// Read TaskMeta from the dual-prefix layout (team first, global
+	// fallback), mirroring readTasksDetail. Collect the artifact paths the
+	// task declares: result_path (published result), spec_path (task spec)
+	// and deliverables (published artifact list). The client may request any
+	// of them via ?path=; without ?path= the result_path is served (default).
+	resultPath, specPath := "", ""
+	deliverables := []string{}
+	for _, key := range taskMetaKeys(taskID, team) {
+		data, err := h.oss.GetObject(r.Context(), key)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			httputil.WriteError(w, http.StatusInternalServerError, "read task meta: "+err.Error())
+			return
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(data, &raw); err != nil {
+			continue // malformed TaskMeta; keep scanning other prefixes
+		}
+		resultPath = str(raw["result_path"])
+		specPath = str(raw["spec_path"])
+		deliverables = nil
+		if list, ok := raw["deliverables"].([]any); ok {
+			for _, item := range list {
+				if s := str(item); s != "" {
+					deliverables = append(deliverables, s)
+				}
+			}
+		}
+		break // first readable TaskMeta wins (team prefix listed first)
+	}
+
+	// Decide which artifact to serve. Without ?path= we serve result_path
+	// (the default published result); with ?path= the requested path must be
+	// one of the task's declared artifacts — this prevents downloading files
+	// that live in the task dir but were never published (defense in depth
+	// beyond the prefix allowlist).
+	artifactRelative := ""
+	switch {
+	case requestedPath == "":
+		if resultPath == "" {
+			httputil.WriteError(w, http.StatusNotFound, "task has no artifact")
+			return
+		}
+		artifactRelative = resultPath
+	default:
+		allowed := map[string]bool{resultPath: resultPath != "", specPath: specPath != ""}
+		for _, d := range deliverables {
+			allowed[d] = true
+		}
+		if !allowed[requestedPath] {
+			httputil.WriteError(w, http.StatusNotFound, "task has no such artifact")
+			return
+		}
+		artifactRelative = requestedPath
+	}
+
+	// Path safety: the artifact path is worker-written (result_path /
+	// spec_path / deliverables); validate it against the project/task
+	// storage area so a bad path cannot escape to arbitrary MinIO objects.
+	// Allowed: shared/tasks/{taskID}/... and shared/projects/{projectID}/...
+	// (result files live in the task dir, but accept_task_result may also
+	// publish a project-level result.md). Reject any path with `..` or an
+	// absolute path outright.
+	switch {
+	case strings.HasPrefix(artifactRelative, "shared/tasks/"+taskID+"/"):
+		// OK
+	case strings.HasPrefix(artifactRelative, "shared/projects/"+projectID+"/"):
+		// OK
+	default:
+		httputil.WriteError(w, http.StatusNotFound, "task has no artifact")
+		return
+	}
+	if strings.Contains(artifactRelative, "..") || strings.HasPrefix(artifactRelative, "/") {
+		httputil.WriteError(w, http.StatusNotFound, "task has no artifact")
+		return
+	}
+
+	// The artifact lives under the same dual-prefix layout as TaskMeta: a
+	// team member's files sync to teams/{team}/shared/..., a standalone
+	// worker's to global shared/.... Try the team-scoped key first, then the
+	// global one (mirrors taskMetaKeys ordering).
+	var data []byte
+	var readErr error
+	for _, key := range artifactKeys(artifactRelative, team) {
+		d, err := h.oss.GetObject(r.Context(), key)
+		if err == nil {
+			data = d
+			break
+		}
+		readErr = err
+	}
+	if data == nil {
+		if errors.Is(readErr, os.ErrNotExist) {
+			httputil.WriteError(w, http.StatusNotFound, "artifact not found")
+			return
+		}
+		httputil.WriteError(w, http.StatusInternalServerError, "read artifact: "+errStr(readErr))
+		return
+	}
+
+	// Stream back with an attachment disposition so the file downloads
+	// rather than rendering inline. The filename is the basename of the
+	// artifact path; Content-Type is inferred from the extension.
+	//
+	// mime.FormatMediaType produces RFC 5987 filename*=utf-8''... for
+	// non-ASCII names (Chinese etc.) and plain filename="..." for ASCII, so
+	// browsers decode the download name correctly in both cases.
+	fileName := path.Base(artifactRelative)
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": fileName}))
+	w.Header().Set("Content-Type", contentTypeFor(fileName))
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+// artifactKeys returns candidate object keys for an artifact relative path
+// under the given team ("" for global), team-scoped prefix first. Mirrors
+// taskMetaKeys: team members sync to teams/{team}/shared/..., standalone
+// workers to global shared/...
+func artifactKeys(relative, team string) []string {
+	keys := make([]string, 0, 2)
+	if team != "" && strings.HasPrefix(relative, "shared/") {
+		keys = append(keys, "teams/"+team+"/"+relative)
+	}
+	keys = append(keys, relative)
+	return keys
+}
+
+// errStr returns err's message or "" for nil, avoiding a nil deref in error
+// paths where the last read error may be nil when the key list is empty.
+func errStr(err error) string {
+	if err == nil {
+		return "unknown error"
+	}
+	return err.Error()
+}
+
+// taskMetaKeys returns the candidate TaskMeta keys for a task in the given
+// team ("" for global), team-scoped prefix first. Mirrors readTasksDetail.
+func taskMetaKeys(taskID, team string) []string {
+	keys := make([]string, 0, 2)
+	if team != "" {
+		keys = append(keys, "teams/"+team+"/shared/tasks/"+taskID+"/meta.json")
+	}
+	keys = append(keys, "shared/tasks/"+taskID+"/meta.json")
+	return keys
+}
+
+// contentTypeFor maps a file extension to a Content-Type for artifact
+// downloads. Unknown extensions fall back to application/octet-stream.
+func contentTypeFor(name string) string {
+	ext := strings.ToLower(path.Ext(name))
+	switch ext {
+	case ".md", ".markdown", ".txt":
+		return "text/markdown; charset=utf-8"
+	case ".pdf":
+		return "application/pdf"
+	case ".json":
+		return "application/json"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".svg":
+		return "image/svg+xml"
+	case ".doc", ".docx":
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	case ".xls", ".xlsx":
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	case ".ppt", ".pptx":
+		return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+	case ".zip":
+		return "application/zip"
+	case ".csv":
+		return "text/csv; charset=utf-8"
+	case ".html", ".htm":
+		return "text/html; charset=utf-8"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 // str is a small helper to coerce a JSON value to string ("" for nil).

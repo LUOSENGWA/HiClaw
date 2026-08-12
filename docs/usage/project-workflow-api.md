@@ -169,6 +169,41 @@ Error responses:
 | `404` | Project not found (no meta.json under any scanned prefix) — **or** the caller is a scoped reader (team leader / L2 human) who does not own the project (existence is hidden to prevent id enumeration). |
 | `500` | K8s or object-store failure. |
 
+### `GET /api/v1/projects/{id}/tasks/{taskId}/artifact`
+
+Download one of a task's artifacts, completing the "deliverable → download →
+review → accept" loop for dashboards and the console plugin.
+
+Optional query parameter:
+
+| Param | Meaning |
+|:--|:--|
+| `path` | The artifact path to download. Must be one of the task's **declared** artifacts — `result_path`, `spec_path` or an entry of `deliverables` (all read from TaskMeta). When omitted, the `result_path` (the published result) is served. |
+
+Without `?path=` the artifact is the task's `result_path` (published result).
+With `?path=` the requested path must be one of the task's declared artifacts
+— `result_path`, `spec_path` (task spec) or a `deliverables` entry. The path
+is then validated against a strict allowlist: it must be under
+`shared/tasks/{taskId}/` or `shared/projects/{projectId}/`, and must not
+contain `..` or start with `/`. Because the allowlist AND the declared-artifact
+check both apply, a compromised worker cannot craft a path that reads
+arbitrary MinIO objects, nor can a client download an undeclared file that
+happens to live in the task directory.
+
+The file is returned with `Content-Disposition: attachment` (filename =
+basename, RFC 5987 `filename*=utf-8''...` for non-ASCII names so Chinese
+filenames download correctly) and a `Content-Type` inferred from the
+extension.
+
+Error responses:
+
+| Code | Meaning |
+|:--|:--|
+| `400` | Missing project id or task id. |
+| `403` | Authenticated but the role cannot read projects at all (e.g. Worker). |
+| `404` | Project not found / caller does not own it (existence hidden) / task not in the project graph / task has no published artifact / requested path is not a declared artifact / artifact file missing / artifact path rejected. |
+| `500` | K8s or object-store failure. |
+
 ## Authentication & authorization
 
 Two bearer-token paths are accepted (composite authenticator):

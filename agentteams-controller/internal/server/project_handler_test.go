@@ -444,6 +444,18 @@ func TestHTTPServer_RegistersProjectRoutes(t *testing.T) {
 		t.Fatalf("expected p1 in workflow, got %s", rec2.Body.String())
 	}
 
+	// GET /api/v1/projects/p1/tasks/t1/artifact (route registered; no task
+	// meta/artifact stored → 404 rather than 405/404-for-unmatched)
+	putProject(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "completed",
+	})
+	reqArt := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact", nil)
+	recArt := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(recArt, reqArt)
+	if recArt.Code != http.StatusNotFound {
+		t.Fatalf("GET artifact status=%d, want 404 (no result_path)", recArt.Code)
+	}
+
 	// Unmatched route should 404 (no wildcard shadowing)
 	req3 := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/nope", nil)
 	rec3 := httptest.NewRecorder()
@@ -1530,5 +1542,457 @@ func TestGetProjectWorkflow_IncludeTasksLoopTasks(t *testing.T) {
 	}
 	if len(wf.TasksDetail) != 1 || wf.TasksDetail[0].TaskID != "iter-2" {
 		t.Fatalf("tasks_detail=%+v, want iter-2 only", wf.TasksDetail)
+	}
+}
+
+
+func TestGetTaskArtifact_Download(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag",
+		"team_id": "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "completed"},
+		},
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "completed",
+		"result_path": "shared/tasks/t1/result.md",
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t1/result.md", map[string]any{
+		"hello": "artifact body",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact", nil)
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/markdown; charset=utf-8" {
+		t.Fatalf("Content-Type=%q, want text/markdown", ct)
+	}
+	if cd := rec.Header().Get("Content-Disposition"); !strings.Contains(cd, "result.md") {
+		t.Fatalf("Content-Disposition=%q, want attachment with result.md", cd)
+	}
+	if !strings.Contains(rec.Body.String(), "artifact body") {
+		t.Fatalf("body=%q, want artifact content", rec.Body.String())
+	}
+}
+
+func TestGetTaskArtifact_ProjectNotFound(t *testing.T) {
+	store := ossfake.NewMemory()
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/nope/tasks/t1/artifact", nil)
+	req.SetPathValue("id", "nope")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404", rec.Code)
+	}
+}
+
+func TestGetTaskArtifact_TaskNotInProject(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag",
+		"team_id": "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "completed"},
+		},
+	})
+	// t2 exists in shared storage but belongs to another project.
+	putProject(store, "teams/alpha-team/shared/tasks/t2/meta.json", map[string]any{
+		"task_id": "t2", "project_id": "p2", "status": "completed",
+		"result_path": "shared/tasks/t2/result.md",
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t2/result.md", map[string]any{"x": "y"})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t2/artifact", nil)
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t2")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (task not in project graph)", rec.Code)
+	}
+}
+
+func TestGetTaskArtifact_NoResultPath(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag",
+		"team_id": "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "assigned"},
+		},
+	})
+	// TaskMeta exists but has no result_path (not yet submitted).
+	putProject(store, "teams/alpha-team/shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "assigned",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact", nil)
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (no result_path)", rec.Code)
+	}
+}
+
+func TestGetTaskArtifact_MissingArtifactFile(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag",
+		"team_id": "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "completed"},
+		},
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "completed",
+		"result_path": "shared/tasks/t1/result.md",
+	})
+	// result.md does NOT exist in storage.
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact", nil)
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (artifact file missing)", rec.Code)
+	}
+}
+
+func TestGetTaskArtifact_PathTraversalRejected(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag",
+		"team_id": "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "completed"},
+		},
+	})
+	// Malicious worker sets a traversal result_path.
+	putProject(store, "teams/alpha-team/shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "completed",
+		"result_path": "shared/tasks/t1/../../secret/credentials.json",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact", nil)
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (traversal rejected)", rec.Code)
+	}
+}
+
+func TestGetTaskArtifact_EscapePrefixRejected(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag",
+		"team_id": "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "completed"},
+		},
+	})
+	// result_path points at an unrelated shared object (not this task/project).
+	putProject(store, "teams/alpha-team/shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "completed",
+		"result_path": "shared/tasks/OTHER/result.md",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact", nil)
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (escape prefix rejected)", rec.Code)
+	}
+}
+
+func TestGetTaskArtifact_L2Scoped(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag",
+		"team_id": "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "completed"},
+		},
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "completed",
+		"result_path": "shared/tasks/t1/result.md",
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t1/result.md", map[string]any{"ok": true})
+	// L2 human with alpha-team accessible.
+	l2 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "sun", Teams: []string{"alpha-team"}}
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact", nil)
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, l2)
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 (L2 own team)", rec.Code)
+	}
+}
+
+func TestGetTaskArtifact_L2CrossTeam404(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag",
+		"team_id": "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "completed"},
+		},
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "completed",
+		"result_path": "shared/tasks/t1/result.md",
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t1/result.md", map[string]any{"ok": true})
+	// L2 human controlling only beta-team cannot read alpha-team artifact.
+	l2 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "ma", Teams: []string{"beta-team"}}
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact", nil)
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, l2)
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (L2 cross-team existence hidden)", rec.Code)
+	}
+}
+
+func TestGetTaskArtifact_GlobalPrefixFallback(t *testing.T) {
+	store := ossfake.NewMemory()
+	// Standalone project (no team) -> global shared/ prefixes.
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Standalone", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "completed"},
+		},
+	})
+	putProject(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "completed",
+		"result_path": "shared/tasks/t1/result.pdf",
+	})
+	putProject(store, "shared/tasks/t1/result.pdf", map[string]any{"hello": "pdf body"})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact", nil)
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 (global prefix)", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/pdf" {
+		t.Fatalf("Content-Type=%q, want application/pdf", ct)
+	}
+}
+
+
+func TestGetTaskArtifact_ByPathDeliverable(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag",
+		"team_id": "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "completed"},
+		},
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "completed",
+		"result_path": "shared/tasks/t1/result.md",
+		"deliverables": []any{"shared/tasks/t1/output.pdf"},
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t1/output.pdf", map[string]any{"pdf": "content"})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact?path=shared/tasks/t1/output.pdf", nil)
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/pdf" {
+		t.Fatalf("Content-Type=%q, want application/pdf", ct)
+	}
+	if !strings.Contains(rec.Body.String(), "content") {
+		t.Fatalf("body=%q, want deliverable content", rec.Body.String())
+	}
+}
+
+func TestGetTaskArtifact_ByPathSpec(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag",
+		"team_id": "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "completed"},
+		},
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "completed",
+		"result_path": "shared/tasks/t1/result.md",
+		"spec_path":   "shared/tasks/t1/spec.md",
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t1/spec.md", map[string]any{"spec": "the spec"})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact?path=shared/tasks/t1/spec.md", nil)
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "the spec") {
+		t.Fatalf("body=%q, want spec content", rec.Body.String())
+	}
+}
+
+func TestGetTaskArtifact_ByPathNotDeclared(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag",
+		"team_id": "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "completed"},
+		},
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "completed",
+		"result_path": "shared/tasks/t1/result.md",
+	})
+	// secret.json exists in the task dir but is NOT declared as an artifact.
+	putProject(store, "teams/alpha-team/shared/tasks/t1/secret.json", map[string]any{"secret": "value"})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact?path=shared/tasks/t1/secret.json", nil)
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (path not declared as artifact)", rec.Code)
+	}
+}
+
+func TestGetTaskArtifact_ChineseFilenameEncoding(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "completed"},
+		},
+	})
+	putProject(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "completed",
+		"result_path": "shared/tasks/t1/result.md",
+	})
+	putProject(store, "shared/tasks/t1/result.md", map[string]any{"ok": true})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact", nil)
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// result.md is ASCII -> plain filename=result.md (no RFC 5987 needed).
+	if cd := rec.Header().Get("Content-Disposition"); !strings.Contains(cd, "result.md") {
+		t.Fatalf("Content-Disposition=%q, want filename=result.md", cd)
+	}
+}
+
+
+func TestGetTaskArtifact_ChineseDeliverableFilenameRFC5987(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "completed"},
+		},
+	})
+	putProject(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "completed",
+		"result_path": "shared/tasks/t1/result.md",
+		"deliverables": []any{"shared/tasks/t1/季度报告.pdf"},
+	})
+	putProject(store, "shared/tasks/t1/季度报告.pdf", map[string]any{"report": "chinese content"})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact?path=shared/tasks/t1/季度报告.pdf", nil)
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	cd := rec.Header().Get("Content-Disposition")
+	// RFC 5987: non-ASCII filename must be encoded as filename*=utf-8''...
+	if !strings.Contains(cd, "filename*=utf-8''") {
+		t.Fatalf("Content-Disposition=%q, want RFC 5987 filename*=utf-8'' for Chinese filename", cd)
+	}
+	if !strings.Contains(cd, "%E5%AD%A3%E5%BA%A6") { // 季度 in UTF-8 percent-encoding
+		t.Fatalf("Content-Disposition=%q, want percent-encoded 季度", cd)
 	}
 }
