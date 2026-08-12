@@ -3207,10 +3207,43 @@ def _notification_needed(
     return result
 
 
+def _project_id_for_pull(arguments: dict[str, Any], payload: dict[str, Any]) -> str:
+    """Resolve the project id for a projectflow/taskflow payload before the
+    read-before-read pull.
+
+    create_project/create_quick_project generate/validate a unique id, so the
+    project does not yet exist — pull is meaningless (and would fail on the
+    remote). Read-type actions carry projectId/project_id directly, except
+    resolve_project which may carry only taskId (the task belongs to a
+    project). Returns "" when the payload does not identify a project.
+    """
+    action = str(payload.get("action") or "").strip()
+    if action in {"create_project", "create_quick_project"}:
+        return ""
+    project_id = _first_text(payload.get("projectId"), payload.get("project_id"))
+    if project_id:
+        return project_id
+    task_id = _first_text(payload.get("taskId"), payload.get("task_id"))
+    if task_id:
+        task = _read_json(_task_state_path(arguments, task_id))
+        if task:
+            return _first_text(task.get("project_id"), task.get("projectId"))
+    return ""
+
+
 def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
     action = str(arguments.get("action") or "").strip()
     payload = _payload(arguments)
     try:
+        # W-PR-2 read-before-read: pull the authoritative meta.json from
+        # shared storage before any read-type action so a Controller write
+        # (pause/resume/replan) takes effect on the next read. One call at
+        # the entry covers every read path (resolve_project, ready_nodes,
+        # ready_loop_nodes, accept_task_result, record_loop_iteration,
+        # pause/resume/complete, ...) instead of adding a pull per action.
+        pid = _project_id_for_pull(arguments, payload)
+        if pid:
+            _pull_project(arguments, pid)
         if action == "create_project":
             project_id = _project_id_from_payload(arguments, payload)
             project = {
@@ -3797,6 +3830,65 @@ def _pull_task(arguments: dict[str, Any], task_id: str) -> bool:
     return True
 
 
+def _pull_project(arguments: dict[str, Any], project_id: str) -> bool:
+    """Pull a project's meta.json from shared storage (single file) so a
+    Controller-level write (pause / resume / replan) takes effect on the next
+    read.
+
+    Mirrors _pull_task's field-preservation pattern, but for the single
+    authoritative file (shared/projects/{id}/meta.json) instead of a task
+    directory (E3): plan.md/result.md are derived/data files and the
+    Controller only ever writes meta.json. The pull uses a single-file
+    `mc cp` (the normalized path has 4 segments, so _normalize_shared_path
+    treats it as a file, not a directory), which is an order of magnitude
+    cheaper than a directory mirror.
+
+    After the pull, if the authoritative fields (status / tasks / plan_type)
+    differ from the pre-pull local copy, plan.md is re-rendered from the new
+    meta (D2) so the derived plan document stays consistent with the single
+    source of truth. Fields that the remote copy omits (older versions) are
+    back-filled from the local copy to avoid clobbering them.
+
+    Returns True on a successful pull (even when the remote object does not
+    exist — the pull is best-effort); callers ignore the return value and
+    proceed to read local state, which yields "project not found" naturally
+    when the project does not exist.
+    """
+    existing = _read_json(_project_state_path(arguments, project_id))
+    sync_args = dict(arguments)
+    sync_args.update({
+        "action": "pull",
+        "path": f"shared/projects/{project_id}/meta.json",
+    })
+    result = _filesync(sync_args)
+    if not result.get("ok"):
+        return False
+    pulled = _read_json(_project_state_path(arguments, project_id))
+    if not pulled:
+        return False
+
+    changed = any(pulled.get(key) != existing.get(key) for key in ("status", "tasks", "plan_type"))
+    if existing:
+        # Back-fill fields the remote copy omits (older versions). String
+        # fields use _first_text; reply_route is a dict and must be preserved
+        # as-is when the remote omits it.
+        for snake, camel in (
+            ("source_room_id", "sourceRoomId"),
+            ("team_id", "teamId"),
+        ):
+            if _first_text(pulled.get(snake), pulled.get(camel)):
+                continue
+            preserved = _first_text(existing.get(snake), existing.get(camel))
+            if preserved:
+                pulled[snake] = preserved
+        if not pulled.get("reply_route") and existing.get("reply_route"):
+            pulled["reply_route"] = existing["reply_route"]
+        _write_json(_project_state_path(arguments, project_id), pulled)
+    if changed:
+        _write_project_plan(_project_dir(arguments, project_id), pulled)
+    return True
+
+
 TERMINAL_TASK_STATUSES = {"completed", "revision", "blocked", "cancelled"}
 
 
@@ -3956,6 +4048,15 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
     payload = _payload(arguments)
     role = _role(arguments)
     try:
+        # W-PR-2 read-before-read: taskflow has no create action; every
+        # action (delegate/ack/submit/cancel/check) belongs to a project.
+        # Pull the authoritative meta.json first so a Controller pause /
+        # resume / replan is visible before ack/submit/cancel write the
+        # project node status back (otherwise the write-back would clobber
+        # the Controller's paused status with a stale active).
+        pid = _project_id_for_pull(arguments, payload)
+        if pid:
+            _pull_project(arguments, pid)
         if action == "delegate_task":
             if role != "leader":
                 raise ValueError("delegate_task requires leader role")

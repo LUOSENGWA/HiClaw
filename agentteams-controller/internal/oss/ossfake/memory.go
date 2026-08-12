@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss"
 )
@@ -24,11 +25,13 @@ import (
 type Memory struct {
 	mu      sync.RWMutex
 	objects map[string][]byte
+	modTime time.Time
+	next    int64
 }
 
 // NewMemory constructs an empty in-memory storage client.
 func NewMemory() *Memory {
-	return &Memory{objects: make(map[string][]byte)}
+	return &Memory{objects: make(map[string][]byte), modTime: time.Unix(1700000000, 0)}
 }
 
 // PutObject stores data under key.
@@ -38,6 +41,8 @@ func (m *Memory) PutObject(_ context.Context, key string, data []byte) error {
 	buf := make([]byte, len(data))
 	copy(buf, data)
 	m.objects[key] = buf
+	m.modTime = m.modTime.Add(time.Second)
+	m.next++
 	return nil
 }
 
@@ -73,6 +78,18 @@ func (m *Memory) Stat(_ context.Context, key string) error {
 		return os.ErrNotExist
 	}
 	return nil
+}
+
+// StatMeta returns a monotonic mtime for the object. Writes advance the clock,
+// so a test can verify the optimistic-lock conflict path by writing after a
+// read. Returns os.ErrNotExist when the key is missing.
+func (m *Memory) StatMeta(_ context.Context, key string) (oss.ObjectMeta, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.objects[key]; !ok {
+		return oss.ObjectMeta{}, os.ErrNotExist
+	}
+	return oss.ObjectMeta{Size: int64(len(m.objects[key])), ModTime: m.modTime}, nil
 }
 
 // DeleteObject removes the object stored under key. Deleting a missing key

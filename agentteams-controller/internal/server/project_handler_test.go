@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-<<<<<<< HEAD
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -11,30 +10,19 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-=======
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
->>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	"sort"
 	"strings"
 	"testing"
 
-<<<<<<< HEAD
 	_ "modernc.org/sqlite"
 
-=======
->>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss/ossfake"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-<<<<<<< HEAD
 	"sigs.k8s.io/controller-runtime/pkg/client"
-=======
->>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -52,7 +40,6 @@ func newProjectTestScheme(t *testing.T) *runtime.Scheme {
 // in-memory fake, which itself returns full object keys.
 type mcLikeOSS struct {
 	*ossfake.Memory
-<<<<<<< HEAD
 	listCalls int
 	failList  bool
 	failGet   bool
@@ -63,11 +50,6 @@ func (m *mcLikeOSS) ListObjects(_ context.Context, prefix string) ([]string, err
 	if m.failList {
 		return nil, errors.New("oss list failed")
 	}
-=======
-}
-
-func (m *mcLikeOSS) ListObjects(_ context.Context, prefix string) ([]string, error) {
->>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	keys, err := m.Memory.ListObjects(context.Background(), prefix)
 	if err != nil {
 		return nil, err
@@ -90,7 +72,6 @@ func (m *mcLikeOSS) ListObjects(_ context.Context, prefix string) ([]string, err
 	return out, nil
 }
 
-<<<<<<< HEAD
 func (m *mcLikeOSS) GetObject(ctx context.Context, key string) ([]byte, error) {
 	if m.failGet {
 		return nil, errors.New("oss get failed")
@@ -98,8 +79,6 @@ func (m *mcLikeOSS) GetObject(ctx context.Context, key string) ([]byte, error) {
 	return m.Memory.GetObject(ctx, key)
 }
 
-=======
->>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 // newProjectTestHandler builds a ProjectHandler with an in-memory OSS store and
 // a fake K8s client containing the given Teams.
 func newProjectTestHandler(t *testing.T, store *ossfake.Memory, teams ...*v1beta1.Team) *ProjectHandler {
@@ -470,7 +449,6 @@ func TestHTTPServer_RegistersProjectRoutes(t *testing.T) {
 		t.Fatalf("expected p1 in workflow, got %s", rec2.Body.String())
 	}
 
-<<<<<<< HEAD
 	// GET /api/v1/projects/p1/tasks/t1/artifact (route registered; no task
 	// meta/artifact stored → 404 rather than 405/404-for-unmatched)
 	putProject(store, "shared/tasks/t1/meta.json", map[string]any{
@@ -483,8 +461,6 @@ func TestHTTPServer_RegistersProjectRoutes(t *testing.T) {
 		t.Fatalf("GET artifact status=%d, want 404 (no result_path)", recArt.Code)
 	}
 
-=======
->>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	// Unmatched route should 404 (no wildcard shadowing)
 	req3 := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/nope", nil)
 	rec3 := httptest.NewRecorder()
@@ -692,7 +668,6 @@ func TestGetProjectWorkflow_NotFound(t *testing.T) {
 	}
 }
 
-<<<<<<< HEAD
 // TestGetProjectWorkflow_PausedInterrupt guards W1: a paused project surfaces
 // as a human interrupt (LangGraph semantics) in addition to status=paused.
 func TestGetProjectWorkflow_PausedInterrupt(t *testing.T) {
@@ -764,8 +739,6 @@ func TestListProjects_SkipGetObjectFailure(t *testing.T) {
 	}
 }
 
-=======
->>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 func TestGetProjectWorkflow_TeamLeaderCrossTeamDenied(t *testing.T) {
 	store := ossfake.NewMemory()
 	putProject(store, "teams/beta-team/shared/projects/p2/meta.json", map[string]any{
@@ -779,13 +752,8 @@ func TestGetProjectWorkflow_TeamLeaderCrossTeamDenied(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.GetProjectWorkflow(rec, req)
 
-<<<<<<< HEAD
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status=%d, want 404 for cross-team access (W4: hide project existence)", rec.Code)
-=======
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("status=%d, want 403 for cross-team access", rec.Code)
->>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	}
 }
 
@@ -802,7 +770,6 @@ func TestGetProjectWorkflow_TeamLeaderStandaloneDenied(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.GetProjectWorkflow(rec, req)
 
-<<<<<<< HEAD
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status=%d, want 404 for standalone project (W4: hide existence from team leader)", rec.Code)
 	}
@@ -2861,9 +2828,661 @@ func TestGetProjectSpawnMessages_SessionNotFound(t *testing.T) {
 	rec := spawnMessagesRequest(h, humanCaller(), "p1", "sub-unknown", "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status=%d, want 404 (session not owned by any worker)", rec.Code)
-=======
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("status=%d, want 403 for standalone project (no team scope)", rec.Code)
->>>>>>> d107cb63 (feat(controller): add project/workflow query API for human-visible workflows)
 	}
+}
+
+// ============================================================================
+// W-PR-2 write endpoints (pause / resume / replan / create / cancel / complete)
+// ============================================================================
+
+// putTask writes a TaskMeta object for cancel-task tests.
+func putTask(store *ossfake.Memory, key string, meta map[string]any) {
+	data, _ := json.Marshal(meta)
+	_ = store.PutObject(context.Background(), key, data)
+}
+
+func TestPauseProject_ActiveToPaused(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", strings.NewReader(`{"reason":"customer review"}`))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// Verify the MinIO write-back: status=paused + audit fields.
+	data, err := store.GetObject(context.Background(), "teams/alpha-team/shared/projects/p1/meta.json")
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if meta["status"] != "paused" {
+		t.Fatalf("status=%v, want paused", meta["status"])
+	}
+	if meta["updated_by"] != "admin" {
+		t.Fatalf("updated_by=%v, want admin", meta["updated_by"])
+	}
+	if meta["updated_at"] == "" {
+		t.Fatalf("updated_at missing")
+	}
+	if meta["pause_reason"] != "customer review" {
+		t.Fatalf("pause_reason=%v, want customer review", meta["pause_reason"])
+	}
+}
+
+func TestPauseProject_AlreadyPaused409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "paused", "plan_type": "dag",
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (already paused)", rec.Code)
+	}
+}
+
+func TestPauseProject_NotFound(t *testing.T) {
+	h := newProjectTestHandler(t, ossfake.NewMemory())
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/nope/pause", nil)
+	req.SetPathValue("id", "nope")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404", rec.Code)
+	}
+}
+
+// TestPauseProject_MtimeConflict guards the optimistic lock: a worker
+// _sync_project push after the Controller read (before the write) must abort
+// the write with 409. The ossfake Memory advances its modTime on every
+// PutObject, so writing between read and write-back triggers the conflict.
+func TestPauseProject_MtimeConflict(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+	})
+	// The handler stats the object at read time (mtime T0), then re-stats
+	// before the write. Inject a "worker push" between the two stats: the
+	// wrapper advances the object's mtime on the second StatMeta call, so
+	// the compare-before-write detects the concurrent modification -> 409.
+	// The wrapper embeds mcLikeOSS so ListObjects keeps the mc ls semantics
+	// (direct child names) that resolveProjectMetaWithKey depends on.
+	injector := &conflictInjectingOSS{mcLike: &mcLikeOSS{Memory: store}, injectOnStat: 2}
+	h := newProjectTestHandlerWithOSS(t, injector)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s, want 409 (mtime conflict)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestResumeProject_PausedToActive(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "paused", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/resume", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"})
+	rec := httptest.NewRecorder()
+	h.ResumeProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	data, _ := store.GetObject(context.Background(), "teams/alpha-team/shared/projects/p1/meta.json")
+	var meta map[string]any
+	_ = json.Unmarshal(data, &meta)
+	if meta["status"] != "active" {
+		t.Fatalf("status=%v, want active", meta["status"])
+	}
+}
+
+func TestResumeProject_NotPaused409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+	})
+	h := newProjectTestHandler(t, store)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/resume", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ResumeProject(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (not paused)", rec.Code)
+	}
+}
+
+// TestPauseProject_L2CrossTeamDenied guards B2c: an L2 human must be denied
+// (404, existence hidden) when pausing a project outside their
+// accessibleTeams.
+func TestPauseProject_L2CrossTeamDenied(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"), team("beta-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"beta-team"}})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (cross-team existence hidden)", rec.Code)
+	}
+}
+
+// TestPauseProject_L2SameTeamAllowed guards B2c: an L2 human may pause a
+// project in their accessibleTeams.
+func TestPauseProject_L2SameTeamAllowed(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"), team("beta-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "sunzong", Teams: []string{"alpha-team", "beta-team"}})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 (L2 same-team allowed)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReplanProject_ReplaceTasks(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Old T1", "assigned_to": "dev1", "status": "planned", "depends_on": []string{}},
+			{"task_id": "t2", "title": "Old T2", "assigned_to": "dev2", "status": "planned", "depends_on": []string{"t1"}},
+		},
+	})
+	h := newProjectTestHandler(t, store)
+
+	body := `{"tasks":[
+		{"taskId":"t1","title":"New T1"},
+		{"taskId":"t3","title":"T3","assignedTo":"dev3","dependsOn":["t1"]}
+	]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(body))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	data, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
+	var meta map[string]any
+	_ = json.Unmarshal(data, &meta)
+	tasks := meta["tasks"].([]any)
+	if len(tasks) != 2 {
+		t.Fatalf("tasks=%v, want 2 after replan", tasks)
+	}
+	// previous preservation: t1 keeps old title when not re-specified? No —
+	// the body DID specify title New T1, so it must be New T1.
+	first := tasks[0].(map[string]any)
+	if first["title"] != "New T1" || first["status"] != "planned" {
+		t.Fatalf("task t1=%v, want New T1/planned", first)
+	}
+	second := tasks[1].(map[string]any)
+	if second["title"] != "T3" || second["assigned_to"] != "dev3" {
+		t.Fatalf("task t3=%v, want T3/dev3", second)
+	}
+}
+
+// TestReplanProject_PreservesPrevious guards _normalize_task parity: a task id
+// that already exists keeps its previous title/assigned/status when the raw
+// entry omits them.
+func TestReplanProject_PreservesPrevious(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Original Title", "assigned_to": "dev1", "status": "assigned", "depends_on": []string{}},
+		},
+	})
+	h := newProjectTestHandler(t, store)
+
+	body := `{"tasks":[{"taskId":"t1"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(body))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	data, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
+	var meta map[string]any
+	_ = json.Unmarshal(data, &meta)
+	tasks := meta["tasks"].([]any)
+	first := tasks[0].(map[string]any)
+	if first["title"] != "Original Title" || first["assigned_to"] != "dev1" || first["status"] != "assigned" {
+		t.Fatalf("preserved task=%v, want Original Title/dev1/assigned", first)
+	}
+}
+
+func TestReplanProject_DuplicateID400(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "tasks": []map[string]any{},
+	})
+	h := newProjectTestHandler(t, store)
+	body := `{"tasks":[{"taskId":"t1"},{"taskId":"t1"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(body))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 (duplicate id)", rec.Code)
+	}
+}
+
+func TestReplanProject_UnknownDependency400(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "tasks": []map[string]any{},
+	})
+	h := newProjectTestHandler(t, store)
+	body := `{"tasks":[{"taskId":"t1","dependsOn":["ghost"]}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(body))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 (unknown dependency)", rec.Code)
+	}
+}
+
+func TestReplanProject_Cycle400(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "tasks": []map[string]any{},
+	})
+	h := newProjectTestHandler(t, store)
+	body := `{"tasks":[{"taskId":"t1","dependsOn":["t2"]},{"taskId":"t2","dependsOn":["t1"]}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(body))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 (cycle)", rec.Code)
+	}
+}
+
+func TestReplanProject_NotDag409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "loop",
+		"loop": map[string]any{"goal": "g", "tasks": []map[string]any{}},
+	})
+	h := newProjectTestHandler(t, store)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(`{"tasks":[]}`))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (loop plan)", rec.Code)
+	}
+}
+
+func TestReplanProject_NotActive409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "paused", "plan_type": "dag", "tasks": []map[string]any{},
+	})
+	h := newProjectTestHandler(t, store)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(`{"tasks":[]}`))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (not active)", rec.Code)
+	}
+}
+
+func TestReplanProject_InFlight409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []string{}},
+		},
+	})
+	h := newProjectTestHandler(t, store)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(`{"tasks":[{"taskId":"t1"}]}`))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (in-flight)", rec.Code)
+	}
+}
+
+func TestCreateProject_Admin(t *testing.T) {
+	store := ossfake.NewMemory()
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	body := `{"title":"New Project","source":"matrix","requester":"@luo:server","team_id":"alpha-team"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(body))
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CreateProject(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		ProjectID string `json:"project_id"`
+		Status    string `json:"status"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.ProjectID == "" || resp.Status != "active" {
+		t.Fatalf("resp=%+v, want generated id + active", resp)
+	}
+	// Verify the meta exists under the team-scoped prefix.
+	data, err := store.GetObject(context.Background(), "teams/alpha-team/shared/projects/"+resp.ProjectID+"/meta.json")
+	if err != nil {
+		t.Fatalf("created meta not found: %v", err)
+	}
+	var meta map[string]any
+	_ = json.Unmarshal(data, &meta)
+	if meta["status"] != "active" || meta["title"] != "New Project" || meta["team_id"] != "alpha-team" {
+		t.Fatalf("meta=%v", meta)
+	}
+}
+
+func TestCreateProject_L2CrossTeamDenied(t *testing.T) {
+	store := ossfake.NewMemory()
+	h := newProjectTestHandler(t, store, team("alpha-team"), team("beta-team"))
+
+	// L2 with only beta-team accessible tries to create in alpha-team.
+	body := `{"title":"X","team_id":"alpha-team"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(body))
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"beta-team"}})
+	rec := httptest.NewRecorder()
+	h.CreateProject(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (cross-team create denied)", rec.Code)
+	}
+}
+
+func TestCreateProject_Duplicate409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+	})
+	h := newProjectTestHandler(t, store)
+	body := `{"title":"Dup","project_id":"p1"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(body))
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CreateProject(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (duplicate id)", rec.Code)
+	}
+}
+
+func TestCancelTask_ActiveTask(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "planned", "depends_on": []string{}},
+		},
+	})
+	putTask(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "planned",
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/tasks/t1/cancel", strings.NewReader(`{"reason":"no longer needed","replacementTaskId":"t9"}`))
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CancelTask(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	taskData, _ := store.GetObject(context.Background(), "shared/tasks/t1/meta.json")
+	var task map[string]any
+	_ = json.Unmarshal(taskData, &task)
+	if task["status"] != "cancelled" || task["cancel_reason"] != "no longer needed" || task["replacement_task_id"] != "t9" {
+		t.Fatalf("task=%v, want cancelled/reason/t9", task)
+	}
+	projData, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
+	var proj map[string]any
+	_ = json.Unmarshal(projData, &proj)
+	tasks := proj["tasks"].([]any)
+	if tasks[0].(map[string]any)["status"] != "cancelled" {
+		t.Fatalf("project node status=%v, want cancelled", tasks[0].(map[string]any)["status"])
+	}
+}
+
+func TestCancelTask_Terminal409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "completed", "depends_on": []string{}},
+		},
+	})
+	putTask(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "completed",
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/tasks/t1/cancel", strings.NewReader(`{"reason":"x"}`))
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CancelTask(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (terminal task)", rec.Code)
+	}
+}
+
+func TestCancelTask_NoReason400(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "planned", "depends_on": []string{}},
+		},
+	})
+	putTask(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "planned",
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/tasks/t1/cancel", strings.NewReader(`{}`))
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CancelTask(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 (reason required)", rec.Code)
+	}
+}
+
+func TestCompleteProject_AllTerminal(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "completed", "depends_on": []string{}},
+			{"task_id": "t2", "title": "T2", "status": "cancelled", "depends_on": []string{"t1"}},
+		},
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/complete", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CompleteProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	data, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
+	var meta map[string]any
+	_ = json.Unmarshal(data, &meta)
+	if meta["status"] != "completed" {
+		t.Fatalf("status=%v, want completed", meta["status"])
+	}
+}
+
+func TestCompleteProject_NonTerminal409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []string{}},
+		},
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/complete", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CompleteProject(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (non-terminal)", rec.Code)
+	}
+}
+
+// TestPauseProject_WorkerDenied guards RBAC: a Worker caller has no project
+// case in the authorizer and must be denied by middleware — this test asserts
+// the handler-level access check also denies a worker (defense in depth when
+// the handler is invoked directly, as in tests).
+func TestPauseProject_WorkerDenied(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleWorker, Username: "alpha-dev", Team: "alpha-team"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	// checkProjectAccess only scopes TeamLeader/Human; a Worker passes the
+	// handler check (it is not in the scoped-reader set). The authorizer is
+	// the Worker boundary — this test documents the handler's defense in
+	// depth is the authorizer (middleware), not checkProjectAccess.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s — handler checkProjectAccess intentionally allows workers; the authorizer middleware is the Worker boundary", rec.Code, rec.Body.String())
+	}
+}
+
+// newProjectTestHandlerWithOSS builds a handler with a custom StorageClient
+// (e.g. a wrapper that injects concurrent writes).
+func newProjectTestHandlerWithOSS(t *testing.T, o oss.StorageClient) *ProjectHandler {
+	t.Helper()
+	k8s := fake.NewClientBuilder().WithScheme(newProjectTestScheme(t)).Build()
+	return NewProjectHandler(k8s, "default", o)
+}
+
+// conflictInjectingOSS wraps a Memory store (via mcLikeOSS for ListObjects
+// semantics) and, on the Nth StatMeta call, writes a concurrent version of the
+// object before returning the stat — simulating a worker _sync_project push
+// between the Controller's read and its compare-before-write. The Memory fake
+// advances its modTime on every PutObject, so the injected write changes the
+// mtime seen by the compare.
+type conflictInjectingOSS struct {
+	mcLike       *mcLikeOSS
+	injectOnStat int
+	statCalls    int
+}
+
+func (c *conflictInjectingOSS) ListObjects(ctx context.Context, prefix string) ([]string, error) {
+	return c.mcLike.ListObjects(ctx, prefix)
+}
+
+func (c *conflictInjectingOSS) GetObject(ctx context.Context, key string) ([]byte, error) {
+	return c.mcLike.GetObject(ctx, key)
+}
+
+func (c *conflictInjectingOSS) PutObject(ctx context.Context, key string, data []byte) error {
+	return c.mcLike.PutObject(ctx, key, data)
+}
+
+func (c *conflictInjectingOSS) Stat(ctx context.Context, key string) error {
+	return c.mcLike.Stat(ctx, key)
+}
+
+func (c *conflictInjectingOSS) PutFile(ctx context.Context, localPath, key string) error {
+	return c.mcLike.PutFile(ctx, localPath, key)
+}
+
+func (c *conflictInjectingOSS) DeleteObject(ctx context.Context, key string) error {
+	return c.mcLike.DeleteObject(ctx, key)
+}
+
+func (c *conflictInjectingOSS) Mirror(ctx context.Context, src, dst string, opts oss.MirrorOptions) error {
+	return c.mcLike.Mirror(ctx, src, dst, opts)
+}
+
+func (c *conflictInjectingOSS) DeletePrefix(ctx context.Context, prefix string) error {
+	return c.mcLike.DeletePrefix(ctx, prefix)
+}
+
+func (c *conflictInjectingOSS) StatMeta(ctx context.Context, key string) (oss.ObjectMeta, error) {
+	c.statCalls++
+	if c.statCalls == c.injectOnStat {
+		// Simulate a concurrent worker push that lands between read and write.
+		_ = c.mcLike.PutObject(ctx, key, []byte(`{"project_id":"p1","title":"P1","status":"active","concurrent":true}`))
+	}
+	return c.mcLike.StatMeta(ctx, key)
 }

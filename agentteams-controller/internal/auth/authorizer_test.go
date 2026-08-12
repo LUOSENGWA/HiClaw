@@ -24,8 +24,9 @@ func TestAuthorizer_ManagerAllowsEverything(t *testing.T) {
 }
 
 // TestAuthorizer_HumanReadOnly guards the L2 security boundary: an L2 human
-// (RoleHuman) may read projects/teams/workers in scope but must NOT manage
-// workers, refresh credentials, or mutate projects/teams.
+// (RoleHuman) may read projects/teams/workers in scope, may update projects in
+// scope (W-PR-2: pause/resume/replan/lifecycle, code-level requireSameTeam),
+// but must NOT manage workers, refresh credentials, or mutate teams.
 func TestAuthorizer_HumanReadOnly(t *testing.T) {
 	az := NewAuthorizer()
 	caller := &CallerIdentity{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}}
@@ -33,6 +34,7 @@ func TestAuthorizer_HumanReadOnly(t *testing.T) {
 	allowed := []AuthzRequest{
 		{Action: ActionList, ResourceKind: "project"},
 		{Action: ActionGet, ResourceKind: "project"},
+		{Action: ActionUpdate, ResourceKind: "project", ResourceTeam: "market-team"},
 		{Action: ActionList, ResourceKind: "team"},
 		{Action: ActionGet, ResourceKind: "team"},
 		{Action: ActionList, ResourceKind: "worker"},
@@ -52,7 +54,7 @@ func TestAuthorizer_HumanReadOnly(t *testing.T) {
 		{Action: ActionSleep, ResourceKind: "worker"},
 		{Action: ActionRefreshMatrixToken, ResourceKind: "credentials"},
 		{Action: ActionSTS, ResourceKind: "credentials"},
-		{Action: ActionUpdate, ResourceKind: "project"},
+		{Action: ActionUpdate, ResourceKind: "project", ResourceTeam: "another-team"},
 		{Action: ActionCreate, ResourceKind: "team"},
 		{Action: ActionDelete, ResourceKind: "team"},
 	}

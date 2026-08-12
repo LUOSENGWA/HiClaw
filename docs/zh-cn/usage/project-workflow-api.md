@@ -169,6 +169,105 @@ Controller 提供两个只读端点，把 TeamHarness 项目状态
 | `404` | 项目不存在 / 调用者不拥有它（隐藏存在性）/ 任务不在项目图中 / 任务没有已发布产物 / 请求路径不是已声明产物 / 产物文件缺失 / 产物路径被拒绝。 |
 | `500` | K8s 或对象存储故障。 |
 
+## 人类干预与生命周期端点（W-PR-2）
+
+上面的只读端点之外，还有让人类干预 agent 编排工作流的写端点。所有写入都经过
+**代码级授权**：中间件拒绝跨团队写入（authorizer `requireSameTeam`），handler
+解析出归属团队后还会显式调用 `checkProjectAccess`（因为中间件无法把 project
+路径映射到团队）。每次写入都打上审计字段（`updated_by` / `updated_at`，给了
+原因时还有 `pause_reason`），并应用 mtime 乐观锁——如果读取与写入之间 worker
+推送了更新的 `meta.json`，写入以 `409` 失败而不是覆盖它。
+
+### `POST /api/v1/projects`
+
+创建项目（结构化，对齐 TeamHarness `create_project`）。admin/manager 可以
+不带团队创建独立项目；team-leader 或 L2 人类必须传一个自己可访问的
+`team_id`。
+
+请求体：
+
+```json
+{
+  "title": "新项目",
+  "source": "matrix",
+  "requester": "@luo:server",
+  "team_id": "biz-team",
+  "project_id": "可选自定义 id",
+  "source_room_id": "!room:server"
+}
+```
+
+省略 `project_id` 时自动生成；必须为纯 token（`[A-Za-z0-9._-]`）。响应
+`201 Created`：
+
+```json
+{
+  "project_id": "proj-2026-08-12T00:00:00Z",
+  "title": "新项目",
+  "status": "active",
+  "team_id": "biz-team",
+  "plan_type": "dag"
+}
+```
+
+错误：`400` 缺 title/非法 id/受限调用方缺 team；`409` 项目已存在；
+`403`/`404` 跨团队（拒绝 / 隐藏存在性）。
+
+### `POST /api/v1/projects/{id}/pause`
+
+把项目状态置为 `paused`。暂停会停止新任务派发（`ready_nodes` 返回空）但
+**不会中断进行中任务**；它们的完成报告仍会到达（文档化行为——进行中任务不被
+取消）。可选请求体 `{"reason": "..."}` 记录到 `pause_reason`。响应 `200`
+返回更新后的工作流（`buildWorkflow`）。错误：`409` 已暂停/已完成；`404`
+不存在或无权访问。
+
+### `POST /api/v1/projects/{id}/resume`
+
+把暂停的项目恢复为 `active`。响应 `200` 返回更新后的工作流。错误：`409`
+未暂停；`404` 不存在或无权访问。
+
+### `POST /api/v1/projects/{id}/replan`
+
+替换项目的 DAG 计划。请求体携带新任务（可选 `tasks` 数组）：
+
+```json
+{
+  "tasks": [
+    {"taskId": "t1", "title": "步骤 1", "assignedTo": "@dev:server", "dependsOn": []},
+    {"taskId": "t2", "title": "步骤 2", "dependsOn": ["t1"]}
+  ]
+}
+```
+
+字段按 TeamHarness `_normalize_task` 归一化（`taskId`/`task_id`、
+`assignedTo`/`assigned_to`、`dependsOn`/`depends_on`，status 默认
+`planned`，`pending` 映射为 `planned`）；已存在的 task id 在原始条目省略
+字段时保留之前的 title/assignee/status。校验对齐 `_validate_task_graph`：
+重复 id、未知依赖、依赖环都以 `400` 拒绝。前置条件（`409`）：`plan_type`
+必须是 `dag`（loop 的重规划走 `record_loop_iteration`）、状态必须是
+`active`、不能有 `in_progress`/`submitted` 任务。响应 `200` 返回更新后的
+工作流。
+
+### `POST /api/v1/projects/{id}/tasks/{taskId}/cancel`
+
+取消单个任务。请求体要求 `reason`（可选 `replacementTaskId`）。任务必须
+可变——终态任务（completed/revision/blocked/cancelled）以 `409` 拒绝。
+任务的 `TaskMeta` 打上 `status=cancelled` + `cancel_reason`，项目节点状态
+同步更新。响应 `200` 返回更新后的工作流。错误：`400` 缺 reason；`404`
+任务不在项目里/任务 meta 缺失；`409` 终态任务。
+
+### `POST /api/v1/projects/{id}/complete`
+
+把项目标记为已完成（终态）。所有任务必须处于终态
+（completed/revision/blocked/cancelled——不能有 in_progress/submitted/
+planned），否则 `409`。响应 `200` 返回更新后的工作流。
+
+### 通知
+
+写入成功后，Controller 用 `SendMessageAsAdmin` 向项目的 `source_room_id`
+（回退到 `reply_route.target_session`）发送管理员消息，让房间里的 agent
+无需轮询就能知道干预发生。尽力而为：房间未知或未配置 Matrix 时不发通知。
+
 ## 认证与授权
 
 接受两种 bearer 令牌路径（复合认证器）：
@@ -183,12 +282,12 @@ Controller 提供两个只读端点，把 TeamHarness 项目状态
 
 授权矩阵：
 
-| 调用方 | List | 获取工作流 |
-|:--|:--|:--|
-| admin / manager | 所有团队 | 任意项目 |
-| team-leader（SA） | 仅自己团队 | 仅自己团队 |
-| L2 人类（Matrix） | 所有 `accessibleTeams` | 任意可控团队 |
-| worker | 拒绝 | 拒绝 |
+| 调用方 | List | 获取工作流 | 写入（create/pause/resume/replan/cancel/complete） |
+|:--|:--|:--|:--|
+| admin / manager | 所有团队 | 任意项目 | 任意项目 |
+| team-leader（SA） | 仅自己团队 | 仅自己团队 | 仅自己团队 |
+| L2 人类（Matrix） | 所有 `accessibleTeams` | 任意可控团队 | 任意可控团队 |
+| worker | 拒绝 | 拒绝 | 拒绝 |
 
 ## `agt` CLI
 

@@ -61,10 +61,13 @@ func (a *Authorizer) Authorize(caller *CallerIdentity, req AuthzRequest) error {
 	}
 }
 
-// authorizeHuman is the read-only permission matrix for L2 humans (Human CR
+// authorizeHuman is the permission matrix for L2 humans (Human CR
 // permissionLevel=2, authenticated by Matrix token). Humans view the teams
-// and workers in their accessibleTeams scope; they must NOT manage workers,
-// refresh credentials, or mutate projects. The handler filters list results
+// and workers in their accessibleTeams scope; they must NOT manage workers or
+// refresh credentials. Since W-PR-2 they may update (pause/resume/replan/
+// lifecycle) projects within their accessibleTeams scope, enforced
+// code-level by requireSameTeam — a cross-team write is denied even if the
+// model ignores any prompt-level guidance. The handler filters list results
 // by caller.Teams (accessibleTeams).
 func (a *Authorizer) authorizeHuman(caller *CallerIdentity, req AuthzRequest) error {
 	switch req.ResourceKind {
@@ -75,6 +78,19 @@ func (a *Authorizer) authorizeHuman(caller *CallerIdentity, req AuthzRequest) er
 		switch req.Action {
 		case ActionList, ActionGet:
 			return nil // handler filters by accessibleTeams
+		case ActionCreate:
+			// W-PR-2: L2 humans may create projects within their accessible
+			// teams. The handler resolves the requested team_id and calls
+			// checkProjectAccess (the middleware cannot resolve project ->
+			// team, so requireSameTeam short-circuits on an empty
+			// ResourceTeam; the handler-side check is the real boundary).
+			return a.requireSameTeam(caller, req)
+		case ActionUpdate:
+			// W-PR-2: L2 humans may write (pause/resume/replan/lifecycle)
+			// projects within their accessibleTeams scope. requireSameTeam
+			// rejects cross-team writes at the code level (the model cannot
+			// bypass it), matching the upstream MCP code-level role checks.
+			return a.requireSameTeam(caller, req)
 		default:
 			return deny(caller, req)
 		}
@@ -122,12 +138,13 @@ func (a *Authorizer) authorizeTeamLeader(caller *CallerIdentity, req AuthzReques
 
 	case "project":
 		// Projects live under teams/{team}/shared/projects/ (team-scoped) or the
-		// global shared/projects/ prefix. Team leaders may list projects and read
-		// workflow detail for their own team only.
+		// global shared/projects/ prefix. Team leaders may list projects, read
+		// workflow detail, and (W-PR-2) create/pause/resume/replan projects for
+		// their own team only.
 		switch req.Action {
 		case ActionList:
 			return nil // handler filters by team prefix
-		case ActionGet, ActionUpdate:
+		case ActionGet, ActionUpdate, ActionCreate:
 			return a.requireSameTeam(caller, req)
 		default:
 			return deny(caller, req)

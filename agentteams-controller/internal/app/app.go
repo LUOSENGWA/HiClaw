@@ -648,6 +648,7 @@ func (a *App) initHTTPServer(_ context.Context) error {
 		ControllerName: a.cfg.ControllerName,
 		SocketPath:     a.cfg.SocketPath,
 		MatrixConfig:   a.cfg.MatrixConfig(),
+		MatrixClient:   a.matrix,
 		Provisioner:    a.provisioner,
 
 		DefaultWorkerRuntime: a.cfg.DefaultWorkerRuntime,

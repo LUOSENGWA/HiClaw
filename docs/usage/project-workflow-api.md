@@ -404,3 +404,155 @@ The CLI forwards whatever bearer token is configured (`AGENTTEAMS_AUTH_TOKEN`
 or `AGENTTEAMS_AUTH_TOKEN_FILE`) verbatim, so an L2 human can also use it by
 pointing either variable at their own Matrix access token — no separate CLI
 auth mode is needed.
+
+## Human intervention & lifecycle endpoints 
+
+The read endpoints above are complemented by write endpoints that let
+humans intervene in agent-orchestrated workflows. All writes are code-level
+authorized: the middleware rejects cross-team writes (authorizer
+`requireSameTeam`), and the handler additionally runs `checkProjectAccess`
+after resolving the owning team because the middleware cannot map a project
+path to a team. Every write is stamped with audit fields
+(`updated_by` / `updated_at`, and `pause_reason` when a reason is given) and
+applies an mtime optimistic lock — if a worker pushed a newer `meta.json`
+between the read and the write, the write fails with `409` instead of
+clobbering it.
+
+### `POST /api/v1/projects`
+
+Create a project (structured, aligned with TeamHarness `create_project`).
+An admin/manager may create a standalone project without a team; a team
+leader or L2 human must pass a `team_id` they can access.
+
+Request body:
+
+```json
+{
+  "title": "New project",
+  "source": "matrix",
+  "requester": "@luo:server",
+  "team_id": "biz-team",
+  "project_id": "optional-custom-id",
+  "source_room_id": "!room:server"
+}
+```
+
+`project_id` defaults to a generated value when omitted and must be a plain
+token (`[A-Za-z0-9._-]`). Response `201 Created`:
+
+```json
+{
+  "project_id": "proj-2026-08-12T00:00:00Z",
+  "title": "New project",
+  "status": "active",
+  "team_id": "biz-team",
+  "plan_type": "dag"
+}
+```
+
+Errors: `400` missing/invalid title or project id / team required for
+scoped callers; `409` project already exists; `403`/`404` cross-team
+(denied / existence hidden).
+
+### `POST /api/v1/projects/{id}/pause`
+
+Set a project's status to `paused`. Pausing stops new task dispatch
+(`ready_nodes` returns empty) but does not interrupt in-flight tasks; their
+completion reports still arrive (documented behavior — in-flight work is
+not cancelled). Optional body `{"reason": "..."}` is recorded in
+`pause_reason`. Response `200` returns the updated workflow
+(`buildWorkflow`). Errors: `409` already paused / completed; `404` not
+found or not owned.
+
+### `POST /api/v1/projects/{id}/resume`
+
+Set a paused project back to `active`. Response `200` returns the updated
+workflow. Errors: `409` not paused; `404` not found or not owned.
+
+### `POST /api/v1/projects/{id}/replan`
+
+Replace a project's DAG plan. The request body carries the new tasks
+(optional `tasks` array):
+
+```json
+{
+  "tasks": [
+    {"taskId": "t1", "title": "Step 1", "assignedTo": "@dev:server", "dependsOn": []},
+    {"taskId": "t2", "title": "Step 2", "dependsOn": ["t1"]}
+  ]
+}
+```
+
+Fields are normalized like TeamHarness `_normalize_task`
+(`taskId`/`task_id`, `assignedTo`/`assigned_to`, `dependsOn`/`depends_on`,
+status defaults to `planned`, `pending` maps to `planned`); a task id that
+already exists keeps its previous title/assignee/status when the raw entry
+omits them. Validation mirrors `_validate_task_graph`: duplicate ids,
+unknown dependencies, and dependency cycles are rejected with `400`.
+Preconditions (`409`): `plan_type` must be `dag` (loop replans go through
+`record_loop_iteration`), status must be `active`, and no task may be
+`in_progress`/`submitted`. Response `200` returns the updated workflow.
+
+### `POST /api/v1/projects/{id}/tasks/{taskId}/cancel`
+
+Cancel a single task. Body requires `reason` (and optional
+`replacementTaskId`). The task must be mutable — a terminal task
+(completed/revision/blocked/cancelled) is rejected with `409`. The task's
+`TaskMeta` is stamped `status=cancelled` + `cancel_reason` and the project
+node status is updated. Response `200` returns the updated workflow.
+Errors: `400` missing reason; `404` task not in project / task meta
+missing; `409` terminal task.
+
+### `POST /api/v1/projects/{id}/complete`
+
+Mark a project completed (terminal state). All tasks must be in a terminal
+status (completed/revision/blocked/cancelled — no in_progress/submitted/
+planned), otherwise `409`. Response `200` returns the updated workflow.
+
+### Notifications
+
+After a successful write, the Controller sends an admin message
+(`SendMessageAsAdmin`) to the project's `source_room_id` (falling back to
+`reply_route.target_session`), so agents in that room learn about the
+intervention without polling. Best-effort: no notification is sent when
+the room is unknown or Matrix is not configured.
+
+## Authentication & authorization
+
+Two bearer-token paths are accepted (composite authenticator):
+
+1. **Kubernetes service-account token** (TokenReview): admin / manager /
+   worker. Team leaders (worker with `team_leader` role) see only their own
+   team's projects.
+2. **Matrix access token** (L2 humans): the token is validated with
+   `GET /_matrix/client/v3/account/whoami`; the owning Matrix localpart is
+   matched to a `Human` CR with `permissionLevel: 2` (Team). The human's
+   `accessibleTeams` set is used as the multi-team scope — every team they
+   control is aggregated into a single list/read view. Non-L2 humans
+   (permissionLevel 1 or 3) are rejected.
+
+Authorization matrix:
+
+| Caller | List | Get workflow | Write (create/pause/resume/replan/cancel/complete) |
+|:--|:--|:--|:--|
+| admin / manager | all teams | any project | any project |
+| team-leader (SA) | own team only | own team only | own team only |
+| L2 human (Matrix) | all `accessibleTeams` | any accessible team | any accessible team |
+| worker | denied | denied | denied |
+
+## `agt` CLI
+
+`agt get projects [name]` wraps both endpoints:
+
+```bash
+agt get projects                      # list all
+agt get projects --team biz-team      # filter by team
+agt get projects demo-project-001     # workflow detail
+agt get projects demo-project-001 -o json
+agt get projects demo-project-001 --mermaid   # render DAG as mermaid
+```
+
+The CLI forwards whatever bearer token is configured (`AGENTTEAMS_AUTH_TOKEN`
+or `AGENTTEAMS_AUTH_TOKEN_FILE`) verbatim, so an L2 human can also use it by
+pointing either variable at their own Matrix access token — no separate CLI
+auth mode is needed.

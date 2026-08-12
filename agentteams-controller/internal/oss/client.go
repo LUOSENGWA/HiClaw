@@ -1,6 +1,15 @@
 package oss
 
-import "context"
+import (
+	"context"
+	"time"
+)
+
+// ObjectMeta describes an object in storage.
+type ObjectMeta struct {
+	Size    int64
+	ModTime time.Time
+}
 
 // StorageClient abstracts object storage operations.
 // Implementations: MinIOClient (mc CLI), future S3Client (aws-sdk-go).
@@ -17,6 +26,11 @@ type StorageClient interface {
 
 	// Stat checks if an object exists. Returns os.ErrNotExist if not found.
 	Stat(ctx context.Context, key string) error
+
+	// StatMeta returns object metadata (size, modification time). Returns
+	// os.ErrNotExist if the object does not exist. Used by W-PR-2 write
+	// endpoints for mtime optimistic-locking (compare-before-write).
+	StatMeta(ctx context.Context, key string) (ObjectMeta, error)
 
 	// DeleteObject removes the object at key.
 	DeleteObject(ctx context.Context, key string) error

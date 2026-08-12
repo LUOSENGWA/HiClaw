@@ -3,11 +3,13 @@ package oss
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // MinIOClient implements StorageClient using the mc (MinIO Client) CLI.
@@ -125,6 +127,37 @@ func (c *MinIOClient) Stat(ctx context.Context, key string) error {
 		return err
 	}
 	return nil
+}
+
+// StatMeta returns the object's size and last-modified time by invoking
+// `mc stat --json <fullpath>` and parsing the lastModified field. The last
+// modified time is second-precision (MinIO), which is sufficient for the
+// low-frequency human-intervention optimistic lock (W-PR-2): the check
+// catches "Controller read then Worker pushed before the write".
+func (c *MinIOClient) StatMeta(ctx context.Context, key string) (ObjectMeta, error) {
+	if err := c.ensureAlias(ctx); err != nil {
+		return ObjectMeta{}, err
+	}
+	out, err := c.runMC(ctx, "stat", "--json", c.fullPath(key))
+	if err != nil {
+		if strings.Contains(err.Error(), "Object does not exist") ||
+			strings.Contains(err.Error(), "exit status") {
+			return ObjectMeta{}, os.ErrNotExist
+		}
+		return ObjectMeta{}, err
+	}
+	var info struct {
+		LastModified string `json:"lastModified"`
+		Size         int64  `json:"size"`
+	}
+	if err := json.Unmarshal([]byte(out), &info); err != nil {
+		return ObjectMeta{}, fmt.Errorf("parse mc stat --json: %w", err)
+	}
+	modTime, err := time.Parse(time.RFC3339, info.LastModified)
+	if err != nil {
+		return ObjectMeta{}, fmt.Errorf("parse lastModified %q: %w", info.LastModified, err)
+	}
+	return ObjectMeta{Size: info.Size, ModTime: modTime}, nil
 }
 
 func (c *MinIOClient) DeleteObject(ctx context.Context, key string) error {
