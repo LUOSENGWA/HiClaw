@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -650,6 +651,76 @@ func TestGetProjectWorkflow_NotFound(t *testing.T) {
 	}
 }
 
+// TestGetProjectWorkflow_PausedInterrupt guards W1: a paused project surfaces
+// as a human interrupt (LangGraph semantics) in addition to status=paused.
+func TestGetProjectWorkflow_PausedInterrupt(t *testing.T) {	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/paused1/meta.json", map[string]any{
+		"project_id": "paused1", "title": "Paused", "status": "paused", "plan_type": "dag", "tasks": []map[string]any{},
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/paused1/workflow", nil)
+	req.SetPathValue("id", "paused1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleManager, Username: "manager"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var wf workflowResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &wf); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	found := false
+	for _, in := range wf.Interrupts {
+		if in.ID == "project" && in.Value == "paused" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected paused project interrupt, got %+v", wf.Interrupts)
+	}
+}
+
+// TestListProjects_SkipGetObjectFailure guards W5: a per-object GetObject
+// failure must be skipped (not 500 the whole list); infrastructure-level
+// ListObjects failures still 500 (covered by TestListProjects_OSSErrorReturns500).
+func TestListProjects_SkipGetObjectFailure(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/good1/meta.json", map[string]any{
+		"project_id": "good1", "title": "Good", "status": "active", "plan_type": "dag",
+	})
+	putProject(store, "shared/projects/bad1/meta.json", map[string]any{
+		"project_id": "bad1", "title": "Bad", "status": "active", "plan_type": "dag",
+	})
+	m := &mcLikeOSS{Memory: store, failGet: true}
+	scheme := newProjectTestScheme(t)
+	k8s := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(team("alpha-team")).Build()
+	h := NewProjectHandler(k8s, "default", m)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ListProjects(rec, req)
+
+	// W5: GetObject failures are skipped, so the list still succeeds and
+	// simply contains no projects from the failing store.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 (per-object failure skipped)", rec.Code)
+	}
+	var resp struct {
+		Projects []map[string]any `json:"projects"`
+		Total    int              `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Total != 0 {
+		t.Fatalf("total=%d, want 0 (all GetObject failed, skipped)", resp.Total)
+	}
+}
+
 func TestGetProjectWorkflow_TeamLeaderCrossTeamDenied(t *testing.T) {
 	store := ossfake.NewMemory()
 	putProject(store, "teams/beta-team/shared/projects/p2/meta.json", map[string]any{
@@ -663,8 +734,8 @@ func TestGetProjectWorkflow_TeamLeaderCrossTeamDenied(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.GetProjectWorkflow(rec, req)
 
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("status=%d, want 403 for cross-team access", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 for cross-team access (W4: hide project existence)", rec.Code)
 	}
 }
 
@@ -681,8 +752,8 @@ func TestGetProjectWorkflow_TeamLeaderStandaloneDenied(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.GetProjectWorkflow(rec, req)
 
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("status=%d, want 403 for standalone project (no team scope)", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 for standalone project (W4: hide existence from team leader)", rec.Code)
 	}
 }
 
@@ -902,14 +973,14 @@ func TestGetProjectWorkflow_L2HumanAnyAccessibleTeam(t *testing.T) {
 		t.Fatalf("accessible team status=%d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 
-	// Non-accessible team -> 403.
+	// Non-accessible team -> 404 (W4: hide project existence).
 	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/projects/pc/workflow", nil)
 	req2.SetPathValue("id", "pc")
 	req2 = withCaller(req2, l2)
 	rec2 := httptest.NewRecorder()
 	h.GetProjectWorkflow(rec2, req2)
-	if rec2.Code != http.StatusForbidden {
-		t.Fatalf("non-accessible team status=%d, want 403", rec2.Code)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("non-accessible team status=%d, want 404 (W4: hide existence)", rec2.Code)
 	}
 }
 
@@ -1150,5 +1221,78 @@ func TestProjectHTTP_L2AuthChain(t *testing.T) {
 	srv.Mux.ServeHTTP(rec4, req4)
 	if rec4.Code != http.StatusOK {
 		t.Fatalf("L2 workflow status=%d, want 200; body=%s", rec4.Code, rec4.Body.String())
+	}
+}
+
+
+// TestGetProjectWorkflow_PassThroughAuditFields guards W2: human-intervention
+// audit fields written by W-PR-2 (updated_by/updated_at/pause_reason) are
+// passed through the workflow response.
+func TestGetProjectWorkflow_PassThroughAuditFields(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/audit1/meta.json", map[string]any{
+		"project_id": "audit1", "title": "Audit", "status": "paused", "plan_type": "dag",
+		"updated_by": "luo", "updated_at": "2026-08-12T10:00:00Z", "pause_reason": "hold for review",
+		"tasks": []map[string]any{},
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/audit1/workflow", nil)
+	req.SetPathValue("id", "audit1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleManager, Username: "manager"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+
+	var wf workflowResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &wf); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if wf.UpdatedBy != "luo" || wf.UpdatedAt != "2026-08-12T10:00:00Z" || wf.PauseReason != "hold for review" {
+		t.Fatalf("audit fields not passed through: %+v", wf)
+	}
+}
+
+// TestListProjects_ConcurrentFetch guards W7: the concurrent GetObject pool
+// returns the same complete, deduplicated list as serial iteration would.
+func TestListProjects_ConcurrentFetch(t *testing.T) {
+	store := ossfake.NewMemory()
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("cp%02d", i)
+		putProject(store, "shared/projects/"+id+"/meta.json", map[string]any{
+			"project_id": id, "title": "CP " + id, "status": "active", "plan_type": "dag",
+		})
+	}
+	// One duplicate across prefixes should be deduplicated.
+	putProject(store, "teams/alpha-team/shared/projects/cp01/meta.json", map[string]any{
+		"project_id": "cp01", "title": "CP cp01", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ListProjects(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Projects []map[string]any `json:"projects"`
+		Total    int              `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Total != 20 {
+		t.Fatalf("total=%d, want 20 (20 unique projects, 1 deduped)", resp.Total)
+	}
+	// Deterministic ordering preserved.
+	last := ""
+	for _, p := range resp.Projects {
+		id, _ := p["project_id"].(string)
+		if last != "" && last > id {
+			t.Fatalf("not sorted: %s > %s", last, id)
+		}
+		last = id
 	}
 }

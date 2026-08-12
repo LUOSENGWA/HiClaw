@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
@@ -53,6 +54,12 @@ type projectMeta struct {
 	RequesterReport map[string]any    `json:"requester_report,omitempty"`
 	ReplyRoute      map[string]any    `json:"reply_route,omitempty"`
 	SourceRoomID    string            `json:"source_room_id,omitempty"`
+	// W2: human-intervention audit fields (written by W-PR-2 Controller API;
+	// tolerated by json.Unmarshal when absent, and passed through here so
+	// consumers can show who paused/resumed and why).
+	UpdatedBy   string `json:"updated_by,omitempty"`
+	UpdatedAt   string `json:"updated_at,omitempty"`
+	PauseReason string `json:"pause_reason,omitempty"`
 }
 
 type projectTaskMeta struct {
@@ -94,6 +101,10 @@ type workflowResponse struct {
 	RequesterReport map[string]any      `json:"requester_report,omitempty"`
 	ReplyRoute      map[string]any      `json:"reply_route,omitempty"`
 	SourceRoomID    string              `json:"source_room_id,omitempty"`
+	// W2: human-intervention audit fields.
+	UpdatedBy   string `json:"updated_by,omitempty"`
+	UpdatedAt   string `json:"updated_at,omitempty"`
+	PauseReason string `json:"pause_reason,omitempty"`
 }
 
 // workflowValues is the current state summary (LangGraph StateSnapshot.values
@@ -341,6 +352,15 @@ func (h *ProjectHandler) ListProjects(w http.ResponseWriter, r *http.Request) {
 	// crToEffective expands to the effective storage names too.
 	accessible := callerAccessiblePrefixes(caller, crToEffective)
 
+	// W7: collect all candidate keys first, then fetch meta.json concurrently.
+	// Each GetObject is a separate mc subprocess, so N projects would
+	// otherwise pay N process spawns serially. A small worker pool collapses
+	// that to ~ceil(N/concurrency) rounds.
+	type candidate struct {
+		prefix string
+		key    string
+	}
+	var cands []candidate
 	for _, prefix := range prefixes {
 		if accessible != nil && !accessible[prefix] {
 			continue
@@ -362,41 +382,68 @@ func (h *ProjectHandler) ListProjects(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				continue
 			}
-			data, err := h.oss.GetObject(r.Context(), key)
-			if err != nil {
-				if errors.Is(err, os.ErrNotExist) {
-					continue // project dir without meta.json yet; skip, not 500
-				}
-				writeK8sError(w, "list projects: read meta", err)
-				return
-			}
-			var meta projectMeta
-			if err := json.Unmarshal(data, &meta); err != nil {
-				continue // skip malformed meta instead of failing the whole list
-			}
-			if meta.ProjectID == "" || seen[meta.ProjectID] {
-				continue
-			}
-			seen[meta.ProjectID] = true
-			team := teamFromPrefix(prefix)
-			if meta.TeamID == "" {
-				meta.TeamID = team
-			}
-			// Optional ?team= filter (mirrors ListWorkers). Team leaders are
-			// already scoped by their own prefix; standalone projects have an
-			// empty team and are only matched when no filter is set.
-			if teamFilter != "" && meta.TeamID != teamFilter {
-				continue
-			}
-			projects = append(projects, projectSummary{
-				ProjectID: meta.ProjectID,
-				Title:     meta.Title,
-				Status:    meta.Status,
-				PlanType:  meta.PlanType,
-				TeamID:    meta.TeamID,
-				Mode:      meta.Mode,
-			})
+			cands = append(cands, candidate{prefix: prefix, key: key})
 		}
+	}
+
+	const listConcurrency = 8
+	type result struct {
+		candidate
+		data []byte
+		err  error
+	}
+	results := make([]result, len(cands))
+	sem := make(chan struct{}, listConcurrency)
+	var wg sync.WaitGroup
+	for i, c := range cands {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, c candidate) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			data, err := h.oss.GetObject(r.Context(), c.key)
+			results[i] = result{candidate: c, data: data, err: err}
+		}(i, c)
+	}
+	wg.Wait()
+
+	for _, res := range results {
+		if res.err != nil {
+			if errors.Is(res.err, os.ErrNotExist) {
+				continue // project dir without meta.json yet; skip, not 500
+			}
+			// W5: a single project read failure must not fail the whole
+			// list (one bad/transient object would 500 everything else).
+			// Infrastructure-level failures (ListObjects) still 500;
+			// per-object data failures are skipped like malformed meta.
+			continue
+		}
+		var meta projectMeta
+		if err := json.Unmarshal(res.data, &meta); err != nil {
+			continue // skip malformed meta instead of failing the whole list
+		}
+		if meta.ProjectID == "" || seen[meta.ProjectID] {
+			continue
+		}
+		seen[meta.ProjectID] = true
+		team := teamFromPrefix(res.prefix)
+		if meta.TeamID == "" {
+			meta.TeamID = team
+		}
+		// Optional ?team= filter (mirrors ListWorkers). Team leaders are
+		// already scoped by their own prefix; standalone projects have an
+		// empty team and are only matched when no filter is set.
+		if teamFilter != "" && meta.TeamID != teamFilter {
+			continue
+		}
+		projects = append(projects, projectSummary{
+			ProjectID: meta.ProjectID,
+			Title:     meta.Title,
+			Status:    meta.Status,
+			PlanType:  meta.PlanType,
+			TeamID:    meta.TeamID,
+			Mode:      meta.Mode,
+		})
 	}
 
 	// Deterministic ordering across prefixes.
@@ -429,7 +476,17 @@ func (h *ProjectHandler) GetProjectWorkflow(w http.ResponseWriter, r *http.Reque
 		httputil.WriteError(w, http.StatusNotFound, "project not found")
 		return
 	}
+	// W4: hide project existence from scoped callers (L2 / team leader) who
+	// do not own this project. resolveProjectMeta scans all prefixes, so a
+	// cross-team project is found; returning 403 would let callers enumerate
+	// other teams' project ids. Return 404 to hide existence (same as a
+	// non-existent id). Admin/Manager (checkProjectAccess returns nil) are
+	// unaffected.
 	if err := h.checkProjectAccess(caller, team, crToEffective); err != nil {
+		if _, ok := err.(*accessDeniedError); ok {
+			httputil.WriteError(w, http.StatusNotFound, "project not found")
+			return
+		}
 		httputil.WriteError(w, http.StatusForbidden, err.Error())
 		return
 	}
@@ -512,6 +569,14 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta) *workflowResponse {
 		}
 	}
 
+	// W1: a paused project is a human interrupt in LangGraph terms — the
+	// workflow is suspended awaiting a human decision (resume). Surfacing it
+	// as an interrupt (in addition to status=paused) lets consumers show
+	// "paused by human" without parsing project status separately.
+	if meta.Status == "paused" {
+		interrupts = append(interrupts, workflowInterrupt{ID: "project", Value: "paused"})
+	}
+
 	// values: current state summary (LangGraph StateSnapshot.values analog).
 	taskCount := map[string]int{}
 	for _, n := range nodes {
@@ -544,5 +609,8 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta) *workflowResponse {
 		RequesterReport: meta.RequesterReport,
 		ReplyRoute:      meta.ReplyRoute,
 		SourceRoomID:    meta.SourceRoomID,
+		UpdatedBy:       meta.UpdatedBy,
+		UpdatedAt:       meta.UpdatedAt,
+		PauseReason:     meta.PauseReason,
 	}
 }
