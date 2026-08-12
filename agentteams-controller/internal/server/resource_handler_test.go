@@ -979,7 +979,7 @@ func TestListWorkers_L2Scoped(t *testing.T) {
 }
 
 // TestGetTeam_L2Scoped guards single-team fetch: an L2 human may only read a
-// team in its accessibleTeams; other teams are 403.
+// team in its accessibleTeams; other teams are hidden (404, W8).
 func TestGetTeam_L2Scoped(t *testing.T) {
 	scheme := newServerTestScheme(t)
 	alpha := &v1beta1.Team{}
@@ -1007,13 +1007,14 @@ func TestGetTeam_L2Scoped(t *testing.T) {
 	req2 = req2.WithContext(context.WithValue(req2.Context(), authpkg.CallerKeyForTest(), l2))
 	rec2 := httptest.NewRecorder()
 	handler.GetTeam(rec2, req2)
-	if rec2.Code != http.StatusForbidden {
-		t.Fatalf("non-accessible team status=%d, want 403", rec2.Code)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("non-accessible team status=%d, want 404 (W8: hide existence)", rec2.Code)
 	}
 }
 
 // TestGetWorker_L2Scoped guards single-worker fetch: an L2 human may only read
-// workers in its accessible teams; other-team/standalone workers are 403.
+// workers in its accessible teams; other-team/standalone workers are hidden
+// (404, W8).
 func TestGetWorker_L2Scoped(t *testing.T) {
 	scheme := newServerTestScheme(t)
 	alphaLead := &v1beta1.Worker{}
@@ -1050,23 +1051,23 @@ func TestGetWorker_L2Scoped(t *testing.T) {
 		t.Fatalf("own team worker status=%d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 
-	// Other team worker -> 403.
+	// Other team worker -> 404 (hidden, W8).
 	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/workers/beta-dev", nil)
 	req2.SetPathValue("name", "beta-dev")
 	req2 = req2.WithContext(context.WithValue(req2.Context(), authpkg.CallerKeyForTest(), l2))
 	rec2 := httptest.NewRecorder()
 	handler.GetWorker(rec2, req2)
-	if rec2.Code != http.StatusForbidden {
-		t.Fatalf("other team worker status=%d, want 403", rec2.Code)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("other team worker status=%d, want 404 (W8: hide existence)", rec2.Code)
 	}
 
-	// Standalone worker -> 403.
+	// Standalone worker -> 404 (hidden, W8).
 	req3 := httptest.NewRequest(http.MethodGet, "/api/v1/workers/solo", nil)
 	req3.SetPathValue("name", "solo")
 	req3 = req3.WithContext(context.WithValue(req3.Context(), authpkg.CallerKeyForTest(), l2))
 	rec3 := httptest.NewRecorder()
 	handler.GetWorker(rec3, req3)
-	if rec3.Code != http.StatusForbidden {
-		t.Fatalf("standalone worker status=%d, want 403", rec3.Code)
+	if rec3.Code != http.StatusNotFound {
+		t.Fatalf("standalone worker status=%d, want 404 (W8: hide existence)", rec3.Code)
 	}
 }

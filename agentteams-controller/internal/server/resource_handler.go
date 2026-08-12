@@ -147,11 +147,13 @@ func (h *ResourceHandler) GetWorker(w http.ResponseWriter, r *http.Request) {
 			h.applyTeamMember(&resp, team, member)
 		}
 		// Scoped readers (team leaders or L2 humans) may only fetch workers
-		// in the teams they control; standalone workers are hidden.
+		// in the teams they control; standalone workers are hidden. W8: return
+		// 404 (not 403) so scoped callers cannot probe worker existence by
+		// name — consistent with the project enumeration fix (W4).
 		if caller := authpkg.CallerFromContext(r.Context()); caller != nil &&
 			(caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) &&
 			!caller.TeamMatches(resp.Team) {
-			httputil.WriteError(w, http.StatusForbidden, "team-leader cannot access worker outside team")
+			httputil.WriteError(w, http.StatusNotFound, "get worker: not found")
 			return
 		}
 		httputil.WriteJSON(w, http.StatusOK, resp)
@@ -363,18 +365,25 @@ func (h *ResourceHandler) GetTeam(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Scoped readers (team leaders or L2 humans) may only fetch the teams
-	// they control.
-	if caller := authpkg.CallerFromContext(r.Context()); caller != nil &&
-		(caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) &&
-		!caller.TeamMatches(name) {
-		httputil.WriteError(w, http.StatusForbidden, "team-leader cannot access team outside scope")
+	var team v1beta1.Team
+	if err := h.client.Get(r.Context(), client.ObjectKey{Name: name, Namespace: h.namespace}, &team); err != nil {
+		if apierrors.IsNotFound(err) {
+			httputil.WriteError(w, http.StatusNotFound, "get team: not found")
+			return
+		}
+		writeK8sError(w, "get team", err)
 		return
 	}
 
-	var team v1beta1.Team
-	if err := h.client.Get(r.Context(), client.ObjectKey{Name: name, Namespace: h.namespace}, &team); err != nil {
-		writeK8sError(w, "get team", err)
+	// Scoped readers (team leaders or L2 humans) may only fetch the teams
+	// they control. W8: return 404 (not 403) so scoped callers cannot probe
+	// team existence by name — consistent with the project enumeration fix
+	// (W4). The team exists but is out of scope, so it is hidden the same
+	// way a non-existent team is.
+	if caller := authpkg.CallerFromContext(r.Context()); caller != nil &&
+		(caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) &&
+		!caller.TeamMatches(name) {
+		httputil.WriteError(w, http.StatusNotFound, "get team: not found")
 		return
 	}
 

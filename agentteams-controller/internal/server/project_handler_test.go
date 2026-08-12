@@ -1222,6 +1222,20 @@ func TestProjectHTTP_L2AuthChain(t *testing.T) {
 	if rec4.Code != http.StatusOK {
 		t.Fatalf("L2 workflow status=%d, want 200; body=%s", rec4.Code, rec4.Body.String())
 	}
+
+	// W4: L2 human requests a project from a non-accessible team through the
+	// full HTTP chain -> 404 (existence hidden, same as a missing project).
+	putProject(store, "teams/beta-team/shared/projects/pb/meta.json", map[string]any{
+		"project_id": "pb", "title": "PB", "status": "active", "plan_type": "dag", "team_id": "beta-team",
+	})
+	req5 := httptest.NewRequest(http.MethodGet, "/api/v1/projects/pb/workflow", nil)
+	req5.SetPathValue("id", "pb")
+	req5.Header.Set("Authorization", "Bearer matrix-token")
+	rec5 := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec5, req5)
+	if rec5.Code != http.StatusNotFound {
+		t.Fatalf("L2 cross-team workflow status=%d, want 404 (W4: hide existence)", rec5.Code)
+	}
 }
 
 
