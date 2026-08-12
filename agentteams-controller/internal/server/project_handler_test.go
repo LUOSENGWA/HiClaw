@@ -1256,6 +1256,125 @@ func TestProjectHTTP_L2AuthChain(t *testing.T) {
 	}
 }
 
+// TestProjectHTTP_L2WriteChain exercises the W-PR-2 write path through the
+// full HTTP chain — bearer extraction -> composite auth -> identity
+// enrichment -> authorizer (ActionUpdate + project -> requireSameTeam) ->
+// handler (checkProjectAccess + mtime lock) — for an L2 human:
+//
+//   - pause an accessible-team project via the real HTTP stack -> 200
+//   - pause a non-accessible team project -> 404 (existence hidden)
+//   - create with a non-accessible team -> 404
+func TestProjectHTTP_L2WriteChain(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/pa/meta.json", map[string]any{
+		"project_id": "pa", "title": "PA", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	scheme := newProjectTestScheme(t)
+	human := &v1beta1.Human{
+		ObjectMeta: metav1.ObjectMeta{Name: "maizong", Namespace: "default"},
+		Spec:       v1beta1.HumanSpec{Username: "maizong", PermissionLevel: 2, AccessibleTeams: []string{"alpha-team"}},
+	}
+	k8s := fake.NewClientBuilder().WithScheme(scheme).
+		WithRuntimeObjects(human, team("alpha-team"), team("beta-team")).Build()
+
+	matrixAuth := authpkg.NewMatrixTokenAuthenticator(k8s, "default", &staticWhoami{validToken: "matrix-token", userID: "@maizong:matrix.local"})
+	composite := authpkg.NewCompositeAuthenticator(&alwaysFailAuth{}, matrixAuth)
+	enricher := authpkg.NewCREnricher(k8s, "default")
+	mw := authpkg.NewMiddleware(composite, enricher, authpkg.NewAuthorizer(), k8s, "default")
+
+	var ossStore oss.StorageClient = &mcLikeOSS{Memory: store}
+	srv := NewHTTPServer(":0", ServerDeps{
+		Client:    k8s,
+		Namespace: "default",
+		OSS:       ossStore,
+		AuthMw:    mw,
+	})
+
+	// L2 human pauses an accessible team's project via the full HTTP chain.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/pa/pause", strings.NewReader(`{"reason":"review"}`))
+	req.Header.Set("Authorization", "Bearer matrix-token")
+	rec := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("L2 pause status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	data, _ := store.GetObject(context.Background(), "teams/alpha-team/shared/projects/pa/meta.json")
+	var meta map[string]any
+	_ = json.Unmarshal(data, &meta)
+	if meta["status"] != "paused" || meta["pause_reason"] != "review" || meta["updated_by"] != "maizong (human)" {
+		t.Fatalf("meta after pause=%v, want paused/review/maizong (human)", meta)
+	}
+
+	// Cross-team pause -> 404 (existence hidden through the write path too).
+	putProject(store, "teams/beta-team/shared/projects/pb/meta.json", map[string]any{
+		"project_id": "pb", "title": "PB", "status": "active", "plan_type": "dag", "team_id": "beta-team",
+	})
+	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/projects/pb/pause", nil)
+	req2.Header.Set("Authorization", "Bearer matrix-token")
+	rec2 := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("L2 cross-team pause status=%d, want 404 (existence hidden)", rec2.Code)
+	}
+
+	// L2 create in a non-accessible team -> 404.
+	req3 := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(`{"title":"X","team_id":"beta-team"}`))
+	req3.Header.Set("Authorization", "Bearer matrix-token")
+	rec3 := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusNotFound {
+		t.Fatalf("L2 cross-team create status=%d, want 404", rec3.Code)
+	}
+}
+
+// alwaysAdminAuth is a fake Authenticator that always returns an admin
+// identity for the admin HTTP write-chain test.
+type alwaysAdminAuth struct{}
+
+func (a *alwaysAdminAuth) Authenticate(_ context.Context, _ string) (*authpkg.CallerIdentity, error) {
+	return &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"}, nil
+}
+
+// TestProjectHTTP_AdminWriteChain verifies an admin can create + complete a
+// project through the full HTTP chain (no team restriction).
+func TestProjectHTTP_AdminWriteChain(t *testing.T) {
+	store := ossfake.NewMemory()
+	scheme := newProjectTestScheme(t)
+	k8s := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(team("alpha-team")).Build()
+	enricher := authpkg.NewCREnricher(k8s, "default")
+	mw := authpkg.NewMiddleware(&alwaysAdminAuth{}, enricher, authpkg.NewAuthorizer(), k8s, "default")
+	var ossStore oss.StorageClient = &mcLikeOSS{Memory: store}
+	srv := NewHTTPServer(":0", ServerDeps{Client: k8s, Namespace: "default", OSS: ossStore, AuthMw: mw})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(`{"title":"New","team_id":"alpha-team"}`))
+	req.Header.Set("Authorization", "Bearer sa-token")
+	rec := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("admin create status=%d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ProjectID string `json:"project_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	if created.ProjectID == "" {
+		t.Fatal("create returned empty project_id")
+	}
+
+	// The created project is immediately visible to the admin via the
+	// workflow endpoint (dual-prefix scan finds the team-scoped meta).
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/projects/"+created.ProjectID+"/workflow", nil)
+	req2.SetPathValue("id", created.ProjectID)
+	req2.Header.Set("Authorization", "Bearer sa-token")
+	rec2 := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("admin workflow-after-create status=%d, want 200; body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
 // TestGetProjectWorkflow_PassThroughAuditFields guards W2: human-intervention
 // audit fields written by W-PR-2 (updated_by/updated_at/pause_reason) are
 // passed through the workflow response.
@@ -2831,10 +2950,8 @@ func TestGetProjectSpawnMessages_SessionNotFound(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// W-PR-2 write endpoints (pause / resume / replan / create / cancel / complete)
-// ============================================================================
-
+// =====================================================================// W-PR-2 write endpoints (pause / resume / replan / create / cancel / complete)
+// =====================================================================
 // putTask writes a TaskMeta object for cancel-task tests.
 func putTask(store *ossfake.Memory, key string, meta map[string]any) {
 	data, _ := json.Marshal(meta)
