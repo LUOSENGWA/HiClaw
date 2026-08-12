@@ -7,6 +7,30 @@ project state (`shared/projects/{id}/meta.json`) as a LangGraph-aligned
 workflow view. They are the data source for human-facing views (dashboard,
 QwenPaw console plugin) and are consumed by `agt get projects`.
 
+## Scope & prerequisites
+
+These endpoints work in **any AgentTeams deployment** that runs TeamHarness
+(projectflow/taskflow) on its workers — the storage layout is read through
+the controller's configured object-store client, so `AGENTTEAMS_STORAGE_PREFIX`
+and `AGENTTEAMS_FS_BUCKET` (including non-default values) are handled
+automatically; no per-deployment code or configuration is required.
+
+Prerequisites:
+
+* TeamHarness MCP (`plugins/teamharness`) is installed on the workers that
+  orchestrate projects. Only projects created by `projectflow`
+  (`create_project` / `create_quick_project`) produce the
+  `shared/projects/{id}/meta.json` that these endpoints read. Teams that
+  manage tasks manually without projectflow have no project data — that is
+  expected, not a bug.
+* Project writes are pushed to shared storage by `_sync_project`
+  (introduced alongside this API), so the controller sees near-live state
+  rather than a startup snapshot.
+
+Deployment modes (embedded Docker, incluster K8s) are all supported; in the
+no-K8s development mode the controller skips authentication like the other
+endpoints, so RBAC applies only when an authenticator is configured.
+
 ## Endpoints
 
 ### `GET /api/v1/projects`

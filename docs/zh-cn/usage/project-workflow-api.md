@@ -7,6 +7,17 @@ Controller 提供两个只读端点，把 TeamHarness 项目状态
 它们是面向人类视图（dashboard、QwenPaw console 插件）的数据源，
 也被 `agt get projects` 消费。
 
+## 适用范围与前置条件
+
+这些端点在**任何运行 TeamHarness（projectflow/taskflow）的 AgentTeams 部署**中都能工作——存储布局通过 Controller 配置的对象存储客户端读取，因此 `AGENTTEAMS_STORAGE_PREFIX` 与 `AGENTTEAMS_FS_BUCKET`（包括非默认值）都被自动处理，无需按部署定制代码或配置。
+
+前置条件：
+
+* 编排项目的 Worker 上安装了 TeamHarness MCP（`plugins/teamharness`）。只有 `projectflow`（`create_project` / `create_quick_project`）创建的项目才会产生这些端点读取的 `shared/projects/{id}/meta.json`。没有用 projectflow 而手工管理任务的团队没有项目数据——这是预期行为，不是 bug。
+* 项目写入通过 `_sync_project`（随本 API 一同引入）实时推送到共享存储，因此 Controller 读到的是近实时状态，而非启动快照。
+
+部署模式（embedded Docker、incluster K8s）全部支持；在无 K8s 的开发模式下 Controller 与其他端点一样跳过认证，因此 RBAC 仅在配置了认证器时生效。
+
 ## 端点
 
 ### `GET /api/v1/projects`
