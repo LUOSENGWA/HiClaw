@@ -304,3 +304,18 @@ agt get projects demo-project-001 --mermaid   # 渲染 DAG 为 mermaid
 CLI 原样转发配置的 bearer 令牌（`AGENTTEAMS_AUTH_TOKEN` 或
 `AGENTTEAMS_AUTH_TOKEN_FILE`），所以 L2 人类也可以用——把任一变量指向自己的
 Matrix 访问令牌即可，无需单独的 CLI 认证模式。
+
+### `agt project`（W-PR-2 写命令）
+
+`agt project` 包装写端点，人类无需 raw curl 即可干预：
+
+```bash
+agt project create --title "新项目" --team biz-team --source matrix
+agt project pause demo-project-001 --reason "客户评审"
+agt project resume demo-project-001
+agt project replan demo-project-001 --tasks tasks.json   # JSON 数组文件
+agt project cancel demo-project-001 demo-project-001-01 --reason "不再需要"
+agt project complete demo-project-001
+```
+
+同样的 bearer 令牌转发适用（L2 人类用 Matrix 令牌）。

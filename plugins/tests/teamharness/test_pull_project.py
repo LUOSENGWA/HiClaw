@@ -232,6 +232,32 @@ def test_projectflow_taskid_indirect(tmp_path: Path, monkeypatch) -> None:
     assert pulls[0]["path"] == "shared/projects/p1/meta.json"
 
 
+def test_projectflow_plan_loop_pulls(tmp_path: Path, monkeypatch) -> None:
+    """plan_loop is a write-type action that also reads the authoritative
+    meta.json first; the entry pull must fire for it too (its payload carries
+    projectId directly)."""
+    server = _load_server()
+    fake = FakeFilesync(remote_files={
+        "shared/projects/p1/meta.json": {
+            "project_id": "p1", "title": "P1", "status": "active",
+            "loop": {"goal": "g", "tasks": []},
+        },
+    })
+    monkeypatch.setattr(server, "_filesync", fake)
+
+    workspace = tmp_path / "agent"
+    _write_project(workspace, "p1", {
+        "project_id": "p1", "title": "P1", "status": "active",
+        "loop": {"goal": "g", "tasks": []},
+    })
+
+    result = server._projectflow(_arguments(workspace, "plan_loop", projectId="p1", maxIterations=5, goal="g", stopCondition="done", iterationTemplate="t"))
+    assert result.get("ok") is True
+    pulls = [c for c in fake.calls if c["action"] == "pull"]
+    assert len(pulls) == 1
+    assert pulls[0]["path"] == "shared/projects/p1/meta.json"
+
+
 def test_taskflow_actions_pull(tmp_path: Path, monkeypatch) -> None:
     server = _load_server()
     fake = FakeFilesync()

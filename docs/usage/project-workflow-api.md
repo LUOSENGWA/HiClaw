@@ -556,3 +556,19 @@ The CLI forwards whatever bearer token is configured (`AGENTTEAMS_AUTH_TOKEN`
 or `AGENTTEAMS_AUTH_TOKEN_FILE`) verbatim, so an L2 human can also use it by
 pointing either variable at their own Matrix access token — no separate CLI
 auth mode is needed.
+
+### `agt project` (W-PR-2 write commands)
+
+`agt project` wraps the write endpoints so a human can intervene without
+raw curl:
+
+```bash
+agt project create --title "New project" --team biz-team --source matrix
+agt project pause demo-project-001 --reason "customer review"
+agt project resume demo-project-001
+agt project replan demo-project-001 --tasks tasks.json   # JSON array file
+agt project cancel demo-project-001 demo-project-001-01 --reason "no longer needed"
+agt project complete demo-project-001
+```
+
+The same bearer-token forwarding applies (Matrix token for L2 humans).

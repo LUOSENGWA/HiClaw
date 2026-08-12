@@ -154,6 +154,29 @@ type workflowEdge struct {
 type workflowInterrupt struct {
 	ID    string `json:"id"`
 	Value string `json:"value"`
+	// ActionRequest mirrors the LangChain Agent Inbox HumanInterrupt model:
+	// the action a human can take on this interrupt (e.g. resume a paused
+	// project). Consumers render a button/action from it; the actual write
+	// goes to the W-PR-2 endpoints.
+	ActionRequest *interruptActionRequest `json:"action_request,omitempty"`
+	// Config mirrors HumanInterruptConfig: which response kinds the
+	// interrupt supports. For a paused project, allow_accept = the human can
+	// resume it.
+	Config *interruptConfig `json:"config,omitempty"`
+	// Description is a human-readable explanation of the interrupt.
+	Description string `json:"description,omitempty"`
+}
+
+type interruptActionRequest struct {
+	Action string         `json:"action"`
+	Args   map[string]any `json:"args,omitempty"`
+}
+
+type interruptConfig struct {
+	AllowIgnore  bool `json:"allow_ignore"`
+	AllowRespond bool `json:"allow_respond"`
+	AllowEdit    bool `json:"allow_edit"`
+	AllowAccept  bool `json:"allow_accept"`
 }
 
 // taskDetail is the per-task detail payload returned when
@@ -669,9 +692,20 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta, team string, includeTa
 	// W1: a paused project is a human interrupt in LangGraph terms — the
 	// workflow is suspended awaiting a human decision (resume). Surfacing it
 	// as an interrupt (in addition to status=paused) lets consumers show
-	// "paused by human" without parsing project status separately.
+	// "paused by human" without parsing project status separately. The
+	// action_request/config fields align with the LangChain Agent Inbox
+	// HumanInterrupt model so a dashboard/plugin can render a "Resume"
+	// button directly (W-PR-2 endpoint POST /pause|/resume).
 	if meta.Status == "paused" {
-		interrupts = append(interrupts, workflowInterrupt{ID: "project", Value: "paused"})
+		interrupt := workflowInterrupt{ID: "project", Value: "paused"}
+		interrupt.ActionRequest = &interruptActionRequest{Action: "resume", Args: map[string]any{"project_id": meta.ProjectID}}
+		interrupt.Config = &interruptConfig{AllowAccept: true}
+		desc := "project is paused"
+		if meta.PauseReason != "" {
+			desc += ": " + meta.PauseReason
+		}
+		interrupt.Description = desc
+		interrupts = append(interrupts, interrupt)
 	}
 
 	// values: current state summary (LangGraph StateSnapshot.values analog).

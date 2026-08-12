@@ -670,10 +670,14 @@ func TestGetProjectWorkflow_NotFound(t *testing.T) {
 
 // TestGetProjectWorkflow_PausedInterrupt guards W1: a paused project surfaces
 // as a human interrupt (LangGraph semantics) in addition to status=paused.
+// Since W-PR-2, the interrupt carries an action_request (resume) + config
+// (allow_accept) aligned with the LangChain Agent Inbox HumanInterrupt model,
+// so a dashboard can render a "Resume" button.
 func TestGetProjectWorkflow_PausedInterrupt(t *testing.T) {
 	store := ossfake.NewMemory()
 	putProject(store, "shared/projects/paused1/meta.json", map[string]any{
-		"project_id": "paused1", "title": "Paused", "status": "paused", "plan_type": "dag", "tasks": []map[string]any{},
+		"project_id": "paused1", "title": "Paused", "status": "paused", "plan_type": "dag",
+		"pause_reason": "customer review", "tasks": []map[string]any{},
 	})
 	h := newProjectTestHandler(t, store)
 
@@ -690,14 +694,25 @@ func TestGetProjectWorkflow_PausedInterrupt(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &wf); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	found := false
-	for _, in := range wf.Interrupts {
-		if in.ID == "project" && in.Value == "paused" {
-			found = true
+	var found *workflowInterrupt
+	for i := range wf.Interrupts {
+		if wf.Interrupts[i].ID == "project" && wf.Interrupts[i].Value == "paused" {
+			found = &wf.Interrupts[i]
+			break
 		}
 	}
-	if !found {
+	if found == nil {
 		t.Fatalf("expected paused project interrupt, got %+v", wf.Interrupts)
+	}
+	// W-PR-2: action_request + config + description aligned with Agent Inbox.
+	if found.ActionRequest == nil || found.ActionRequest.Action != "resume" {
+		t.Fatalf("paused interrupt action_request=%+v, want resume", found.ActionRequest)
+	}
+	if found.Config == nil || !found.Config.AllowAccept {
+		t.Fatalf("paused interrupt config=%+v, want allow_accept", found.Config)
+	}
+	if !strings.Contains(found.Description, "customer review") {
+		t.Fatalf("paused interrupt description=%q, want to include pause reason", found.Description)
 	}
 }
 
