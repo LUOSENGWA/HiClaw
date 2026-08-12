@@ -112,8 +112,8 @@ Error responses:
 | Code | Meaning |
 |:--|:--|
 | `400` | Missing project id. |
-| `403` | Team leader (or L2 human) outside the project's team. |
-| `404` | Project not found (no meta.json under any scanned prefix). |
+| `403` | Authenticated but the role cannot read projects at all (e.g. Worker). |
+| `404` | Project not found (no meta.json under any scanned prefix) — **or** the caller is a scoped reader (team leader / L2 human) who does not own the project (existence is hidden to prevent id enumeration). |
 | `500` | K8s or object-store failure. |
 
 ## Authentication & authorization
