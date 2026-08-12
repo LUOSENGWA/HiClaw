@@ -47,6 +47,12 @@ Controller 提供两个只读端点，把 TeamHarness 项目状态
 
 返回一个项目的 LangGraph 对齐工作流。
 
+可选查询参数：
+
+| 参数 | 类型 | 含义 |
+|:--|:--|:--|
+| `includeTasks` | `bool` | 为 `true` 时同时读取每个任务的 TaskMeta（`shared/tasks/{id}/meta.json`），在响应中附加 `tasks_detail` 数组（spec/result/交付物字段）。默认 `false` 保持响应轻量。 |
+
 响应 `200 OK`：
 
 ```json
@@ -81,9 +87,24 @@ Controller 提供两个只读端点，把 TeamHarness 项目状态
   },
   "loop": null,
   "requester": "dingtalk:user:session",
-  "source_room_id": "!room:matrix.local"
+  "source_room_id": "!room:matrix.local",
+  "tasks_detail": [
+    {
+      "task_id": "t1",
+      "project_id": "demo-project-001",
+      "status": "completed",
+      "spec_path": "shared/tasks/t1/spec.md",
+      "assigned_to": "@w1:matrix.local",
+      "summary": "Alpha report done",
+      "result_status": "SUCCESS",
+      "deliverables": [{"type": "file", "path": "shared/tasks/t1/output.pdf"}],
+      "result_path": "shared/tasks/t1/result.md"
+    }
+  ]
 }
 ```
+
+`tasks_detail` 仅在 `?includeTasks=true` 时出现。它透传项目级 `nodes[]` 摘要不包含的 TaskMeta 字段：`spec_path`（任务规格文件）、`summary` / `result_status` / `result_path`（提交结果）、`deliverables`（产物清单）与 `cancel_reason`（取消原因）。TaskMeta 按与项目相同的双前缀布局读取（优先 `teams/{team}/shared/tasks/{id}/meta.json`，其次 `shared/tasks/{id}/`），团队作用域的任务优先于任何全局副本。没有 TaskMeta 文件的任务（如尚未委派）会被跳过；单个任务读取错误也会跳过，避免一个坏任务拖垮整个响应。
 
 节点状态归一化为前端友好枚举：
 

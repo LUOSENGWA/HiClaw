@@ -49,6 +49,12 @@ Response `200 OK`:
 
 Return the LangGraph-aligned workflow for one project.
 
+Optional query parameter:
+
+| Parameter | Type | Meaning |
+|:--|:--|:--|
+| `includeTasks` | `bool` | When `true`, also read each task's TaskMeta (`shared/tasks/{id}/meta.json`) and attach a `tasks_detail` array with spec/result/deliverable fields. Default `false` keeps the response lightweight. |
+
 Response `200 OK`:
 
 ```json
@@ -83,9 +89,32 @@ Response `200 OK`:
   },
   "loop": null,
   "requester": "dingtalk:user:session",
-  "source_room_id": "!room:matrix.local"
+  "source_room_id": "!room:matrix.local",
+  "tasks_detail": [
+    {
+      "task_id": "t1",
+      "project_id": "demo-project-001",
+      "status": "completed",
+      "spec_path": "shared/tasks/t1/spec.md",
+      "assigned_to": "@w1:matrix.local",
+      "summary": "Alpha report done",
+      "result_status": "SUCCESS",
+      "deliverables": [{"type": "file", "path": "shared/tasks/t1/output.pdf"}],
+      "result_path": "shared/tasks/t1/result.md"
+    }
+  ]
 }
 ```
+
+`tasks_detail` is only present when `?includeTasks=true`. It surfaces the
+TaskMeta fields that the project-level `nodes[]` summary does not carry:
+`spec_path` (task spec file), `summary` / `result_status` / `result_path`
+(submission result), `deliverables` (artifact list) and `cancel_reason`.
+TaskMeta is read from the same dual-prefix layout as projects
+(`teams/{team}/shared/tasks/{id}/meta.json` first, then `shared/tasks/{id}/`),
+so team-scoped tasks win over any global copy. Tasks without a TaskMeta file
+(e.g. not yet delegated) are skipped; per-task read errors are skipped so one
+bad task never fails the whole response.
 
 Node statuses are normalized to a frontend-friendly enum:
 

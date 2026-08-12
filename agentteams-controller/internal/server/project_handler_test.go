@@ -1310,3 +1310,225 @@ func TestListProjects_ConcurrentFetch(t *testing.T) {
 		last = id
 	}
 }
+
+
+func TestGetProjectWorkflow_IncludeTasksDetail(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1",
+		"title":      "Alpha Project",
+		"status":     "active",
+		"plan_type":  "dag",
+		"team_id":    "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "assigned_to": "@w1", "depends_on": []string{}, "status": "completed"},
+			{"task_id": "t2", "title": "Task 2", "assigned_to": "@w2", "depends_on": []string{"t1"}, "status": "assigned"},
+		},
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t1/meta.json", map[string]any{
+		"task_id":       "t1",
+		"project_id":    "p1",
+		"status":        "completed",
+		"spec_path":     "shared/tasks/t1/spec.md",
+		"assigned_to":   "@w1",
+		"summary":       "Alpha report done",
+		"result_status": "SUCCESS",
+		"deliverables":  []any{map[string]any{"type": "file", "path": "shared/tasks/t1/output.pdf"}},
+		"result_path":   "shared/tasks/t1/result.md",
+	})
+	putProject(store, "shared/tasks/t2/meta.json", map[string]any{
+		"task_id":     "t2",
+		"project_id":  "p1",
+		"status":      "assigned",
+		"spec_path":   "shared/tasks/t2/spec.md",
+		"assigned_to": "@w2",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow?includeTasks=true", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var wf workflowResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &wf); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(wf.TasksDetail) != 2 {
+		t.Fatalf("tasks_detail=%d, want 2", len(wf.TasksDetail))
+	}
+	byID := map[string]taskDetail{}
+	for _, d := range wf.TasksDetail {
+		byID[d.TaskID] = d
+	}
+	if wf.TasksDetail[0].TaskID != "t1" || wf.TasksDetail[1].TaskID != "t2" {
+		t.Fatalf("tasks_detail order wrong: %+v", wf.TasksDetail)
+	}
+	d1 := byID["t1"]
+	if d1.Summary != "Alpha report done" || d1.ResultStatus != "SUCCESS" || d1.ResultPath != "shared/tasks/t1/result.md" {
+		t.Fatalf("t1 detail wrong: %+v", d1)
+	}
+	if len(d1.Deliverables) != 1 {
+		t.Fatalf("t1 deliverables=%d, want 1", len(d1.Deliverables))
+	}
+	if d1.SpecPath != "shared/tasks/t1/spec.md" {
+		t.Fatalf("t1 spec_path wrong: %s", d1.SpecPath)
+	}
+	d2 := byID["t2"]
+	if d2.SpecPath != "shared/tasks/t2/spec.md" || d2.ProjectID != "p1" {
+		t.Fatalf("t2 detail wrong: %+v", d2)
+	}
+	if d2.ResultStatus != "" || d2.Summary != "" {
+		t.Fatalf("t2 should not have result fields: %+v", d2)
+	}
+}
+
+func TestGetProjectWorkflow_IncludeTasksDefaultOmitted(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1",
+		"title":      "Alpha Project",
+		"status":     "active",
+		"plan_type":  "dag",
+		"team_id":    "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "assigned_to": "@w1", "depends_on": []string{}, "status": "completed"},
+		},
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "status": "completed", "summary": "secret detail",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var wf workflowResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &wf); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(wf.TasksDetail) != 0 {
+		t.Fatalf("tasks_detail=%d, want 0 without includeTasks", len(wf.TasksDetail))
+	}
+}
+
+func TestGetProjectWorkflow_IncludeTasksMissingMetaSkipped(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1",
+		"title":      "Standalone",
+		"status":     "active",
+		"plan_type":  "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "assigned"},
+			{"task_id": "t2", "title": "Task 2", "status": "planned"},
+		},
+	})
+	putProject(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "status": "assigned", "spec_path": "shared/tasks/t1/spec.md",
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow?includeTasks=true", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var wf workflowResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &wf); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(wf.Nodes) != 2 {
+		t.Fatalf("nodes=%d, want 2", len(wf.Nodes))
+	}
+	if len(wf.TasksDetail) != 1 || wf.TasksDetail[0].TaskID != "t1" {
+		t.Fatalf("tasks_detail=%+v, want only t1", wf.TasksDetail)
+	}
+}
+
+func TestGetProjectWorkflow_IncludeTasksTeamPrefixWins(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag",
+		"team_id": "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "assigned"},
+		},
+	})
+	putProject(store, "teams/alpha-team/shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "status": "assigned", "summary": "team copy",
+	})
+	putProject(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "status": "assigned", "summary": "global copy",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow?includeTasks=true", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var wf workflowResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &wf); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(wf.TasksDetail) != 1 {
+		t.Fatalf("tasks_detail=%d, want 1", len(wf.TasksDetail))
+	}
+	if wf.TasksDetail[0].Summary != "team copy" {
+		t.Fatalf("team prefix should win, got summary=%q", wf.TasksDetail[0].Summary)
+	}
+}
+
+func TestGetProjectWorkflow_IncludeTasksLoopTasks(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Loop", "status": "active", "plan_type": "loop",
+		"loop": map[string]any{
+			"goal": "iterate", "current_iteration": 1, "max_iterations": 3, "status": "running",
+			"tasks": []map[string]any{
+				{"task_id": "iter-1", "title": "Iter 1", "status": "completed"},
+				{"task_id": "iter-2", "title": "Iter 2", "status": "assigned"},
+			},
+		},
+	})
+	putProject(store, "shared/tasks/iter-2/meta.json", map[string]any{
+		"task_id": "iter-2", "status": "assigned", "summary": "second iteration",
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow?includeTasks=true", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var wf workflowResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &wf); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(wf.TasksDetail) != 1 || wf.TasksDetail[0].TaskID != "iter-2" {
+		t.Fatalf("tasks_detail=%+v, want iter-2 only", wf.TasksDetail)
+	}
+}

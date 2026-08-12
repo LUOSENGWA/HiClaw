@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"sort"
@@ -101,6 +102,9 @@ type workflowResponse struct {
 	RequesterReport map[string]any      `json:"requester_report,omitempty"`
 	ReplyRoute      map[string]any      `json:"reply_route,omitempty"`
 	SourceRoomID    string              `json:"source_room_id,omitempty"`
+	// TasksDetail is populated only when ?includeTasks=true; otherwise it is
+	// omitted so the default workflow response stays lightweight.
+	TasksDetail []taskDetail `json:"tasks_detail,omitempty"`
 	// W2: human-intervention audit fields.
 	UpdatedBy   string `json:"updated_by,omitempty"`
 	UpdatedAt   string `json:"updated_at,omitempty"`
@@ -135,6 +139,27 @@ type workflowEdge struct {
 type workflowInterrupt struct {
 	ID    string `json:"id"`
 	Value string `json:"value"`
+}
+
+// taskDetail is the per-task detail payload returned when
+// ?includeTasks=true. It surfaces TaskMeta (shared/tasks/{id}/meta.json)
+// fields that are not part of the project-level tasks[] node summary: the
+// spec path, submission summary/result status, deliverables list and result
+// path. TaskMeta is written by TeamHarness taskflow (delegate_task creates
+// spec.md + meta.json, submit_task adds summary/result_status/deliverables/
+// result_path) and pushed to shared storage via _sync_task, so the same
+// dual-prefix scan used for projects applies here.
+type taskDetail struct {
+	TaskID       string     `json:"task_id"`
+	ProjectID    string     `json:"project_id,omitempty"`
+	Status       string     `json:"status,omitempty"`
+	SpecPath     string     `json:"spec_path,omitempty"`
+	AssignedTo   string     `json:"assigned_to,omitempty"`
+	Summary      string     `json:"summary,omitempty"`
+	ResultStatus string     `json:"result_status,omitempty"`
+	Deliverables []any      `json:"deliverables,omitempty"`
+	ResultPath   string     `json:"result_path,omitempty"`
+	CancelReason string     `json:"cancel_reason,omitempty"`
 }
 
 // normalizeTaskStatus maps ProjectMeta task status to the frontend-friendly
@@ -460,6 +485,7 @@ func (h *ProjectHandler) GetProjectWorkflow(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	caller := authpkg.CallerFromContext(r.Context())
+	includeTasks := r.URL.Query().Get("includeTasks") == "true"
 
 	// Single K8s List for both meta resolution and the access check (O1).
 	prefixes, crToEffective, err := h.teamProjectPrefixes(r.Context())
@@ -491,11 +517,13 @@ func (h *ProjectHandler) GetProjectWorkflow(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta))
+	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, team, includeTasks))
 }
 
 // buildWorkflow converts project meta into the LangGraph-aligned response.
-func (h *ProjectHandler) buildWorkflow(meta *projectMeta) *workflowResponse {
+// When includeTasks is true it additionally reads per-task TaskMeta from
+// shared storage and attaches tasks_detail.
+func (h *ProjectHandler) buildWorkflow(meta *projectMeta, team string, includeTasks bool) *workflowResponse {
 	nodes := make([]workflowNode, 0, len(meta.Tasks))
 	edges := make([]workflowEdge, 0)
 	next := make([]string, 0)
@@ -583,6 +611,16 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta) *workflowResponse {
 		taskCount[n.Status]++
 	}
 
+	// includeTasks: read per-task TaskMeta (shared/tasks/{id}/meta.json)
+	// from the same dual-prefix layout as projects and attach tasks_detail.
+	// Tasks without a TaskMeta file are skipped (the node summary remains
+	// authoritative); per-task read errors are skipped too so one bad task
+	// does not fail the whole workflow response.
+	var tasksDetail []taskDetail
+	if includeTasks {
+		tasksDetail = h.readTasksDetail(meta, team)
+	}
+
 	return &workflowResponse{
 		ProjectID:  meta.ProjectID,
 		Title:      meta.Title,
@@ -609,8 +647,151 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta) *workflowResponse {
 		RequesterReport: meta.RequesterReport,
 		ReplyRoute:      meta.ReplyRoute,
 		SourceRoomID:    meta.SourceRoomID,
+		TasksDetail:     tasksDetail,
 		UpdatedBy:       meta.UpdatedBy,
 		UpdatedAt:       meta.UpdatedAt,
 		PauseReason:     meta.PauseReason,
 	}
+}
+
+// readTasksDetail reads TaskMeta (shared/tasks/{id}/meta.json) for every task
+// in the project's graph and returns the detail list in node order.
+//
+// TaskMeta is stored under the same dual-prefix layout as projects
+// (teams/{team}/shared/tasks/{id}/meta.json for team members, shared/tasks/
+// {id}/meta.json for standalone workers) — _sync_task pushes the local
+// shared/tasks/{id} directory after delegate/ack/submit/cancel. We probe the
+// task prefix belonging to this project's team first, then the global
+// prefix, mirroring resolveProjectMeta. Reads are concurrent (W7 pattern) so
+// N tasks cost ~ceil(N/8) mc subprocess rounds instead of N serial spawns.
+func (h *ProjectHandler) readTasksDetail(meta *projectMeta, team string) []taskDetail {
+	// Collect unique task ids from the graph (project tasks, or loop tasks
+	// for loop plans — same set buildWorkflow renders).
+	graphTasks := meta.Tasks
+	if meta.PlanType == "loop" && meta.Loop != nil {
+		graphTasks = meta.Loop.Tasks
+	}
+	taskIDs := make([]string, 0, len(graphTasks))
+	seen := map[string]bool{}
+	for _, t := range graphTasks {
+		if t.TaskID == "" || seen[t.TaskID] {
+			continue
+		}
+		seen[t.TaskID] = true
+		taskIDs = append(taskIDs, t.TaskID)
+	}
+	if len(taskIDs) == 0 {
+		return nil
+	}
+
+	// Candidate TaskMeta keys: project team prefix first, global fallback.
+	var keys []string
+	for _, id := range taskIDs {
+		if team != "" {
+			keys = append(keys, "teams/"+team+"/shared/tasks/"+id+"/meta.json")
+		}
+		keys = append(keys, "shared/tasks/"+id+"/meta.json")
+	}
+
+	const detailConcurrency = 8
+	type keyResult struct {
+		taskID string
+		key    string
+		data   []byte
+	}
+	results := make([]keyResult, len(keys))
+	sem := make(chan struct{}, detailConcurrency)
+	var wg sync.WaitGroup
+	for i, key := range keys {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, taskID, key string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			data, err := h.oss.GetObject(context.Background(), key)
+			if err != nil {
+				results[i] = keyResult{taskID: taskID, key: key}
+				return
+			}
+			results[i] = keyResult{taskID: taskID, key: key, data: data}
+		}(i, keyForTaskID(key, taskIDs), key)
+	}
+	wg.Wait()
+
+	// First non-empty match per task id wins (team prefix takes precedence
+	// because it is listed first; a task published to the global prefix is a
+	// fallback for standalone projects).
+	detailByTask := make(map[string]taskDetail, len(taskIDs))
+	for _, res := range results {
+		if len(res.data) == 0 {
+			continue
+		}
+		if _, ok := detailByTask[res.taskID]; ok {
+			continue
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(res.data, &raw); err != nil {
+			continue // malformed TaskMeta; keep node summary only
+		}
+		detail := taskDetail{
+			TaskID:       str(taskIDFromRaw(raw, res.taskID)),
+			Status:       str(raw["status"]),
+			SpecPath:     str(raw["spec_path"]),
+			AssignedTo:   str(raw["assigned_to"]),
+			Summary:      str(raw["summary"]),
+			ResultStatus: str(raw["result_status"]),
+			ResultPath:   str(raw["result_path"]),
+			CancelReason: str(raw["cancel_reason"]),
+		}
+		if raw["project_id"] != nil {
+			detail.ProjectID = str(raw["project_id"])
+		}
+		if raw["deliverables"] != nil {
+			if list, ok := raw["deliverables"].([]any); ok {
+				detail.Deliverables = list
+			}
+		}
+		detailByTask[res.taskID] = detail
+	}
+
+	// Return in graph order for stable output.
+	out := make([]taskDetail, 0, len(taskIDs))
+	for _, id := range taskIDs {
+		if d, ok := detailByTask[id]; ok {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// keyForTaskID maps a candidate key back to the task id by extracting the
+// directory component after ".../tasks/". All keys are built from taskIDs in
+// readTasksDetail, so a simple suffix search is sufficient; if the lookup
+// fails the key index order (team-first) still yields the right task id.
+func keyForTaskID(key string, taskIDs []string) string {
+	for _, id := range taskIDs {
+		if strings.Contains(key, "/tasks/"+id+"/") {
+			return id
+		}
+	}
+	return ""
+}
+
+// str is a small helper to coerce a JSON value to string ("" for nil).
+func str(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+// taskIDFromRaw prefers the raw task_id field, falling back to the key-derived id.
+func taskIDFromRaw(raw map[string]any, fallback string) string {
+	if s := str(raw["task_id"]); s != "" {
+		return s
+	}
+	return fallback
 }
