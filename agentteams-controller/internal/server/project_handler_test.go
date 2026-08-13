@@ -2055,6 +2055,7 @@ func TestGetProjectSpawns_AggregatesWorkerSpawns(t *testing.T) {
 		spawnChat("sub-3f2a9b1c", map[string]any{
 			"spawn": true, "root_session_id": "matrix:!room:server",
 			"subagent_allowed_tools": []any{"read_file", "write_file"},
+			"subagent_skills":        []any{"pdf", "xlsx"},
 		}),
 		{"id": "c-normal", "session_id": "matrix:!room:server", "channel": "matrix", "status": "idle"},
 	})
@@ -2105,6 +2106,9 @@ func TestGetProjectSpawns_AggregatesWorkerSpawns(t *testing.T) {
 	}
 	if len(s.AllowedTools) != 2 || s.AllowedTools[0] != "read_file" {
 		t.Fatalf("allowed_tools=%v, want [read_file write_file]", s.AllowedTools)
+	}
+	if len(s.Skills) != 2 || s.Skills[1] != "xlsx" {
+		t.Fatalf("skills=%v, want [pdf xlsx]", s.Skills)
 	}
 	// Bare room id in root_session_id normalizes to the matrix: form.
 	dev := byWorker["alpha-dev"].Spawns[0]

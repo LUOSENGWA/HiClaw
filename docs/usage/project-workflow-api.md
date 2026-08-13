@@ -235,7 +235,8 @@ Response:
           "updated_at": "2026-08-13T10:05:00+00:00",
           "root_session_id": "matrix:!room:server",
           "spawn": true,
-          "subagent_allowed_tools": ["read_file", "write_file"]
+          "subagent_allowed_tools": ["read_file", "write_file"],
+          "subagent_skills": ["pdf"]
         }
       ]
     }
@@ -250,8 +251,12 @@ Notes:
   linkage feature is 2.1+); clients should degrade to a flat list.
 - A worker with a missing or unreadable `chats.json` is still listed, with
   an empty `spawns` array — one broken worker never 500s the whole project.
-- `subagent_allowed_tools` is only present when the spawn was created with
-  a tool whitelist (2.1+).
+- `subagent_allowed_tools` / `subagent_skills` are only present when the
+  spawn was created with a tool/skill whitelist (2.1+).
+- `name` is the chat title assigned when the spawn session was created
+  (not the full task prompt).
+- Standalone projects (no owning team) return an empty `workers` array —
+  there is no team membership to derive the worker list from.
 
 Error responses:
 

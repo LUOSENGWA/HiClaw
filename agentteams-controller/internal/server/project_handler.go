@@ -1106,6 +1106,7 @@ type spawnInfo struct {
 	RootSessionID *string  `json:"root_session_id"` // null on 2.0.1 workers
 	Spawn         bool     `json:"spawn"`
 	AllowedTools  []string `json:"subagent_allowed_tools,omitempty"`
+	Skills        []string `json:"subagent_skills,omitempty"`
 }
 
 // normalizeSessionKey canonicalizes a Matrix room id or channel session id
@@ -1155,9 +1156,19 @@ func spawnRootSession(c workerChat) *string {
 }
 
 // spawnAllowedTools returns the tool whitelist persisted in the chat meta
-// (absent on 2.0.1).
+// (absent on 2.0.1). spawnSkills is the same for the skill whitelist; both
+// are written by the QwenPaw spawn linkage feature from the spawn's
+// request_context.
 func spawnAllowedTools(c workerChat) []string {
-	raw, ok := c.Meta["subagent_allowed_tools"].([]any)
+	return spawnMetaList(c, "subagent_allowed_tools")
+}
+
+func spawnSkills(c workerChat) []string {
+	return spawnMetaList(c, "subagent_skills")
+}
+
+func spawnMetaList(c workerChat, key string) []string {
+	raw, ok := c.Meta[key].([]any)
 	if !ok {
 		return nil
 	}
@@ -1242,6 +1253,7 @@ func (h *ProjectHandler) readWorkerSpawns(ctx context.Context, worker string) []
 			RootSessionID: spawnRootSession(c),
 			Spawn:         true,
 			AllowedTools:  spawnAllowedTools(c),
+			Skills:        spawnSkills(c),
 		})
 	}
 	return out
