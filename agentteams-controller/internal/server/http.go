@@ -113,6 +113,7 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	mux.Handle("GET /api/v1/projects", mw.RequireAuthz(authpkg.ActionList, "project", nil)(http.HandlerFunc(projh.ListProjects)))
 	mux.Handle("GET /api/v1/projects/{id}/workflow", mw.RequireAuthz(authpkg.ActionGet, "project", projectNameFn)(http.HandlerFunc(projh.GetProjectWorkflow)))
 	mux.Handle("GET /api/v1/projects/{id}/tasks/{taskId}/artifact", mw.RequireAuthz(authpkg.ActionGet, "project", projectNameFn)(http.HandlerFunc(projh.GetTaskArtifact)))
+	mux.Handle("GET /api/v1/projects/{id}/spawns", mw.RequireAuthz(authpkg.ActionGet, "project", projectNameFn)(http.HandlerFunc(projh.GetProjectSpawns)))
 
 	// --- Gateway ---
 	gh := NewGatewayHandler(deps.Gateway)

@@ -1051,3 +1051,244 @@ func taskIDFromRaw(raw map[string]any, fallback string) string {
 	}
 	return fallback
 }
+
+// --- spawn aggregation (GET /api/v1/projects/{id}/spawns) ---
+//
+// Spawn subagents (spawn_subagent) are the primary workhorses of the
+// AgentTeam architecture: workers schedule, spawns execute. The TeamHarness
+// meta.json only tracks the team-level task state, so this endpoint reads
+// each team worker's chats.json (mirrored into object storage by the
+// worker's FileSync) and aggregates the spawn sessions.
+//
+// Parent-child linkage (meta.root_session_id / meta.spawn) is persisted by
+// the QwenPaw spawn-linkage feature (2.1+). On 2.0.1 workers those fields
+// are absent; the endpoint degrades gracefully (root_session_id null, sub-
+// prefix detection) so the client can fall back to a flat list.
+
+// workerChatsFile mirrors the worker-side chats.json written by QwenPaw's
+// JsonChatRepository. Both 2.0.1 and 2.1 write {version, chats: [...]}.
+type workerChatsFile struct {
+	Version int          `json:"version"`
+	Chats   []workerChat `json:"chats"`
+}
+
+// workerChat is the per-chat subset needed for spawn aggregation.
+type workerChat struct {
+	ID        string         `json:"id"`
+	Name      string         `json:"name"`
+	SessionID string         `json:"session_id"`
+	UserID    string         `json:"user_id"`
+	Channel   string         `json:"channel"`
+	CreatedAt string         `json:"created_at"`
+	UpdatedAt string         `json:"updated_at"`
+	Meta      map[string]any `json:"meta"`
+	Status    string         `json:"status"`
+	Source    string         `json:"source"`
+}
+
+// projectSpawnsResponse is the GET /api/v1/projects/{id}/spawns payload.
+type projectSpawnsResponse struct {
+	ProjectID string         `json:"project_id"`
+	Workers   []workerSpawns `json:"workers"`
+}
+
+type workerSpawns struct {
+	Worker string      `json:"worker"`
+	Spawns []spawnInfo `json:"spawns"`
+}
+
+type spawnInfo struct {
+	SessionID     string   `json:"session_id"`
+	Name          string   `json:"name,omitempty"`
+	Status        string   `json:"status"`
+	CreatedAt     string   `json:"created_at,omitempty"`
+	UpdatedAt     string   `json:"updated_at,omitempty"`
+	RootSessionID *string  `json:"root_session_id"` // null on 2.0.1 workers
+	Spawn         bool     `json:"spawn"`
+	AllowedTools  []string `json:"subagent_allowed_tools,omitempty"`
+}
+
+// normalizeSessionKey canonicalizes a Matrix room id or channel session id
+// into the chats.json session_id form. Bare room ids (!abc:server) gain the
+// canonical lowercase `matrix:` prefix; full session keys keep their channel
+// prefix but fold it to lowercase (Matrix:!abc -> matrix:!abc). Empty stays
+// empty. This lets room_id values from TaskMeta and session_id values from
+// chats.json be compared reliably.
+//
+// A leading "!" disambiguates a bare Matrix room id (which itself contains
+// a ":" domain separator) from a channel session key.
+func normalizeSessionKey(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, "!") {
+		return "matrix:" + s
+	}
+	if i := strings.Index(s, ":"); i > 0 {
+		return strings.ToLower(s[:i]) + s[i:]
+	}
+	return "matrix:" + s
+}
+
+// isSpawnChat reports whether a chat entry represents a spawn subagent
+// session. 2.1 persists meta.spawn; 2.0.1 only leaves the `sub-` session id
+// prefix as a signal. Both are accepted (plus a future source="spawn").
+func isSpawnChat(c workerChat) bool {
+	if b, ok := c.Meta["spawn"].(bool); ok && b {
+		return true
+	}
+	if c.Source == "spawn" {
+		return true
+	}
+	return strings.HasPrefix(c.SessionID, "sub-")
+}
+
+// spawnRootSession returns the persisted root session id (normalized) or
+// nil when absent (2.0.1 workers).
+func spawnRootSession(c workerChat) *string {
+	if s := str(c.Meta["root_session_id"]); s != "" {
+		normalized := normalizeSessionKey(s)
+		return &normalized
+	}
+	return nil
+}
+
+// spawnAllowedTools returns the tool whitelist persisted in the chat meta
+// (absent on 2.0.1).
+func spawnAllowedTools(c workerChat) []string {
+	raw, ok := c.Meta["subagent_allowed_tools"].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s := str(v); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// teamWorkerNames resolves the Worker CRs referenced by the team's
+// WorkerMembers into their MinIO storage names (WorkerSpec.WorkerName is the
+// OSS path key; fall back to the CR name).
+func (h *ProjectHandler) teamWorkerNames(ctx context.Context, team string) []string {
+	var teams v1beta1.TeamList
+	if err := h.client.List(ctx, &teams, client.InNamespace(h.namespace)); err != nil {
+		return nil
+	}
+	var memberNames []string
+	for i := range teams.Items {
+		if teams.Items[i].Spec.EffectiveTeamName(teams.Items[i].Name) != team {
+			continue
+		}
+		for _, m := range teams.Items[i].Spec.WorkerMembers {
+			memberNames = append(memberNames, m.Name)
+		}
+		break
+	}
+	if len(memberNames) == 0 {
+		return nil
+	}
+
+	byName := map[string]string{}
+	var workers v1beta1.WorkerList
+	if err := h.client.List(ctx, &workers, client.InNamespace(h.namespace)); err == nil {
+		for i := range workers.Items {
+			name := workers.Items[i].Spec.WorkerName
+			if name == "" {
+				name = workers.Items[i].Name
+			}
+			byName[workers.Items[i].Name] = name
+		}
+	}
+	out := make([]string, 0, len(memberNames))
+	for _, n := range memberNames {
+		if storage, ok := byName[n]; ok {
+			out = append(out, storage)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// workerChatsPath is the workspace-relative path of a worker's chats.json.
+// The worker FileSync mirrors its workspace (including .qwenpaw/workspaces/
+// default/chats.json — not in the background-push exclusion list) under
+// agents/{worker}/.
+const workerChatsPath = ".qwenpaw/workspaces/default/chats.json"
+
+func (h *ProjectHandler) readWorkerSpawns(ctx context.Context, worker string) []spawnInfo {
+	out := make([]spawnInfo, 0)
+	data, err := h.oss.GetObject(ctx, "agents/"+worker+"/"+workerChatsPath)
+	if err != nil {
+		return out // chats.json missing/unreadable: skip worker, don't 500
+	}
+	var file workerChatsFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		return out // truncated/legacy shape: skip worker
+	}
+	for _, c := range file.Chats {
+		if !isSpawnChat(c) {
+			continue
+		}
+		out = append(out, spawnInfo{
+			SessionID:     c.SessionID,
+			Name:          c.Name,
+			Status:        c.Status,
+			CreatedAt:     c.CreatedAt,
+			UpdatedAt:     c.UpdatedAt,
+			RootSessionID: spawnRootSession(c),
+			Spawn:         true,
+			AllowedTools:  spawnAllowedTools(c),
+		})
+	}
+	return out
+}
+
+// GetProjectSpawns handles GET /api/v1/projects/{id}/spawns.
+// Auth/RBAC mirrors GetProjectWorkflow: RoleHuman read + team-scope check,
+// cross-team access hidden as 404.
+func (h *ProjectHandler) GetProjectSpawns(w http.ResponseWriter, r *http.Request) {
+	projectID := r.PathValue("id")
+	if projectID == "" {
+		httputil.WriteError(w, http.StatusBadRequest, "project id is required")
+		return
+	}
+	caller := authpkg.CallerFromContext(r.Context())
+
+	prefixes, crToEffective, err := h.teamProjectPrefixes(r.Context())
+	if err != nil {
+		writeK8sError(w, "get project spawns: resolve prefixes", err)
+		return
+	}
+	meta, team, err := h.resolveProjectMeta(r.Context(), projectID, prefixes)
+	if err != nil {
+		writeK8sError(w, "get project spawns", err)
+		return
+	}
+	if meta == nil {
+		httputil.WriteError(w, http.StatusNotFound, "project not found")
+		return
+	}
+	// W4: hide existence from scoped callers who do not own this project.
+	if err := h.checkProjectAccess(caller, team, crToEffective); err != nil {
+		if _, ok := err.(*accessDeniedError); ok {
+			httputil.WriteError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		httputil.WriteError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
+	workers := h.teamWorkerNames(r.Context(), team)
+	resp := projectSpawnsResponse{ProjectID: projectID, Workers: make([]workerSpawns, 0, len(workers))}
+	for _, worker := range workers {
+		resp.Workers = append(resp.Workers, workerSpawns{
+			Worker: worker,
+			Spawns: h.readWorkerSpawns(r.Context(), worker),
+		})
+	}
+	httputil.WriteJSON(w, http.StatusOK, resp)
+}

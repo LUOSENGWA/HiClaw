@@ -2,10 +2,11 @@
 
 > Added by the project workflow inspection PR (agentteams/AgentTeams#1169).
 
-The controller exposes two read-only endpoints that surface TeamHarness
+The controller exposes three read-only endpoints that surface TeamHarness
 project state (`shared/projects/{id}/meta.json`) as a LangGraph-aligned
-workflow view. They are the data source for human-facing views (dashboard,
-QwenPaw console plugin) and are consumed by `agt get projects`.
+workflow view, plus per-team spawn subagent sessions. They are the data
+source for human-facing views (dashboard, QwenPaw console plugin) and are
+consumed by `agt get projects`.
 
 ## Scope & prerequisites
 
@@ -204,6 +205,63 @@ Error responses:
 | `404` | Project not found / caller does not own it (existence hidden) / task not in the project graph / task has no published artifact / requested path is not a declared artifact / artifact file missing / artifact path rejected. |
 | `500` | K8s or object-store failure. |
 
+### `GET /api/v1/projects/{id}/spawns`
+
+Aggregate the **spawn subagent sessions** created by the project team's
+workers. Spawn subagents are the primary execution vehicle of worker agents
+(workers schedule, spawns execute); this endpoint makes that activity
+visible alongside the team-level task graph.
+
+Data source: each team worker's `chats.json`
+(`agents/{worker}/.qwenpaw/workspaces/default/chats.json` in object storage,
+mirrored by the worker's FileSync). A chat entry is a spawn session when
+`meta.spawn == true` (QwenPaw 2.1+) or its `session_id` carries the `sub-`
+prefix (2.0.1 fallback).
+
+Response:
+
+```json
+{
+  "project_id": "demo-project-001",
+  "workers": [
+    {
+      "worker": "sysdev-lead",
+      "spawns": [
+        {
+          "session_id": "sub-3f2a9b1c",
+          "name": "fix harmony build script",
+          "status": "running",
+          "created_at": "2026-08-13T10:00:00+00:00",
+          "updated_at": "2026-08-13T10:05:00+00:00",
+          "root_session_id": "matrix:!room:server",
+          "spawn": true,
+          "subagent_allowed_tools": ["read_file", "write_file"]
+        }
+      ]
+    }
+  ]
+}
+```
+
+Notes:
+
+- `root_session_id` is the normalized session key of the parent session
+  (`matrix:` prefix canonicalized). It is `null` on 2.0.1 workers (the
+  linkage feature is 2.1+); clients should degrade to a flat list.
+- A worker with a missing or unreadable `chats.json` is still listed, with
+  an empty `spawns` array — one broken worker never 500s the whole project.
+- `subagent_allowed_tools` is only present when the spawn was created with
+  a tool whitelist (2.1+).
+
+Error responses:
+
+| Code | Meaning |
+|:--|:--|
+| `400` | Missing project id. |
+| `403` | Authenticated but the role cannot read projects at all (e.g. Worker). |
+| `404` | Project not found / caller does not own it (existence hidden). |
+| `500` | K8s or object-store failure. |
+
 ## Authentication & authorization
 
 Two bearer-token paths are accepted (composite authenticator):
@@ -220,12 +278,12 @@ Two bearer-token paths are accepted (composite authenticator):
 
 Authorization matrix:
 
-| Caller | List | Get workflow |
-|:--|:--|:--|
-| admin / manager | all teams | any project |
-| team-leader (SA) | own team only | own team only |
-| L2 human (Matrix) | all `accessibleTeams` | any accessible team |
-| worker | denied | denied |
+| Caller | List | Get workflow | Get spawns |
+|:--|:--|:--|:--|
+| admin / manager | all teams | any project | any project |
+| team-leader (SA) | own team only | own team only | own team only |
+| L2 human (Matrix) | all `accessibleTeams` | any accessible team | any accessible team |
+| worker | denied | denied | denied |
 
 ## `agt` CLI
 

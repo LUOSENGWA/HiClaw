@@ -1996,3 +1996,286 @@ func TestGetTaskArtifact_ChineseDeliverableFilenameRFC5987(t *testing.T) {
 		t.Fatalf("Content-Disposition=%q, want percent-encoded 季度", cd)
 	}
 }
+
+// --- spawn aggregation tests (GET /api/v1/projects/{id}/spawns) ---
+
+func workerCR(name, storageName string) *v1beta1.Worker {
+	return &v1beta1.Worker{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec:       v1beta1.WorkerSpec{WorkerName: storageName},
+	}
+}
+
+// putChats writes a worker chats.json into the in-memory store at the
+// mirror path agents/{worker}/.qwenpaw/workspaces/default/chats.json.
+func putChats(store *ossfake.Memory, worker string, chats []map[string]any) {
+	data, _ := json.Marshal(map[string]any{"version": 1, "chats": chats})
+	_ = store.PutObject(context.Background(), "agents/"+worker+"/"+workerChatsPath, data)
+}
+
+func spawnChat(sessionID string, meta map[string]any) map[string]any {
+	chat := map[string]any{
+		"id":         "c-" + sessionID,
+		"name":       "spawn task",
+		"session_id": sessionID,
+		"user_id":    "default",
+		"channel":    "console",
+		"status":     "running",
+		"source":     "chat",
+	}
+	if meta != nil {
+		chat["meta"] = meta
+	}
+	return chat
+}
+
+// newSpawnTestHandler builds a handler with Teams and Workers in the fake
+// K8s client.
+func newSpawnTestHandler(t *testing.T, store *ossfake.Memory, objs ...runtime.Object) *ProjectHandler {
+	t.Helper()
+	k8s := fake.NewClientBuilder().WithScheme(newProjectTestScheme(t)).WithRuntimeObjects(objs...).Build()
+	var o oss.StorageClient = &mcLikeOSS{Memory: store}
+	return NewProjectHandler(k8s, "default", o)
+}
+
+func teamWithWorkers(name string, members ...v1beta1.TeamWorkerRef) *v1beta1.Team {
+	return &v1beta1.Team{
+		ObjectMeta:   metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec:         v1beta1.TeamSpec{TeamName: name, WorkerMembers: members},
+	}
+}
+
+func TestGetProjectSpawns_AggregatesWorkerSpawns(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	// 2.1-style data: meta.spawn + meta.root_session_id persisted.
+	putChats(store, "alpha-lead", []map[string]any{
+		spawnChat("sub-3f2a9b1c", map[string]any{
+			"spawn": true, "root_session_id": "matrix:!room:server",
+			"subagent_allowed_tools": []any{"read_file", "write_file"},
+		}),
+		{"id": "c-normal", "session_id": "matrix:!room:server", "channel": "matrix", "status": "idle"},
+	})
+	putChats(store, "alpha-dev", []map[string]any{
+		spawnChat("sub-9d1e2f3a", map[string]any{"spawn": true, "root_session_id": "!room:server"}),
+	})
+	teamCR := teamWithWorkers("alpha-team",
+		v1beta1.TeamWorkerRef{Name: "alpha-lead-cr", Role: "team_leader"},
+		v1beta1.TeamWorkerRef{Name: "alpha-dev-cr", Role: "worker"},
+	)
+	h := newSpawnTestHandler(t, store, teamCR,
+		workerCR("alpha-lead-cr", "alpha-lead"),
+		workerCR("alpha-dev-cr", "alpha-dev"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/spawns", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "luo", Teams: []string{"alpha-team"}})
+	rec := httptest.NewRecorder()
+	h.GetProjectSpawns(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	var resp projectSpawnsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.ProjectID != "p1" {
+		t.Fatalf("project_id=%q, want p1", resp.ProjectID)
+	}
+	if len(resp.Workers) != 2 {
+		t.Fatalf("workers=%d, want 2", len(resp.Workers))
+	}
+	byWorker := map[string]workerSpawns{}
+	for _, w := range resp.Workers {
+		byWorker[w.Worker] = w
+	}
+	lead := byWorker["alpha-lead"]
+	if len(lead.Spawns) != 1 {
+		t.Fatalf("alpha-lead spawns=%d, want 1 (non-spawn chat filtered)", len(lead.Spawns))
+	}
+	s := lead.Spawns[0]
+	if s.SessionID != "sub-3f2a9b1c" || !s.Spawn {
+		t.Fatalf("spawn=%+v, want session sub-3f2a9b1c spawn=true", s)
+	}
+	if s.RootSessionID == nil || *s.RootSessionID != "matrix:!room:server" {
+		t.Fatalf("root_session_id=%v, want matrix:!room:server", s.RootSessionID)
+	}
+	if len(s.AllowedTools) != 2 || s.AllowedTools[0] != "read_file" {
+		t.Fatalf("allowed_tools=%v, want [read_file write_file]", s.AllowedTools)
+	}
+	// Bare room id in root_session_id normalizes to the matrix: form.
+	dev := byWorker["alpha-dev"].Spawns[0]
+	if dev.RootSessionID == nil || *dev.RootSessionID != "matrix:!room:server" {
+		t.Fatalf("dev root_session_id=%v, want normalized matrix:!room:server", dev.RootSessionID)
+	}
+}
+
+func TestGetProjectSpawns_LegacyWorkerNullRootSession(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	// 2.0.1-style data: no meta.spawn, no root_session_id — only the sub-
+	// prefix identifies the spawn session.
+	putChats(store, "alpha-lead", []map[string]any{
+		{"id": "c1", "session_id": "sub-legacy01", "channel": "console", "status": "idle"},
+	})
+	teamCR := teamWithWorkers("alpha-team", v1beta1.TeamWorkerRef{Name: "alpha-lead-cr", Role: "team_leader"})
+	h := newSpawnTestHandler(t, store, teamCR, workerCR("alpha-lead-cr", "alpha-lead"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/spawns", nil)
+	req.SetPathValue("id", "p1")
+	rec := httptest.NewRecorder()
+	h.GetProjectSpawns(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	var resp projectSpawnsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(resp.Workers) != 1 || len(resp.Workers[0].Spawns) != 1 {
+		t.Fatalf("workers=%+v, want 1 worker with 1 spawn", resp.Workers)
+	}
+	s := resp.Workers[0].Spawns[0]
+	if s.RootSessionID != nil {
+		t.Fatalf("root_session_id=%v, want null on legacy 2.0.1 data", *s.RootSessionID)
+	}
+	if s.Spawn != true {
+		t.Fatalf("spawn=%v, want true (sub- prefix detection)", s.Spawn)
+	}
+}
+
+func TestGetProjectSpawns_NoSpawnsEmptyArray(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	putChats(store, "alpha-lead", []map[string]any{
+		{"id": "c1", "session_id": "matrix:!room:server", "channel": "matrix", "status": "idle"},
+	})
+	teamCR := teamWithWorkers("alpha-team", v1beta1.TeamWorkerRef{Name: "alpha-lead-cr", Role: "team_leader"})
+	h := newSpawnTestHandler(t, store, teamCR, workerCR("alpha-lead-cr", "alpha-lead"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/spawns", nil)
+	req.SetPathValue("id", "p1")
+	rec := httptest.NewRecorder()
+	h.GetProjectSpawns(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	var resp projectSpawnsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(resp.Workers) != 1 {
+		t.Fatalf("workers=%d, want 1", len(resp.Workers))
+	}
+	if resp.Workers[0].Spawns == nil || len(resp.Workers[0].Spawns) != 0 {
+		t.Fatalf("spawns=%v, want empty array (JSON [])", resp.Workers[0].Spawns)
+	}
+	if !strings.Contains(rec.Body.String(), `"spawns":[]`) {
+		t.Fatalf("body=%s, want literal empty array", rec.Body.String())
+	}
+}
+
+func TestGetProjectSpawns_MissingOrCorruptChatsSkipped(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	// alpha-dev has no chats.json at all; alpha-writer has corrupt JSON.
+	_ = store.PutObject(context.Background(), "agents/alpha-writer/"+workerChatsPath, []byte("{not json"))
+	teamCR := teamWithWorkers("alpha-team",
+		v1beta1.TeamWorkerRef{Name: "alpha-dev-cr", Role: "worker"},
+		v1beta1.TeamWorkerRef{Name: "alpha-writer-cr", Role: "worker"},
+	)
+	h := newSpawnTestHandler(t, store, teamCR,
+		workerCR("alpha-dev-cr", "alpha-dev"),
+		workerCR("alpha-writer-cr", "alpha-writer"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/spawns", nil)
+	req.SetPathValue("id", "p1")
+	rec := httptest.NewRecorder()
+	h.GetProjectSpawns(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 (missing/corrupt chats skipped, not 500)", rec.Code)
+	}
+	var resp projectSpawnsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(resp.Workers) != 2 {
+		t.Fatalf("workers=%d, want 2 (both listed, empty spawns)", len(resp.Workers))
+	}
+	for _, w := range resp.Workers {
+		if len(w.Spawns) != 0 {
+			t.Fatalf("worker %s spawns=%d, want 0", w.Worker, len(w.Spawns))
+		}
+	}
+}
+
+func TestGetProjectSpawns_CrossTeamDenied(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/beta-team/shared/projects/p2/meta.json", map[string]any{
+		"project_id": "p2", "title": "Beta", "status": "active", "plan_type": "dag", "team_id": "beta-team",
+	})
+	h := newProjectTestHandler(t, store, team("beta-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p2/spawns", nil)
+	req.SetPathValue("id", "p2")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"})
+	rec := httptest.NewRecorder()
+	h.GetProjectSpawns(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 for cross-team access (W4)", rec.Code)
+	}
+}
+
+func TestNormalizeSessionKey_Variants(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"!abc:server:1234", "matrix:!abc:server:1234"},
+		{"matrix:!abc:server:1234", "matrix:!abc:server:1234"},
+		{"Matrix:!abc:server:1234", "matrix:!abc:server:1234"},
+		{"MATRIX:!ABC:server", "matrix:!ABC:server"},
+		{"console:user:default", "console:user:default"},
+		{"  !abc:server  ", "matrix:!abc:server"},
+		{"", ""},
+		{"   ", ""},
+		{"!bare-no-server", "matrix:!bare-no-server"},
+	}
+	for _, c := range cases {
+		if got := normalizeSessionKey(c.in); got != c.want {
+			t.Errorf("normalizeSessionKey(%q)=%q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestIsSpawnChat_Detection(t *testing.T) {
+	cases := []struct {
+		chat workerChat
+		want bool
+	}{
+		{workerChat{SessionID: "sub-abc", Meta: map[string]any{"spawn": true}}, true},
+		{workerChat{SessionID: "sub-abc"}, true},                    // 2.0.1 prefix fallback
+		{workerChat{SessionID: "c1", Source: "spawn"}, true},        // future source flag
+		{workerChat{SessionID: "matrix:!room:server"}, false},      // team room chat
+		{workerChat{SessionID: "console:user:default"}, false},     // human console chat
+		{workerChat{SessionID: "sub-abc", Meta: map[string]any{"spawn": false}}, true}, // prefix wins
+	}
+	for i, c := range cases {
+		if got := isSpawnChat(c.chat); got != c.want {
+			t.Errorf("case %d: isSpawnChat(%+v)=%v, want %v", i, c.chat, got, c.want)
+		}
+	}
+}
