@@ -2,14 +2,19 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+
+	_ "modernc.org/sqlite"
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
@@ -665,7 +670,8 @@ func TestGetProjectWorkflow_NotFound(t *testing.T) {
 
 // TestGetProjectWorkflow_PausedInterrupt guards W1: a paused project surfaces
 // as a human interrupt (LangGraph semantics) in addition to status=paused.
-func TestGetProjectWorkflow_PausedInterrupt(t *testing.T) {	store := ossfake.NewMemory()
+func TestGetProjectWorkflow_PausedInterrupt(t *testing.T) {
+	store := ossfake.NewMemory()
 	putProject(store, "shared/projects/paused1/meta.json", map[string]any{
 		"project_id": "paused1", "title": "Paused", "status": "paused", "plan_type": "dag", "tasks": []map[string]any{},
 	})
@@ -1250,7 +1256,6 @@ func TestProjectHTTP_L2AuthChain(t *testing.T) {
 	}
 }
 
-
 // TestGetProjectWorkflow_PassThroughAuditFields guards W2: human-intervention
 // audit fields written by W-PR-2 (updated_by/updated_at/pause_reason) are
 // passed through the workflow response.
@@ -1322,7 +1327,6 @@ func TestListProjects_ConcurrentFetch(t *testing.T) {
 		last = id
 	}
 }
-
 
 func TestGetProjectWorkflow_IncludeTasksDetail(t *testing.T) {
 	store := ossfake.NewMemory()
@@ -1544,7 +1548,6 @@ func TestGetProjectWorkflow_IncludeTasksLoopTasks(t *testing.T) {
 		t.Fatalf("tasks_detail=%+v, want iter-2 only", wf.TasksDetail)
 	}
 }
-
 
 func TestGetTaskArtifact_Download(t *testing.T) {
 	store := ossfake.NewMemory()
@@ -1832,7 +1835,6 @@ func TestGetTaskArtifact_GlobalPrefixFallback(t *testing.T) {
 	}
 }
 
-
 func TestGetTaskArtifact_ByPathDeliverable(t *testing.T) {
 	store := ossfake.NewMemory()
 	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
@@ -1844,7 +1846,7 @@ func TestGetTaskArtifact_ByPathDeliverable(t *testing.T) {
 	})
 	putProject(store, "teams/alpha-team/shared/tasks/t1/meta.json", map[string]any{
 		"task_id": "t1", "project_id": "p1", "status": "completed",
-		"result_path": "shared/tasks/t1/result.md",
+		"result_path":  "shared/tasks/t1/result.md",
 		"deliverables": []any{"shared/tasks/t1/output.pdf"},
 	})
 	putProject(store, "teams/alpha-team/shared/tasks/t1/output.pdf", map[string]any{"pdf": "content"})
@@ -1960,7 +1962,6 @@ func TestGetTaskArtifact_ChineseFilenameEncoding(t *testing.T) {
 	}
 }
 
-
 func TestGetTaskArtifact_ChineseDeliverableFilenameRFC5987(t *testing.T) {
 	store := ossfake.NewMemory()
 	putProject(store, "shared/projects/p1/meta.json", map[string]any{
@@ -1971,7 +1972,7 @@ func TestGetTaskArtifact_ChineseDeliverableFilenameRFC5987(t *testing.T) {
 	})
 	putProject(store, "shared/tasks/t1/meta.json", map[string]any{
 		"task_id": "t1", "project_id": "p1", "status": "completed",
-		"result_path": "shared/tasks/t1/result.md",
+		"result_path":  "shared/tasks/t1/result.md",
 		"deliverables": []any{"shared/tasks/t1/季度报告.pdf"},
 	})
 	putProject(store, "shared/tasks/t1/季度报告.pdf", map[string]any{"report": "chinese content"})
@@ -2040,8 +2041,8 @@ func newSpawnTestHandler(t *testing.T, store *ossfake.Memory, objs ...runtime.Ob
 
 func teamWithWorkers(name string, members ...v1beta1.TeamWorkerRef) *v1beta1.Team {
 	return &v1beta1.Team{
-		ObjectMeta:   metav1.ObjectMeta{Name: name, Namespace: "default"},
-		Spec:         v1beta1.TeamSpec{TeamName: name, WorkerMembers: members},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec:       v1beta1.TeamSpec{TeamName: name, WorkerMembers: members},
 	}
 }
 
@@ -2271,15 +2272,273 @@ func TestIsSpawnChat_Detection(t *testing.T) {
 		want bool
 	}{
 		{workerChat{SessionID: "sub-abc", Meta: map[string]any{"spawn": true}}, true},
-		{workerChat{SessionID: "sub-abc"}, true},                    // 2.0.1 prefix fallback
-		{workerChat{SessionID: "c1", Source: "spawn"}, true},        // future source flag
-		{workerChat{SessionID: "matrix:!room:server"}, false},      // team room chat
-		{workerChat{SessionID: "console:user:default"}, false},     // human console chat
+		{workerChat{SessionID: "sub-abc"}, true},                                       // 2.0.1 prefix fallback
+		{workerChat{SessionID: "c1", Source: "spawn"}, true},                           // future source flag
+		{workerChat{SessionID: "matrix:!room:server"}, false},                          // team room chat
+		{workerChat{SessionID: "console:user:default"}, false},                         // human console chat
 		{workerChat{SessionID: "sub-abc", Meta: map[string]any{"spawn": false}}, true}, // prefix wins
 	}
 	for i, c := range cases {
 		if got := isSpawnChat(c.chat); got != c.want {
 			t.Errorf("case %d: isSpawnChat(%+v)=%v, want %v", i, c.chat, got, c.want)
 		}
+	}
+}
+
+// --- spawn messages (GET /api/v1/projects/{id}/spawns/{sessionId}/messages) ---
+
+// makeHistoryDBBytes builds a real SQLite history.db (v2.0.1/2.1
+// conversation_history schema) in a temp dir and returns its bytes, so the
+// in-memory OSS mock serves what the worker FileSync would mirror.
+func makeHistoryDBBytes(t *testing.T, rows []historyRow) []byte {
+	t.Helper()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "history.db")
+	db, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatalf("open temp sqlite: %v", err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE conversation_history (
+			seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id   TEXT NOT NULL,
+			agent_id     TEXT,
+			kind         TEXT NOT NULL,
+			role         TEXT,
+			name         TEXT,
+			content      TEXT,
+			tool_call_id TEXT,
+			tool_input   TEXT,
+			tool_state   TEXT,
+			headline     TEXT,
+			blocks       TEXT,
+			metadata     TEXT,
+			created_at   TEXT,
+			dedup_key    TEXT
+		)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	for _, r := range rows {
+		if _, err := db.Exec(
+			"INSERT INTO conversation_history (session_id, kind, role, name, content, tool_state, headline, created_at) VALUES (?,?,?,?,?,?,?,?)",
+			r.sessionID, r.kind, r.role, r.name, r.content, r.toolState, r.headline, r.createdAt,
+		); err != nil {
+			t.Fatalf("insert row: %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close temp sqlite: %v", err)
+	}
+	data, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read temp sqlite: %v", err)
+	}
+	return data
+}
+
+type historyRow struct {
+	sessionID string
+	kind      string
+	role      string
+	name      string
+	content   string
+	toolState string
+	headline  string
+	createdAt string
+}
+
+func putHistory(store *ossfake.Memory, worker string, data []byte) {
+	_ = store.PutObject(context.Background(), "agents/"+worker+"/"+workerHistoryDBPath, data)
+}
+
+// spawnMessagesRequest drives GET /api/v1/projects/{id}/spawns/{sid}/messages
+// through the handler and returns the recorder.
+func spawnMessagesRequest(h *ProjectHandler, caller *authpkg.CallerIdentity, projectID, sessionID, query string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/"+projectID+"/spawns/"+sessionID+"/messages"+query, nil)
+	req.SetPathValue("id", projectID)
+	req.SetPathValue("sessionId", sessionID)
+	req = withCaller(req, caller)
+	rec := httptest.NewRecorder()
+	h.GetProjectSpawnMessages(rec, req)
+	return rec
+}
+
+func spawnMsgEnv(t *testing.T, history []byte) (*ProjectHandler, *ossfake.Memory) {
+	t.Helper()
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	putChats(store, "alpha-lead", []map[string]any{
+		spawnChat("sub-3f2a9b1c", map[string]any{"spawn": true}),
+	})
+	if history != nil {
+		putHistory(store, "alpha-lead", history)
+	}
+	teamCR := teamWithWorkers("alpha-team", v1beta1.TeamWorkerRef{Name: "alpha-lead-cr", Role: "team_leader"})
+	h := newSpawnTestHandler(t, store, teamCR, workerCR("alpha-lead-cr", "alpha-lead"))
+	return h, store
+}
+
+func humanCaller() *authpkg.CallerIdentity {
+	return &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "luo", Teams: []string{"alpha-team"}}
+}
+
+func TestGetProjectSpawnMessages_ReturnsStreamAndTask(t *testing.T) {
+	h, _ := spawnMsgEnv(t, makeHistoryDBBytes(t, []historyRow{
+		// First user message carries the spawn task text.
+		{kind: "context_msg", role: "user", content: "Design the auth module", sessionID: "sub-3f2a9b1c"},
+		{kind: "model_turn", role: "assistant", name: "read_file", content: "Reading the spec first", headline: "read spec", sessionID: "sub-3f2a9b1c"},
+		{kind: "tool_result", role: "assistant", name: "read_file", content: "spec.md contents", toolState: "success", sessionID: "sub-3f2a9b1c"},
+		{kind: "model_turn", role: "assistant", content: "Drafting the design", sessionID: "sub-3f2a9b1c"},
+		// Another session must not leak.
+		{kind: "model_turn", role: "assistant", content: "other session", sessionID: "sub-other00"},
+	}))
+
+	rec := spawnMessagesRequest(h, humanCaller(), "p1", "sub-3f2a9b1c", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	var resp spawnMessagesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.SessionID != "sub-3f2a9b1c" {
+		t.Fatalf("session_id=%q", resp.SessionID)
+	}
+	if resp.Task != "Design the auth module" {
+		t.Fatalf("task=%q, want first user message", resp.Task)
+	}
+	if resp.HasMore {
+		t.Fatalf("has_more=true, want false (4 rows, limit 20)")
+	}
+	if len(resp.Messages) != 4 {
+		t.Fatalf("messages=%d, want 4", len(resp.Messages))
+	}
+	// Ascending order, first row is the task message.
+	if resp.Messages[0].Kind != "context_msg" || resp.Messages[0].Role != "user" {
+		t.Fatalf("messages[0]=%+v, want user context_msg", resp.Messages[0])
+	}
+	// Tool-result frame exposes the tool name and state.
+	tr := resp.Messages[2]
+	if tr.Kind != "tool_result" || tr.Name != "read_file" || tr.ToolState != "success" {
+		t.Fatalf("tool result=%+v, want kind=tool_result name=read_file tool_state=success", tr)
+	}
+	// Model turn carries its headline.
+	if resp.Messages[1].Headline != "read spec" {
+		t.Fatalf("headline=%q, want read spec", resp.Messages[1].Headline)
+	}
+}
+
+func TestGetProjectSpawnMessages_LimitAndHasMore(t *testing.T) {
+	rows := make([]historyRow, 0, 12)
+	for i := 0; i < 12; i++ {
+		rows = append(rows, historyRow{
+			kind: "tool_result", role: "assistant", name: "execute_shell_command",
+			content: fmt.Sprintf("step %d", i), toolState: "success",
+			sessionID: "sub-3f2a9b1c",
+		})
+	}
+	h, _ := spawnMsgEnv(t, makeHistoryDBBytes(t, rows))
+
+	rec := spawnMessagesRequest(h, humanCaller(), "p1", "sub-3f2a9b1c", "?limit=5")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	var resp spawnMessagesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Messages) != 5 {
+		t.Fatalf("messages=%d, want 5", len(resp.Messages))
+	}
+	if !resp.HasMore {
+		t.Fatalf("has_more=false, want true (12 rows, limit 5)")
+	}
+	// The newest 5, in ascending order: steps 7..11.
+	if resp.Messages[0].Content != "step 7" || resp.Messages[4].Content != "step 11" {
+		t.Fatalf("window=%q..%q, want step 7..step 11", resp.Messages[0].Content, resp.Messages[4].Content)
+	}
+}
+
+func TestGetProjectSpawnMessages_LimitCappedAt50(t *testing.T) {
+	rows := make([]historyRow, 0, 55)
+	for i := 0; i < 55; i++ {
+		rows = append(rows, historyRow{kind: "tool_result", role: "assistant", name: "t", content: fmt.Sprintf("s%d", i), sessionID: "sub-3f2a9b1c"})
+	}
+	h, _ := spawnMsgEnv(t, makeHistoryDBBytes(t, rows))
+
+	rec := spawnMessagesRequest(h, humanCaller(), "p1", "sub-3f2a9b1c", "?limit=999")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	var resp spawnMessagesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Messages) != 50 {
+		t.Fatalf("messages=%d, want 50 (cap)", len(resp.Messages))
+	}
+	if !resp.HasMore {
+		t.Fatalf("has_more=false, want true (55 rows, capped 50)")
+	}
+}
+
+func TestGetProjectSpawnMessages_HistoryMissing404(t *testing.T) {
+	h, _ := spawnMsgEnv(t, nil) // chats.json present, history.db absent
+	rec := spawnMessagesRequest(h, humanCaller(), "p1", "sub-3f2a9b1c", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (history.db missing)", rec.Code)
+	}
+}
+
+func TestGetProjectSpawnMessages_CorruptHistory404(t *testing.T) {
+	h, _ := spawnMsgEnv(t, []byte("this is not a sqlite database"))
+	rec := spawnMessagesRequest(h, humanCaller(), "p1", "sub-3f2a9b1c", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (corrupt db, never 500)", rec.Code)
+	}
+}
+
+func TestGetProjectSpawnMessages_EmptySession(t *testing.T) {
+	// Valid db, but no rows for this session: 200 with an empty array.
+	h, _ := spawnMsgEnv(t, makeHistoryDBBytes(t, []historyRow{
+		{kind: "model_turn", role: "assistant", content: "unrelated", sessionID: "sub-other99"},
+	}))
+	rec := spawnMessagesRequest(h, humanCaller(), "p1", "sub-3f2a9b1c", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	var resp spawnMessagesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Messages == nil || len(resp.Messages) != 0 {
+		t.Fatalf("messages=%v, want empty array (not null)", resp.Messages)
+	}
+	if resp.Task != "" || resp.HasMore {
+		t.Fatalf("task=%q has_more=%v, want empty/false", resp.Task, resp.HasMore)
+	}
+}
+
+func TestGetProjectSpawnMessages_CrossTeamDenied(t *testing.T) {
+	h, _ := spawnMsgEnv(t, makeHistoryDBBytes(t, []historyRow{
+		{kind: "context_msg", role: "user", content: "task", sessionID: "sub-3f2a9b1c"},
+	}))
+	// A human scoped to another team sees 404, not 403 (existence hidden).
+	rec := spawnMessagesRequest(h, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "mallory", Teams: []string{"beta-team"}}, "p1", "sub-3f2a9b1c", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (cross-team hidden)", rec.Code)
+	}
+}
+
+func TestGetProjectSpawnMessages_SessionNotFound(t *testing.T) {
+	h, _ := spawnMsgEnv(t, makeHistoryDBBytes(t, []historyRow{
+		{kind: "context_msg", role: "user", content: "task", sessionID: "sub-3f2a9b1c"},
+	}))
+	// A session id no team worker owns: 404 (same hiding rationale).
+	rec := spawnMessagesRequest(h, humanCaller(), "p1", "sub-unknown", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (session not owned by any worker)", rec.Code)
 	}
 }

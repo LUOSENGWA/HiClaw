@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,10 +10,13 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+
+	_ "modernc.org/sqlite" // pure-Go SQLite driver; read-only queries here
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
@@ -153,16 +157,16 @@ type workflowInterrupt struct {
 // result_path) and pushed to shared storage via _sync_task, so the same
 // dual-prefix scan used for projects applies here.
 type taskDetail struct {
-	TaskID       string     `json:"task_id"`
-	ProjectID    string     `json:"project_id,omitempty"`
-	Status       string     `json:"status,omitempty"`
-	SpecPath     string     `json:"spec_path,omitempty"`
-	AssignedTo   string     `json:"assigned_to,omitempty"`
-	Summary      string     `json:"summary,omitempty"`
-	ResultStatus string     `json:"result_status,omitempty"`
-	Deliverables []any      `json:"deliverables,omitempty"`
-	ResultPath   string     `json:"result_path,omitempty"`
-	CancelReason string     `json:"cancel_reason,omitempty"`
+	TaskID       string `json:"task_id"`
+	ProjectID    string `json:"project_id,omitempty"`
+	Status       string `json:"status,omitempty"`
+	SpecPath     string `json:"spec_path,omitempty"`
+	AssignedTo   string `json:"assigned_to,omitempty"`
+	Summary      string `json:"summary,omitempty"`
+	ResultStatus string `json:"result_status,omitempty"`
+	Deliverables []any  `json:"deliverables,omitempty"`
+	ResultPath   string `json:"result_path,omitempty"`
+	CancelReason string `json:"cancel_reason,omitempty"`
 }
 
 // normalizeTaskStatus maps ProjectMeta task status to the frontend-friendly
@@ -1301,6 +1305,234 @@ func (h *ProjectHandler) GetProjectSpawns(w http.ResponseWriter, r *http.Request
 			Worker: worker,
 			Spawns: h.readWorkerSpawns(r.Context(), worker),
 		})
+	}
+	httputil.WriteJSON(w, http.StatusOK, resp)
+}
+
+// --- spawn messages (GET /api/v1/projects/{id}/spawns/{sessionId}/messages) ---
+//
+// The aggregation endpoint above returns per-session metadata only. This
+// endpoint drills into one spawn session and returns its conversation stream
+// from the worker's history.db (QwenPaw's scroll HistoryStore, mirrored into
+// object storage by FileSync). The schema is stable across 2.0.1 and 2.1
+// (verified against both tags): the same conversation_history table with
+// seq/session_id/kind/role/name/content/tool_state/headline/created_at.
+//
+// Reading is strictly read-only against a temp copy: the db (plus -wal/-shm
+// when present) is pulled from object storage and opened with mode=ro,
+// falling back to immutable=1 when the WAL sidecars are missing or
+// inconsistent (a worker-side snapshot may capture the main file between
+// checkpoints; immutable reads the checkpointed portion only).
+//
+// The stream keeps user context messages, model turns and tool results in
+// ascending order, most recent limit items; has_more reports whether older
+// rows exist. task carries the first user message — the spawn task text.
+
+// workerHistoryDBPath is the workspace-relative path of a worker's
+// history.db (QwenPaw scroll HistoryStore).
+const workerHistoryDBPath = ".qwenpaw/workspaces/default/history.db"
+
+const (
+	defaultSpawnMessagesLimit = 20
+	maxSpawnMessagesLimit     = 50
+)
+
+type spawnMessage struct {
+	Seq       int64  `json:"seq"`
+	Kind      string `json:"kind"`
+	Role      string `json:"role,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Content   string `json:"content,omitempty"`
+	ToolState string `json:"tool_state,omitempty"`
+	Headline  string `json:"headline,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+}
+
+type spawnMessagesResponse struct {
+	SessionID string         `json:"session_id"`
+	Task      string         `json:"task,omitempty"`
+	Messages  []spawnMessage `json:"messages"`
+	HasMore   bool           `json:"has_more"`
+}
+
+// findSpawnWorker returns the worker whose chats.json contains the spawn
+// session plus the chat's raw session id (the value history.db rows are
+// keyed by), or "" when no team worker owns it. Session keys are normalized
+// on both sides so bare room ids and channel-prefixed keys compare reliably;
+// the raw value is kept for the SQL lookup because history.db stores the
+// original key.
+func (h *ProjectHandler) findSpawnWorker(ctx context.Context, workers []string, sessionID string) (string, string) {
+	for _, worker := range workers {
+		data, err := h.oss.GetObject(ctx, "agents/"+worker+"/"+workerChatsPath)
+		if err != nil {
+			continue
+		}
+		var file workerChatsFile
+		if err := json.Unmarshal(data, &file); err != nil {
+			continue
+		}
+		for _, c := range file.Chats {
+			if !isSpawnChat(c) {
+				continue
+			}
+			if normalizeSessionKey(c.SessionID) == sessionID {
+				return worker, c.SessionID
+			}
+		}
+	}
+	return "", ""
+}
+
+// openReadOnlySQLite opens a SQLite database read-only, falling back to
+// immutable mode (skips WAL/lock handling) when the normal open fails —
+// e.g. a worker snapshot whose -wal/-shm sidecars are missing or stale.
+func openReadOnlySQLite(path string) (*sql.DB, error) {
+	for _, uri := range []string{
+		"file:" + path + "?mode=ro",
+		"file:" + path + "?mode=ro&immutable=1",
+	} {
+		db, err := sql.Open("sqlite", uri)
+		if err == nil {
+			if err = db.Ping(); err == nil {
+				return db, nil
+			}
+			_ = db.Close()
+		}
+	}
+	return nil, fmt.Errorf("open %s: not a readable sqlite database", path)
+}
+
+// readSpawnMessages pulls the worker's history.db from object storage and
+// returns the spawn session's conversation stream. Failures degrade to a
+// non-200 status (never a 500): the db is missing/unreadable on the object
+// store, or the copy cannot be opened as SQLite.
+func (h *ProjectHandler) readSpawnMessages(ctx context.Context, worker, sessionID string, limit int) (spawnMessagesResponse, int) {
+	resp := spawnMessagesResponse{SessionID: sessionID, Messages: make([]spawnMessage, 0)}
+	unavailable := func() (spawnMessagesResponse, int) {
+		return resp, http.StatusNotFound
+	}
+
+	dbData, err := h.oss.GetObject(ctx, "agents/"+worker+"/"+workerHistoryDBPath)
+	if err != nil {
+		return unavailable()
+	}
+	tmp, err := os.MkdirTemp("", "spawn-msgs-")
+	if err != nil {
+		return resp, http.StatusInternalServerError
+	}
+	defer os.RemoveAll(tmp)
+	dbPath := filepath.Join(tmp, "history.db")
+	if err := os.WriteFile(dbPath, dbData, 0o600); err != nil {
+		return resp, http.StatusInternalServerError
+	}
+	// Best-effort WAL sidecars: the most recent rows live in -wal until a
+	// checkpoint; without them (or when stale) the immutable fallback below
+	// still serves the checkpointed portion.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if sidecar, err := h.oss.GetObject(ctx, "agents/"+worker+"/"+workerHistoryDBPath+suffix); err == nil {
+			_ = os.WriteFile(dbPath+suffix, sidecar, 0o600)
+		}
+	}
+
+	db, err := openReadOnlySQLite(dbPath)
+	if err != nil {
+		return unavailable()
+	}
+	defer db.Close()
+
+	// task: the first user message is the spawn task text.
+	_ = db.QueryRow(
+		"SELECT content FROM conversation_history WHERE session_id=? AND role='user' ORDER BY seq ASC LIMIT 1",
+		sessionID,
+	).Scan(&resp.Task)
+
+	rows, err := db.Query(
+		"SELECT seq, kind, role, name, content, tool_state, headline, created_at "+
+			"FROM conversation_history WHERE session_id=? ORDER BY seq DESC LIMIT ?",
+		sessionID, limit+1,
+	)
+	if err != nil {
+		return unavailable()
+	}
+	defer rows.Close()
+
+	desc := make([]spawnMessage, 0, limit)
+	for rows.Next() {
+		var m spawnMessage
+		var role, name, content, toolState, headline, createdAt sql.NullString
+		if err := rows.Scan(&m.Seq, &m.Kind, &role, &name, &content, &toolState, &headline, &createdAt); err != nil {
+			continue
+		}
+		m.Role, m.Name, m.Content = role.String, name.String, content.String
+		m.ToolState, m.Headline, m.CreatedAt = toolState.String, headline.String, createdAt.String
+		desc = append(desc, m)
+	}
+	if len(desc) > limit {
+		resp.HasMore = true
+		desc = desc[:limit]
+	}
+	resp.Messages = make([]spawnMessage, len(desc))
+	for i := range desc {
+		resp.Messages[len(desc)-1-i] = desc[i]
+	}
+	return resp, http.StatusOK
+}
+
+// GetProjectSpawnMessages handles GET /api/v1/projects/{id}/spawns/{sessionId}/messages.
+// Auth/RBAC mirrors GetProjectSpawns: RoleHuman read + team-scope check,
+// cross-team access and unknown sessions hidden as 404.
+func (h *ProjectHandler) GetProjectSpawnMessages(w http.ResponseWriter, r *http.Request) {
+	projectID := r.PathValue("id")
+	sessionID := normalizeSessionKey(r.PathValue("sessionId"))
+	if projectID == "" || sessionID == "" {
+		httputil.WriteError(w, http.StatusBadRequest, "project id and session id are required")
+		return
+	}
+	caller := authpkg.CallerFromContext(r.Context())
+
+	prefixes, crToEffective, err := h.teamProjectPrefixes(r.Context())
+	if err != nil {
+		writeK8sError(w, "get spawn messages: resolve prefixes", err)
+		return
+	}
+	meta, team, err := h.resolveProjectMeta(r.Context(), projectID, prefixes)
+	if err != nil {
+		writeK8sError(w, "get spawn messages", err)
+		return
+	}
+	if meta == nil {
+		httputil.WriteError(w, http.StatusNotFound, "project not found")
+		return
+	}
+	// W4: hide existence from scoped callers who do not own this project.
+	if err := h.checkProjectAccess(caller, team, crToEffective); err != nil {
+		if _, ok := err.(*accessDeniedError); ok {
+			httputil.WriteError(w, http.StatusNotFound, "project not found")
+			return
+		}
+		httputil.WriteError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
+	limit := defaultSpawnMessagesLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			limit = n
+			if limit > maxSpawnMessagesLimit {
+				limit = maxSpawnMessagesLimit
+			}
+		}
+	}
+
+	worker, rawSessionID := h.findSpawnWorker(r.Context(), h.teamWorkerNames(r.Context(), team), sessionID)
+	if worker == "" {
+		httputil.WriteError(w, http.StatusNotFound, "spawn session not found")
+		return
+	}
+	resp, status := h.readSpawnMessages(r.Context(), worker, rawSessionID, limit)
+	if status != http.StatusOK {
+		httputil.WriteError(w, status, "spawn messages unavailable")
+		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, resp)
 }
