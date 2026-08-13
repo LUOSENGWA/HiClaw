@@ -2,11 +2,11 @@
 
 > Added by the project workflow inspection PR (agentteams/AgentTeams#1169).
 
-The controller exposes three read-only endpoints that surface TeamHarness
+The controller exposes four read-only endpoints that surface TeamHarness
 project state (`shared/projects/{id}/meta.json`) as a LangGraph-aligned
-workflow view, plus per-team spawn subagent sessions. They are the data
-source for human-facing views (dashboard, QwenPaw console plugin) and are
-consumed by `agt get projects`.
+workflow view, plus per-team spawn subagent sessions and their conversation
+streams. They are the data source for human-facing views (dashboard, QwenPaw
+console plugin) and are consumed by `agt get projects`.
 
 ## Scope & prerequisites
 
@@ -267,6 +267,79 @@ Error responses:
 | `404` | Project not found / caller does not own it (existence hidden). |
 | `500` | K8s or object-store failure. |
 
+### `GET /api/v1/projects/{id}/spawns/{sessionId}/messages`
+
+Returns one spawn session's **conversation stream** — user context messages,
+model turns and tool results — so a client can show what the spawn is doing,
+its full task prompt, and its progress. The stream is read from the owning
+worker's `history.db` (QwenPaw's scroll `HistoryStore`, mirrored into object
+storage by the worker FileSync alongside `chats.json`).
+
+Query parameters:
+
+| Param | Type | Default | Meaning |
+|:--|:--|:--|:--|
+| `limit` | int | `20` | Number of messages (most recent window). Capped at `50`. |
+
+Response:
+
+```json
+{
+  "session_id": "sub-3f2a9b1c",
+  "task": "Design the auth module",
+  "messages": [
+    {
+      "seq": 1,
+      "kind": "context_msg",
+      "role": "user",
+      "content": "Design the auth module",
+      "created_at": "2026-08-13T15:00:00"
+    },
+    {
+      "seq": 2,
+      "kind": "model_turn",
+      "role": "assistant",
+      "name": "read_file",
+      "content": "Reading the spec first",
+      "headline": "read spec",
+      "created_at": "2026-08-13T15:00:05"
+    },
+    {
+      "seq": 3,
+      "kind": "tool_result",
+      "role": "assistant",
+      "name": "read_file",
+      "content": "spec.md contents",
+      "tool_state": "success",
+      "created_at": "2026-08-13T15:00:06"
+    }
+  ],
+  "has_more": false
+}
+```
+
+- `kind` is one of `context_msg` (user message), `model_turn` (assistant
+  reply — `headline` is the turn's retrieval headline, "what it is doing at
+  a glance"), or `tool_result` (tool execution result — `name` is the tool
+  and `tool_state` its final state).
+- `task` is the first user message of the session — the spawn task text.
+- `messages` is ascending (oldest first), covering the most recent `limit`
+  rows; `has_more` reports whether older rows exist.
+- The database is pulled to a temp dir and opened strictly read-only
+  (pure-Go `modernc.org/sqlite`), with a fallback that reads the
+  checkpointed portion when the WAL sidecars are missing or inconsistent.
+  The schema is stable across QwenPaw 2.0.1 and 2.1.
+- An empty session (db present, no rows) returns `200` with `messages: []`.
+
+Error responses:
+
+| Code | Meaning |
+|:--|:--|
+| `400` | Missing project id or session id. |
+| `403` | Authenticated but the role cannot read projects at all (e.g. Worker). |
+| `404` | Project not found / caller does not own it (existence hidden) / session not owned by any team worker / `history.db` missing or unreadable. |
+| `500` | K8s or object-store failure. |
+
 ## Authentication & authorization
 
 Two bearer-token paths are accepted (composite authenticator):
@@ -283,12 +356,12 @@ Two bearer-token paths are accepted (composite authenticator):
 
 Authorization matrix:
 
-| Caller | List | Get workflow | Get spawns |
-|:--|:--|:--|:--|
-| admin / manager | all teams | any project | any project |
-| team-leader (SA) | own team only | own team only | own team only |
-| L2 human (Matrix) | all `accessibleTeams` | any accessible team | any accessible team |
-| worker | denied | denied | denied |
+| Caller | List | Get workflow | Get spawns | Get spawn messages |
+|:--|:--|:--|:--|:--|
+| admin / manager | all teams | any project | any project | any project |
+| team-leader (SA) | own team only | own team only | own team only | own team only |
+| L2 human (Matrix) | all `accessibleTeams` | any accessible team | any accessible team | any accessible team |
+| worker | denied | denied | denied | denied |
 
 ## `agt` CLI
 
