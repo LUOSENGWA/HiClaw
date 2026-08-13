@@ -9,7 +9,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+<<<<<<< HEAD
 	"path/filepath"
+=======
+>>>>>>> 3133aff6 (fix(projects): add missing os import and correct bareLikeOSS file children)
 	"sort"
 	"strings"
 	"testing"
@@ -3616,6 +3619,8 @@ func (c *conflictInjectingOSS) StatMeta(ctx context.Context, key string) (oss.Ob
 		_ = c.mcLike.PutObject(ctx, key, []byte(`{"project_id":"p1","title":"P1","status":"active","concurrent":true}`))
 	}
 	return c.mcLike.StatMeta(ctx, key)
+}
+
 // --- project history snapshot tests (writeProjectMeta timeline) ---
 
 // bareLikeOSS mimics mc ls returning bare child names for BOTH files and
@@ -3636,12 +3641,12 @@ func (m *bareLikeOSS) ListObjects(_ context.Context, prefix string) ([]string, e
 	out := make([]string, 0)
 	for _, k := range keys {
 		rest := strings.TrimPrefix(k, prefix)
-		parts := strings.SplitN(rest, "/", 2)
-		if len(parts) != 2 || parts[0] == "" {
+		if rest == "" {
 			continue
 		}
+		parts := strings.SplitN(rest, "/", 2)
 		child := parts[0]
-		if strings.Contains(rest, "/") {
+		if len(parts) > 1 && parts[1] != "" {
 			child = parts[0] + "/"
 		}
 		if !seen[child] {
