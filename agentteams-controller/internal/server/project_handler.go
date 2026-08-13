@@ -1736,6 +1736,53 @@ func (h *ProjectHandler) GetProjectSpawnMessages(w http.ResponseWriter, r *http.
 // compare-before-write → 409 on conflict).
 // ============================================================================
 
+// projectHistoryLimit caps the retained meta.json snapshots per project.
+// Snapshots are written on every human intervention (pause/resume/replan/
+// cancel/complete), so the limit bounds storage growth while keeping a
+// meaningful timeline window for inspection and rollback.
+const projectHistoryLimit = 50
+
+// snapshotProjectMeta stores a best-effort copy of the current meta.json
+// into the project's history/ directory before writeProjectMeta overwrites
+// it. Every intervention therefore leaves a recoverable point in the
+// project timeline (checkpoint-inspired: immutable history files, like the
+// QwenPaw workspace checkpoint model).
+//
+// Everything here is best-effort: failures (unreadable meta, put error,
+// gc error) are logged and swallowed — history bookkeeping must never block
+// or fail the intervention write itself.
+func (h *ProjectHandler) snapshotProjectMeta(ctx context.Context, key string) {
+	if !strings.HasSuffix(key, "meta.json") {
+		return
+	}
+	historyPrefix := strings.TrimSuffix(key, "meta.json") + "history/"
+	historyKey := historyPrefix + strconv.FormatInt(time.Now().UnixNano(), 10) + ".json"
+
+	data, err := h.oss.GetObject(ctx, key)
+	if err != nil {
+		log.FromContext(ctx).Info("snapshot project meta: read current failed", "key", key, "error", err.Error())
+		return
+	}
+	if err := h.oss.PutObject(ctx, historyKey, data); err != nil {
+		log.FromContext(ctx).Info("snapshot project meta: write history failed", "key", historyKey, "error", err.Error())
+		return
+	}
+
+	// Best-effort gc: keep the most recent projectHistoryLimit snapshots.
+	// Timestamp names sort lexically == chronologically.
+	children, err := h.oss.ListObjects(ctx, historyPrefix)
+	if err != nil || len(children) <= projectHistoryLimit {
+		return
+	}
+	sort.Strings(children)
+	for _, old := range children[:len(children)-projectHistoryLimit] {
+		if err := h.oss.DeleteObject(ctx, historyPrefix+old); err != nil {
+			log.FromContext(ctx).Info("snapshot project meta: gc delete failed", "key", historyPrefix+old, "error", err.Error())
+			return
+		}
+	}
+}
+
 // writeProjectMeta is the shared write-back helper. It applies the mtime
 // optimistic lock: if expectedMeta (the ModTime read at resolve time) is
 // non-zero, it re-stats the object and returns a 409 conflict when the
@@ -1762,6 +1809,11 @@ func (h *ProjectHandler) writeProjectMeta(ctx context.Context, w http.ResponseWr
 			return false
 		}
 	}
+
+	// Timeline: persist the pre-intervention version before overwriting.
+	// Best-effort — never blocks the write.
+	h.snapshotProjectMeta(ctx, key)
+
 	if err := h.oss.PutObject(ctx, key, data); err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, "write project meta: "+err.Error())
 		return false

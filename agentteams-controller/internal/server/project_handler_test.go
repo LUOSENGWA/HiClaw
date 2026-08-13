@@ -2966,8 +2966,7 @@ func TestGetProjectSpawnMessages_SessionNotFound(t *testing.T) {
 }
 
 // =====================================================================// W-PR-2 write endpoints (pause / resume / replan / create / cancel / complete)
-// =====================================================================
-// putTask writes a TaskMeta object for cancel-task tests.
+// ==============================================================// putTask writes a TaskMeta object for cancel-task tests.
 func putTask(store *ossfake.Memory, key string, meta map[string]any) {
 	data, _ := json.Marshal(meta)
 	_ = store.PutObject(context.Background(), key, data)
@@ -3617,4 +3616,180 @@ func (c *conflictInjectingOSS) StatMeta(ctx context.Context, key string) (oss.Ob
 		_ = c.mcLike.PutObject(ctx, key, []byte(`{"project_id":"p1","title":"P1","status":"active","concurrent":true}`))
 	}
 	return c.mcLike.StatMeta(ctx, key)
+// --- project history snapshot tests (writeProjectMeta timeline) ---
+
+// bareLikeOSS mimics mc ls returning bare child names for BOTH files and
+// directories (mcLikeOSS only surfaces directories, which history gc needs
+// files for).
+type bareLikeOSS struct {
+	*ossfake.Memory
+}
+
+func (m *bareLikeOSS) ListObjects(_ context.Context, prefix string) ([]string, error) {
+	keys, err := m.Memory.ListObjects(context.Background(), prefix)
+	if err != nil {
+		return nil, err
+	}
+	// mc ls semantics: direct children only — directory children keep the
+	// trailing slash ("p1/"), file children stay bare ("t1.json").
+	seen := map[string]bool{}
+	out := make([]string, 0)
+	for _, k := range keys {
+		rest := strings.TrimPrefix(k, prefix)
+		parts := strings.SplitN(rest, "/", 2)
+		if len(parts) != 2 || parts[0] == "" {
+			continue
+		}
+		child := parts[0]
+		if strings.Contains(rest, "/") {
+			child = parts[0] + "/"
+		}
+		if !seen[child] {
+			seen[child] = true
+			out = append(out, child)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func newSnapshotTestHandler(t *testing.T, store *ossfake.Memory, objs ...runtime.Object) *ProjectHandler {
+	t.Helper()
+	k8s := fake.NewClientBuilder().WithScheme(newProjectTestScheme(t)).WithRuntimeObjects(objs...).Build()
+	var o oss.StorageClient = &bareLikeOSS{Memory: store}
+	return NewProjectHandler(k8s, "default", o)
+}
+
+func historyPrefixFor(key string) string {
+	return strings.TrimSuffix(key, "meta.json") + "history/"
+}
+
+func TestWriteProjectMeta_SnapshotsPreviousVersion(t *testing.T) {
+	store := ossfake.NewMemory()
+	key := "teams/alpha-team/shared/projects/p1/meta.json"
+	putProject(store, key, map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	h := newSnapshotTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", strings.NewReader(`{"reason":"human review"}`))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// Exactly one snapshot, holding the PRE-intervention version.
+	children, err := store.ListObjects(context.Background(), historyPrefixFor(key))
+	if err != nil {
+		t.Fatalf("list history: %v", err)
+	}
+	if len(children) != 1 {
+		t.Fatalf("history entries=%d, want 1", len(children))
+	}
+	snap, err := store.GetObject(context.Background(), children[0])
+	if err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	var oldMeta map[string]any
+	if err := json.Unmarshal(snap, &oldMeta); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	if oldMeta["status"] != "active" {
+		t.Fatalf("snapshot status=%v, want active (pre-intervention version)", oldMeta["status"])
+	}
+	// Main meta is the new version.
+	data, _ := store.GetObject(context.Background(), key)
+	var newMeta map[string]any
+	_ = json.Unmarshal(data, &newMeta)
+	if newMeta["status"] != "paused" {
+		t.Fatalf("main meta status=%v, want paused", newMeta["status"])
+	}
+}
+
+func TestWriteProjectMeta_SnapshotGCKeepsLimit(t *testing.T) {
+	store := ossfake.NewMemory()
+	key := "teams/alpha-team/shared/projects/p1/meta.json"
+	putProject(store, key, map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	// Pre-fill 50 history entries (zero-padded so lexical == chronological).
+	for i := 1; i <= projectHistoryLimit; i++ {
+		_ = store.PutObject(context.Background(), historyPrefixFor(key)+fmt.Sprintf("%020d.json", i), []byte("{}"))
+	}
+	h := newSnapshotTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", strings.NewReader(`{"reason":"gc"}`))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	children, err := store.ListObjects(context.Background(), historyPrefixFor(key))
+	if err != nil {
+		t.Fatalf("list history: %v", err)
+	}
+	if len(children) != projectHistoryLimit {
+		t.Fatalf("history entries=%d, want %d (gc kept limit)", len(children), projectHistoryLimit)
+	}
+	// Oldest (t000...001.json) must be gone.
+	if _, err := store.GetObject(context.Background(), historyPrefixFor(key)+fmt.Sprintf("%020d.json", 1)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("oldest snapshot still present, want gc'd")
+	}
+}
+
+func TestWriteProjectMeta_SnapshotBestEffort(t *testing.T) {
+	store := ossfake.NewMemory()
+	key := "teams/alpha-team/shared/projects/p1/meta.json"
+	putProject(store, key, map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	// Snapshot with an OSS whose GetObject always fails: the history write is
+	// skipped silently — no panic, no entries — and the main flow is
+	// unaffected (the snapshot caller is best-effort by contract).
+	h := newSnapshotTestHandler(t, store, team("alpha-team"))
+	failing := &ProjectHandler{client: h.client, namespace: h.namespace, oss: &snapshotFailGet{StorageClient: h.oss}}
+	failing.snapshotProjectMeta(context.Background(), key)
+
+	children, _ := store.ListObjects(context.Background(), historyPrefixFor(key))
+	if len(children) != 0 {
+		t.Fatalf("history entries=%d, want 0 (read failure skips snapshot)", len(children))
+	}
+}
+
+// snapshotFailGet wraps a StorageClient and fails every GetObject, so the
+// snapshot's read path silently no-ops (best-effort contract).
+type snapshotFailGet struct {
+	oss.StorageClient
+}
+
+func (f *snapshotFailGet) GetObject(ctx context.Context, key string) ([]byte, error) {
+	return nil, errors.New("get failed")
+}
+
+func TestCreateProject_NoSnapshot(t *testing.T) {
+	store := ossfake.NewMemory()
+	h := newSnapshotTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(`{"title":"fresh","team_id":"alpha-team"}`))
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CreateProject(rec, req)
+
+	if rec.Code != http.StatusCreated && rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// Fresh project must have no history entries (creation is not a
+	// snapshot point — there is nothing to snapshot).
+	keys, _ := store.ListObjects(context.Background(), "teams/alpha-team/shared/projects/")
+	for _, k := range keys {
+		if strings.Contains(k, "/history/") {
+			t.Fatalf("fresh project has history entry: %s", k)
+		}
+	}
 }
