@@ -37,7 +37,7 @@ import (
 // Instead this handler reads the same MinIO objects the workers sync.
 //
 // Response schema is aligned with LangGraph Graph.to_json() / StateSnapshot
-// (MIT License, © LangChain, Inc.) — see the W-PR design doc.
+// (MIT License, © LangChain, Inc.) — see the workflow API design doc.
 type ProjectHandler struct {
 	client    client.Client
 	namespace string
@@ -70,7 +70,7 @@ type projectMeta struct {
 	RequesterReport map[string]any    `json:"requester_report,omitempty"`
 	ReplyRoute      map[string]any    `json:"reply_route,omitempty"`
 	SourceRoomID    string            `json:"source_room_id,omitempty"`
-	// W2: human-intervention audit fields (written by W-PR-2 Controller API;
+	// human-intervention audit fields (written by the lifecycle write API;
 	// tolerated by json.Unmarshal when absent, and passed through here so
 	// consumers can show who paused/resumed and why).
 	UpdatedBy   string `json:"updated_by,omitempty"`
@@ -157,7 +157,7 @@ type workflowInterrupt struct {
 	// ActionRequest mirrors the LangChain Agent Inbox HumanInterrupt model:
 	// the action a human can take on this interrupt (e.g. resume a paused
 	// project). Consumers render a button/action from it; the actual write
-	// goes to the W-PR-2 endpoints.
+	// goes to the lifecycle write endpoints.
 	ActionRequest *interruptActionRequest `json:"action_request,omitempty"`
 	// Config mirrors HumanInterruptConfig: which response kinds the
 	// interrupt supports. For a paused project, allow_accept = the human can
@@ -703,7 +703,7 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta, team string, includeTa
 	// "paused by human" without parsing project status separately. The
 	// action_request/config fields align with the LangChain Agent Inbox
 	// HumanInterrupt model so a dashboard/plugin can render a "Resume"
-	// button directly (W-PR-2 endpoint POST /pause|/resume).
+	// button directly (lifecycle write endpoint POST /pause|/resume).
 	if meta.Status == "paused" {
 		interrupt := workflowInterrupt{ID: "project", Value: "paused"}
 		interrupt.ActionRequest = &interruptActionRequest{Action: "resume", Args: map[string]any{"project_id": meta.ProjectID}}
@@ -1732,7 +1732,7 @@ func (h *ProjectHandler) GetProjectSpawnMessages(w http.ResponseWriter, r *http.
 }
 
 // ============================================================================
-// W-PR-2: human intervention + lifecycle write endpoints
+// human intervention + lifecycle write endpoints
 //
 // All write endpoints follow the same pattern: resolve the project meta and
 // its exact object key (resolveProjectMeta + projectMatch.key), run the
@@ -1882,7 +1882,7 @@ func authzActor(caller *authpkg.CallerIdentity) string {
 	return fmt.Sprintf("%s (%s)", caller.Username, caller.Role)
 }
 
-// markAuditFields stamps the W-PR-2 human-intervention audit fields on a
+// markAuditFields stamps the human-intervention audit fields on a
 // project before writing it back.
 func markAuditFields(meta *projectMeta, actor, reason string) {
 	meta.UpdatedBy = actor

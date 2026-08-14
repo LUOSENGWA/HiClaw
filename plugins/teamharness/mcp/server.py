@@ -3266,7 +3266,7 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
     action = str(arguments.get("action") or "").strip()
     payload = _payload(arguments)
     try:
-        # W-PR-2 read-before-read: pull the authoritative meta.json from
+        # the lifecycle write API read-before-read: pull the authoritative meta.json from
         # shared storage before any read-type action so a Controller write
         # (pause/resume/replan) takes effect on the next read. One call at
         # the entry covers every read path (resolve_project, ready_nodes,
@@ -4084,7 +4084,7 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
     payload = _payload(arguments)
     role = _role(arguments)
     try:
-        # W-PR-2 read-before-read: taskflow has no create action; every
+        # the lifecycle write API read-before-read: taskflow has no create action; every
         # action (delegate/ack/submit/cancel/check) belongs to a project.
         # Pull the authoritative meta.json first so a Controller pause /
         # resume / replan is visible before ack/submit/cancel write the

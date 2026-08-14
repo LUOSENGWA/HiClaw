@@ -671,7 +671,7 @@ func TestGetProjectWorkflow_NotFound(t *testing.T) {
 
 // TestGetProjectWorkflow_PausedInterrupt guards W1: a paused project surfaces
 // as a human interrupt (LangGraph semantics) in addition to status=paused.
-// Since W-PR-2, the interrupt carries an action_request (resume) + config
+// Since the lifecycle write API, the interrupt carries an action_request (resume) + config
 // (allow_accept) aligned with the LangChain Agent Inbox HumanInterrupt model,
 // so a dashboard can render a "Resume" button.
 func TestGetProjectWorkflow_PausedInterrupt(t *testing.T) {
@@ -705,7 +705,7 @@ func TestGetProjectWorkflow_PausedInterrupt(t *testing.T) {
 	if found == nil {
 		t.Fatalf("expected paused project interrupt, got %+v", wf.Interrupts)
 	}
-	// W-PR-2: action_request + config + description aligned with Agent Inbox.
+	// the lifecycle write API: action_request + config + description aligned with Agent Inbox.
 	if found.ActionRequest == nil || found.ActionRequest.Action != "resume" {
 		t.Fatalf("paused interrupt action_request=%+v, want resume", found.ActionRequest)
 	}
@@ -1272,7 +1272,7 @@ func TestProjectHTTP_L2AuthChain(t *testing.T) {
 	}
 }
 
-// TestProjectHTTP_L2WriteChain exercises the W-PR-2 write path through the
+// TestProjectHTTP_L2WriteChain exercises the the lifecycle write API write path through the
 // full HTTP chain — bearer extraction -> composite auth -> identity
 // enrichment -> authorizer (ActionUpdate + project -> requireSameTeam) ->
 // handler (checkProjectAccess + mtime lock) — for an L2 human:
@@ -1392,7 +1392,7 @@ func TestProjectHTTP_AdminWriteChain(t *testing.T) {
 }
 
 // TestGetProjectWorkflow_PassThroughAuditFields guards W2: human-intervention
-// audit fields written by W-PR-2 (updated_by/updated_at/pause_reason) are
+// audit fields written by the lifecycle write API (updated_by/updated_at/pause_reason) are
 // passed through the workflow response.
 func TestGetProjectWorkflow_PassThroughAuditFields(t *testing.T) {
 	store := ossfake.NewMemory()
@@ -2966,7 +2966,7 @@ func TestGetProjectSpawnMessages_SessionNotFound(t *testing.T) {
 	}
 }
 
-// =====================================================================// W-PR-2 write endpoints (pause / resume / replan / create / cancel / complete)
+// =====================================================================// the lifecycle write API write endpoints (pause / resume / replan / create / cancel / complete)
 // ==============================================================// putTask writes a TaskMeta object for cancel-task tests.
 func putTask(store *ossfake.Memory, key string, meta map[string]any) {
 	data, _ := json.Marshal(meta)

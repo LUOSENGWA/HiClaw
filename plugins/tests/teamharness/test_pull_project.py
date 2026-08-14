@@ -1,4 +1,4 @@
-"""W-PR-2 read-before-read tests for TeamHarness server.py.
+"""the lifecycle write API read-before-read tests for TeamHarness server.py.
 
 Covers the _pull_project implementation and the _projectflow/_taskflow
 entry-point unified pull:

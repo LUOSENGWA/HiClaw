@@ -560,7 +560,7 @@ or `AGENTTEAMS_AUTH_TOKEN_FILE`) verbatim, so an L2 human can also use it by
 pointing either variable at their own Matrix access token — no separate CLI
 auth mode is needed.
 
-### `agt project` (W-PR-2 write commands)
+### `agt project` (the lifecycle write API write commands)
 
 `agt project` wraps the write endpoints so a human can intervene without
 raw curl:
