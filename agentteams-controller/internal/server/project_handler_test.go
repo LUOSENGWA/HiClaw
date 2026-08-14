@@ -9,10 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-<<<<<<< HEAD
 	"path/filepath"
-=======
->>>>>>> 3133aff6 (fix(projects): add missing os import and correct bareLikeOSS file children)
 	"sort"
 	"strings"
 	"testing"
