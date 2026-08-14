@@ -106,12 +106,28 @@ func (c *MinIOClient) PutObjectIfMatch(ctx context.Context, key string, data []b
 // regular read/write path stays on the mc CLI (mirror semantics, alias
 // handling, dynamic STS credentials); only If-Match writes need the SDK.
 func (c *MinIOClient) sdkClient() (*minio.Client, error) {
+	// Preserve the endpoint scheme for TLS selection: https:// → Secure,
+	// anything else → plain. The endpoint stays intact (host[:port]).
 	endpoint := c.config.Endpoint
-	endpoint = strings.TrimPrefix(endpoint, "http://")
+	secure := false
+	if strings.HasPrefix(endpoint, "https://") {
+		secure = true
+	}
 	endpoint = strings.TrimPrefix(endpoint, "https://")
+	endpoint = strings.TrimPrefix(endpoint, "http://")
+
+	// Dynamic STS credentials win over the static pair (external OSS /
+	// refreshable tokens); the static pair is the embedded-MinIO default.
+	accessKey, secretKey, token := c.config.AccessKey, c.config.SecretKey, ""
+	if c.credSource != nil {
+		if creds, err := c.credSource.Resolve(context.Background()); err == nil {
+			accessKey, secretKey, token = creds.AccessKeyID, creds.AccessKeySecret, creds.SecurityToken
+		}
+	}
+
 	return minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(c.config.AccessKey, c.config.SecretKey, ""),
-		Secure: false,
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, token),
+		Secure: secure,
 	})
 }
 

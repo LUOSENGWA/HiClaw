@@ -405,7 +405,7 @@ or `AGENTTEAMS_AUTH_TOKEN_FILE`) verbatim, so an L2 human can also use it by
 pointing either variable at their own Matrix access token — no separate CLI
 auth mode is needed.
 
-## Human intervention & lifecycle endpoints 
+## Human intervention & lifecycle endpoints
 
 The read endpoints above are complemented by write endpoints that let
 humans intervene in agent-orchestrated workflows. All writes are code-level

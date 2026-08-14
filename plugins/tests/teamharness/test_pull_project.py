@@ -356,3 +356,53 @@ def test_projectflow_pull_failure_read_action_tolerated(tmp_path: Path, monkeypa
 
     resp = server._projectflow(_arguments(workspace, "resolve_project", projectId="p1"))
     assert resp.get("ok") is True
+
+
+def test_taskflow_pull_failure_blocks_ack(tmp_path: Path, monkeypatch) -> None:
+    """ack_task is mutating: a failed authoritative pull must block it with
+    a retryable error and leave the task untouched."""
+    server = _load_server()
+    fake = FailingFilesync()
+    monkeypatch.setattr(server, "_filesync", fake)
+
+    workspace = tmp_path / "agent"
+    _write_project(workspace, "p1", {
+        "project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+        "tasks": [{"task_id": "t1", "title": "T1", "status": "assigned", "depends_on": []}],
+    })
+    _write_task(workspace, "t1", {"task_id": "t1", "project_id": "p1", "status": "assigned"})
+
+    resp = server._taskflow(_arguments(workspace, "ack_task", projectId="p1", taskId="t1"))
+    assert resp.get("ok") is False
+    assert resp.get("retryable") is True
+    assert "pull" in resp.get("error", "")
+
+    task = server._read_json(server._task_state_path(_arguments(workspace, "ack_task"), "t1"))
+    assert task["status"] == "assigned"
+    project = server._read_json(server._project_state_path(_arguments(workspace, "resolve_project"), "p1"))
+    assert project["tasks"][0]["status"] == "assigned"
+
+
+def test_taskflow_pull_failure_blocks_submit(tmp_path: Path, monkeypatch) -> None:
+    """submit_task is mutating: a failed authoritative pull must block it
+    with a retryable error and leave the task untouched."""
+    server = _load_server()
+    fake = FailingFilesync()
+    monkeypatch.setattr(server, "_filesync", fake)
+
+    workspace = tmp_path / "agent"
+    _write_project(workspace, "p1", {
+        "project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+        "tasks": [{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []}],
+    })
+    _write_task(workspace, "t1", {"task_id": "t1", "project_id": "p1", "status": "in_progress"})
+
+    resp = server._taskflow(_arguments(
+        workspace, "submit_task", projectId="p1", taskId="t1", summary="done",
+    ))
+    assert resp.get("ok") is False
+    assert resp.get("retryable") is True
+    assert "pull" in resp.get("error", "")
+
+    task = server._read_json(server._task_state_path(_arguments(workspace, "submit_task"), "t1"))
+    assert task["status"] == "in_progress"

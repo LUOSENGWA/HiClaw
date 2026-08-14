@@ -3057,7 +3057,7 @@ func TestPauseProject_EtagConflict(t *testing.T) {
 	// If-Match write fails -> 409.
 	// The wrapper embeds mcLikeOSS so ListObjects keeps the mc ls semantics
 	// (direct child names) that resolveProjectMetaWithKey depends on.
-	injector := &conflictInjectingOSS{mcLike: &mcLikeOSS{Memory: store}, injectOnStat: 2}
+	injector := &conflictInjectingOSS{mcLike: &mcLikeOSS{Memory: store}, injectOnGet: 1}
 	h := newProjectTestHandlerWithOSS(t, injector)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
@@ -3567,15 +3567,15 @@ func newProjectTestHandlerWithOSS(t *testing.T, o oss.StorageClient) *ProjectHan
 }
 
 // conflictInjectingOSS wraps a Memory store (via mcLikeOSS for ListObjects
-// semantics) and, on the Nth StatMeta call, writes a concurrent version of the
-// object before returning the stat — simulating a worker _sync_project push
-// between the Controller's read and its compare-before-write. The Memory fake
-// advances its modTime on every PutObject, so the injected write changes the
-// mtime seen by the compare.
+// semantics) and, after the Nth GetObject call, writes a concurrent version
+// of the object — simulating a worker _sync_project push landing between the
+// Controller's read and its conditional write. The Controller binds its
+// If-Match ETag to the bytes it read, so the injected write changes the
+// remote ETag and the write fails with 409.
 type conflictInjectingOSS struct {
-	mcLike       *mcLikeOSS
-	injectOnStat int
-	statCalls    int
+	mcLike      *mcLikeOSS
+	injectOnGet int
+	getCalls    int
 }
 
 func (c *conflictInjectingOSS) ListObjects(ctx context.Context, prefix string) ([]string, error) {
@@ -3583,7 +3583,13 @@ func (c *conflictInjectingOSS) ListObjects(ctx context.Context, prefix string) (
 }
 
 func (c *conflictInjectingOSS) GetObject(ctx context.Context, key string) ([]byte, error) {
-	return c.mcLike.GetObject(ctx, key)
+	data, err := c.mcLike.GetObject(ctx, key)
+	c.getCalls++
+	if err == nil && c.getCalls == c.injectOnGet && strings.HasSuffix(key, "/meta.json") {
+		// Simulate a worker push between the Controller's read and write.
+		_ = c.mcLike.PutObject(ctx, key, []byte(`{"project_id":"p1","title":"P1","status":"active","concurrent":true}`))
+	}
+	return data, err
 }
 
 func (c *conflictInjectingOSS) PutObject(ctx context.Context, key string, data []byte) error {
@@ -3595,7 +3601,7 @@ func (c *conflictInjectingOSS) PutObject(ctx context.Context, key string, data [
 // underlying object's ETag no longer matches the read-time ETag, so the
 // conditional write fails — exactly like the MinIO backend would.
 func (c *conflictInjectingOSS) PutObjectIfMatch(ctx context.Context, key string, data []byte, matchETag string) error {
-	cur, err := c.StatMeta(ctx, key)
+	cur, err := c.mcLike.StatMeta(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -3626,11 +3632,6 @@ func (c *conflictInjectingOSS) DeletePrefix(ctx context.Context, prefix string) 
 }
 
 func (c *conflictInjectingOSS) StatMeta(ctx context.Context, key string) (oss.ObjectMeta, error) {
-	c.statCalls++
-	if c.statCalls == c.injectOnStat {
-		// Simulate a concurrent worker push that lands between read and write.
-		_ = c.mcLike.PutObject(ctx, key, []byte(`{"project_id":"p1","title":"P1","status":"active","concurrent":true}`))
-	}
 	return c.mcLike.StatMeta(ctx, key)
 }
 
@@ -3864,7 +3865,7 @@ func TestPauseProject_EtagConflictOnConcurrentWrite(t *testing.T) {
 	putProject(store, "shared/projects/p1/meta.json", map[string]any{
 		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
 	})
-	injector := &conflictInjectingOSS{mcLike: &mcLikeOSS{Memory: store}, injectOnStat: 2}
+	injector := &conflictInjectingOSS{mcLike: &mcLikeOSS{Memory: store}, injectOnGet: 1}
 	h := newProjectTestHandlerWithOSS(t, injector)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
@@ -3889,7 +3890,7 @@ func TestCancelTask_ProjectWriteFailureLeavesTaskUntouched(t *testing.T) {
 	putTask(store, "shared/tasks/t1/meta.json", map[string]any{
 		"task_id": "t1", "project_id": "p1", "status": "in_progress",
 	})
-	injector := &conflictInjectingOSS{mcLike: &mcLikeOSS{Memory: store}, injectOnStat: 2}
+	injector := &conflictInjectingOSS{mcLike: &mcLikeOSS{Memory: store}, injectOnGet: 1}
 	h := newProjectTestHandlerWithOSS(t, injector)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/tasks/t1/cancel",
@@ -3909,5 +3910,85 @@ func TestCancelTask_ProjectWriteFailureLeavesTaskUntouched(t *testing.T) {
 	_ = json.Unmarshal(taskData, &task)
 	if task["status"] != "in_progress" {
 		t.Fatalf("task status=%v, want in_progress (untouched on project conflict)", task["status"])
+	}
+}
+
+// failTaskPutOSS wraps a StorageClient and fails the next N PutObject calls
+// for a specific key prefix — simulating a task-meta write failure after the
+// project write already succeeded (reviewer failure-injection case).
+type failTaskPutOSS struct {
+	oss.StorageClient
+	failPrefix string
+	failures   int
+}
+
+func (f *failTaskPutOSS) PutObject(ctx context.Context, key string, data []byte) error {
+	if f.failures > 0 && strings.HasPrefix(key, f.failPrefix) {
+		f.failures--
+		return errors.New("injected task-meta write failure")
+	}
+	return f.StorageClient.PutObject(ctx, key, data)
+}
+
+func TestCancelTask_RetryConvergesBothObjects(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []string{}}},
+	})
+	putTask(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "in_progress",
+	})
+
+	// First attempt: the project write succeeds, the task-meta write fails.
+	failFirst := &failTaskPutOSS{StorageClient: &mcLikeOSS{Memory: store}, failPrefix: "shared/tasks/t1/", failures: 1}
+	h := newProjectTestHandlerWithOSS(t, failFirst)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/tasks/t1/cancel",
+		strings.NewReader(`{"reason":"obsolete"}`))
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CancelTask(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("first attempt status=%d, want 500 (injected task-meta write failure)", rec.Code)
+	}
+
+	// Project node is cancelled after the first attempt; task meta is not.
+	projData, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
+	var proj map[string]any
+	_ = json.Unmarshal(projData, &proj)
+	tasks, _ := proj["tasks"].([]any)
+	if tasks[0].(map[string]any)["status"] != "cancelled" {
+		t.Fatalf("project node status=%v, want cancelled after first attempt", tasks[0].(map[string]any)["status"])
+	}
+	taskData, _ := store.GetObject(context.Background(), "shared/tasks/t1/meta.json")
+	var task map[string]any
+	_ = json.Unmarshal(taskData, &task)
+	if task["status"] != "in_progress" {
+		t.Fatalf("task status=%v, want in_progress after failed task-meta write", task["status"])
+	}
+
+	// Retry: the node is already cancelled, so the retry converges by
+	// re-writing the idempotent task meta — no 409 at the terminal check.
+	h2 := newProjectTestHandler(t, store)
+	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/tasks/t1/cancel",
+		strings.NewReader(`{"reason":"obsolete"}`))
+	req2.SetPathValue("id", "p1")
+	req2.SetPathValue("taskId", "t1")
+	req2 = withCaller(req2, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec2 := httptest.NewRecorder()
+	h2.CancelTask(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("retry status=%d body=%s, want 200 (converged)", rec2.Code, rec2.Body.String())
+	}
+
+	// Both objects converged.
+	taskData2, _ := store.GetObject(context.Background(), "shared/tasks/t1/meta.json")
+	var task2 map[string]any
+	_ = json.Unmarshal(taskData2, &task2)
+	if task2["status"] != "cancelled" || task2["cancel_reason"] != "obsolete" {
+		t.Fatalf("task=%v, want cancelled + reason after retry", task2)
 	}
 }

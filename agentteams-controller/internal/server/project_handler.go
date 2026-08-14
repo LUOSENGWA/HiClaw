@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/md5"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +26,7 @@ import (
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/httputil"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/matrix"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss"
+	"github.com/google/uuid"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -345,11 +348,13 @@ func (h *ProjectHandler) resolveProjectMeta(ctx context.Context, projectID strin
 				continue
 			}
 			seenTeam[meta.TeamID] = true
-			etag := ""
-			if om, err := h.oss.StatMeta(ctx, key); err == nil {
-				etag = om.ETag
-			}
-			matches = append(matches, projectMatch{meta: &meta, team: team, key: key, etag: etag})
+			// The ETag is computed from the bytes actually returned by
+			// GetObject (MinIO single-part ETag == MD5 of content). This
+			// binds the version to the READ ITSELF: a Worker write between
+			// the read and the conditional write changes the remote ETag
+			// away from this value and the If-Match fails. Never empty when
+			// the read succeeded — fail closed, no unconditional fallback.
+			matches = append(matches, projectMatch{meta: &meta, team: team, key: key, etag: contentETag(data)})
 		}
 	}
 	return matches, nil
@@ -1855,12 +1860,21 @@ func (h *ProjectHandler) interventionNotify(ctx context.Context, meta *projectMe
 }
 
 // teamHarnessSafeProjectID generates a default project id accepted by
-// TeamHarness _safe_id ([A-Za-z0-9][A-Za-z0-9._-]*): a compact timestamp
-// plus the sub-second nanoseconds for uniqueness. RFC3339 timestamps contain
-// ':' and are rejected upstream, so the default cannot use utcTimestamp.
+// TeamHarness _safe_id ([A-Za-z0-9][A-Za-z0-9._-]*). A UUID guarantees
+// uniqueness (crypto/rand), unlike a clock-based suffix whose resolution can
+// repeat across consecutive calls. RFC3339 timestamps contain ':' and are
+// rejected upstream, so the default cannot use utcTimestamp.
 func teamHarnessSafeProjectID() string {
-	now := time.Now().UTC()
-	return "proj-" + now.Format("20060102-150405") + "-" + strconv.Itoa(now.Nanosecond())
+	return "proj-" + uuid.NewString()
+}
+
+// contentETag returns the MD5 hex digest of data — the ETag MinIO assigns
+// to a single-part PutObject. Computing it from the read bytes (rather than
+// a separate stat) binds the write's precondition to exactly the version
+// that was read.
+func contentETag(data []byte) string {
+	sum := md5.Sum(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // utcTimestamp returns an RFC3339 UTC timestamp for the audit fields
@@ -2324,7 +2338,10 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "task not found in project")
 		return
 	}
-	if isTerminalTaskStatus(nodeStatus) {
+	// A node already cancelled is NOT rejected: it is the retry-convergence
+	// path — the first attempt may have written the project but failed the
+	// task-meta write, and the retry re-writes the idempotent task meta.
+	if isTerminalTaskStatus(nodeStatus) && nodeStatus != "cancelled" {
 		writeError(w, http.StatusConflict, "cannot cancel terminal task: "+nodeStatus)
 		return
 	}
