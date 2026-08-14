@@ -3046,15 +3046,15 @@ func TestPauseProject_NotFound(t *testing.T) {
 // _sync_project push after the Controller read (before the write) must abort
 // the write with 409. The ossfake Memory advances its modTime on every
 // PutObject, so writing between read and write-back triggers the conflict.
-func TestPauseProject_MtimeConflict(t *testing.T) {
+func TestPauseProject_EtagConflict(t *testing.T) {
 	store := ossfake.NewMemory()
 	putProject(store, "shared/projects/p1/meta.json", map[string]any{
 		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
 	})
-	// The handler stats the object at read time (mtime T0), then re-stats
-	// before the write. Inject a "worker push" between the two stats: the
-	// wrapper advances the object's mtime on the second StatMeta call, so
-	// the compare-before-write detects the concurrent modification -> 409.
+	// The handler binds the read to its ETag, then performs a conditional
+	// write. Inject a "worker push" on the second StatMeta call (the
+	// conditional write's stat): the object's ETag changes, so the
+	// If-Match write fails -> 409.
 	// The wrapper embeds mcLikeOSS so ListObjects keeps the mc ls semantics
 	// (direct child names) that resolveProjectMetaWithKey depends on.
 	injector := &conflictInjectingOSS{mcLike: &mcLikeOSS{Memory: store}, injectOnStat: 2}
