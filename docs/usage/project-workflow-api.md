@@ -414,9 +414,10 @@ authorized: the middleware rejects cross-team writes (authorizer
 after resolving the owning team because the middleware cannot map a project
 path to a team. Every write is stamped with audit fields
 (`updated_by` / `updated_at`, and `pause_reason` when a reason is given) and
-applies an mtime optimistic lock — if a worker pushed a newer `meta.json`
-between the read and the write, the write fails with `409` instead of
-clobbering it.
+applies an ETag conditional write — the object's ETag (content hash) is
+bound at read time and the write is a MinIO If-Match conditional write, so
+a worker pushing a newer `meta.json` between the read and the write makes
+the write fail with `409` instead of clobbering it.
 
 ### `POST /api/v1/projects`
 
@@ -438,11 +439,13 @@ Request body:
 ```
 
 `project_id` defaults to a generated value when omitted and must be a plain
-token (`[A-Za-z0-9._-]`). Response `201 Created`:
+token matching TeamHarness `_safe_id` (`[A-Za-z0-9][A-Za-z0-9._-]*`); the
+generated default is a compact timestamp + nanoseconds (never an RFC3339
+timestamp — its `:` would be rejected by TeamHarness). Response `201 Created`:
 
 ```json
 {
-  "project_id": "proj-2026-08-12T00:00:00Z",
+  "project_id": "proj-20260814-160628-406426239",
   "title": "New project",
   "status": "active",
   "team_id": "biz-team",
