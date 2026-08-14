@@ -3231,6 +3231,37 @@ def _project_id_for_pull(arguments: dict[str, Any], payload: dict[str, Any]) -> 
     return ""
 
 
+# Actions that write project/task state back to shared storage. When the
+# authoritative pull fails, these must NOT continue from stale local state
+# (their _sync would clobber a Controller pause/resume/replan) — they fail
+# with a retryable error instead. Read-only actions tolerate a failed pull
+# and serve local state.
+_PROJECTFLOW_MUTATING_ACTIONS = frozenset({
+    "accept_task_result",
+    "record_loop_iteration",
+    "pause_project",
+    "resume_project",
+    "complete_project",
+    "replan_project",
+})
+_TASKFLOW_MUTATING_ACTIONS = frozenset({
+    "delegate_task",
+    "ack_task",
+    "submit_task",
+    "cancel_task",
+})
+
+
+def _pull_failed_response(tool: str, action: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "tool": tool,
+        "action": action,
+        "error": "cannot pull authoritative project state from shared storage; retry",
+        "retryable": True,
+    }
+
+
 def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
     action = str(arguments.get("action") or "").strip()
     payload = _payload(arguments)
@@ -3242,8 +3273,13 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
         # ready_loop_nodes, accept_task_result, record_loop_iteration,
         # pause/resume/complete, ...) instead of adding a pull per action.
         pid = _project_id_for_pull(arguments, payload)
-        if pid:
-            _pull_project(arguments, pid)
+        if pid and not _pull_project(arguments, pid):
+            # Mutating actions must not continue from stale local state:
+            # their write-back (_sync_project) could clobber a Controller
+            # pause/resume/replan that this worker has not seen. Fail with a
+            # retryable error; read actions tolerate the stale state.
+            if action in _PROJECTFLOW_MUTATING_ACTIONS:
+                return _pull_failed_response("projectflow", action)
         if action == "create_project":
             project_id = _project_id_from_payload(arguments, payload)
             project = {
@@ -4055,8 +4091,12 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
         # project node status back (otherwise the write-back would clobber
         # the Controller's paused status with a stale active).
         pid = _project_id_for_pull(arguments, payload)
-        if pid:
-            _pull_project(arguments, pid)
+        if pid and not _pull_project(arguments, pid):
+            # Same rationale as _projectflow: ack/submit/cancel write the
+            # project node status back — proceeding on stale local state
+            # could clobber a Controller intervention.
+            if action in _TASKFLOW_MUTATING_ACTIONS:
+                return _pull_failed_response("taskflow", action)
         if action == "delegate_task":
             if role != "leader":
                 raise ValueError("delegate_task requires leader role")

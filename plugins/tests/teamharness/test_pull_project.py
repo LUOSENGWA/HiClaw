@@ -277,3 +277,82 @@ def test_taskflow_actions_pull(tmp_path: Path, monkeypatch) -> None:
         if c["action"] == "pull" and c["path"] == "shared/projects/p1/meta.json"
     ]
     assert len(project_pulls) == 1
+
+
+class FailingFilesync(FakeFilesync):
+    """Filesync fake that fails pulls — simulates shared storage being
+    unreachable, so the authoritative state cannot be refreshed."""
+
+    def __call__(self, arguments: dict):
+        self.calls.append(dict(arguments))
+        action = arguments.get("action")
+        if action == "pull":
+            return {"ok": False, "tool": "filesync", "action": action, "error": "storage unreachable"}
+        return {"ok": True, "tool": "filesync", "action": action, "path": arguments.get("path")}
+
+
+def test_projectflow_pull_failure_blocks_pause(tmp_path: Path, monkeypatch) -> None:
+    """A mutating projectflow action must fail retryably when the
+    authoritative pull fails — proceeding would write back stale state and
+    clobber a Controller intervention."""
+    server = _load_server()
+    fake = FailingFilesync()
+    monkeypatch.setattr(server, "_filesync", fake)
+
+    workspace = tmp_path / "agent"
+    _write_project(workspace, "p1", {
+        "project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "tasks": [],
+    })
+
+    resp = server._projectflow(_arguments(workspace, "pause_project", projectId="p1"))
+    assert resp.get("ok") is False
+    assert resp.get("retryable") is True
+    assert "pull" in resp.get("error", "")
+
+    # The local project state was NOT mutated.
+    local = server._read_json(server._project_state_path(_arguments(workspace, "resolve_project"), "p1"))
+    assert local["status"] == "active"
+
+
+def test_taskflow_pull_failure_blocks_cancel(tmp_path: Path, monkeypatch) -> None:
+    """A mutating taskflow action must fail retryably when the authoritative
+    pull fails — cancel_task writes the project node back and must not run on
+    stale local state."""
+    server = _load_server()
+    fake = FailingFilesync()
+    monkeypatch.setattr(server, "_filesync", fake)
+
+    workspace = tmp_path / "agent"
+    _write_project(workspace, "p1", {
+        "project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+        "tasks": [{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []}],
+    })
+    _write_task(workspace, "t1", {"task_id": "t1", "project_id": "p1", "status": "in_progress"})
+
+    resp = server._taskflow(_arguments(workspace, "cancel_task", projectId="p1", taskId="t1", reason="test"))
+    assert resp.get("ok") is False
+    assert resp.get("retryable") is True
+    assert "pull" in resp.get("error", "")
+
+    # Neither the task meta nor the project node was mutated.
+    task = server._read_json(server._task_state_path(_arguments(workspace, "cancel_task"), "t1"))
+    assert task["status"] == "in_progress"
+    project = server._read_json(server._project_state_path(_arguments(workspace, "resolve_project"), "p1"))
+    assert project["tasks"][0]["status"] == "in_progress"
+
+
+def test_projectflow_pull_failure_read_action_tolerated(tmp_path: Path, monkeypatch) -> None:
+    """Read actions tolerate a failed pull and serve local state (the pull is
+    best-effort for reads) — the retryable failure is only for mutating
+    actions."""
+    server = _load_server()
+    fake = FailingFilesync()
+    monkeypatch.setattr(server, "_filesync", fake)
+
+    workspace = tmp_path / "agent"
+    _write_project(workspace, "p1", {
+        "project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "tasks": [],
+    })
+
+    resp = server._projectflow(_arguments(workspace, "resolve_project", projectId="p1"))
+    assert resp.get("ok") is True

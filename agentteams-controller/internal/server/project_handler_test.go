@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -3589,6 +3590,21 @@ func (c *conflictInjectingOSS) PutObject(ctx context.Context, key string, data [
 	return c.mcLike.PutObject(ctx, key, data)
 }
 
+// PutObjectIfMatch simulates the conditional write. When injectOnStat has
+// been reached (the concurrent-write simulation fired on StatMeta), the
+// underlying object's ETag no longer matches the read-time ETag, so the
+// conditional write fails — exactly like the MinIO backend would.
+func (c *conflictInjectingOSS) PutObjectIfMatch(ctx context.Context, key string, data []byte, matchETag string) error {
+	cur, err := c.StatMeta(ctx, key)
+	if err != nil {
+		return err
+	}
+	if cur.ETag != matchETag {
+		return oss.ErrPreconditionFailed
+	}
+	return c.mcLike.PutObject(ctx, key, data)
+}
+
 func (c *conflictInjectingOSS) Stat(ctx context.Context, key string) error {
 	return c.mcLike.Stat(ctx, key)
 }
@@ -3793,5 +3809,105 @@ func TestCreateProject_NoSnapshot(t *testing.T) {
 		if strings.Contains(k, "/history/") {
 			t.Fatalf("fresh project has history entry: %s", k)
 		}
+	}
+}
+
+func TestTeamHarnessSafeProjectID_Contract(t *testing.T) {
+	// Contract with TeamHarness _safe_id: [A-Za-z0-9][A-Za-z0-9._-]*.
+	// An RFC3339 timestamp (with ':') would be rejected upstream.
+	re := regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	seen := map[string]bool{}
+	for i := 0; i < 100; i++ {
+		id := teamHarnessSafeProjectID()
+		if !re.MatchString(id) {
+			t.Fatalf("generated id %q does not match TeamHarness _safe_id contract", id)
+		}
+		if seen[id] {
+			t.Fatalf("generated id %q collided", id)
+		}
+		seen[id] = true
+	}
+}
+
+func TestCreateProject_DefaultIDSafeForTeamHarness(t *testing.T) {
+	store := ossfake.NewMemory()
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	body := strings.NewReader(`{"title":"Auto ID"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", body)
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CreateProject(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	id, _ := resp["project_id"].(string)
+	if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`).MatchString(id) {
+		t.Fatalf("default project id %q not TeamHarness-safe", id)
+	}
+	if strings.Contains(id, ":") {
+		t.Fatalf("default project id %q contains ':' (RFC3339 leak)", id)
+	}
+}
+
+func TestPauseProject_EtagConflictOnConcurrentWrite(t *testing.T) {
+	// A Worker write landing between the Controller's read (ETag E0) and its
+	// conditional write changes the ETag → the write fails with 409 instead
+	// of overwriting. The conflictInjectingOSS wrapper injects the
+	// concurrent write on the second StatMeta call (the read-time stat is
+	// the first), so the conditional write sees a mismatching ETag.
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+	})
+	injector := &conflictInjectingOSS{mcLike: &mcLikeOSS{Memory: store}, injectOnStat: 2}
+	h := newProjectTestHandlerWithOSS(t, injector)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (etag conflict)", rec.Code)
+	}
+}
+
+func TestCancelTask_ProjectWriteFailureLeavesTaskUntouched(t *testing.T) {
+	// Reviewer failure-injection case: if the project write conflicts, the
+	// task meta must NOT already be cancelled — the old order (task first)
+	// left task=cancelled while the project node kept its old status.
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []string{}}},
+	})
+	putTask(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "in_progress",
+	})
+	injector := &conflictInjectingOSS{mcLike: &mcLikeOSS{Memory: store}, injectOnStat: 2}
+	h := newProjectTestHandlerWithOSS(t, injector)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/tasks/t1/cancel",
+		strings.NewReader(`{"reason":"obsolete"}`))
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CancelTask(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (project write conflict)", rec.Code)
+	}
+
+	// Task meta untouched by the failed request.
+	taskData, _ := store.GetObject(context.Background(), "shared/tasks/t1/meta.json")
+	var task map[string]any
+	_ = json.Unmarshal(taskData, &task)
+	if task["status"] != "in_progress" {
+		t.Fatalf("task status=%v, want in_progress (untouched on project conflict)", task["status"])
 	}
 }

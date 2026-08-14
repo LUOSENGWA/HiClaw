@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"time"
 )
 
@@ -70,6 +74,45 @@ func (c *MinIOClient) ensureAlias(ctx context.Context) error {
 
 func (c *MinIOClient) fullPath(key string) string {
 	return c.config.StoragePrefix + "/" + strings.TrimPrefix(key, "/")
+}
+
+// PutObjectIfMatch performs a conditional write: the object is only replaced
+// when its current ETag equals matchETag. This closes the check-then-act
+// race of the optimistic lock — a Worker write landing between the
+// Controller's read and its write makes the ETag change and the write fails
+// with ErrPreconditionFailed instead of silently overwriting.
+func (c *MinIOClient) PutObjectIfMatch(ctx context.Context, key string, data []byte, matchETag string) error {
+	sdk, err := c.sdkClient()
+	if err != nil {
+		return err
+	}
+	reader := bytes.NewReader(data)
+	opts := minio.PutObjectOptions{ContentType: "application/json"}
+	opts.SetMatchETag(matchETag)
+	_, err = sdk.PutObject(ctx, c.config.Bucket, strings.TrimPrefix(key, "/"), reader, int64(len(data)), opts)
+	if err != nil {
+		// MinIO rejects an If-Match mismatch with a precondition-failed
+		// response; the SDK surfaces it as an ErrorResponse with that code.
+		var resp minio.ErrorResponse
+		if errors.As(err, &resp) && (resp.Code == "PreconditionFailed" || resp.Code == "412") {
+			return ErrPreconditionFailed
+		}
+		return err
+	}
+	return nil
+}
+
+// sdkClient lazily builds a minio-go client for conditional writes. The
+// regular read/write path stays on the mc CLI (mirror semantics, alias
+// handling, dynamic STS credentials); only If-Match writes need the SDK.
+func (c *MinIOClient) sdkClient() (*minio.Client, error) {
+	endpoint := c.config.Endpoint
+	endpoint = strings.TrimPrefix(endpoint, "http://")
+	endpoint = strings.TrimPrefix(endpoint, "https://")
+	return minio.New(endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(c.config.AccessKey, c.config.SecretKey, ""),
+		Secure: false,
+	})
 }
 
 func (c *MinIOClient) PutObject(ctx context.Context, key string, data []byte) error {
@@ -149,6 +192,7 @@ func (c *MinIOClient) StatMeta(ctx context.Context, key string) (ObjectMeta, err
 	var info struct {
 		LastModified string `json:"lastModified"`
 		Size         int64  `json:"size"`
+		ETag         string `json:"etag"`
 	}
 	if err := json.Unmarshal([]byte(out), &info); err != nil {
 		return ObjectMeta{}, fmt.Errorf("parse mc stat --json: %w", err)
@@ -157,7 +201,7 @@ func (c *MinIOClient) StatMeta(ctx context.Context, key string) (ObjectMeta, err
 	if err != nil {
 		return ObjectMeta{}, fmt.Errorf("parse lastModified %q: %w", info.LastModified, err)
 	}
-	return ObjectMeta{Size: info.Size, ModTime: modTime}, nil
+	return ObjectMeta{Size: info.Size, ModTime: modTime, ETag: info.ETag}, nil
 }
 
 func (c *MinIOClient) DeleteObject(ctx context.Context, key string) error {

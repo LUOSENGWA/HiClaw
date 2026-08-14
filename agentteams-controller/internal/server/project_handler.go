@@ -279,6 +279,10 @@ type projectMatch struct {
 	meta *projectMeta
 	team string
 	key  string
+	// etag is the object's content hash at read time (from the stat that
+	// immediately follows the GetObject). Write endpoints use it for the
+	// conditional write — the read version is bound to the write.
+	etag string
 }
 
 // resolveProjectMeta locates and reads a project's meta.json across the given
@@ -341,7 +345,11 @@ func (h *ProjectHandler) resolveProjectMeta(ctx context.Context, projectID strin
 				continue
 			}
 			seenTeam[meta.TeamID] = true
-			matches = append(matches, projectMatch{meta: &meta, team: team, key: key})
+			etag := ""
+			if om, err := h.oss.StatMeta(ctx, key); err == nil {
+				etag = om.ETag
+			}
+			matches = append(matches, projectMatch{meta: &meta, team: team, key: key, etag: etag})
 		}
 	}
 	return matches, nil
@@ -1788,32 +1796,34 @@ func (h *ProjectHandler) snapshotProjectMeta(ctx context.Context, key string) {
 // non-zero, it re-stats the object and returns a 409 conflict when the
 // remote mtime has advanced — meaning a worker _sync_project pushed a newer
 // version while we were editing.
-func (h *ProjectHandler) writeProjectMeta(ctx context.Context, w http.ResponseWriter, key string, meta *projectMeta, expectedMeta *oss.ObjectMeta) bool {
+// writeProjectMeta writes the updated meta back with a conditional write
+// bound to the ETag read at resolve time. A concurrent modification between
+// read and write (Worker _sync_project, another Controller request) changes
+// the ETag and the write fails with 409 — never silently overwritten. When
+// the backend reported no ETag (empty), it falls back to a plain write.
+func (h *ProjectHandler) writeProjectMeta(ctx context.Context, w http.ResponseWriter, key string, meta *projectMeta, etag string) bool {
 	data, err := json.Marshal(meta)
 	if err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, "marshal project meta: "+err.Error())
 		return false
-	}
-	if expectedMeta != nil && !expectedMeta.ModTime.IsZero() {
-		cur, err := h.oss.StatMeta(ctx, key)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				httputil.WriteError(w, http.StatusConflict, "conflict: project meta was deleted")
-				return false
-			}
-			httputil.WriteError(w, http.StatusInternalServerError, "stat project meta: "+err.Error())
-			return false
-		}
-		if !cur.ModTime.Equal(expectedMeta.ModTime) {
-			httputil.WriteError(w, http.StatusConflict, "conflict: project was modified concurrently")
-			return false
-		}
 	}
 
 	// Timeline: persist the pre-intervention version before overwriting.
 	// Best-effort — never blocks the write.
 	h.snapshotProjectMeta(ctx, key)
 
+	if etag != "" {
+		err = h.oss.PutObjectIfMatch(ctx, key, data, etag)
+		if err == nil {
+			return true
+		}
+		if errors.Is(err, oss.ErrPreconditionFailed) {
+			httputil.WriteError(w, http.StatusConflict, "conflict: project was modified concurrently")
+			return false
+		}
+		httputil.WriteError(w, http.StatusInternalServerError, "write project meta: "+err.Error())
+		return false
+	}
 	if err := h.oss.PutObject(ctx, key, data); err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, "write project meta: "+err.Error())
 		return false
@@ -1842,6 +1852,15 @@ func (h *ProjectHandler) interventionNotify(ctx context.Context, meta *projectMe
 		ctrlLog := log.FromContext(ctx)
 		ctrlLog.Error(err, "project intervention notification failed", "roomID", roomID)
 	}
+}
+
+// teamHarnessSafeProjectID generates a default project id accepted by
+// TeamHarness _safe_id ([A-Za-z0-9][A-Za-z0-9._-]*): a compact timestamp
+// plus the sub-second nanoseconds for uniqueness. RFC3339 timestamps contain
+// ':' and are rejected upstream, so the default cannot use utcTimestamp.
+func teamHarnessSafeProjectID() string {
+	now := time.Now().UTC()
+	return "proj-" + now.Format("20060102-150405") + "-" + strconv.Itoa(now.Nanosecond())
 }
 
 // utcTimestamp returns an RFC3339 UTC timestamp for the audit fields
@@ -1873,21 +1892,33 @@ func markAuditFields(meta *projectMeta, actor, reason string) {
 	}
 }
 
+// projectWriteContext is the resolved write target: the project meta, its
+// owning team, its exact object key, and the object's ETag at read time.
+// The ETag binds the read version to the write — writeProjectMeta performs
+// a conditional write against it, so any concurrent modification between
+// read and write fails with 409 instead of being silently overwritten.
+type projectWriteContext struct {
+	meta *projectMeta
+	team string
+	key  string
+	etag string
+}
+
 // readProjectWriteContext resolves the project + key + access check for a
 // write endpoint. Returns (meta, team, key, false) on success; on failure it
 // writes the HTTP error response and returns (nil, "", "", true).
-func (h *ProjectHandler) readProjectWriteContext(w http.ResponseWriter, r *http.Request) (*projectMeta, string, string, bool) {
+func (h *ProjectHandler) readProjectWriteContext(w http.ResponseWriter, r *http.Request) (*projectWriteContext, bool) {
 	projectID := r.PathValue("id")
 	if projectID == "" {
 		writeError(w, http.StatusBadRequest, "project id is required")
-		return nil, "", "", true
+		return nil, true
 	}
 	caller := authpkg.CallerFromContext(r.Context())
 	teamFilter := r.URL.Query().Get("team")
 	prefixes, crToEffective, err := h.teamProjectPrefixes(r.Context())
 	if err != nil {
 		writeK8sError(w, "resolve prefixes", err)
-		return nil, "", "", true
+		return nil, true
 	}
 	// Same resolution rules as the read endpoints: all matches collected,
 	// ambiguous id → 409 with ?team= qualifier. Writing through a silent
@@ -1895,16 +1926,17 @@ func (h *ProjectHandler) readProjectWriteContext(w http.ResponseWriter, r *http.
 	matches, err := h.resolveProjectMeta(r.Context(), projectID, prefixes, teamFilter, caller, crToEffective)
 	if err != nil {
 		writeK8sError(w, "resolve project meta", err)
-		return nil, "", "", true
+		return nil, true
 	}
 	meta, team, ok := h.resolveSingleProject(w, matches)
 	if !ok {
-		return nil, "", "", true
+		return nil, true
 	}
-	key := ""
+	pwc := &projectWriteContext{meta: meta, team: team}
 	for _, m := range matches {
 		if m.meta == meta {
-			key = m.key
+			pwc.key = m.key
+			pwc.etag = m.etag
 			break
 		}
 	}
@@ -1913,12 +1945,12 @@ func (h *ProjectHandler) readProjectWriteContext(w http.ResponseWriter, r *http.
 	if err := h.checkProjectAccess(caller, team, crToEffective); err != nil {
 		if _, ok := err.(*accessDeniedError); ok {
 			writeError(w, http.StatusNotFound, "project not found")
-			return nil, "", "", true
+			return nil, true
 		}
 		writeError(w, http.StatusForbidden, err.Error())
-		return nil, "", "", true
+		return nil, true
 	}
-	return meta, team, key, false
+	return pwc, false
 }
 
 // writeError is a local alias helper for handlers in this file to keep the
@@ -1935,10 +1967,11 @@ func writeError(w http.ResponseWriter, status int, message string) {
 //
 // POST /api/v1/projects/{id}/pause  body: {"reason": "optional note"}
 func (h *ProjectHandler) PauseProject(w http.ResponseWriter, r *http.Request) {
-	meta, team, key, failed := h.readProjectWriteContext(w, r)
+	pwc, failed := h.readProjectWriteContext(w, r)
 	if failed {
 		return
 	}
+	meta := pwc.meta
 	caller := authpkg.CallerFromContext(r.Context())
 	var reqBody struct {
 		Reason string `json:"reason"`
@@ -1953,53 +1986,36 @@ func (h *ProjectHandler) PauseProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "cannot pause a completed project")
 		return
 	}
-	expected, err := h.oss.StatMeta(r.Context(), key)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			writeError(w, http.StatusConflict, "project meta was deleted")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "stat project meta: "+err.Error())
-		return
-	}
 	meta.Status = "paused"
 	markAuditFields(meta, authzActor(caller), reqBody.Reason)
-	if !h.writeProjectMeta(r.Context(), w, key, meta, &expected) {
+	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("⏸️ 项目 %s 已被暂停%s", meta.ProjectID, pauseReasonSuffix(reqBody.Reason)))
-	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, team, false))
+	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
 }
 
 // ResumeProject sets a paused project back to active.
 //
 // POST /api/v1/projects/{id}/resume
 func (h *ProjectHandler) ResumeProject(w http.ResponseWriter, r *http.Request) {
-	meta, team, key, failed := h.readProjectWriteContext(w, r)
+	pwc, failed := h.readProjectWriteContext(w, r)
 	if failed {
 		return
 	}
+	meta := pwc.meta
 	caller := authpkg.CallerFromContext(r.Context())
 	if meta.Status != "paused" {
 		writeError(w, http.StatusConflict, "project is not paused")
 		return
 	}
-	expected, err := h.oss.StatMeta(r.Context(), key)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			writeError(w, http.StatusConflict, "project meta was deleted")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "stat project meta: "+err.Error())
-		return
-	}
 	meta.Status = "active"
 	markAuditFields(meta, authzActor(caller), "")
-	if !h.writeProjectMeta(r.Context(), w, key, meta, &expected) {
+	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("▶️ 项目 %s 已恢复", meta.ProjectID))
-	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, team, false))
+	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
 }
 
 // pauseReasonSuffix formats an optional pause reason for the notification.
@@ -2026,10 +2042,11 @@ func pauseReasonSuffix(reason string) string {
 // POST /api/v1/projects/{id}/replan  body: {"tasks": [{taskId,title,
 // assignedTo,dependsOn,status}]}
 func (h *ProjectHandler) ReplanProject(w http.ResponseWriter, r *http.Request) {
-	meta, team, key, failed := h.readProjectWriteContext(w, r)
+	pwc, failed := h.readProjectWriteContext(w, r)
 	if failed {
 		return
 	}
+	meta := pwc.meta
 	caller := authpkg.CallerFromContext(r.Context())
 	var reqBody struct {
 		Tasks []json.RawMessage `json:"tasks"`
@@ -2082,23 +2099,14 @@ func (h *ProjectHandler) ReplanProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	expected, err := h.oss.StatMeta(r.Context(), key)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			writeError(w, http.StatusConflict, "project meta was deleted")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "stat project meta: "+err.Error())
-		return
-	}
 	meta.Tasks = planned
 	meta.PlanType = "dag"
 	markAuditFields(meta, authzActor(caller), "")
-	if !h.writeProjectMeta(r.Context(), w, key, meta, &expected) {
+	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("📋 项目 %s 已重规划（%d 个任务）", meta.ProjectID, len(planned)))
-	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, team, false))
+	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
 }
 
 // normalizeReplanTasks converts raw plan tasks into projectTaskMeta with the
@@ -2269,9 +2277,11 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := ""
+	etag := ""
 	for _, m := range matches {
 		if m.meta == meta {
 			key = m.key
+			etag = m.etag
 			break
 		}
 	}
@@ -2342,21 +2352,8 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "marshal task meta: "+err.Error())
 		return
 	}
-	if err := h.oss.PutObject(r.Context(), taskMetaKeys(taskID, team)[0], taskJSON); err != nil {
-		writeError(w, http.StatusInternalServerError, "write task meta: "+err.Error())
-		return
-	}
 
-	// Update the project node status to cancelled with the same mtime lock.
-	expected, err := h.oss.StatMeta(r.Context(), key)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			writeError(w, http.StatusConflict, "project meta was deleted")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "stat project meta: "+err.Error())
-		return
-	}
+	// Update the project node status to cancelled.
 	for i := range meta.Tasks {
 		if meta.Tasks[i].TaskID == taskID {
 			meta.Tasks[i].Status = "cancelled"
@@ -2370,7 +2367,14 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	markAuditFields(meta, authzActor(caller), reason)
-	if !h.writeProjectMeta(r.Context(), w, key, meta, &expected) {
+	if nodeStatus != "cancelled" {
+		// First attempt: write the project node, then the task meta.
+		if !h.writeProjectMeta(r.Context(), w, key, meta, etag) {
+			return
+		}
+	}
+	if err := h.oss.PutObject(r.Context(), taskMetaKeys(taskID, team)[0], taskJSON); err != nil {
+		writeError(w, http.StatusInternalServerError, "write task meta: "+err.Error())
 		return
 	}
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("🚫 任务 %s 已取消（项目 %s）", taskID, meta.ProjectID))
@@ -2439,7 +2443,10 @@ func (h *ProjectHandler) CreateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	projectID := strings.TrimSpace(reqBody.ProjectID)
 	if projectID == "" {
-		projectID = "proj-" + utcTimestamp()
+		// TeamHarness _safe_id only accepts [A-Za-z0-9][A-Za-z0-9._-]* —
+		// an RFC3339 timestamp (with ':') would be rejected by every
+		// subsequent projectflow operation. Generate a safe id instead.
+		projectID = teamHarnessSafeProjectID()
 	} else if !isPlainToken(projectID) {
 		writeError(w, http.StatusBadRequest, "project_id must be a plain token (letters, digits, '-', '_', '.')")
 		return
@@ -2553,10 +2560,11 @@ func isPlainToken(s string) bool {
 //
 // POST /api/v1/projects/{id}/complete
 func (h *ProjectHandler) CompleteProject(w http.ResponseWriter, r *http.Request) {
-	meta, team, key, failed := h.readProjectWriteContext(w, r)
+	pwc, failed := h.readProjectWriteContext(w, r)
 	if failed {
 		return
 	}
+	meta := pwc.meta
 	caller := authpkg.CallerFromContext(r.Context())
 	if meta.Status == "completed" {
 		writeError(w, http.StatusConflict, "project is already completed")
@@ -2572,23 +2580,14 @@ func (h *ProjectHandler) CompleteProject(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
-	expected, err := h.oss.StatMeta(r.Context(), key)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			writeError(w, http.StatusConflict, "project meta was deleted")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "stat project meta: "+err.Error())
-		return
-	}
 	meta.Status = "completed"
 	if meta.Loop != nil {
 		meta.Loop.Status = "completed"
 	}
 	markAuditFields(meta, authzActor(caller), "")
-	if !h.writeProjectMeta(r.Context(), w, key, meta, &expected) {
+	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("✅ 项目 %s 已完成", meta.ProjectID))
-	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, team, false))
+	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
 }

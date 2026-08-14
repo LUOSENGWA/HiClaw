@@ -2,6 +2,7 @@ package oss
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -9,7 +10,14 @@ import (
 type ObjectMeta struct {
 	Size    int64
 	ModTime time.Time
+	// ETag is the object's content hash (MD5 for single-part writes).
+	// Empty when the backend cannot report one.
+	ETag string
 }
+
+// ErrPreconditionFailed is returned by PutObjectIfMatch when the object's
+// current ETag does not match the expected one — the write was NOT applied.
+var ErrPreconditionFailed = errors.New("oss: precondition failed (etag mismatch)")
 
 // StorageClient abstracts object storage operations.
 // Implementations: MinIOClient (mc CLI), future S3Client (aws-sdk-go).
@@ -17,6 +25,11 @@ type StorageClient interface {
 	// PutObject writes data to the given key path.
 	// Key is relative to the configured storage prefix.
 	PutObject(ctx context.Context, key string, data []byte) error
+
+	// PutObjectIfMatch writes data only when the object's current ETag
+	// equals matchETag (conditional write). Returns ErrPreconditionFailed
+	// (without writing) on mismatch. matchETag must be non-empty.
+	PutObjectIfMatch(ctx context.Context, key string, data []byte, matchETag string) error
 
 	// PutFile uploads a local file to the given key path.
 	PutFile(ctx context.Context, localPath, key string) error

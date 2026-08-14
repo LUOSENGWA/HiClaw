@@ -8,6 +8,9 @@
 package ossfake
 
 import (
+	"crypto/md5"
+	"encoding/hex"
+
 	"context"
 	"errors"
 	"fmt"
@@ -27,6 +30,13 @@ type Memory struct {
 	objects map[string][]byte
 	modTime time.Time
 	next    int64
+}
+
+// md5Hex returns the lowercase MD5 hex digest of data (MinIO single-part
+// ETag semantics).
+func md5Hex(data []byte) string {
+	sum := md5.Sum(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // NewMemory constructs an empty in-memory storage client.
@@ -82,14 +92,36 @@ func (m *Memory) Stat(_ context.Context, key string) error {
 
 // StatMeta returns a monotonic mtime for the object. Writes advance the clock,
 // so a test can verify the optimistic-lock conflict path by writing after a
-// read. Returns os.ErrNotExist when the key is missing.
+// read. The ETag is the content MD5 (mirroring MinIO single-part semantics),
+// so a content-changing concurrent write also changes the ETag. Returns
+// os.ErrNotExist when the key is missing.
 func (m *Memory) StatMeta(_ context.Context, key string) (oss.ObjectMeta, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if _, ok := m.objects[key]; !ok {
+	data, ok := m.objects[key]
+	if !ok {
 		return oss.ObjectMeta{}, os.ErrNotExist
 	}
-	return oss.ObjectMeta{Size: int64(len(m.objects[key])), ModTime: m.modTime}, nil
+	return oss.ObjectMeta{Size: int64(len(data)), ModTime: m.modTime, ETag: md5Hex(data)}, nil
+}
+
+// PutObjectIfMatch writes only when the current object ETag equals matchETag.
+// Mirrors the MinIO conditional-write semantics: mismatch returns
+// oss.ErrPreconditionFailed and leaves the object untouched.
+func (m *Memory) PutObjectIfMatch(_ context.Context, key string, data []byte, matchETag string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if cur, ok := m.objects[key]; ok {
+		if matchETag == "" || md5Hex(cur) != matchETag {
+			return oss.ErrPreconditionFailed
+		}
+	}
+	buf := make([]byte, len(data))
+	copy(buf, data)
+	m.objects[key] = buf
+	m.modTime = m.modTime.Add(time.Second)
+	m.next++
+	return nil
 }
 
 // DeleteObject removes the object stored under key. Deleting a missing key
