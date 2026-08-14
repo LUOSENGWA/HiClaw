@@ -744,13 +744,13 @@ func (h *ProjectHandler) readTasksDetail(meta *projectMeta, team string) []taskD
 		return nil
 	}
 
-	// Candidate TaskMeta keys: project team prefix first, global fallback.
+	// Candidate TaskMeta keys: the project's owning scope ONLY, via
+	// taskMetaKeys — no cross-scope fallback (reviewer feedback: a team
+	// project whose TaskMeta is missing must not leak a global TaskMeta for
+	// the same task id).
 	var keys []string
 	for _, id := range taskIDs {
-		if team != "" {
-			keys = append(keys, "teams/"+team+"/shared/tasks/"+id+"/meta.json")
-		}
-		keys = append(keys, "shared/tasks/"+id+"/meta.json")
+		keys = append(keys, taskMetaKeys(id, team)...)
 	}
 
 	const detailConcurrency = 8
@@ -793,9 +793,10 @@ func (h *ProjectHandler) readTasksDetail(meta *projectMeta, team string) []taskD
 		if err := json.Unmarshal(res.data, &raw); err != nil {
 			continue // malformed TaskMeta; keep node summary only
 		}
-		// Ownership check: a TaskMeta that declares a different project_id is
-		// another project's task that shares this id — never mix it in.
-		if pid := str(raw["project_id"]); pid != "" && pid != meta.ProjectID {
+		// Ownership check: TaskMeta must name exactly this project's graph
+		// task — both task_id and project_id must match; absent or mismatched
+		// fields are rejected, never mixed in.
+		if str(raw["task_id"]) != res.taskID || str(raw["project_id"]) != meta.ProjectID {
 			continue
 		}
 		detail := taskDetail{
@@ -930,9 +931,10 @@ func (h *ProjectHandler) GetTaskArtifact(w http.ResponseWriter, r *http.Request)
 		if err := json.Unmarshal(data, &raw); err != nil {
 			continue // malformed TaskMeta; keep scanning other prefixes
 		}
-		// Ownership check: TaskMeta declaring another project must not serve
-		// artifacts under this project's id.
-		if pid := str(raw["project_id"]); pid != "" && pid != projectID {
+		// Ownership check: TaskMeta must name exactly the requested task —
+		// task_id and project_id must both match; absent or mismatched fields
+		// never serve artifacts.
+		if str(raw["task_id"]) != taskID || str(raw["project_id"]) != projectID {
 			continue
 		}
 		resultPath = str(raw["result_path"])
@@ -1326,8 +1328,8 @@ func (h *ProjectHandler) collectProjectRooms(ctx context.Context, meta *projectM
 			if err := json.Unmarshal(data, &raw); err != nil {
 				continue
 			}
-			if pid := str(raw["project_id"]); pid != "" && pid != meta.ProjectID {
-				continue // another project's task sharing this id
+			if str(raw["task_id"]) != t.TaskID || str(raw["project_id"]) != meta.ProjectID {
+				continue // another task/project sharing this id
 			}
 			if r := normalizeSessionKey(str(raw["room_id"])); r != "" {
 				rooms[r] = true

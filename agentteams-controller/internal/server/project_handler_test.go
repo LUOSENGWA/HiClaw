@@ -1364,7 +1364,7 @@ func TestGetProjectWorkflow_IncludeTasksDetail(t *testing.T) {
 		"deliverables":  []any{map[string]any{"type": "file", "path": "shared/tasks/t1/output.pdf"}},
 		"result_path":   "shared/tasks/t1/result.md",
 	})
-	putProject(store, "shared/tasks/t2/meta.json", map[string]any{
+	putProject(store, "teams/alpha-team/shared/tasks/t2/meta.json", map[string]any{
 		"task_id":     "t2",
 		"project_id":  "p1",
 		"status":      "assigned",
@@ -1463,7 +1463,7 @@ func TestGetProjectWorkflow_IncludeTasksMissingMetaSkipped(t *testing.T) {
 		},
 	})
 	putProject(store, "shared/tasks/t1/meta.json", map[string]any{
-		"task_id": "t1", "status": "assigned", "spec_path": "shared/tasks/t1/spec.md",
+		"task_id": "t1", "project_id": "p1", "status": "assigned", "spec_path": "shared/tasks/t1/spec.md",
 	})
 	h := newProjectTestHandler(t, store)
 
@@ -1498,10 +1498,10 @@ func TestGetProjectWorkflow_IncludeTasksTeamPrefixWins(t *testing.T) {
 		},
 	})
 	putProject(store, "teams/alpha-team/shared/tasks/t1/meta.json", map[string]any{
-		"task_id": "t1", "status": "assigned", "summary": "team copy",
+		"task_id": "t1", "project_id": "p1", "status": "assigned", "summary": "team copy",
 	})
 	putProject(store, "shared/tasks/t1/meta.json", map[string]any{
-		"task_id": "t1", "status": "assigned", "summary": "global copy",
+		"task_id": "t1", "project_id": "p1", "status": "assigned", "summary": "global copy",
 	})
 	h := newProjectTestHandler(t, store, team("alpha-team"))
 
@@ -1539,7 +1539,7 @@ func TestGetProjectWorkflow_IncludeTasksLoopTasks(t *testing.T) {
 		},
 	})
 	putProject(store, "shared/tasks/iter-2/meta.json", map[string]any{
-		"task_id": "iter-2", "status": "assigned", "summary": "second iteration",
+		"task_id": "iter-2", "project_id": "p1", "status": "assigned", "summary": "second iteration",
 	})
 	h := newProjectTestHandler(t, store)
 
@@ -2032,6 +2032,11 @@ func putTaskMeta(store *ossfake.Memory, team, taskID string, fields map[string]a
 	if fields == nil {
 		fields = map[string]any{}
 	}
+	// TeamHarness TaskMeta always carries task_id + project_id; default the
+	// task_id so test data matches what the ownership checks require.
+	if _, ok := fields["task_id"]; !ok {
+		fields["task_id"] = taskID
+	}
 	data, _ := json.Marshal(fields)
 	prefix := "shared/tasks/"
 	if team != "" {
@@ -2443,6 +2448,33 @@ func TestTaskDetail_SkipsGlobalFallback(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), "global-intruder") {
 		t.Fatalf("body=%s, must not contain the global intruder task", rec.Body.String())
+	}
+}
+
+func TestTaskDetail_MissingTeamMetaNoGlobalLeak(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+		"tasks": []map[string]any{{"task_id": "t1", "status": "in_progress"}},
+	})
+	// NO team-scoped TaskMeta. The global prefix holds a TaskMeta for the
+	// same task id with a MATCHING project_id — the exact leak the reviewer
+	// reproduced. With scope-only keys the global entry is never read.
+	putTaskMeta(store, "", "t1", map[string]any{
+		"project_id": "p1", "status": "completed", "summary": "global-leak",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow?includeTasks=true", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "global-leak") {
+		t.Fatalf("body=%s, must not leak the global TaskMeta (no team meta)", rec.Body.String())
 	}
 }
 
