@@ -116,6 +116,11 @@ function Write-Warning {
     Write-Host "$($script:ESC)[33m[AgentTeams WARNING]$($script:ESC)[0m $Message"
 }
 
+function ConvertTo-MatrixAppServiceEnabledValue {
+    param([string]$Value)
+    return $Value.ToLowerInvariant()
+}
+
 # Pause before exit on error so user can read the message when running via double-click
 function Exit-Script {
     param([int]$ExitCode = 0)
@@ -1030,6 +1035,11 @@ AGENTTEAMS_PORT_MANAGER_CONSOLE=$($Config.PORT_MANAGER_CONSOLE)
 # Matrix
 AGENTTEAMS_MATRIX_DOMAIN=$($Config.MATRIX_DOMAIN)
 AGENTTEAMS_MATRIX_CLIENT_DOMAIN=$($Config.MATRIX_CLIENT_DOMAIN)
+
+# Matrix AppService
+AGENTTEAMS_MATRIX_APPSERVICE_ENABLED=$($Config.MATRIX_APPSERVICE_ENABLED)
+AGENTTEAMS_MATRIX_APPSERVICE_AS_TOKEN=$($Config.MATRIX_APPSERVICE_AS_TOKEN)
+AGENTTEAMS_MATRIX_APPSERVICE_HS_TOKEN=$($Config.MATRIX_APPSERVICE_HS_TOKEN)
 
 # Gateway
 AGENTTEAMS_AI_GATEWAY_DOMAIN=$($Config.AI_GATEWAY_DOMAIN)
@@ -2697,6 +2707,12 @@ function Install-Manager {
     $config.MINIO_USER = if ($env:AGENTTEAMS_MINIO_USER) { $env:AGENTTEAMS_MINIO_USER } else { $config.ADMIN_USER }
     $config.MINIO_PASSWORD = if ($env:AGENTTEAMS_MINIO_PASSWORD) { $env:AGENTTEAMS_MINIO_PASSWORD } else { $config.ADMIN_PASSWORD }
     $config.MANAGER_GATEWAY_KEY = if ($env:AGENTTEAMS_MANAGER_GATEWAY_KEY) { $env:AGENTTEAMS_MANAGER_GATEWAY_KEY } else { New-RandomKey }
+    $matrixAppServiceEnabled = if ($env:AGENTTEAMS_MATRIX_APPSERVICE_ENABLED) { $env:AGENTTEAMS_MATRIX_APPSERVICE_ENABLED } else { "true" }
+    $config.MATRIX_APPSERVICE_ENABLED = ConvertTo-MatrixAppServiceEnabledValue $matrixAppServiceEnabled
+    if ($config.MATRIX_APPSERVICE_ENABLED -ne "false" -and $config.MATRIX_APPSERVICE_ENABLED -ne "0") {
+        $config.MATRIX_APPSERVICE_AS_TOKEN = if ($env:AGENTTEAMS_MATRIX_APPSERVICE_AS_TOKEN) { $env:AGENTTEAMS_MATRIX_APPSERVICE_AS_TOKEN } else { New-RandomKey }
+        $config.MATRIX_APPSERVICE_HS_TOKEN = if ($env:AGENTTEAMS_MATRIX_APPSERVICE_HS_TOKEN) { $env:AGENTTEAMS_MATRIX_APPSERVICE_HS_TOKEN } else { New-RandomKey }
+    }
 
     # Store additional config
     $config.LANGUAGE = $script:AGENTTEAMS_LANGUAGE
@@ -3096,6 +3112,9 @@ function Install-Manager {
             "-e", "AGENTTEAMS_ELEMENT_HOMESERVER_URL=http://127.0.0.1:$($config.PORT_GATEWAY)",
             "-e", "AGENTTEAMS_MATRIX_URL=http://127.0.0.1:6167",
             "-e", "AGENTTEAMS_MATRIX_E2EE=$($config.MATRIX_E2EE)",
+            "-e", "AGENTTEAMS_MATRIX_APPSERVICE_ENABLED=$($config.MATRIX_APPSERVICE_ENABLED)",
+            "-e", "AGENTTEAMS_MATRIX_APPSERVICE_AS_TOKEN=$($config.MATRIX_APPSERVICE_AS_TOKEN)",
+            "-e", "AGENTTEAMS_MATRIX_APPSERVICE_HS_TOKEN=$($config.MATRIX_APPSERVICE_HS_TOKEN)",
             "-e", "AGENTTEAMS_MINIO_ENDPOINT=http://127.0.0.1:9000",
             "-e", "AGENTTEAMS_MINIO_BUCKET=agentteams-storage",
             "-e", "AGENTTEAMS_STORAGE_PREFIX=agentteams/agentteams-storage",
