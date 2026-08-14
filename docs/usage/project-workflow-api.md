@@ -135,11 +135,13 @@ Response `200 OK`:
 TaskMeta fields that the project-level `nodes[]` summary does not carry:
 `spec_path` (task spec file), `summary` / `result_status` / `result_path`
 (submission result), `deliverables` (artifact list) and `cancel_reason`.
-TaskMeta is read from the same dual-prefix layout as projects
-(`teams/{team}/shared/tasks/{id}/meta.json` first, then `shared/tasks/{id}/`),
-so team-scoped tasks win over any global copy. Tasks without a TaskMeta file
-(e.g. not yet delegated) are skipped; per-task read errors are skipped so one
-bad task never fails the whole response.
+TaskMeta is read from the project's owning scope only: team projects read
+`teams/{team}/shared/tasks/{id}/meta.json`, standalone projects read
+`shared/tasks/{id}/meta.json`. There is no cross-scope fallback, and a
+TaskMeta whose `project_id` names a different project is rejected — an
+unrelated task that happens to share the id can never mix in. Tasks without
+a TaskMeta file (e.g. not yet delegated) are skipped; per-task read errors
+are skipped so one bad task never fails the whole response.
 
 Node statuses are normalized to a frontend-friendly enum:
 
@@ -202,7 +204,7 @@ Error responses:
 |:--|:--|
 | `400` | Missing project id or task id. |
 | `403` | Authenticated but the role cannot read projects at all (e.g. Worker). |
-| `404` | Project not found / caller does not own it (existence hidden) / task not in the project graph / task has no published artifact / requested path is not a declared artifact / artifact file missing / artifact path rejected. |
+| `404` | Project not found / caller does not own it (existence hidden) / task not in the project graph / task has no published artifact / requested path is not a declared artifact / artifact file missing / artifact path rejected / TaskMeta exists only outside the project's scope or belongs to another project. |
 | `500` | K8s or object-store failure. |
 
 ### `GET /api/v1/projects/{id}/spawns`
@@ -247,8 +249,13 @@ Response:
 Notes:
 
 - `root_session_id` is the normalized session key of the parent session
-  (`matrix:` prefix canonicalized). It is `null` on 2.0.1 workers (the
-  linkage feature is 2.1+); clients should degrade to a flat list.
+  (`matrix:` prefix canonicalized) — the session that called
+  `spawn_subagent`. The endpoint is **project-scoped, not team-scoped**: a
+  spawn is listed only when its root session is one of the project's rooms
+  (the project `source_room_id` or a graph task's `TaskMeta.room_id`). A
+  spawn rooted elsewhere — another project's room, or a legacy 2.0.1 spawn
+  without a persisted root — is **omitted**, never attached to every project
+  of the team.
 - A worker with a missing or unreadable `chats.json` is still listed, with
   an empty `spawns` array — one broken worker never 500s the whole project.
 - `subagent_allowed_tools` / `subagent_skills` are only present when the
@@ -339,6 +346,24 @@ Error responses:
 | `403` | Authenticated but the role cannot read projects at all (e.g. Worker). |
 | `404` | Project not found / caller does not own it (existence hidden) / session not owned by any team worker / `history.db` missing or unreadable. |
 | `500` | K8s or object-store failure. |
+
+## Project identity & disambiguation
+
+Project ids are only unique within a worker workspace upstream: two teams can
+hold the same project id. The API therefore treats `(team, project_id)` as
+the identity:
+
+- `GET /api/v1/projects` lists every distinct `(team, project_id)` — the same
+  id under two teams appears twice, disambiguated by `team_id` (a scoped
+  caller only sees the entries of their accessible teams).
+- The read endpoints (`workflow`, `tasks/{taskId}/artifact`, `spawns`,
+  `spawns/{sessionId}/messages`) accept an optional `?team=` query parameter
+  that narrows resolution to that team's storage prefix.
+- Without `?team=`, if the same project id exists under multiple teams the
+  endpoint returns `409 Conflict` (`project id is ambiguous across teams;
+  retry with ?team=`) instead of silently resolving to the first match.
+  Callers scoped to one of those teams (team leader / L2 human) resolve their
+  own team's project without ambiguity.
 
 ## Authentication & authorization
 

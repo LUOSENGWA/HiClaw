@@ -243,18 +243,41 @@ func metaKeyFromListResult(prefix, child string) (string, bool) {
 	return prefix + child + "meta.json", true
 }
 
+// projectMatch is one project id resolved at a specific storage prefix.
+type projectMatch struct {
+	meta *projectMeta
+	team string
+}
+
 // resolveProjectMeta locates and reads a project's meta.json across the given
-// prefixes. Returns the meta and the owning team ("" for global shared/
-// projects).
+// prefixes and returns ALL matches (deduplicated by owning team). Project ids
+// are only unique per worker workspace upstream, so two teams may hold the
+// same id; handlers turn 1 match into a resolved project and >1 matches into
+// a 409 asking for an explicit ?team= qualifier (never a silent first-match
+// that would hide one team's project).
+//
+// teamFilter narrows the scan to one team's prefix (the ?team= query param).
+// Scoped callers (team leader / L2 human) additionally see only matches for
+// teams they may access; a scoped caller whose team shares the id is served
+// their own team's project without ambiguity.
 //
 // prefixes must come from teamProjectPrefixes so callers that also need the
 // crToEffective map (e.g. for access checks) can share a single K8s List call
 // instead of paying two round-trips per request.
-func (h *ProjectHandler) resolveProjectMeta(ctx context.Context, projectID string, prefixes []string) (*projectMeta, string, error) {
+func (h *ProjectHandler) resolveProjectMeta(ctx context.Context, projectID string, prefixes []string, teamFilter string, caller *authpkg.CallerIdentity, crToEffective map[string]string) ([]projectMatch, error) {
+	var matches []projectMatch
+	seenTeam := map[string]bool{}
+	accessible := callerAccessiblePrefixes(caller, crToEffective)
 	for _, prefix := range prefixes {
+		if teamFilter != "" && teamFromPrefix(prefix) != teamFilter {
+			continue
+		}
+		if accessible != nil && !accessible[prefix] {
+			continue
+		}
 		children, err := h.oss.ListObjects(ctx, prefix)
 		if err != nil {
-			return nil, "", err
+			return nil, err
 		}
 		for _, child := range children {
 			key, ok := metaKeyFromListResult(prefix, child)
@@ -266,7 +289,7 @@ func (h *ProjectHandler) resolveProjectMeta(ctx context.Context, projectID strin
 				if errors.Is(err, os.ErrNotExist) {
 					continue // project dir exists but meta.json not yet written
 				}
-				return nil, "", err
+				return nil, err
 			}
 			var meta projectMeta
 			if err := json.Unmarshal(data, &meta); err != nil {
@@ -279,10 +302,33 @@ func (h *ProjectHandler) resolveProjectMeta(ctx context.Context, projectID strin
 			if meta.TeamID == "" {
 				meta.TeamID = team
 			}
-			return &meta, team, nil
+			// The same team may be reachable under both its CR name and its
+			// effective name (teamProjectPrefixes emits both); dedupe by the
+			// team recorded in the meta so one project never looks like two.
+			if seenTeam[meta.TeamID] {
+				continue
+			}
+			seenTeam[meta.TeamID] = true
+			matches = append(matches, projectMatch{meta: &meta, team: team})
 		}
 	}
-	return nil, "", nil
+	return matches, nil
+}
+
+// resolveSingleProject applies the 0/1/many resolution of resolveProjectMeta
+// and writes the corresponding error responses. Returns (meta, team, true)
+// when exactly one match was resolved.
+func (h *ProjectHandler) resolveSingleProject(w http.ResponseWriter, matches []projectMatch) (*projectMeta, string, bool) {
+	switch len(matches) {
+	case 0:
+		httputil.WriteError(w, http.StatusNotFound, "project not found")
+		return nil, "", false
+	case 1:
+		return matches[0].meta, matches[0].team, true
+	default:
+		httputil.WriteError(w, http.StatusConflict, "project id is ambiguous across teams; retry with ?team=")
+		return nil, "", false
+	}
 }
 
 // teamFromPrefix extracts the team name from a project prefix, or "" for the
@@ -454,14 +500,20 @@ func (h *ProjectHandler) ListProjects(w http.ResponseWriter, r *http.Request) {
 		if err := json.Unmarshal(res.data, &meta); err != nil {
 			continue // skip malformed meta instead of failing the whole list
 		}
-		if meta.ProjectID == "" || seen[meta.ProjectID] {
+		if meta.ProjectID == "" {
 			continue
 		}
-		seen[meta.ProjectID] = true
 		team := teamFromPrefix(res.prefix)
 		if meta.TeamID == "" {
 			meta.TeamID = team
 		}
+		// Project ids are only unique per worker workspace upstream; two teams
+		// may hold the same id. Dedupe by (team, project_id) so both appear
+		// (disambiguated by team_id) instead of one hiding the other.
+		if seen[meta.TeamID+"\x00"+meta.ProjectID] {
+			continue
+		}
+		seen[meta.TeamID+"\x00"+meta.ProjectID] = true
 		// Optional ?team= filter (mirrors ListWorkers). Team leaders are
 		// already scoped by their own prefix; standalone projects have an
 		// empty team and are only matched when no filter is set.
@@ -493,6 +545,7 @@ func (h *ProjectHandler) GetProjectWorkflow(w http.ResponseWriter, r *http.Reque
 	}
 	caller := authpkg.CallerFromContext(r.Context())
 	includeTasks := r.URL.Query().Get("includeTasks") == "true"
+	teamFilter := r.URL.Query().Get("team")
 
 	// Single K8s List for both meta resolution and the access check (O1).
 	prefixes, crToEffective, err := h.teamProjectPrefixes(r.Context())
@@ -500,13 +553,13 @@ func (h *ProjectHandler) GetProjectWorkflow(w http.ResponseWriter, r *http.Reque
 		writeK8sError(w, "get project workflow: resolve prefixes", err)
 		return
 	}
-	meta, team, err := h.resolveProjectMeta(r.Context(), projectID, prefixes)
+	matches, err := h.resolveProjectMeta(r.Context(), projectID, prefixes, teamFilter, caller, crToEffective)
 	if err != nil {
 		writeK8sError(w, "get project workflow", err)
 		return
 	}
-	if meta == nil {
-		httputil.WriteError(w, http.StatusNotFound, "project not found")
+	meta, team, ok := h.resolveSingleProject(w, matches)
+	if !ok {
 		return
 	}
 	// W4: hide project existence from scoped callers (L2 / team leader) who
@@ -740,6 +793,11 @@ func (h *ProjectHandler) readTasksDetail(meta *projectMeta, team string) []taskD
 		if err := json.Unmarshal(res.data, &raw); err != nil {
 			continue // malformed TaskMeta; keep node summary only
 		}
+		// Ownership check: a TaskMeta that declares a different project_id is
+		// another project's task that shares this id — never mix it in.
+		if pid := str(raw["project_id"]); pid != "" && pid != meta.ProjectID {
+			continue
+		}
 		detail := taskDetail{
 			TaskID:       str(taskIDFromRaw(raw, res.taskID)),
 			Status:       str(raw["status"]),
@@ -804,6 +862,7 @@ func (h *ProjectHandler) GetTaskArtifact(w http.ResponseWriter, r *http.Request)
 	}
 	caller := authpkg.CallerFromContext(r.Context())
 	requestedPath := r.URL.Query().Get("path")
+	teamFilter := r.URL.Query().Get("team")
 
 	// Single K8s List for both meta resolution and the access check (O1
 	// pattern). Reuse the same dual-prefix layout as GetProjectWorkflow.
@@ -812,13 +871,13 @@ func (h *ProjectHandler) GetTaskArtifact(w http.ResponseWriter, r *http.Request)
 		writeK8sError(w, "get task artifact: resolve prefixes", err)
 		return
 	}
-	meta, team, err := h.resolveProjectMeta(r.Context(), projectID, prefixes)
+	matches, err := h.resolveProjectMeta(r.Context(), projectID, prefixes, teamFilter, caller, crToEffective)
 	if err != nil {
 		writeK8sError(w, "get task artifact", err)
 		return
 	}
-	if meta == nil {
-		httputil.WriteError(w, http.StatusNotFound, "project not found")
+	meta, team, ok := h.resolveSingleProject(w, matches)
+	if !ok {
 		return
 	}
 	// W4: hide project existence from scoped callers who do not own this
@@ -870,6 +929,11 @@ func (h *ProjectHandler) GetTaskArtifact(w http.ResponseWriter, r *http.Request)
 		var raw map[string]any
 		if err := json.Unmarshal(data, &raw); err != nil {
 			continue // malformed TaskMeta; keep scanning other prefixes
+		}
+		// Ownership check: TaskMeta declaring another project must not serve
+		// artifacts under this project's id.
+		if pid := str(raw["project_id"]); pid != "" && pid != projectID {
+			continue
 		}
 		resultPath = str(raw["result_path"])
 		specPath = str(raw["spec_path"])
@@ -992,13 +1056,17 @@ func errStr(err error) string {
 
 // taskMetaKeys returns the candidate TaskMeta keys for a task in the given
 // team ("" for global), team-scoped prefix first. Mirrors readTasksDetail.
+// taskMetaKeys returns the TaskMeta object keys for a task under the project's
+// owning scope. Team-scoped projects read ONLY their team prefix; standalone
+// projects read ONLY the global prefix. There is deliberately no cross-scope
+// fallback: a team project must never mix in an unrelated global task that
+// happens to share the task id (reviewer feedback — ownership must be
+// verified, not guessed across scopes).
 func taskMetaKeys(taskID, team string) []string {
-	keys := make([]string, 0, 2)
 	if team != "" {
-		keys = append(keys, "teams/"+team+"/shared/tasks/"+taskID+"/meta.json")
+		return []string{"teams/" + team + "/shared/tasks/" + taskID + "/meta.json"}
 	}
-	keys = append(keys, "shared/tasks/"+taskID+"/meta.json")
-	return keys
+	return []string{"shared/tasks/" + taskID + "/meta.json"}
 }
 
 // contentTypeFor maps a file extension to a Content-Type for artifact
@@ -1228,13 +1296,68 @@ func (h *ProjectHandler) teamWorkerNames(ctx context.Context, team string) []str
 	return out
 }
 
+// collectProjectRooms derives the set of session/room ids that belong to
+// this project: the project's source_room_id plus every graph task's
+// TaskMeta.room_id. Spawn association is derived through this set — a spawn's
+// persisted root_session_id (QwenPaw 2.1+) is the session that called
+// spawn_subagent, i.e. one of these rooms. Reads are best-effort: an
+// unreadable TaskMeta just contributes nothing, never a 500.
+func (h *ProjectHandler) collectProjectRooms(ctx context.Context, meta *projectMeta, team string) map[string]bool {
+	rooms := map[string]bool{}
+	if r := normalizeSessionKey(meta.SourceRoomID); r != "" {
+		rooms[r] = true
+	}
+	graphTasks := meta.Tasks
+	if meta.PlanType == "loop" && meta.Loop != nil {
+		graphTasks = meta.Loop.Tasks
+	}
+	seen := map[string]bool{}
+	for _, t := range graphTasks {
+		if t.TaskID == "" || seen[t.TaskID] {
+			continue
+		}
+		seen[t.TaskID] = true
+		for _, key := range taskMetaKeys(t.TaskID, team) {
+			data, err := h.oss.GetObject(ctx, key)
+			if err != nil {
+				continue
+			}
+			var raw map[string]any
+			if err := json.Unmarshal(data, &raw); err != nil {
+				continue
+			}
+			if pid := str(raw["project_id"]); pid != "" && pid != meta.ProjectID {
+				continue // another project's task sharing this id
+			}
+			if r := normalizeSessionKey(str(raw["room_id"])); r != "" {
+				rooms[r] = true
+			}
+			break
+		}
+	}
+	return rooms
+}
+
+// spawnBelongsToProject reports whether a spawn chat belongs to the project's
+// room set. A spawn without a persisted root_session_id (2.0.1 legacy) cannot
+// be associated safely and is omitted; a root outside the project's rooms is
+// another project's activity (same team, different project) and is omitted
+// too. Reviewer feedback: never attach a spawn to every project of its team.
+func spawnBelongsToProject(c workerChat, rooms map[string]bool) bool {
+	root := spawnRootSession(c)
+	if root == nil {
+		return false
+	}
+	return rooms[*root]
+}
+
 // workerChatsPath is the workspace-relative path of a worker's chats.json.
 // The worker FileSync mirrors its workspace (including .qwenpaw/workspaces/
 // default/chats.json — not in the background-push exclusion list) under
 // agents/{worker}/.
 const workerChatsPath = ".qwenpaw/workspaces/default/chats.json"
 
-func (h *ProjectHandler) readWorkerSpawns(ctx context.Context, worker string) []spawnInfo {
+func (h *ProjectHandler) readWorkerSpawns(ctx context.Context, worker string, rooms map[string]bool) []spawnInfo {
 	out := make([]spawnInfo, 0)
 	data, err := h.oss.GetObject(ctx, "agents/"+worker+"/"+workerChatsPath)
 	if err != nil {
@@ -1247,6 +1370,9 @@ func (h *ProjectHandler) readWorkerSpawns(ctx context.Context, worker string) []
 	for _, c := range file.Chats {
 		if !isSpawnChat(c) {
 			continue
+		}
+		if !spawnBelongsToProject(c, rooms) {
+			continue // unassociated (legacy) or another project's spawn
 		}
 		out = append(out, spawnInfo{
 			SessionID:     c.SessionID,
@@ -1273,19 +1399,20 @@ func (h *ProjectHandler) GetProjectSpawns(w http.ResponseWriter, r *http.Request
 		return
 	}
 	caller := authpkg.CallerFromContext(r.Context())
+	teamFilter := r.URL.Query().Get("team")
 
 	prefixes, crToEffective, err := h.teamProjectPrefixes(r.Context())
 	if err != nil {
 		writeK8sError(w, "get project spawns: resolve prefixes", err)
 		return
 	}
-	meta, team, err := h.resolveProjectMeta(r.Context(), projectID, prefixes)
+	matches, err := h.resolveProjectMeta(r.Context(), projectID, prefixes, teamFilter, caller, crToEffective)
 	if err != nil {
 		writeK8sError(w, "get project spawns", err)
 		return
 	}
-	if meta == nil {
-		httputil.WriteError(w, http.StatusNotFound, "project not found")
+	meta, team, ok := h.resolveSingleProject(w, matches)
+	if !ok {
 		return
 	}
 	// W4: hide existence from scoped callers who do not own this project.
@@ -1298,12 +1425,13 @@ func (h *ProjectHandler) GetProjectSpawns(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	rooms := h.collectProjectRooms(r.Context(), meta, team)
 	workers := h.teamWorkerNames(r.Context(), team)
 	resp := projectSpawnsResponse{ProjectID: projectID, Workers: make([]workerSpawns, 0, len(workers))}
 	for _, worker := range workers {
 		resp.Workers = append(resp.Workers, workerSpawns{
 			Worker: worker,
-			Spawns: h.readWorkerSpawns(r.Context(), worker),
+			Spawns: h.readWorkerSpawns(r.Context(), worker, rooms),
 		})
 	}
 	httputil.WriteJSON(w, http.StatusOK, resp)
@@ -1361,7 +1489,7 @@ type spawnMessagesResponse struct {
 // on both sides so bare room ids and channel-prefixed keys compare reliably;
 // the raw value is kept for the SQL lookup because history.db stores the
 // original key.
-func (h *ProjectHandler) findSpawnWorker(ctx context.Context, workers []string, sessionID string) (string, string) {
+func (h *ProjectHandler) findSpawnWorker(ctx context.Context, workers []string, sessionID string) (string, string, *string) {
 	for _, worker := range workers {
 		data, err := h.oss.GetObject(ctx, "agents/"+worker+"/"+workerChatsPath)
 		if err != nil {
@@ -1376,11 +1504,11 @@ func (h *ProjectHandler) findSpawnWorker(ctx context.Context, workers []string, 
 				continue
 			}
 			if normalizeSessionKey(c.SessionID) == sessionID {
-				return worker, c.SessionID
+				return worker, c.SessionID, spawnRootSession(c)
 			}
 		}
 	}
-	return "", ""
+	return "", "", nil
 }
 
 // openReadOnlySQLite opens a SQLite database read-only, falling back to
@@ -1489,19 +1617,20 @@ func (h *ProjectHandler) GetProjectSpawnMessages(w http.ResponseWriter, r *http.
 		return
 	}
 	caller := authpkg.CallerFromContext(r.Context())
+	teamFilter := r.URL.Query().Get("team")
 
 	prefixes, crToEffective, err := h.teamProjectPrefixes(r.Context())
 	if err != nil {
 		writeK8sError(w, "get spawn messages: resolve prefixes", err)
 		return
 	}
-	meta, team, err := h.resolveProjectMeta(r.Context(), projectID, prefixes)
+	matches, err := h.resolveProjectMeta(r.Context(), projectID, prefixes, teamFilter, caller, crToEffective)
 	if err != nil {
 		writeK8sError(w, "get spawn messages", err)
 		return
 	}
-	if meta == nil {
-		httputil.WriteError(w, http.StatusNotFound, "project not found")
+	meta, team, ok := h.resolveSingleProject(w, matches)
+	if !ok {
 		return
 	}
 	// W4: hide existence from scoped callers who do not own this project.
@@ -1524,8 +1653,20 @@ func (h *ProjectHandler) GetProjectSpawnMessages(w http.ResponseWriter, r *http.
 		}
 	}
 
-	worker, rawSessionID := h.findSpawnWorker(r.Context(), h.teamWorkerNames(r.Context(), team), sessionID)
+	worker, rawSessionID, root := h.findSpawnWorker(r.Context(), h.teamWorkerNames(r.Context(), team), sessionID)
 	if worker == "" {
+		httputil.WriteError(w, http.StatusNotFound, "spawn session not found")
+		return
+	}
+	// Project scoping: the spawn must belong to this project (root session in
+	// the project's room set). Legacy spawns without a root and other
+	// projects' spawns are hidden as 404.
+	rooms := h.collectProjectRooms(r.Context(), meta, team)
+	spawnChat := workerChat{Meta: map[string]any{}}
+	if root != nil {
+		spawnChat.Meta["root_session_id"] = *root
+	}
+	if !spawnBelongsToProject(spawnChat, rooms) {
 		httputil.WriteError(w, http.StatusNotFound, "spawn session not found")
 		return
 	}

@@ -1293,7 +1293,9 @@ func TestListProjects_ConcurrentFetch(t *testing.T) {
 			"project_id": id, "title": "CP " + id, "status": "active", "plan_type": "dag",
 		})
 	}
-	// One duplicate across prefixes should be deduplicated.
+	// Same project id on a team prefix: NOT deduplicated away — project ids
+	// are only unique per workspace upstream, so (team, project_id) is the
+	// identity and both must appear (reviewer feedback).
 	putProject(store, "teams/alpha-team/shared/projects/cp01/meta.json", map[string]any{
 		"project_id": "cp01", "title": "CP cp01", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
 	})
@@ -1314,8 +1316,18 @@ func TestListProjects_ConcurrentFetch(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp.Total != 20 {
-		t.Fatalf("total=%d, want 20 (20 unique projects, 1 deduped)", resp.Total)
+	if resp.Total != 21 {
+		t.Fatalf("total=%d, want 21 (20 global + 1 team-scoped cp01)", resp.Total)
+	}
+	// Both cp01 entries appear, disambiguated by team_id.
+	cp01Teams := map[string]bool{}
+	for _, p := range resp.Projects {
+		if id, _ := p["project_id"].(string); id == "cp01" {
+			cp01Teams[str(p["team_id"])] = true
+		}
+	}
+	if len(cp01Teams) != 2 || !cp01Teams[""] || !cp01Teams["alpha-team"] {
+		t.Fatalf("cp01 team_ids=%v, want both '' and alpha-team", cp01Teams)
 	}
 	// Deterministic ordering preserved.
 	last := ""
@@ -2014,6 +2026,20 @@ func putChats(store *ossfake.Memory, worker string, chats []map[string]any) {
 	_ = store.PutObject(context.Background(), "agents/"+worker+"/"+workerChatsPath, data)
 }
 
+// putTaskMeta writes a TaskMeta object for a task owned by the given team
+// ("" writes the global shared/tasks/ prefix).
+func putTaskMeta(store *ossfake.Memory, team, taskID string, fields map[string]any) {
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	data, _ := json.Marshal(fields)
+	prefix := "shared/tasks/"
+	if team != "" {
+		prefix = "teams/" + team + "/shared/tasks/"
+	}
+	_ = store.PutObject(context.Background(), prefix+taskID+"/meta.json", data)
+}
+
 func spawnChat(sessionID string, meta map[string]any) map[string]any {
 	chat := map[string]any{
 		"id":         "c-" + sessionID,
@@ -2050,6 +2076,14 @@ func TestGetProjectSpawns_AggregatesWorkerSpawns(t *testing.T) {
 	store := ossfake.NewMemory()
 	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
 		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "in_progress"},
+		},
+	})
+	// The project's task room ties spawns to this project (root_session_id
+	// is the session that called spawn_subagent).
+	putTaskMeta(store, "alpha-team", "t1", map[string]any{
+		"project_id": "p1", "room_id": "!room:server", "status": "in_progress",
 	})
 	// 2.1-style data: meta.spawn + meta.root_session_id persisted.
 	putChats(store, "alpha-lead", []map[string]any{
@@ -2118,13 +2152,21 @@ func TestGetProjectSpawns_AggregatesWorkerSpawns(t *testing.T) {
 	}
 }
 
-func TestGetProjectSpawns_LegacyWorkerNullRootSession(t *testing.T) {
+func TestGetProjectSpawns_LegacySpawnOmitted(t *testing.T) {
 	store := ossfake.NewMemory()
 	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
 		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Task 1", "status": "in_progress"},
+		},
+	})
+	putTaskMeta(store, "alpha-team", "t1", map[string]any{
+		"project_id": "p1", "room_id": "!room:server", "status": "in_progress",
 	})
 	// 2.0.1-style data: no meta.spawn, no root_session_id — only the sub-
-	// prefix identifies the spawn session.
+	// prefix identifies the spawn session. Without a root it cannot be
+	// associated with any project safely, so it is omitted (reviewer
+	// feedback: legacy data must not be attached to every project).
 	putChats(store, "alpha-lead", []map[string]any{
 		{"id": "c1", "session_id": "sub-legacy01", "channel": "console", "status": "idle"},
 	})
@@ -2143,15 +2185,8 @@ func TestGetProjectSpawns_LegacyWorkerNullRootSession(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
-	if len(resp.Workers) != 1 || len(resp.Workers[0].Spawns) != 1 {
-		t.Fatalf("workers=%+v, want 1 worker with 1 spawn", resp.Workers)
-	}
-	s := resp.Workers[0].Spawns[0]
-	if s.RootSessionID != nil {
-		t.Fatalf("root_session_id=%v, want null on legacy 2.0.1 data", *s.RootSessionID)
-	}
-	if s.Spawn != true {
-		t.Fatalf("spawn=%v, want true (sub- prefix detection)", s.Spawn)
+	if len(resp.Workers) != 1 || len(resp.Workers[0].Spawns) != 0 {
+		t.Fatalf("workers=%+v, want 1 worker with 0 spawns (legacy omitted)", resp.Workers)
 	}
 }
 
@@ -2241,6 +2276,202 @@ func TestGetProjectSpawns_CrossTeamDenied(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status=%d, want 404 for cross-team access (W4)", rec.Code)
+	}
+}
+
+func TestGetProjectSpawns_TwoProjectsSameTeamIsolated(t *testing.T) {
+	store := ossfake.NewMemory()
+	// Two projects on the same team, each with its own task room.
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+		"tasks": []map[string]any{{"task_id": "t1", "status": "in_progress"}},
+	})
+	putProject(store, "teams/alpha-team/shared/projects/p2/meta.json", map[string]any{
+		"project_id": "p2", "title": "Beta", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+		"tasks": []map[string]any{{"task_id": "t2", "status": "in_progress"}},
+	})
+	putTaskMeta(store, "alpha-team", "t1", map[string]any{"project_id": "p1", "room_id": "!room-p1:server"})
+	putTaskMeta(store, "alpha-team", "t2", map[string]any{"project_id": "p2", "room_id": "!room-p2:server"})
+	putChats(store, "alpha-lead", []map[string]any{
+		spawnChat("sub-p1a", map[string]any{"spawn": true, "root_session_id": "matrix:!room-p1:server"}),
+		spawnChat("sub-p2a", map[string]any{"spawn": true, "root_session_id": "matrix:!room-p2:server"}),
+		spawnChat("sub-other", map[string]any{"spawn": true, "root_session_id": "matrix:!other-room:server"}),
+	})
+	teamCR := teamWithWorkers("alpha-team", v1beta1.TeamWorkerRef{Name: "alpha-lead-cr", Role: "team_leader"})
+	h := newSpawnTestHandler(t, store, teamCR, workerCR("alpha-lead-cr", "alpha-lead"))
+
+	// p1 sees only its own room's spawn.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/spawns", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "luo", Teams: []string{"alpha-team"}})
+	rec := httptest.NewRecorder()
+	h.GetProjectSpawns(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("p1 status=%d, want 200", rec.Code)
+	}
+	var r1 projectSpawnsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &r1); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(r1.Workers) != 1 || len(r1.Workers[0].Spawns) != 1 {
+		t.Fatalf("p1 spawns=%+v, want exactly sub-p1a", r1.Workers)
+	}
+	if r1.Workers[0].Spawns[0].SessionID != "sub-p1a" {
+		t.Fatalf("p1 spawn=%q, want sub-p1a", r1.Workers[0].Spawns[0].SessionID)
+	}
+
+	// p2 sees only its own room's spawn.
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p2/spawns", nil)
+	req2.SetPathValue("id", "p2")
+	req2 = withCaller(req2, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "luo", Teams: []string{"alpha-team"}})
+	rec2 := httptest.NewRecorder()
+	h.GetProjectSpawns(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("p2 status=%d, want 200", rec2.Code)
+	}
+	var r2 projectSpawnsResponse
+	if err := json.Unmarshal(rec2.Body.Bytes(), &r2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(r2.Workers) != 1 || len(r2.Workers[0].Spawns) != 1 {
+		t.Fatalf("p2 spawns=%+v, want exactly sub-p2a", r2.Workers)
+	}
+	if r2.Workers[0].Spawns[0].SessionID != "sub-p2a" {
+		t.Fatalf("p2 spawn=%q, want sub-p2a", r2.Workers[0].Spawns[0].SessionID)
+	}
+}
+
+func TestGetProjectSpawns_SpawnRootMismatchOmitted(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+		"tasks": []map[string]any{{"task_id": "t1", "status": "in_progress"}},
+	})
+	putTaskMeta(store, "alpha-team", "t1", map[string]any{"project_id": "p1", "room_id": "!room:server"})
+	// A spawn whose root belongs to a different room (e.g. another project
+	// or a team-wide session) must not attach to this project.
+	putChats(store, "alpha-lead", []map[string]any{
+		spawnChat("sub-x", map[string]any{"spawn": true, "root_session_id": "matrix:!elsewhere:server"}),
+	})
+	teamCR := teamWithWorkers("alpha-team", v1beta1.TeamWorkerRef{Name: "alpha-lead-cr", Role: "team_leader"})
+	h := newSpawnTestHandler(t, store, teamCR, workerCR("alpha-lead-cr", "alpha-lead"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/spawns", nil)
+	req.SetPathValue("id", "p1")
+	rec := httptest.NewRecorder()
+	h.GetProjectSpawns(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	var resp projectSpawnsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Workers) != 1 || len(resp.Workers[0].Spawns) != 0 {
+		t.Fatalf("spawns=%+v, want 0 (root mismatch omitted)", resp.Workers)
+	}
+}
+
+func TestGetProjectWorkflow_AmbiguousProjectID(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	putProject(store, "teams/beta-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Beta", "status": "active", "plan_type": "dag", "team_id": "beta-team",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"), team("beta-team"))
+
+	// No ?team=: two teams hold p1 → 409 (never a silent first match).
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (ambiguous)", rec.Code)
+	}
+
+	// ?team=alpha-team disambiguates.
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow?team=alpha-team", nil)
+	req2.SetPathValue("id", "p1")
+	req2 = withCaller(req2, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec2 := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 with ?team=alpha-team", rec2.Code)
+	}
+
+	// A scoped caller sees only their own team's p1 — no ambiguity.
+	req3 := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow", nil)
+	req3.SetPathValue("id", "p1")
+	req3 = withCaller(req3, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "luo", Teams: []string{"alpha-team"}})
+	rec3 := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("scoped status=%d, want 200 (own team's p1)", rec3.Code)
+	}
+}
+
+func TestTaskDetail_SkipsGlobalFallback(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+		"tasks": []map[string]any{{"task_id": "t1", "status": "in_progress"}},
+	})
+	// The team owns t1; the global prefix holds an unrelated t1 from another
+	// project. The team project must read its own TaskMeta only — the global
+	// one (different project_id, different status) must never mix in.
+	putTaskMeta(store, "alpha-team", "t1", map[string]any{
+		"project_id": "p1", "status": "in_progress", "summary": "team-owned",
+	})
+	putTaskMeta(store, "", "t1", map[string]any{
+		"project_id": "other-project", "status": "completed", "summary": "global-intruder",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow?includeTasks=true", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "team-owned") {
+		t.Fatalf("body=%s, want team-owned task detail", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "global-intruder") {
+		t.Fatalf("body=%s, must not contain the global intruder task", rec.Body.String())
+	}
+}
+
+func TestTaskArtifact_TeamProjectNoGlobalFallback(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+		"tasks": []map[string]any{{"task_id": "t1", "status": "in_progress"}},
+	})
+	// TaskMeta + artifact exist ONLY on the global prefix (e.g. another
+	// project's task sharing the id). A team project must not fall back to
+	// global: artifact read fails 404.
+	putTaskMeta(store, "", "t1", map[string]any{
+		"project_id": "other-project", "status": "completed", "result_path": "shared/tasks/t1/result.md",
+	})
+	_ = store.PutObject(context.Background(), "shared/tasks/t1/result.md", []byte("intruder result"))
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact", nil)
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetTaskArtifact(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (no global fallback for team projects)", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "intruder") {
+		t.Fatalf("body=%s, must not serve the global intruder artifact", rec.Body.String())
 	}
 }
 
@@ -2368,9 +2599,13 @@ func spawnMsgEnv(t *testing.T, history []byte) (*ProjectHandler, *ossfake.Memory
 	store := ossfake.NewMemory()
 	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
 		"project_id": "p1", "title": "Alpha", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+		"tasks": []map[string]any{{"task_id": "t1", "status": "in_progress"}},
+	})
+	putTaskMeta(store, "alpha-team", "t1", map[string]any{
+		"project_id": "p1", "room_id": "!room:server", "status": "in_progress",
 	})
 	putChats(store, "alpha-lead", []map[string]any{
-		spawnChat("sub-3f2a9b1c", map[string]any{"spawn": true}),
+		spawnChat("sub-3f2a9b1c", map[string]any{"spawn": true, "root_session_id": "matrix:!room:server"}),
 	})
 	if history != nil {
 		putHistory(store, "alpha-lead", history)
@@ -2518,6 +2753,27 @@ func TestGetProjectSpawnMessages_EmptySession(t *testing.T) {
 	}
 	if resp.Task != "" || resp.HasMore {
 		t.Fatalf("task=%q has_more=%v, want empty/false", resp.Task, resp.HasMore)
+	}
+}
+
+func TestGetProjectSpawnMessages_SpawnNotInProject404(t *testing.T) {
+	h, store := spawnMsgEnv(t, makeHistoryDBBytes(t, []historyRow{
+		{kind: "context_msg", role: "user", content: "task", sessionID: "sub-3f2a9b1c"},
+	}))
+	// A second spawn owned by the same worker but rooted in a room that does
+	// not belong to this project: hidden as 404.
+	putChats(store, "alpha-lead", []map[string]any{
+		spawnChat("sub-3f2a9b1c", map[string]any{"spawn": true, "root_session_id": "matrix:!room:server"}),
+		spawnChat("sub-other", map[string]any{"spawn": true, "root_session_id": "matrix:!elsewhere:server"}),
+	})
+	rec := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/spawns/sub-other/messages", nil)
+	rec.SetPathValue("id", "p1")
+	rec.SetPathValue("sessionId", "sub-other")
+	rec = withCaller(rec, humanCaller())
+	w := httptest.NewRecorder()
+	h.GetProjectSpawnMessages(w, rec)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (spawn not in project rooms)", w.Code)
 	}
 }
 
