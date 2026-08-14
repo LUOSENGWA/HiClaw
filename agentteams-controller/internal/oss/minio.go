@@ -32,6 +32,9 @@ type MinIOClient struct {
 	config     Config
 	credSource CredentialSource
 	aliasReady bool
+	// sdkPutIfMatch overrides the SDK conditional write for tests; nil uses
+	// the real minio-go path.
+	sdkPutIfMatch func(ctx context.Context, key string, data []byte, matchETag string) error
 }
 
 // NewMinIOClient creates a StorageClient backed by the mc CLI.
@@ -82,6 +85,55 @@ func (c *MinIOClient) fullPath(key string) string {
 // Controller's read and its write makes the ETag change and the write fails
 // with ErrPreconditionFailed instead of silently overwriting.
 func (c *MinIOClient) PutObjectIfMatch(ctx context.Context, key string, data []byte, matchETag string) error {
+	put := c.sdkPutIfMatch
+	if put == nil {
+		put = c.sdkPutObjectIfMatch
+	}
+	err := put(ctx, key, data, matchETag)
+	if err == nil {
+		return nil
+	}
+
+	// MinIO rejects an If-Match mismatch with a precondition-failed
+	// response; the SDK surfaces it as an ErrorResponse with that code.
+	var resp minio.ErrorResponse
+	if errors.As(err, &resp) && (resp.Code == "PreconditionFailed" || resp.Code == "412") {
+		return ErrPreconditionFailed
+	}
+
+	// Provider fallback: Alibaba Cloud OSS does not support If-Match on
+	// PutObject (returns NotImplemented). Availability beats eliminating the
+	// tiny compare-to-put race there: re-check the read-bound ETag against
+	// the current object and, if unchanged, do a plain PutObject. An
+	// observed conflict is still rejected; only the narrow compare-to-put
+	// window is accepted on OSS.
+	if errors.As(err, &resp) && (resp.Code == "NotImplemented" || resp.Code == "501") {
+		return ossFallbackWrite(ctx, key, data, matchETag, c.StatMeta, c.PutObject)
+	}
+	return err
+}
+
+// ossFallbackWrite is the OSS degradation for providers without If-Match
+// (Alibaba Cloud OSS returns NotImplemented). It re-checks the read-bound
+// ETag immediately before a plain PutObject: an observed conflict is
+// rejected; only the narrow compare-to-put race is accepted. Extracted as a
+// pure function so the contract is testable without a live backend.
+func ossFallbackWrite(ctx context.Context, key string, data []byte, matchETag string,
+	stat func(context.Context, string) (ObjectMeta, error),
+	put func(context.Context, string, []byte) error) error {
+	cur, err := stat(ctx, key)
+	if err != nil {
+		return err
+	}
+	if cur.ETag != matchETag {
+		return ErrPreconditionFailed
+	}
+	return put(ctx, key, data)
+}
+
+// sdkPutObjectIfMatch is the MinIO SDK conditional write. It is a separate
+// function so tests can swap the transport via sdkPutIfMatch.
+func (c *MinIOClient) sdkPutObjectIfMatch(ctx context.Context, key string, data []byte, matchETag string) error {
 	sdk, err := c.sdkClient()
 	if err != nil {
 		return err
@@ -90,16 +142,7 @@ func (c *MinIOClient) PutObjectIfMatch(ctx context.Context, key string, data []b
 	opts := minio.PutObjectOptions{ContentType: "application/json"}
 	opts.SetMatchETag(matchETag)
 	_, err = sdk.PutObject(ctx, c.config.Bucket, strings.TrimPrefix(key, "/"), reader, int64(len(data)), opts)
-	if err != nil {
-		// MinIO rejects an If-Match mismatch with a precondition-failed
-		// response; the SDK surfaces it as an ErrorResponse with that code.
-		var resp minio.ErrorResponse
-		if errors.As(err, &resp) && (resp.Code == "PreconditionFailed" || resp.Code == "412") {
-			return ErrPreconditionFailed
-		}
-		return err
-	}
-	return nil
+	return err
 }
 
 // sdkClient lazily builds a minio-go client for conditional writes. The
@@ -118,11 +161,16 @@ func (c *MinIOClient) sdkClient() (*minio.Client, error) {
 
 	// Dynamic STS credentials win over the static pair (external OSS /
 	// refreshable tokens); the static pair is the embedded-MinIO default.
+	// A credential-resolution failure is returned, never silently replaced
+	// by the static pair (which would be the wrong identity for STS-based
+	// deployments).
 	accessKey, secretKey, token := c.config.AccessKey, c.config.SecretKey, ""
 	if c.credSource != nil {
-		if creds, err := c.credSource.Resolve(context.Background()); err == nil {
-			accessKey, secretKey, token = creds.AccessKeyID, creds.AccessKeySecret, creds.SecurityToken
+		creds, err := c.credSource.Resolve(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("resolve dynamic oss credentials: %w", err)
 		}
+		accessKey, secretKey, token = creds.AccessKeyID, creds.AccessKeySecret, creds.SecurityToken
 	}
 
 	return minio.New(endpoint, &minio.Options{
