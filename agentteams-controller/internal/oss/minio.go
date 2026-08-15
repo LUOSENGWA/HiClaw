@@ -125,10 +125,18 @@ func ossFallbackWrite(ctx context.Context, key string, data []byte, matchETag st
 	if err != nil {
 		return err
 	}
-	if cur.ETag != matchETag {
+	if canonicalizeETag(cur.ETag) != matchETag {
 		return ErrPreconditionFailed
 	}
 	return put(ctx, key, data)
+}
+
+// canonicalizeETag normalizes a provider ETag for comparison: S3-style
+// quotes are stripped and hex is lowercased. OSS commonly returns uppercase
+// and/or quoted MD5 ETags while our read-bound ETag is a lowercase hex MD5,
+// so a verbatim comparison would deterministically reject unchanged content.
+func canonicalizeETag(etag string) string {
+	return strings.ToLower(strings.Trim(etag, "\""))
 }
 
 // sdkPutObjectIfMatch is the MinIO SDK conditional write. It is a separate

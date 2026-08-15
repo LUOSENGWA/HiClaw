@@ -137,6 +137,75 @@ func TestOSSFallback_MatchingEtagPlainPut(t *testing.T) {
 	}
 }
 
+func TestOSSFallback_UppercaseQuotedMD5Matches(t *testing.T) {
+	// OSS commonly returns the object MD5 ETag uppercase and quoted
+	// ("A1B2..."); the read-bound matchETag is lowercase hex. The fallback
+	// must canonicalize both sides so unchanged content is accepted.
+	putCalls := 0
+	err := ossFallbackWrite(
+		t.Context(), "projects/p1/meta.json", []byte("new"),
+		"a1b2c3d4e5f60718293a4b5c6d7e8f90",
+		func(_ context.Context, key string) (ObjectMeta, error) {
+			return ObjectMeta{ETag: "\"A1B2C3D4E5F60718293A4B5C6D7E8F90\""}, nil
+		},
+		func(_ context.Context, key string, data []byte) error {
+			putCalls++
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("err=%v, want nil (quoted uppercase MD5 must match)", err)
+	}
+	if putCalls != 1 {
+		t.Fatalf("putCalls=%d, want 1", putCalls)
+	}
+}
+
+func TestOSSFallback_UppercaseUnquotedMD5Matches(t *testing.T) {
+	// Same as above without the S3-style quotes.
+	putCalls := 0
+	err := ossFallbackWrite(
+		t.Context(), "projects/p1/meta.json", []byte("new"),
+		"a1b2c3d4e5f60718293a4b5c6d7e8f90",
+		func(_ context.Context, key string) (ObjectMeta, error) {
+			return ObjectMeta{ETag: "A1B2C3D4E5F60718293A4B5C6D7E8F90"}, nil
+		},
+		func(_ context.Context, key string, data []byte) error {
+			putCalls++
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("err=%v, want nil (uppercase MD5 must match)", err)
+	}
+	if putCalls != 1 {
+		t.Fatalf("putCalls=%d, want 1", putCalls)
+	}
+}
+
+func TestOSSFallback_ChangedMD5Rejected(t *testing.T) {
+	// A genuinely different MD5 (not just formatting) must still reject,
+	// even when both sides canonicalize to the same case.
+	putCalls := 0
+	err := ossFallbackWrite(
+		t.Context(), "projects/p1/meta.json", []byte("new"),
+		"a1b2c3d4e5f60718293a4b5c6d7e8f90",
+		func(_ context.Context, key string) (ObjectMeta, error) {
+			return ObjectMeta{ETag: "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"}, nil
+		},
+		func(_ context.Context, key string, data []byte) error {
+			putCalls++
+			return nil
+		},
+	)
+	if !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("err=%v, want ErrPreconditionFailed", err)
+	}
+	if putCalls != 0 {
+		t.Fatalf("putCalls=%d, want 0 (changed content must not write)", putCalls)
+	}
+}
+
 func TestOSSFallback_StatFailurePropagates(t *testing.T) {
 	// If the pre-write re-check cannot establish the current ETag, fail
 	// closed — never write blindly.
