@@ -15,10 +15,12 @@ package server
 // the shared docker network. The effective container name prefix comes from
 // configuration (AGENTTEAMS_PROXY_CONTAINER_PREFIX, or derived from
 // AGENTTEAMS_RESOURCE_PREFIX when auto-prefixing is enabled; empty when
-// auto-prefixing is disabled), and the port from the worker's
-// AGENTTEAMS_CONSOLE_PORT env (default 8088). In kube mode there is no
-// stable in-cluster DNS name for the worker pod, so the endpoints return
-// 503.
+// auto-prefixing is disabled), and the port is the effective console port
+// resolved through the same system-wins env chain used at container
+// creation (service.EffectiveWorkerConsolePort — a conflicting spec.env
+// value is discarded, so the container always listens on 8088). In kube
+// mode there is no stable in-cluster DNS name for the worker pod, so the
+// endpoints return 503.
 //
 // Fixed-path forwarding only (graph / status, plus the whitelisted limit
 // query on graph) — never a generic reverse proxy, so the attack surface is
@@ -30,24 +32,17 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
-	"strings"
 	"time"
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/httputil"
+	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/service"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
-	// defaultCheckpointWorkerPort is the qwenpaw app fallback port inside the
-	// worker container (the worker env default is AGENTTEAMS_CONSOLE_PORT=8088;
-	// a worker may override it via spec.env, which is resolved per request).
-	defaultCheckpointWorkerPort = 8088
-	// checkpointConsolePortEnv is the worker env key that overrides the qwenpaw
-	// app port (same key the docker backend reads when publishing the port).
-	checkpointConsolePortEnv = "AGENTTEAMS_CONSOLE_PORT"
 	// checkpointProxyTimeout bounds each upstream call.
 	checkpointProxyTimeout = 5 * time.Second
 )
@@ -95,17 +90,15 @@ func NewCheckpointHandler(c client.Client, namespace, kubeMode, containerPrefix 
 }
 
 // defaultWorkerBaseURL resolves a worker's qwenpaw app base URL from the
-// effective container prefix and the worker's env (AGENTTEAMS_CONSOLE_PORT
-// override, falling back to the default). An invalid or out-of-range port
-// value falls back to the default rather than failing the request.
+// effective container prefix and the effective console port. The port goes
+// through service.EffectiveWorkerConsolePort — the same system-wins env
+// chain used at container creation — so the proxy can never target a port
+// the container does not listen on (a conflicting spec.env value is
+// discarded before the container is created, so the raw spec.env must not
+// be read here).
 func (h *CheckpointHandler) defaultWorkerBaseURL(name string, env map[string]string) string {
-	port := defaultCheckpointWorkerPort
-	if raw := strings.TrimSpace(env[checkpointConsolePortEnv]); raw != "" {
-		if p, err := strconv.Atoi(raw); err == nil && p > 0 && p < 65536 {
-			port = p
-		}
-	}
-	return fmt.Sprintf("http://%s%s:%d", h.containerPrefix, name, port)
+	port := service.EffectiveWorkerConsolePort(env)
+	return fmt.Sprintf("http://%s%s:%s", h.containerPrefix, name, port)
 }
 
 // proxyCheckpoint handles GET /api/v1/workers/{name}/checkpoints/{sub}.

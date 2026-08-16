@@ -12,6 +12,8 @@ import (
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
+	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/config"
+	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/service"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -256,9 +258,12 @@ func TestCheckpoint_UpstreamErrorBodyBounded(t *testing.T) {
 }
 
 // TestCheckpointWorkerBaseURL_PrefixAndPortResolution covers the address
-// resolution matrix: default / non-default / empty container prefixes and the
-// per-worker AGENTTEAMS_CONSOLE_PORT override (valid, padded, invalid, and
-// out-of-range values).
+// resolution matrix: default / non-default / empty container prefixes. The
+// console port is ALWAYS the effective system port: the worker system env
+// defines AGENTTEAMS_CONSOLE_PORT and the system-wins user-env merge
+// discards conflicting spec.env values before the container is created, so
+// any user-declared port (valid, padded, invalid, out-of-range) must
+// resolve to the same port the container actually listens on.
 func TestCheckpointWorkerBaseURL_PrefixAndPortResolution(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -269,11 +274,11 @@ func TestCheckpointWorkerBaseURL_PrefixAndPortResolution(t *testing.T) {
 		{"default prefix and port", "agentteams-worker-", nil, "http://agentteams-worker-alice:8088"},
 		{"non-default prefix", "acme-worker-", nil, "http://acme-worker-alice:8088"},
 		{"empty prefix (auto-prefix disabled)", "", nil, "http://alice:8088"},
-		{"custom port", "agentteams-worker-", map[string]string{"AGENTTEAMS_CONSOLE_PORT": "9090"}, "http://agentteams-worker-alice:9090"},
-		{"custom prefix and port", "acme-worker-", map[string]string{"AGENTTEAMS_CONSOLE_PORT": " 7000 "}, "http://acme-worker-alice:7000"},
-		{"invalid port falls back to default", "agentteams-worker-", map[string]string{"AGENTTEAMS_CONSOLE_PORT": "not-a-port"}, "http://agentteams-worker-alice:8088"},
-		{"out-of-range port falls back to default", "agentteams-worker-", map[string]string{"AGENTTEAMS_CONSOLE_PORT": "99999"}, "http://agentteams-worker-alice:8088"},
-		{"zero port falls back to default", "agentteams-worker-", map[string]string{"AGENTTEAMS_CONSOLE_PORT": "0"}, "http://agentteams-worker-alice:8088"},
+		{"user port discarded (system wins)", "agentteams-worker-", map[string]string{"AGENTTEAMS_CONSOLE_PORT": "9090"}, "http://agentteams-worker-alice:8088"},
+		{"custom prefix, user port discarded", "acme-worker-", map[string]string{"AGENTTEAMS_CONSOLE_PORT": " 7000 "}, "http://acme-worker-alice:8088"},
+		{"invalid user port discarded", "agentteams-worker-", map[string]string{"AGENTTEAMS_CONSOLE_PORT": "not-a-port"}, "http://agentteams-worker-alice:8088"},
+		{"out-of-range user port discarded", "agentteams-worker-", map[string]string{"AGENTTEAMS_CONSOLE_PORT": "99999"}, "http://agentteams-worker-alice:8088"},
+		{"zero user port discarded", "agentteams-worker-", map[string]string{"AGENTTEAMS_CONSOLE_PORT": "0"}, "http://agentteams-worker-alice:8088"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -302,10 +307,13 @@ func (c *captureRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 }
 
 // TestCheckpoint_EffectivePrefixAndPortReachUpstream is the end-to-end
-// regression: a controller configured with a non-default container prefix and
-// a worker that overrides its console port must dial exactly
-// http://{prefix}{name}:{port} — the original hard-coded
-// agentteams-worker-{name}:8088 would 502 in this deployment.
+// regression: a controller configured with a non-default container prefix
+// and a worker whose spec.env conflicts with the system console port must
+// dial exactly http://{prefix}{name}:{effective-port} — the conflicting
+// spec.env value is discarded by the same system-wins merge the container
+// creation applies, so the proxy targets the port the container actually
+// listens on. A pre-fix handler reading the raw spec.env would dial 9090
+// and 502, because the container listens on 8088.
 func TestCheckpoint_EffectivePrefixAndPortReachUpstream(t *testing.T) {
 	objs := checkpointTeamWithWorkers("team-a", "daily-luo")
 	objs[1].(*v1beta1.Worker).Spec.Env = map[string]string{"AGENTTEAMS_CONSOLE_PORT": "9090"}
@@ -321,8 +329,39 @@ func TestCheckpoint_EffectivePrefixAndPortReachUpstream(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	want := "http://acme-worker-daily-luo:9090/workspace/checkpoints/status"
+	want := "http://acme-worker-daily-luo:8088/workspace/checkpoints/status"
 	if rt.gotURL.String() != want {
 		t.Fatalf("upstream URL=%s, want %s", rt.gotURL.String(), want)
+	}
+}
+
+// TestCheckpointPort_MatchesContainerCreationEnvChain is the cross-component
+// regression: the port the proxy resolves must equal the port the docker
+// backend derives, computed through the real container-creation env chain
+// (WorkerEnvBuilder.Build + the shared system-wins merge). If the system
+// default or the merge semantics ever change, this test fails instead of
+// the proxy silently 502-ing on every worker.
+func TestCheckpointPort_MatchesContainerCreationEnvChain(t *testing.T) {
+	userEnv := map[string]string{"AGENTTEAMS_CONSOLE_PORT": "9090"}
+
+	// The docker backend reads the port from the merged CreateRequest env.
+	builder := service.NewWorkerEnvBuilder(config.WorkerEnvDefaults{})
+	sysEnv := builder.Build("daily-luo", &service.WorkerProvisionResult{
+		GatewayKey:    "gk",
+		MatrixToken:   "mt",
+		RoomID:        "!room",
+		MinIOPassword: "mp",
+	})
+	service.MergeUserEnv(sysEnv, userEnv) // same semantics the reconciler applies
+	dockerSide := sysEnv[service.WorkerConsolePortEnv]
+
+	// The proxy resolves the port through the shared effective-env helper.
+	proxySide := service.EffectiveWorkerConsolePort(userEnv)
+
+	if dockerSide != proxySide {
+		t.Fatalf("docker backend port %q != checkpoint proxy port %q — proxy would 502", dockerSide, proxySide)
+	}
+	if dockerSide != "8088" {
+		t.Fatalf("effective console port=%q, want %q (system default, user value must be discarded)", dockerSide, "8088")
 	}
 }

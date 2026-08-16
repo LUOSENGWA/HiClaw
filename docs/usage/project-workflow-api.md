@@ -643,7 +643,10 @@ manual `/checkpoint snapshot`, stored in the worker's `checkpoints/shadow.git`.
   effective container prefix (`AGENTTEAMS_PROXY_CONTAINER_PREFIX`, or derived
   from `AGENTTEAMS_RESOURCE_PREFIX` when auto-prefixing is enabled; empty when
   disabled — the same value the docker backend uses for container naming) and
-  the worker's `AGENTTEAMS_CONSOLE_PORT` env (default `8088`). In kube mode
+  the effective console port resolved through the same system-wins env chain
+  used at container creation (the system env always defines
+  `AGENTTEAMS_CONSOLE_PORT`, so a conflicting `Worker.spec.env` value is
+  discarded and the container always listens on `8088`). In kube mode
   they return `503`.
 - **Degradation**: a worker running QwenPaw < 2.1 has no checkpoint router,
   so the upstream `404` is translated to `502` with
