@@ -78,7 +78,18 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     }
     runtime_config = pathlib.Path("#{root}") / "runtime.yaml"
     runtime_config.write_text(
-        "team:\\n  teamRoomId: '!team:example.test'\\n",
+        "team:\\n"
+        "  teamRoomId: '!team:example.test'\\n"
+        "  leaderRuntimeName: 'admin'\\n"
+        "  members:\\n"
+        "    - name: 'Admin'\\n"
+        "      runtimeName: 'admin'\\n"
+        "      role: 'team_leader'\\n"
+        "      matrixUserId: '@admin:example.test'\\n"
+        "    - name: 'Worker A'\\n"
+        "      runtimeName: 'worker-a'\\n"
+        "      role: 'worker'\\n"
+        "      matrixUserId: '@worker-a:example.test'\\n",
         encoding="utf-8",
     )
     os.environ["TEAMHARNESS_RUNTIME_CONFIG"] = str(runtime_config)
@@ -138,6 +149,11 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
                 self.end_headers()
                 return
             if "/send/m.room.message/delegate-" in parsed.path and os.environ.get("TEAMHARNESS_TEST_FAIL_NOTIFICATION") == "1":
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(json.dumps({"errcode": "M_UNKNOWN", "error": "forced Matrix failure"}).encode("utf-8"))
+                return
+            if "/send/m.room.message/submit-" in parsed.path and os.environ.get("TEAMHARNESS_TEST_FAIL_SUBMIT_NOTIFICATION") == "1":
                 self.send_response(500)
                 self.end_headers()
                 self.wfile.write(json.dumps({"errcode": "M_UNKNOWN", "error": "forced Matrix failure"}).encode("utf-8"))
@@ -410,6 +426,56 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     if not all(upload.get("auth") == "Bearer test-token" for upload in matrix["uploads"][:2]):
         raise AssertionError(f"Matrix upload auth mismatch: {matrix['uploads']!r}")
 
+    def completion_events():
+        return [
+            event for event in matrix["events"]
+            if "/send/m.room.message/submit-t-001" in event["path"]
+        ]
+
+    first_completion = completion_events()
+    if len(first_completion) != 1:
+        raise AssertionError(f"submit_task should send exactly one completion notification: {matrix['events']!r}")
+    completion_body = first_completion[0]["content"].get("body", "")
+    if "@admin:example.test" not in (first_completion[0]["content"].get("m.mentions") or {}).get("user_ids", []):
+        raise AssertionError(f"completion notification must mention the leader: {first_completion[0]['content']!r}")
+    if "TASK_COMPLETED: t-001 - Result: shared/tasks/t-001/result.md" not in completion_body:
+        raise AssertionError(f"completion notification must carry the contract line: {completion_body!r}")
+    if "- Worker: @worker-a:example.test" not in completion_body:
+        raise AssertionError(f"completion notification must carry the executor: {completion_body!r}")
+    if "Input collected." not in completion_body:
+        raise AssertionError(f"completion notification must carry the summary: {completion_body!r}")
+    if first_completion[0]["auth"] != "Bearer test-token":
+        raise AssertionError(f"completion notification auth mismatch: {first_completion[0]['auth']!r}")
+    submitted_meta = json.loads((pathlib.Path("#{workspace}") / f"shared/tasks/{task_id}/meta.json").read_text(encoding="utf-8"))
+    if not submitted_meta.get("completionEventId"):
+        raise AssertionError(f"submit_task did not persist completionEventId: {submitted_meta!r}")
+    if submitted_meta.get("completionEventId") != submitted.get("notification", {}).get("eventId"):
+        raise AssertionError(f"persisted completionEventId mismatch: {submitted_meta!r} vs {submitted.get('notification')!r}")
+
+    resubmitted = payload("taskflow", {
+        "role": "worker",
+        "action": "submit_task",
+        "payload": {
+            "taskId": task_id,
+            "status": "SUCCESS",
+            "summary": "Input collected.",
+            "parentEventId": "$task-parent",
+            "deliverables": [
+                "shared/tasks/t-001/result.md",
+                "shared/tasks/t-001/workspace/analysis.md",
+            ],
+        },
+    })
+    if not resubmitted.get("ok") or resubmitted["task"]["status"] != "submitted":
+        raise AssertionError(f"resubmit_task failed: {resubmitted!r}")
+    resubmit_notification = resubmitted.get("notification") or {}
+    if resubmit_notification.get("reused") is not True:
+        raise AssertionError(f"resubmit should reuse the recorded completion notification: {resubmit_notification!r}")
+    if resubmit_notification.get("eventId") != submitted.get("notification", {}).get("eventId"):
+        raise AssertionError(f"resubmit notification event id mismatch: {resubmit_notification!r}")
+    if len(completion_events()) != 1:
+        raise AssertionError(f"resubmit must not duplicate the completion notification: {completion_events()!r}")
+
     context_project_id = "context-parent-project"
     context_task_id = "context-parent-task"
     payload("projectflow", {
@@ -476,9 +542,19 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         raise AssertionError(f"context submit_task should publish result artifact: {context_submitted!r}")
     if context_published[0].get("parentEventId") != "$context-task-parent":
         raise AssertionError(f"context submit_task did not infer parent event: {context_submitted!r}")
-    context_event = matrix["events"][-1]["content"]
-    if context_event.get("m.relates_to") != {"rel_type": "com.agentteams.attachment", "event_id": "$context-task-parent"}:
-        raise AssertionError(f"context submit_task file event missing attachment relation: {context_event!r}")
+    context_file_event = next(
+        (
+            event["content"]
+            for event in reversed(matrix["events"])
+            if event["content"].get("msgtype") == "m.file"
+            and event["content"].get("url") == context_published[0].get("mxcUri")
+        ),
+        None,
+    )
+    if context_file_event is None:
+        raise AssertionError(f"context submit_task file event not found: {context_published!r}")
+    if context_file_event.get("m.relates_to") != {"rel_type": "com.agentteams.attachment", "event_id": "$context-task-parent"}:
+        raise AssertionError(f"context submit_task file event missing attachment relation: {context_file_event!r}")
 
     secret_task_id = "secret-artifact-01"
     payload("taskflow", {
@@ -523,6 +599,128 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         raise AssertionError(f"sensitive deliverable should not be uploaded: {matrix['uploads']!r}")
     if any("abcdefghijklmnopqrstuvwxyz1234567890" in upload.get("body", "") for upload in matrix["uploads"]):
         raise AssertionError("sensitive value leaked into Matrix upload")
+
+    # --- Completion notification: BLOCKED status carries the BLOCKED contract line. ---
+    blocked_project_id = "blocked-project"
+    blocked_task_id = "blocked-task"
+    payload("projectflow", {
+        "action": "create_project",
+        "payload": {
+            "projectId": blocked_project_id,
+            "title": "Blocked Project",
+            "replyRoute": {
+                "channel": "matrix",
+                "targetUser": "@admin:example.test",
+                "targetSession": "!team:example.test",
+            },
+        },
+    })
+    payload("projectflow", {
+        "action": "plan_dag",
+        "payload": {
+            "projectId": blocked_project_id,
+            "tasks": [{
+                "taskId": blocked_task_id,
+                "title": "Blocked task",
+                "assignedTo": "@worker-a:example.test",
+                "dependsOn": [],
+            }],
+        },
+    })
+    payload("taskflow", {
+        "role": "leader",
+        "action": "delegate_task",
+        "payload": {
+            "projectId": blocked_project_id,
+            "taskId": blocked_task_id,
+            "roomId": "room:!team:example.test",
+            "spec": "Will be blocked.",
+        },
+    })
+    blocked_submitted = payload("taskflow", {
+        "role": "worker",
+        "action": "submit_task",
+        "payload": {
+            "taskId": blocked_task_id,
+            "status": "BLOCKED",
+            "summary": "GPU OOM on node 2, needs 24G context.",
+        },
+    })
+    if not blocked_submitted.get("ok") or blocked_submitted["task"]["status"] != "submitted":
+        raise AssertionError(f"blocked submit_task failed: {blocked_submitted!r}")
+    blocked_events = [
+        event for event in matrix["events"]
+        if "/send/m.room.message/submit-blocked-task" in event["path"]
+    ]
+    if len(blocked_events) != 1:
+        raise AssertionError(f"blocked submit should send one completion notification: {matrix['events']!r}")
+    blocked_body = blocked_events[0]["content"].get("body", "")
+    if "BLOCKED: blocked-task - GPU OOM on node 2, needs 24G context." not in blocked_body:
+        raise AssertionError(f"blocked notification must carry the BLOCKED contract line: {blocked_body!r}")
+    if "TASK_COMPLETED" in blocked_body:
+        raise AssertionError(f"blocked notification must not claim completion: {blocked_body!r}")
+
+    # --- Failure injection: a completion send failure must NOT block the
+    #     terminal submission (best-effort by contract). ---
+    fail_submit_project_id = "fail-submit-project"
+    fail_submit_task_id = "fail-submit-task"
+    payload("projectflow", {
+        "action": "create_project",
+        "payload": {
+            "projectId": fail_submit_project_id,
+            "title": "Fail Submit Project",
+            "replyRoute": {
+                "channel": "matrix",
+                "targetUser": "@admin:example.test",
+                "targetSession": "!team:example.test",
+            },
+        },
+    })
+    payload("projectflow", {
+        "action": "plan_dag",
+        "payload": {
+            "projectId": fail_submit_project_id,
+            "tasks": [{
+                "taskId": fail_submit_task_id,
+                "title": "Fail submit task",
+                "assignedTo": "@worker-a:example.test",
+                "dependsOn": [],
+            }],
+        },
+    })
+    payload("taskflow", {
+        "role": "leader",
+        "action": "delegate_task",
+        "payload": {
+            "projectId": fail_submit_project_id,
+            "taskId": fail_submit_task_id,
+            "roomId": "room:!team:example.test",
+            "spec": "Matrix is down during submit.",
+        },
+    })
+    os.environ["TEAMHARNESS_TEST_FAIL_SUBMIT_NOTIFICATION"] = "1"
+    try:
+        fail_submit_result = payload("taskflow", {
+            "role": "worker",
+            "action": "submit_task",
+            "payload": {
+                "taskId": fail_submit_task_id,
+                "status": "SUCCESS",
+                "summary": "Result ready but Matrix is down.",
+            },
+        })
+    finally:
+        os.environ.pop("TEAMHARNESS_TEST_FAIL_SUBMIT_NOTIFICATION", None)
+    if not fail_submit_result.get("ok") or fail_submit_result["task"]["status"] != "submitted":
+        raise AssertionError(f"completion notification failure must not block submission: {fail_submit_result!r}")
+    fail_submit_notification = fail_submit_result.get("notification") or {}
+    if fail_submit_notification.get("sent") is not False:
+        raise AssertionError(f"failed completion send must report sent=False: {fail_submit_notification!r}")
+    if "HTTP 500" not in str(fail_submit_notification.get("error", "")):
+        raise AssertionError(f"failed completion send must report the Matrix error: {fail_submit_notification!r}")
+    fail_submit_meta = json.loads((pathlib.Path("#{workspace}") / f"shared/tasks/{fail_submit_task_id}/meta.json").read_text(encoding="utf-8"))
+    if fail_submit_meta.get("completionEventId"):
+        raise AssertionError(f"failed completion send must not persist completionEventId: {fail_submit_meta!r}")
 
     # --- Failure injection: a notification send failure must return a
     #     retryable error and must NOT leave the task assigned. ---
