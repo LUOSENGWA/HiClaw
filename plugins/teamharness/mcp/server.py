@@ -4079,6 +4079,174 @@ def _send_delegate_notification(
         return {"sent": False, "error": f"Matrix API error: {exc}"}
 
 
+def _team_leader_matrix_id() -> str:
+    """Resolve the team leader's Matrix user ID from the runtime config.
+
+    The controller projects the full team roster (with roles and Matrix
+    user IDs) into the worker's runtime config. Returns an empty string
+    when no leader entry exists (standalone runs) so callers can skip
+    the notification instead of failing.
+    """
+    config = _load_runtime_config()
+    team = _section(config, "team")
+    members = team.get("members")
+    if not isinstance(members, list):
+        return ""
+    for member in members:
+        if not isinstance(member, dict):
+            continue
+        role = str(member.get("role") or "").strip().lower().replace("_", "-")
+        if role in {"team-leader", "teamleader", "leader"}:
+            return str(member.get("matrixUserId") or member.get("matrix_user_id") or "").strip()
+    return ""
+
+
+def _send_task_completion_notification(
+    arguments: dict[str, Any],
+    *,
+    room_id: str,
+    task_id: str,
+    status: str,
+    summary: str,
+    leader: str,
+    worker: str = "",
+    result_path: str = "",
+) -> dict[str, Any]:
+    """Send the automatic Worker completion notification for submit_task.
+
+    Publishes the completion line to the Task room with ``m.mentions``
+    using the same Matrix HTTP send path as the message tool. The first
+    line follows the task-execution skill contract so leader-side prompts
+    that parse completion lines keep working:
+        @leader TASK_COMPLETED: <task-id> - Result: shared/tasks/<task-id>/result.md
+        @leader BLOCKED: <task-id> - <short blocker summary>
+    The transaction ID is stable per task so a retry cannot produce a
+    duplicate completion.
+    """
+    homeserver = os.getenv("AGENTTEAMS_MATRIX_URL", "").rstrip("/")
+    token = os.getenv("AGENTTEAMS_WORKER_MATRIX_TOKEN", "")
+    if not homeserver or not token:
+        return {
+            "sent": False,
+            "error": "AGENTTEAMS_MATRIX_URL and AGENTTEAMS_WORKER_MATRIX_TOKEN are required",
+        }
+
+    matrix_room_id = str(room_id or "").strip()
+    if matrix_room_id.startswith("room:"):
+        matrix_room_id = matrix_room_id[len("room:") :].strip()
+    if not matrix_room_id.startswith("!"):
+        return {"sent": False, "error": f"invalid Matrix room target: {room_id}"}
+
+    summary_preview = (summary or "")[:500]
+    if len(summary or "") > 500:
+        summary_preview += "..."
+    if status == "BLOCKED":
+        notification_text = f"{leader} BLOCKED: {task_id} - {summary_preview}"
+        detail = ""
+    else:
+        if result_path:
+            notification_text = f"{leader} TASK_COMPLETED: {task_id} - Result: {result_path}"
+        else:
+            notification_text = f"{leader} TASK_COMPLETED: {task_id} - {summary_preview}"
+        detail = f"\n{summary_preview}" if summary_preview else ""
+    if worker:
+        notification_text += f"\n- Worker: {worker}"
+    if status in {"REVISION_NEEDED", "INTERRUPTED"}:
+        notification_text += f"\n- Status: {status}"
+    notification_text += detail
+    mentions = [leader]
+    content = _matrix_content(notification_text, mentions)
+
+    room_enc = urllib.parse.quote(matrix_room_id, safe="")
+    txn = urllib.parse.quote(f"submit-{task_id}", safe="")
+    url = f"{homeserver}/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/{txn}"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(content).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8") or "{}")
+        event_id = str(data.get("event_id") or "").strip()
+        if not event_id:
+            return {"sent": False, "error": "Matrix send returned no event_id"}
+        return {
+            "sent": True,
+            "eventId": event_id,
+            "roomId": matrix_room_id,
+            "leader": leader,
+        }
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:200]
+        return {
+            "sent": False,
+            "error": f"Matrix API error: HTTP {exc.code}: {body}",
+        }
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return {"sent": False, "error": f"Matrix API error: {exc}"}
+
+
+def _task_completion_notification(
+    arguments: dict[str, Any],
+    task: dict[str, Any],
+    task_id: str,
+    status: str,
+    summary: str,
+) -> dict[str, Any]:
+    """Best-effort completion notification orchestration for submit_task.
+
+    Mirrors the delegate_task notification lifecycle: resolve the leader
+    from the runtime config, reuse an already-recorded event on retry,
+    validate room membership, send, then persist the event id so the
+    notification cannot be duplicated. Any problem returns a skipped
+    result and never blocks the terminal submission.
+    """
+    room_id = str(task.get("room_id") or "").strip()
+    if not room_id:
+        return {"sent": False, "skipped": True, "error": "task has no room_id"}
+    leader = _team_leader_matrix_id()
+    if not leader:
+        return {
+            "sent": False,
+            "skipped": True,
+            "error": "team leader Matrix ID not found in runtime config",
+        }
+    if task.get("completionEventId"):
+        return {
+            "sent": True,
+            "eventId": str(task["completionEventId"]),
+            "roomId": _canonical_room_id(room_id),
+            "leader": leader,
+            "reused": True,
+        }
+    membership = _validate_assignee_membership(room_id, leader)
+    if not membership.get("ok"):
+        return {
+            "sent": False,
+            "skipped": True,
+            "error": str(membership.get("error") or "room membership check failed"),
+        }
+    notification = _send_task_completion_notification(
+        arguments,
+        room_id=room_id,
+        task_id=task_id,
+        status=status,
+        summary=summary,
+        leader=leader,
+        worker=str(task.get("assigned_to") or ""),
+        result_path=str(task.get("result_path") or ""),
+    )
+    if notification.get("sent"):
+        task["completionEventId"] = notification.get("eventId")
+        _write_task(arguments, task)
+    return notification
+
+
 def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
     action = str(arguments.get("action") or "").strip()
     payload = _payload(arguments)
@@ -4394,6 +4562,13 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 deliverables,
                 _attachment_parent_event_id(payload, arguments),
             )
+            notification = _task_completion_notification(
+                arguments,
+                task,
+                task_id,
+                status,
+                summary,
+            )
             return {
                 "ok": True,
                 "tool": "taskflow",
@@ -4401,6 +4576,7 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 "task": task,
                 "publishedArtifacts": published_artifacts,
                 "synced": _sync_task(arguments, task_id, exclude=["spec.md", "base/"]),
+                "notification": notification,
                 "notificationNeeded": _notification_needed(
                     "submit_task",
                     {"project_id": task.get("project_id", "")},
