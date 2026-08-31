@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
@@ -213,6 +214,12 @@ func (h *ResourceHandler) UpdateWorker(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	if caller := authpkg.CallerFromContext(ctx); caller != nil && caller.Role == authpkg.RoleHuman {
+		if status, msg := h.checkHumanWorkerUpdate(ctx, caller, name, &req); status != 0 {
+			httputil.WriteError(w, status, msg)
+			return
+		}
+	}
 	for attempt := 0; attempt < k8sUpdateMaxRetries; attempt++ {
 		var worker v1beta1.Worker
 		if err := h.client.Get(ctx, client.ObjectKey{Name: name, Namespace: h.namespace}, &worker); err != nil {
@@ -246,6 +253,9 @@ func (h *ResourceHandler) UpdateWorker(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.Skills != nil {
 			worker.Spec.Skills = req.Skills
+		}
+		if req.RemoteSkills != nil {
+			worker.Spec.RemoteSkills = req.RemoteSkills
 		}
 		if req.McpServers != nil {
 			worker.Spec.McpServers = req.McpServers
@@ -874,6 +884,95 @@ func (h *ResourceHandler) findTeamForMember(ctx context.Context, name string) (s
 		return "", false, err
 	}
 	return team.Name, true, nil
+}
+
+// checkHumanWorkerUpdate enforces the L2 human boundary on worker updates.
+// The worker must be a member of one of the caller's accessibleTeams —
+// standalone workers are hidden from L2 readers (ListWorkers), so they are
+// hidden here as well (404 keeps the endpoint probe-resistant). The request
+// may only touch the public-catalog skill assignment (skills). remoteSkills
+// (arbitrary external registries with credential-bearing source URIs) and
+// mcpServers (the gateway consumer key is injected into every entry, so an
+// L2-controlled URL is a credential-exfiltration path) require an elevated
+// capability pending the L2 permission design; everything else (model,
+// image, identity, resources, ...) is the team owner's domain.
+// TestL2WorkerUpdateFieldPolicyCoversAllRequestFields pins the policy so no
+// field of UpdateWorkerRequest becomes L2-writable by omission.
+// Returns (0, "") when the update is allowed.
+func (h *ResourceHandler) checkHumanWorkerUpdate(ctx context.Context, caller *authpkg.CallerIdentity, name string, req *UpdateWorkerRequest) (int, string) {
+	team, _, ok, err := findTeamMember(ctx, h.client, h.namespace, name)
+	if err != nil {
+		return http.StatusInternalServerError, "lookup worker team: " + err.Error()
+	}
+	if !ok {
+		return http.StatusNotFound, "worker: not found"
+	}
+	// Out-of-scope workers are hidden from L2 readers on the read path
+	// (GET → 404, LIST → filtered). The update path must not reopen that
+	// probe surface: a 403 here would let a scoped human enumerate workers
+	// it cannot see and learn which team owns them (W8).
+	if !caller.TeamMatches(team.Name) {
+		return http.StatusNotFound, "worker: not found"
+	}
+	var forbidden []string
+	if req.WorkerName != "" {
+		forbidden = append(forbidden, "workerName")
+	}
+	if req.Model != "" {
+		forbidden = append(forbidden, "model")
+	}
+	if req.ModelProvider != "" {
+		forbidden = append(forbidden, "modelProvider")
+	}
+	if req.Runtime != "" {
+		forbidden = append(forbidden, "runtime")
+	}
+	if req.Image != "" {
+		forbidden = append(forbidden, "image")
+	}
+	if req.Identity != "" {
+		forbidden = append(forbidden, "identity")
+	}
+	if req.Soul != "" {
+		forbidden = append(forbidden, "soul")
+	}
+	if req.Agents != "" {
+		forbidden = append(forbidden, "agents")
+	}
+	// Credential-bearing surfaces: remoteSkills (registry source URIs may
+	// embed tokens) and mcpServers (GenerateMcporterConfig injects the
+	// gateway bearer key into every entry, URL used verbatim — an
+	// attacker-controlled URL exfiltrates it). Elevated capability pending
+	// the L2 permission design.
+	if req.RemoteSkills != nil {
+		forbidden = append(forbidden, "remoteSkills")
+	}
+	if req.McpServers != nil {
+		forbidden = append(forbidden, "mcpServers")
+	}
+	if req.Package != "" {
+		forbidden = append(forbidden, "package")
+	}
+	if req.Expose != nil {
+		forbidden = append(forbidden, "expose")
+	}
+	if req.ChannelPolicy != nil {
+		forbidden = append(forbidden, "channelPolicy")
+	}
+	if req.Resources != nil {
+		forbidden = append(forbidden, "resources")
+	}
+	if req.ContainerManaged != nil {
+		forbidden = append(forbidden, "containerManaged")
+	}
+	if req.State != nil {
+		forbidden = append(forbidden, "state")
+	}
+	if len(forbidden) > 0 {
+		return http.StatusBadRequest,
+			"L2 humans may only update the skills field (public-catalog assignment); remoteSkills and mcpServers require an elevated capability; not allowed: " + strings.Join(forbidden, ", ")
+	}
+	return 0, ""
 }
 
 func (h *ResourceHandler) validateTeamWorkerMembers(ctx context.Context, teamName string, members []v1beta1.TeamWorkerRef) error {
