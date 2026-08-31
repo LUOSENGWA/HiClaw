@@ -137,6 +137,10 @@ Manager 会先上传并验证 `SKILL.md`，再更新 `spec.skills`。QwenPaw Wor
 
 也可以通过 `spec.package` 引入一个包含 `skills/` 目录的 Worker 包。包内 Skills 与按名称分配的 Skills 会合并，互不冲突。
 
+### 技能目录 API
+
+`GET /api/v1/skills` 返回部署中可用技能的只读目录：agent 模板自带的内置技能（取自各 `SKILL.md` frontmatter 的 name + description，`agents` 列出提供该技能的模板），以及各 Worker `spec.remoteSkills` 已引用的远程注册表技能（如 Nacos，带其 `source`）。两种途径都有的技能会合并 source（如 `builtin+nacos`）。输出按名称排序；端点只暴露元数据——不读技能正文、不访问注册表、不泄露凭据。admin、manager、团队 Leader、团队范围人类用户均可访问。设计见 [Skill Catalog API](../design/skill-catalog-api.md)。
+
 ### 带自定义包的 Worker
 
 ```yaml

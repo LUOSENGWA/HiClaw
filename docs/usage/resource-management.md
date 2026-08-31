@@ -137,6 +137,10 @@ All supported Dashboard distribution paths update `spec.skills`. The Controller 
 
 You can also use `spec.package` to provide a Worker package containing a `skills/` directory. Package skills and assigned skills are merged without conflict.
 
+### Skill Catalog API
+
+`GET /api/v1/skills` returns the read-only catalog of skills available in the deployment: the built-in skills shipped with the agent templates (name + description from each `SKILL.md` frontmatter, with the providing templates listed in `agents`), plus the remote registry skills (e.g. Nacos) already referenced by workers' `spec.remoteSkills` (with their registry `source`). A skill available both ways gets a combined source such as `builtin+nacos`. Output is sorted by name; the endpoint is metadata-only — no skill content, no registry calls, no credentials. Available to admins, managers, team leaders, and team-scoped humans. See [Skill Catalog API](../design/skill-catalog-api.md).
+
 ### Worker with Custom Package
 
 ```yaml
