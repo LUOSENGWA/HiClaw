@@ -319,3 +319,46 @@ agt project complete demo-project-001
 ```
 
 同样的 bearer 令牌转发适用（L2 人类用 Matrix 令牌）。
+
+## Worker 知识库（工作区文件）端点
+
+Controller 代理每个 worker 的 QwenPaw app（QwenPaw ≥ 2.1）的三个只读端点，
+让 L2 人类与前端可以查看 worker 的知识库——长期记忆文件 `MEMORY.md`、
+日记目录树 `memory/` 与沉淀知识目录树 `digest/`。
+
+| 端点 | 含义 |
+|:--|:--|
+| `GET /api/v1/workers/{name}/workspace-files/tree` | 分页列出某个知识目录：`?path=`（必填，`memory` / `digest` 或其子路径），可选 `?cursor=`（不透明串）与 `?limit=`（1..500）。返回 `{directory, entries[], has_more, next_cursor}`。 |
+| `GET /api/v1/workers/{name}/workspace-files/file-metadata` | `?path=`（必填，允许的知识库文件）：`{etag, modified_at, path, preview_kind, size}`。 |
+| `GET /api/v1/workers/{name}/workspace-files/file-content` | `?path=`（必填）加可选 `?offset=`（≥0）与 `?limit=`（1..1048576）：有界 UTF-8 分块 `{content, eof, next_offset, truncated, etag, ...}`——`truncated` 为真时用 `offset=next_offset` 续读。 |
+
+- **范围**：与 `GET /api/v1/workers/{name}` 相同的 worker 读授权——团队
+  leader / L2 人类只能看自己可访问团队内的 worker；未知或越权 worker 一律
+  隐藏为 `404`。
+- **路径白名单（只读知识边界）**：只放行 `MEMORY.md`、`memory/**` 与
+  `digest/**`。工作区内其他一切位置——`SOUL.md`、`PROFILE.md`、`TODO.md`、
+  `checkpoints/`、`skills/`，以及所有 dot 目录（`.copaw/agent.json` 承载
+  worker 凭据）——在请求到达 worker 之前即被 `400` 拒绝。根目录按完整首段
+  精确匹配，`memories/` 与 `memoryX/` 不构成 `memory/` 的前缀。
+- **root 固定**：QwenPaw 的 `root=workspace` 参数（agent 自身存储根，相对
+  于 `root=project` 即主绑定项目目录）由服务端固定，不属于客户端查询面。
+- **仅 embedded 模式**：端点经共享 docker 网络代理 worker 的 qwenpaw app，
+  地址解析与 checkpoint 端点相同（生效容器前缀 + system-wins 控制台端口）。
+  kube 模式返回 `503`。
+- **版本门（404 透传）**：worker 运行 QwenPaw < 2.1 时没有工作区文件
+  路由，所有请求均为上游 `404` 原样透传。区分"worker 版本过旧"与"文件不
+  存在"的方法：探测 `file-metadata?path=MEMORY.md`——该文件在每个已初始
+  化的 QwenPaw 工作区中都存在，因此这里的 `404` 表示 worker 为 2.1 以下
+  （或工作区未初始化），其余 `404` 即普通文件缺失。
+- 转发为固定子路径（tree / file-metadata / file-content）+ 严格查询白名单
+  ——不是通用反向代理，工作区 API 的任何写端点均不可达。
+
+错误响应：
+
+| 码 | 含义 |
+|:--|:--|
+| `400` | worker 名非法 / 不支持的子路径或查询参数 / 路径不在知识白名单内 / `limit` 或 `offset` 越界。 |
+| `404` | worker 不存在或不在调用方团队内（存在性隐藏）；或（透传）文件不存在——见上方版本门探测。 |
+| `409` / `416` | （透传）读取期间文件被修改 / offset 超出文件末尾。 |
+| `502` | worker app 不可达，或上游错误（状态码回显在 body 中）。 |
+| `503` | kube 模式（无稳定的 worker pod DNS 可代理）。 |

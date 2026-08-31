@@ -662,3 +662,56 @@ Error responses:
 | `404` | Worker not found / caller does not own it (existence hidden). |
 | `502` | Worker app unreachable, pre-2.1 checkpoint API, or upstream error. |
 | `503` | Kube mode (no stable worker pod DNS to proxy). |
+
+## Worker knowledge base (workspace files) endpoints
+
+The Controller proxies three read-only endpoints of each worker's QwenPaw
+app (QwenPaw ≥ 2.1) so L2 humans and frontends can inspect a worker's
+knowledge base — the long-term memory file `MEMORY.md`, the daily note
+tree `memory/`, and the distilled knowledge tree `digest/`.
+
+| Endpoint | Meaning |
+|:--|:--|
+| `GET /api/v1/workers/{name}/workspace-files/tree` | Paginated listing of one knowledge directory: `?path=` (required, `memory` / `digest` or any subpath of them), optional `?cursor=` (opaque) and `?limit=` (1..500). Returns `{directory, entries[], has_more, next_cursor}`. |
+| `GET /api/v1/workers/{name}/workspace-files/file-metadata` | `?path=` (required, an allowed knowledge file): `{etag, modified_at, path, preview_kind, size}`. |
+| `GET /api/v1/workers/{name}/workspace-files/file-content` | `?path=` (required) plus optional `?offset=` (≥0) and `?limit=` (1..1048576): a bounded UTF-8 chunk `{content, eof, next_offset, truncated, etag, ...}` — continue with `offset=next_offset` while `truncated` is true. |
+
+- **Scope**: same worker read authorization as `GET /api/v1/workers/{name}`
+  and the checkpoint endpoints — team leaders / L2 humans only see workers
+  in their accessible teams; unknown or out-of-scope workers are hidden as
+  `404`.
+- **Path allowlist (read-only knowledge boundary)**: only `MEMORY.md`,
+  `memory/**` and `digest/**` are addressable. Every other workspace
+  location — `SOUL.md`, `PROFILE.md`, `TODO.md`, `checkpoints/`, `skills/`,
+  and all dot directories (`.copaw/agent.json` carries the worker's
+  credentials) — is rejected with `400` before the request reaches the
+  worker. Roots match on the exact first segment, so `memories/` and
+  `memoryX/` are not prefixes of `memory/`.
+- **Root pinned**: the QwenPaw `root=workspace` parameter (the agent's own
+  storage root, as opposed to `root=project`, the primary bound project
+  directory) is fixed server-side and is not part of the client query
+  surface.
+- **Embedded mode only**: the endpoints proxy the worker's qwenpaw app
+  inside the shared docker network, using the effective container prefix
+  and the system-wins console port — the same address resolution as the
+  checkpoint endpoints. In kube mode they return `503`.
+- **Version gate (passthrough 404)**: a worker running QwenPaw < 2.1 has no
+  workspace file router, so every request is an upstream `404` passed
+  through verbatim. To distinguish "worker too old" from "file missing",
+  probe `file-metadata?path=MEMORY.md` — that file exists in every
+  initialized QwenPaw workspace, so a `404` there means the worker is
+  pre-2.1 (or its workspace is not initialized) while other `404`s are
+  plain missing files.
+- Forwarding is fixed-path (tree / file-metadata / file-content) with a
+  strict query whitelist — not a generic reverse proxy, and no write
+  endpoint of the workspace API is reachable.
+
+Error responses:
+
+| Code | Meaning |
+|:--|:--|
+| `400` | Invalid worker name / unsupported subpath or query parameter / path outside the knowledge allowlist / out-of-bounds `limit` or `offset`. |
+| `404` | Worker not found or not in the caller's teams (existence hidden); or (passthrough) the file does not exist — see the version-gate probe above. |
+| `409` / `416` | (passthrough) the file changed while being read / offset beyond end of file. |
+| `502` | Worker app unreachable, or an upstream error (status echoed in the body). |
+| `503` | Kube mode (no stable worker pod DNS to proxy). |
