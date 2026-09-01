@@ -45,6 +45,12 @@ func TestAuthorizer_HumanScoped(t *testing.T) {
 		{Action: ActionUpdate, ResourceKind: "worker", ResourceTeam: "market-team"},
 		{Action: ActionUpdate, ResourceKind: "worker"},
 		{Action: ActionGet, ResourceKind: "status"},
+		// W3②-rw: the knowledge base write action is allowed at the
+		// authorizer level even cross-team (ResourceTeam filled by the
+		// middleware) — a denial here would leak worker existence via 403
+		// (W8 anti-probing). The handler is the real boundary (404).
+		{Action: ActionWorkspaceFilesWrite, ResourceKind: "worker"},
+		{Action: ActionWorkspaceFilesWrite, ResourceKind: "worker", ResourceTeam: "another-team"},
 	}
 	for _, req := range allowed {
 		if err := az.Authorize(caller, req); err != nil {
