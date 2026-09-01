@@ -350,6 +350,10 @@ Controller 代理每个 worker 的 QwenPaw app（QwenPaw ≥ 2.1）的三个只�
   存在"的方法：探测 `file-metadata?path=MEMORY.md`——该文件在每个已初始
   化的 QwenPaw 工作区中都存在，因此这里的 `404` 表示 worker 为 2.1 以下
   （或工作区未初始化），其余 `404` 即普通文件缺失。
+- **Runtime 范围**：端点面向运行 QwenPaw app 的 worker（`qwenpaw`
+  runtime）。其他 runtime 的 worker 没有 QwenPaw 工作区 API：该 runtime 的
+  应用若在服务 console 端口，代理原样透传其响应（通常 `404`）；无人监听
+  时返回 `502`。MEMORY.md 探测因此只对 QwenPaw worker 有意义。
 - 转发为固定子路径（tree / file-metadata / file-content）+ 严格查询白名单
   ——不是通用反向代理，工作区 API 的任何写端点均不可达。
 

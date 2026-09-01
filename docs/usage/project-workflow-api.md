@@ -702,6 +702,12 @@ tree `memory/`, and the distilled knowledge tree `digest/`.
   initialized QwenPaw workspace, so a `404` there means the worker is
   pre-2.1 (or its workspace is not initialized) while other `404`s are
   plain missing files.
+- **Runtime scope**: the endpoints target workers running the QwenPaw app
+  (`qwenpaw` runtime). Workers on other runtimes have no QwenPaw workspace
+  API: when that runtime's app serves the console port the proxy passes its
+  response through verbatim (typically `404`); when nothing listens it
+  returns `502`. The MEMORY.md probe is therefore only meaningful for
+  QwenPaw workers.
 - Forwarding is fixed-path (tree / file-metadata / file-content) with a
   strict query whitelist — not a generic reverse proxy, and no write
   endpoint of the workspace API is reachable.
