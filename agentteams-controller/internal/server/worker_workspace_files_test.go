@@ -12,6 +12,7 @@ import (
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -240,6 +241,7 @@ func TestWorkspaceFiles_RejectsNonKB(t *testing.T) {
 		"memories/x.md",
 		"memoryX/x.md",
 		"digestX/x.md",
+		"MEMORY.md/foo",
 		"memory/a/b/c/d",
 		"",
 	} {
@@ -583,5 +585,440 @@ func TestWorkspaceFiles_EffectivePrefixAndPortReachUpstream(t *testing.T) {
 	want := "http://acme-worker-market-writer:8088/workspace/file-metadata?path=MEMORY.md&root=workspace"
 	if rt.gotURL.String() != want {
 		t.Fatalf("upstream URL=%s, want %s", rt.gotURL.String(), want)
+	}
+}
+
+// ── Knowledge base write (PUT file-content) + file-download tests ─────────
+
+// kbWriteRequest builds a PUT request against the workspace-files route with
+// a JSON body and an optional If-Match header.
+func kbWriteRequest(name, sub, query, body, ifMatch string) *http.Request {
+	target := "/api/v1/workers/placeholder/workspace-files/" + sub
+	if query != "" {
+		target += "?" + query
+	}
+	req := httptest.NewRequest(http.MethodPut, target, strings.NewReader(body))
+	req.SetPathValue("name", name)
+	req.SetPathValue("sub", sub)
+	if ifMatch != "" {
+		req.Header.Set("If-Match", ifMatch)
+	}
+	return req
+}
+
+// kbHumanFixture builds a Human CR (L2 by default).
+func kbHumanFixture(name string, teams []string, access string) *v1beta1.Human {
+	return &v1beta1.Human{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec: v1beta1.HumanSpec{
+			DisplayName:         name,
+			PermissionLevel:     2,
+			AccessibleTeams:     teams,
+			WorkspaceFileAccess: access,
+		},
+	}
+}
+
+// kbWriteUpstream mimics the worker qwenpaw app for write tests: a
+// configurable file-metadata probe answer and a PUT capture that verifies
+// the forwarded body / If-Match.
+func kbWriteUpstream(t *testing.T, exists bool, wantIfMatch string) (*httptest.Server, *int) {
+	t.Helper()
+	putCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/workspace/file-metadata"):
+			if exists {
+				_, _ = w.Write([]byte(`{"path":"memory/t.md","size":6,"modified":1,"etag":"et-1"}`))
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"detail":"File not found"}`))
+			}
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/workspace/file-content"):
+			putCalls++
+			body, _ := io.ReadAll(r.Body)
+			if r.Header.Get("If-Match") != wantIfMatch {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"detail":"unexpected If-Match"}`))
+				return
+			}
+			if !strings.Contains(string(body), `"content":"hello-kb"`) {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"detail":"unexpected content"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"etag":"et-2","path":"memory/t.md","size":9}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	return upstream, &putCalls
+}
+
+// TestWorkspaceFilesWrite_CreateNewFile: L2 human in scope creates a new
+// file (no If-Match — upstream forbids an ETag on a missing file).
+func TestWorkspaceFilesWrite_CreateNewFile(t *testing.T) {
+	upstream, putCalls := kbWriteUpstream(t, false, "")
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream,
+		append(kbWorkerFixture("market-team", "market-writer"),
+			kbHumanFixture("maizong", []string{"market-team"}, "readwrite"))...)
+	req := withCaller(kbWriteRequest("market-writer", "file-content", "path=memory/t.md", `{"content":"hello-kb"}`, ""),
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"market-team"}})
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFileWrite(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 for in-scope L2 human create", rec.Code, rec.Body.String())
+	}
+	if *putCalls != 1 {
+		t.Fatalf("upstream PUT calls=%d, want 1", *putCalls)
+	}
+	if !strings.Contains(rec.Body.String(), `"etag":"et-2"`) {
+		t.Fatalf("body=%s, want upstream etag passthrough", rec.Body.String())
+	}
+}
+
+// TestWorkspaceFilesWrite_UpdateWithETag: existing file + matching If-Match
+// forwards the ETag to the worker app.
+func TestWorkspaceFilesWrite_UpdateWithETag(t *testing.T) {
+	upstream, _ := kbWriteUpstream(t, true, "et-1")
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream,
+		append(kbWorkerFixture("market-team", "market-writer"),
+			kbHumanFixture("maizong", []string{"market-team"}, "readwrite"))...)
+	req := withCaller(kbWriteRequest("market-writer", "file-content", "path=memory/t.md", `{"content":"hello-kb"}`, "et-1"),
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"market-team"}})
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFileWrite(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 for ETag-matched update", rec.Code, rec.Body.String())
+	}
+}
+
+// TestWorkspaceFilesWrite_ExistingWithoutIfMatchRejected: the proxy must not
+// let a client skip the optimistic-concurrency check on an existing file
+// (the worker auto-appends to its memory files — a bare overwrite is a lost
+// update).
+func TestWorkspaceFilesWrite_ExistingWithoutIfMatchRejected(t *testing.T) {
+	upstream, putCalls := kbWriteUpstream(t, true, "")
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream,
+		append(kbWorkerFixture("market-team", "market-writer"),
+			kbHumanFixture("maizong", []string{"market-team"}, "readwrite"))...)
+	req := withCaller(kbWriteRequest("market-writer", "file-content", "path=memory/t.md", `{"content":"hello-kb"}`, ""),
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"market-team"}})
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFileWrite(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 (If-Match required for existing file)", rec.Code)
+	}
+	if *putCalls != 0 {
+		t.Fatalf("upstream PUT calls=%d, want 0 (no write without ETag check)", *putCalls)
+	}
+}
+
+// TestWorkspaceFilesWrite_NewFileWithIfMatchRejected: an ETag on a missing
+// file is a client error (upstream would 409; the proxy rejects earlier).
+func TestWorkspaceFilesWrite_NewFileWithIfMatchRejected(t *testing.T) {
+	upstream, putCalls := kbWriteUpstream(t, false, "")
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream,
+		append(kbWorkerFixture("market-team", "market-writer"),
+			kbHumanFixture("maizong", []string{"market-team"}, "readwrite"))...)
+	req := withCaller(kbWriteRequest("market-writer", "file-content", "path=memory/t.md", `{"content":"hello-kb"}`, "et-1"),
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"market-team"}})
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFileWrite(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 (no If-Match on new file)", rec.Code)
+	}
+	if *putCalls != 0 {
+		t.Fatalf("upstream PUT calls=%d, want 0", *putCalls)
+	}
+}
+
+// TestWorkspaceFilesWrite_ETagConflictPassthrough: the worker changed the
+// file between the client's read and write — upstream 409 passes through.
+func TestWorkspaceFilesWrite_ETagConflictPassthrough(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/workspace/file-metadata"):
+			_, _ = w.Write([]byte(`{"path":"memory/t.md","size":6,"modified":1,"etag":"et-1"}`))
+		default: // the PUT
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"detail":"File changed on disk"}`))
+		}
+	}))
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream,
+		append(kbWorkerFixture("market-team", "market-writer"),
+			kbHumanFixture("maizong", []string{"market-team"}, "readwrite"))...)
+	req := withCaller(kbWriteRequest("market-writer", "file-content", "path=memory/t.md", `{"content":"hello-kb"}`, "stale-et"),
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"market-team"}})
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFileWrite(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 passthrough", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "File changed on disk") {
+		t.Fatalf("body=%s, want upstream conflict detail", rec.Body.String())
+	}
+}
+
+// TestWorkspaceFilesWrite_CrossTeamHidden: W8 — cross-team writes hide the
+// worker as 404 (existence must not be probeable).
+func TestWorkspaceFilesWrite_CrossTeamHidden(t *testing.T) {
+	upstream, putCalls := kbWriteUpstream(t, false, "")
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream,
+		append(kbWorkerFixture("market-team", "market-writer"),
+			kbHumanFixture("sunzong", []string{"biz-team"}, ""))...)
+	req := withCaller(kbWriteRequest("market-writer", "file-content", "path=memory/t.md", `{"content":"hello-kb"}`, ""),
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "sunzong", Teams: []string{"biz-team"}})
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFileWrite(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 for cross-team write (W8)", rec.Code)
+	}
+	if *putCalls != 0 {
+		t.Fatalf("upstream PUT calls=%d, want 0", *putCalls)
+	}
+}
+
+// TestWorkspaceFilesWrite_ReadOnlyHumanDenied: L1 locked the user to
+// read-only via workspaceFileAccess="read" — in-scope writes get 403.
+func TestWorkspaceFilesWrite_ReadOnlyHumanDenied(t *testing.T) {
+	upstream, putCalls := kbWriteUpstream(t, false, "")
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream,
+		append(kbWorkerFixture("market-team", "market-writer"),
+			kbHumanFixture("maizong", []string{"market-team"}, "read"))...)
+	req := withCaller(kbWriteRequest("market-writer", "file-content", "path=memory/t.md", `{"content":"hello-kb"}`, ""),
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"market-team"}})
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFileWrite(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status=%d, want 403 for read-only human", rec.Code)
+	}
+	if *putCalls != 0 {
+		t.Fatalf("upstream PUT calls=%d, want 0", *putCalls)
+	}
+}
+
+// TestWorkspaceFilesWrite_DefaultAccessDenied is the upgrade regression the
+// review required: a Human CR with no workspaceFileAccess field at all (the
+// shape of every pre-existing L2 human right after a controller upgrade)
+// must NOT be able to write — empty means "read", write is an explicit
+// opt-in.
+func TestWorkspaceFilesWrite_DefaultAccessDenied(t *testing.T) {
+	upstream, putCalls := kbWriteUpstream(t, false, "")
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream,
+		append(kbWorkerFixture("market-team", "market-writer"),
+			kbHumanFixture("maizong", []string{"market-team"}, ""))...)
+	req := withCaller(kbWriteRequest("market-writer", "file-content", "path=memory/t.md", `{"content":"hello-kb"}`, ""),
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"market-team"}})
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFileWrite(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s, want 403 for empty workspaceFileAccess (upgrade default = read)", rec.Code, rec.Body.String())
+	}
+	if *putCalls != 0 {
+		t.Fatalf("upstream PUT calls=%d, want 0", *putCalls)
+	}
+}
+
+// TestWorkspaceFilesWrite_LeaderDenied: team leaders stay read-only on the
+// write API (their KB management surface is the chat/tools path, not REST).
+func TestWorkspaceFilesWrite_LeaderDenied(t *testing.T) {
+	upstream, putCalls := kbWriteUpstream(t, false, "")
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream, kbWorkerFixture("market-team", "market-writer")...)
+	req := withCaller(kbWriteRequest("market-writer", "file-content", "path=memory/t.md", `{"content":"hello-kb"}`, ""),
+		&authpkg.CallerIdentity{Role: authpkg.RoleTeamLeader, Username: "market-writer", Team: "market-team"})
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFileWrite(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status=%d, want 403 for in-scope team leader", rec.Code)
+	}
+	if *putCalls != 0 {
+		t.Fatalf("upstream PUT calls=%d, want 0", *putCalls)
+	}
+}
+
+// TestWorkspaceFilesWrite_AdminAllowed: L1 (admin) may write any team's
+// knowledge base — no Human CR needed, no team scope.
+func TestWorkspaceFilesWrite_AdminAllowed(t *testing.T) {
+	upstream, _ := kbWriteUpstream(t, false, "")
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream, kbWorkerFixture("market-team", "market-writer")...)
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFileWrite(rec, adminCaller(kbWriteRequest("market-writer", "file-content", "path=memory/t.md", `{"content":"hello-kb"}`, "")))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 for admin", rec.Code, rec.Body.String())
+	}
+}
+
+// TestWorkspaceFilesWrite_OverSizeRejected: the 1 MiB write cap is enforced
+// before the worker app is touched.
+func TestWorkspaceFilesWrite_OverSizeRejected(t *testing.T) {
+	upstream, putCalls := kbWriteUpstream(t, false, "")
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream,
+		append(kbWorkerFixture("market-team", "market-writer"),
+			kbHumanFixture("maizong", []string{"market-team"}, "readwrite"))...)
+	big := strings.Repeat("x", 1024*1024+1)
+	req := withCaller(kbWriteRequest("market-writer", "file-content", "path=memory/t.md", `{"content":"`+big+`"}`, ""),
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"market-team"}})
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFileWrite(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 for over-size body", rec.Code)
+	}
+	if *putCalls != 0 {
+		t.Fatalf("upstream PUT calls=%d, want 0", *putCalls)
+	}
+}
+
+// TestWorkspaceFilesWrite_SensitivePathRejected: the knowledge base
+// allowlist applies to writes exactly as to reads (SOUL.md is the team
+// owner's domain — never writable through this API).
+func TestWorkspaceFilesWrite_SensitivePathRejected(t *testing.T) {
+	upstream, putCalls := kbWriteUpstream(t, true, "")
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream,
+		append(kbWorkerFixture("market-team", "market-writer"),
+			kbHumanFixture("maizong", []string{"market-team"}, "readwrite"))...)
+	for _, path := range []string{"SOUL.md", "PROFILE.md", "skills/x/SKILL.md", ".copaw/agent.json", "memory/../../SOUL.md", "MEMORY.md/foo"} {
+		req := withCaller(kbWriteRequest("market-writer", "file-content", "path="+url.QueryEscape(path), `{"content":"hello-kb"}`, ""),
+			&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"market-team"}})
+		rec := httptest.NewRecorder()
+		h.proxyWorkspaceFileWrite(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("path=%s status=%d, want 400 (allowlist)", path, rec.Code)
+		}
+	}
+	if *putCalls != 0 {
+		t.Fatalf("upstream PUT calls=%d, want 0", *putCalls)
+	}
+}
+
+// TestWorkspaceFilesWrite_KubeModeUnavailable: uniform 503 in kube mode.
+func TestWorkspaceFilesWrite_KubeModeUnavailable(t *testing.T) {
+	h := newTestWorkspaceFilesHandler(t, "kube", nil, kbWorkerFixture("market-team", "market-writer")...)
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFileWrite(rec, adminCaller(kbWriteRequest("market-writer", "file-content", "path=memory/t.md", `{"content":"hello-kb"}`, "")))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503 in kube mode", rec.Code)
+	}
+}
+
+// TestWorkspaceFilesWrite_UnknownSubpathAndBody: only file-content is a
+// write subpath; the body must be {"content": string}.
+func TestWorkspaceFilesWrite_UnknownSubpathAndBody(t *testing.T) {
+	h := newTestWorkspaceFilesHandler(t, "embedded", nil, kbWorkerFixture("market-team", "market-writer")...)
+	for sub, body := range map[string]string{"file-metadata": `{}`, "file-download": `{}`, "tree": `{}`} {
+		rec := httptest.NewRecorder()
+		h.proxyWorkspaceFileWrite(rec, adminCaller(kbWriteRequest("market-writer", sub, "path=memory", body, "")))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("sub=%s status=%d, want 400 (not a write subpath)", sub, rec.Code)
+		}
+	}
+	upstream, _ := kbWriteUpstream(t, false, "")
+	defer upstream.Close()
+	h2 := newTestWorkspaceFilesHandler(t, "embedded", upstream,
+		append(kbWorkerFixture("market-team", "market-writer"),
+			kbHumanFixture("maizong", []string{"market-team"}, "readwrite"))...)
+	for _, body := range []string{`[]`, `{"noContent":true}`, `not-json`} {
+		req := withCaller(kbWriteRequest("market-writer", "file-content", "path=memory/t.md", body, ""),
+			&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"market-team"}})
+		rec := httptest.NewRecorder()
+		h2.proxyWorkspaceFileWrite(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("body=%q status=%d, want 400 (invalid body)", body, rec.Code)
+		}
+	}
+}
+
+// TestWorkspaceFilesDownload_InScopeAllowed: file-download streams with the
+// attachment headers forwarded verbatim.
+func TestWorkspaceFilesDownload_InScopeAllowed(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/workspace/file-download") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Header().Set("Content-Disposition", `attachment; filename="MEMORY.md"`)
+		w.Header().Set("Content-Length", "11")
+		w.Header().Set("ETag", `"dl-1"`)
+		_, _ = w.Write([]byte("memory-body"))
+	}))
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream, kbWorkerFixture("market-team", "market-writer")...)
+	req := withCaller(kbRequest("market-writer", "file-download", "path=MEMORY.md"),
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"market-team"}})
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFiles(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 for in-scope download", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Disposition"); got != `attachment; filename="MEMORY.md"` {
+		t.Fatalf("Content-Disposition=%q, want attachment header forwarded", got)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/markdown" {
+		t.Fatalf("Content-Type=%q, want upstream media type (not forced JSON)", got)
+	}
+	if rec.Body.String() != "memory-body" {
+		t.Fatalf("body=%q", rec.Body.String())
+	}
+}
+
+// TestWorkspaceFilesDownload_CrossTeamHidden: W8 applies to downloads.
+func TestWorkspaceFilesDownload_CrossTeamHidden(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("secret"))
+	}))
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream, kbWorkerFixture("market-team", "market-writer")...)
+	req := withCaller(kbRequest("market-writer", "file-download", "path=MEMORY.md"),
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "sunzong", Teams: []string{"biz-team"}})
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFiles(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 for cross-team download (W8)", rec.Code)
+	}
+}
+
+// TestWorkspaceFilesDownload_SensitivePathRejected: the allowlist covers
+// downloads — agent.json (Matrix token) must never stream out.
+func TestWorkspaceFilesDownload_SensitivePathRejected(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"token":"leak"}`))
+	}))
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream, kbWorkerFixture("market-team", "market-writer")...)
+	for _, path := range []string{".copaw/agent.json", "MEMORY.md/foo"} {
+		req := adminCaller(kbRequest("market-writer", "file-download", "path="+url.QueryEscape(path)))
+		rec := httptest.NewRecorder()
+		h.proxyWorkspaceFiles(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("path=%s status=%d, want 400 (allowlist) even for admin", path, rec.Code)
+		}
 	}
 }

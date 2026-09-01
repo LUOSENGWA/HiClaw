@@ -1,16 +1,17 @@
 package server
 
-// Worker knowledge base file inspection
-// (GET /api/v1/workers/{name}/workspace-files/...).
+// Worker knowledge base file inspection and management
+// (/api/v1/workers/{name}/workspace-files/...).
 //
-// Each worker's qwenpaw app (QwenPaw >= 2.1) exposes read-only workspace
-// file endpoints on :8088 (0.0.0.0 listen; no auth in worker context
-// because no console user is registered): /workspace/tree (paginated
-// directory listing), /workspace/file-metadata and /workspace/file-content
-// (bounded UTF-8 chunk reads). The Controller proxies those three
-// read-only subpaths so L2 humans and the workbench plugin can inspect a
-// worker's knowledge base (MEMORY.md, memory/**, digest/**) without
-// reaching into the docker network directly.
+// Each worker's qwenpaw app (QwenPaw >= 2.1) exposes workspace file
+// endpoints on :8088 (0.0.0.0 listen; no auth in worker context because no
+// console user is registered): /workspace/tree (paginated directory
+// listing), /workspace/file-metadata, /workspace/file-content (bounded
+// UTF-8 chunk reads and ETag-guarded writes), and /workspace/file-download
+// (bounded stream). The Controller proxies those four subpaths so L2 humans
+// and the workbench plugin can inspect — and, where the Human CR grants it,
+// update — a worker's knowledge base (MEMORY.md, memory/**, digest/**)
+// without reaching into the docker network directly.
 //
 // Embedded mode only: the worker app is reachable by container name inside
 // the shared docker network. The effective container name prefix comes from
@@ -44,12 +45,27 @@ package server
 // opposed to root=project, the primary bound project directory) is pinned
 // server-side and is never part of the client-facing query surface.
 //
-// Fixed-path forwarding only (tree / file-metadata / file-content, plus
-// their whitelisted queries) — never a generic reverse proxy, and never a
-// write endpoint, so the attack surface is limited to three read-only
-// QwenPaw endpoints.
+// Fixed-path forwarding only (tree / file-metadata / file-content GET+PUT /
+// file-download, plus their whitelisted queries) — never a generic reverse
+// proxy — so the attack surface is limited to four QwenPaw endpoints.
+//
+// Write scope (PUT file-content, introduced with the team-scoped write
+// access): admin/manager (L1) may write any worker's knowledge base; an L2
+// human may write only workers in their own teams, and only when their
+// Human CR carries workspaceFileAccess="readwrite" — write is an explicit
+// opt-in. An empty/missing value means "read" (never "readwrite"), so a
+// controller upgrade cannot silently grant pre-existing L2 humans the new
+// ability to modify worker knowledge files; L1 opts a user into writing by
+// setting the field to "readwrite". Team leaders stay read-only on this
+// API. The proxy enforces optimistic concurrency for
+// existing files (If-Match is mandatory — the worker auto-appends to its
+// memory files, so a skipped ETag check is a lost update) and caps the
+// write body at 1 MiB, mirroring the read chunk cap. Every write is
+// audit-logged.
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -65,6 +81,7 @@ import (
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/service"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const (
@@ -90,12 +107,19 @@ const (
 )
 
 // workspaceFileSubpaths is the fixed whitelist of forwardable QwenPaw
-// endpoints. Write endpoints (file-content PUT, file-upload) and binary
-// streaming (file-download) are deliberately absent.
+// endpoints. file-content is served for both GET (chunked read) and PUT
+// (ETag-guarded write); everything else the upstream app exposes
+// (file-upload multipart, running-config, ...) stays deliberately absent.
 var workspaceFileSubpaths = map[string]bool{
 	"tree":          true,
 	"file-metadata": true,
 	"file-content":  true,
+	"file-download": true,
+}
+
+// workspaceFileWriteSubpaths are the subpaths served by the PUT handler.
+var workspaceFileWriteSubpaths = map[string]bool{
+	"file-content": true,
 }
 
 // kbFileRoots are the top-level single files addressable by the
@@ -137,6 +161,14 @@ func validateKbPath(path string, forFile bool) error {
 	if forFile {
 		for _, root := range kbFileRoots {
 			if first == root {
+				// File roots are single top-level files (MEMORY.md) —
+				// exactly one segment. Rejecting deeper paths keeps the
+				// allowlist in line with the documented contract (MEMORY.md
+				// is a file, not a directory); nested files must live under
+				// the memory/ or digest/ directory roots.
+				if len(segments) != 1 {
+					return errors.New("file roots are single top-level files (e.g. MEMORY.md); use memory/ or digest/ for nested paths")
+				}
 				return nil
 			}
 		}
@@ -163,6 +195,8 @@ func validateWorkspaceFilesQuery(sub string, q url.Values) (string, error) {
 		allowed = map[string]bool{"path": true}
 	case "file-content":
 		allowed = map[string]bool{"path": true, "offset": true, "limit": true}
+	case "file-download":
+		allowed = map[string]bool{"path": true}
 	}
 	for key, vals := range q {
 		if !allowed[key] {
@@ -338,7 +372,17 @@ func (h *WorkspaceFilesHandler) proxyWorkspaceFiles(w http.ResponseWriter, r *ht
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		w.Header().Set("Content-Type", "application/json")
+		if sub == "file-download" {
+			// Stream the file verbatim with its attachment headers —
+			// the client saves it under the worker's file name.
+			for _, h := range []string{"Content-Disposition", "Content-Length", "ETag", "Accept-Ranges", "Content-Type"} {
+				if v := resp.Header.Get(h); v != "" {
+					w.Header().Set(h, v)
+				}
+			}
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.Copy(w, resp.Body)
 	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusRequestedRangeNotSatisfiable:
@@ -353,5 +397,217 @@ func (h *WorkspaceFilesHandler) proxyWorkspaceFiles(w http.ResponseWriter, r *ht
 	default:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		httputil.WriteError(w, http.StatusBadGateway, fmt.Sprintf("workspace files API error (status %d): %s", resp.StatusCode, string(body)))
+	}
+}
+
+// upstreamKBFileExists probes the worker's file-metadata endpoint to decide
+// the If-Match policy before a write. exists=true means the file is present
+// (a write must carry a matching If-Match); exists=false means the file is
+// absent (a write must NOT carry If-Match — upstream treats an ETag on a
+// missing file as a conflict).
+func (h *WorkspaceFilesHandler) upstreamKBFileExists(ctx context.Context, baseURL, path string) (bool, error) {
+	target := baseURL + "/workspace/file-metadata?path=" + url.QueryEscape(path) + "&root=workspace"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := h.http.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		return true, nil
+	case resp.StatusCode == http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("file-metadata probe returned status %d", resp.StatusCode)
+	}
+}
+
+// proxyWorkspaceFileWrite handles PUT
+// /api/v1/workers/{name}/workspace-files/file-content.
+//
+// Write scope: admin/manager (L1) may write any worker's knowledge base; an
+// L2 human may write only workers in their own teams while their Human CR
+// carries workspaceFileAccess="readwrite" (explicit opt-in — an
+// empty/missing value means "read"). Team leaders stay read-only on this
+// API. Out-of-scope workers hide as 404 (same W8 anti-probing rule as the
+// read path).
+//
+// Concurrency: the proxy first probes file-metadata; for an existing file
+// the If-Match header is mandatory (the worker auto-appends to its memory
+// files, so a write without an ETag check is a lost update), and for a new
+// file it must be absent (upstream rejects an ETag on a missing file). The
+// write body is capped at kbMaxFileLimit (1 MiB, the read chunk cap).
+func (h *WorkspaceFilesHandler) proxyWorkspaceFileWrite(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	sub := r.PathValue("sub")
+	if name == "" || !workerNamePattern.MatchString(name) {
+		httputil.WriteError(w, http.StatusBadRequest, "worker name is required and must be a valid DNS label")
+		return
+	}
+	if !workspaceFileWriteSubpaths[sub] {
+		httputil.WriteError(w, http.StatusBadRequest, "unsupported workspace file write subpath")
+		return
+	}
+	if h.kubeMode != "embedded" {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "worker workspace file inspection requires embedded mode")
+		return
+	}
+
+	var worker v1beta1.Worker
+	if err := h.client.Get(r.Context(), client.ObjectKey{Name: name, Namespace: h.namespace}, &worker); err != nil {
+		if apierrors.IsNotFound(err) {
+			httputil.WriteError(w, http.StatusNotFound, "worker not found")
+			return
+		}
+		writeK8sError(w, "write worker workspace file", err)
+		return
+	}
+	// Same team-scope chain as the read path: findTeamMember's second return
+	// value is the member name, not the team name — the scope check must
+	// compare against the Team CR name.
+	teamObj, _, _, err := findTeamMember(r.Context(), h.client, h.namespace, name)
+	if err != nil {
+		writeK8sError(w, "write worker workspace file", err)
+		return
+	}
+	teamName := ""
+	if teamObj != nil {
+		teamName = teamObj.Name
+	}
+	caller := authpkg.CallerFromContext(r.Context())
+	if caller == nil {
+		httputil.WriteError(w, http.StatusForbidden, "caller identity required")
+		return
+	}
+	if caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman {
+		if !caller.TeamMatches(teamName) {
+			httputil.WriteError(w, http.StatusNotFound, "worker not found")
+			return
+		}
+	}
+	// Write-role boundary (see the function comment).
+	switch caller.Role {
+	case authpkg.RoleAdmin, authpkg.RoleManager:
+		// full access
+	case authpkg.RoleTeamLeader:
+		httputil.WriteError(w, http.StatusForbidden, "team leaders can read workspace files but not write them")
+		return
+	case authpkg.RoleHuman:
+		var human v1beta1.Human
+		if err := h.client.Get(r.Context(), client.ObjectKey{Name: caller.Username, Namespace: h.namespace}, &human); err != nil {
+			httputil.WriteError(w, http.StatusForbidden, "workspace file access cannot be verified for this user")
+			return
+		}
+		// Write is an explicit opt-in: an empty or missing
+		// workspaceFileAccess means "read". Defaulting to readwrite would
+		// silently grant every pre-existing L2 human a new ability to
+		// modify worker knowledge files on controller upgrade.
+		if !strings.EqualFold(human.Spec.WorkspaceFileAccess, "readwrite") {
+			httputil.WriteError(w, http.StatusForbidden, "workspace file write access requires workspaceFileAccess=readwrite (explicit opt-in)")
+			return
+		}
+	default:
+		httputil.WriteError(w, http.StatusForbidden, "workspace file write denied for this caller role")
+		return
+	}
+
+	q := r.URL.Query()
+	if len(q) != 1 || len(q["path"]) != 1 || q.Get("path") == "" {
+		httputil.WriteError(w, http.StatusBadRequest, "the only supported query parameter is path (exactly once)")
+		return
+	}
+	path := q.Get("path")
+	if err := validateKbPath(path, true); err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Body: {"content": string}, capped at the 1 MiB write limit.
+	raw, err := io.ReadAll(io.LimitReader(r.Body, kbMaxFileLimit+1))
+	if err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, "read request body: "+err.Error())
+		return
+	}
+	if len(raw) > kbMaxFileLimit {
+		httputil.WriteError(w, http.StatusBadRequest, "content exceeds the 1 MiB write limit")
+		return
+	}
+	var payload struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, "request body must be a JSON object with a content string field")
+		return
+	}
+	if payload.Content == "" {
+		// An empty write would truncate the worker's knowledge file —
+		// the write API is for updating knowledge, not blanking it.
+		httputil.WriteError(w, http.StatusBadRequest, "content must be a non-empty string")
+		return
+	}
+
+	// If-Match policy: probe existence first (the worker app is the source
+	// of truth for what is on disk).
+	baseURL := h.workerBaseURL(name, worker.Spec.Env)
+	ifMatch := r.Header.Get("If-Match")
+	exists, err := h.upstreamKBFileExists(r.Context(), baseURL, path)
+	if err != nil {
+		httputil.WriteError(w, http.StatusBadGateway, "probe worker workspace file: "+err.Error())
+		return
+	}
+	if exists && ifMatch == "" {
+		httputil.WriteError(w, http.StatusBadRequest, "If-Match header is required to update an existing file")
+		return
+	}
+	if !exists && ifMatch != "" {
+		httputil.WriteError(w, http.StatusBadRequest, "If-Match must not be sent when creating a new file")
+		return
+	}
+
+	target := baseURL + "/workspace/file-content?path=" + url.QueryEscape(path) + "&root=workspace"
+	body, _ := json.Marshal(map[string]string{"content": payload.Content})
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPut, target, strings.NewReader(string(body)))
+	if err != nil {
+		httputil.WriteError(w, http.StatusInternalServerError, "build workspace file write request: "+err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if ifMatch != "" {
+		req.Header.Set("If-Match", ifMatch)
+	}
+	resp, err := h.http.Do(req)
+	if err != nil {
+		httputil.WriteError(w, http.StatusBadGateway, "worker workspace API unreachable")
+		return
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		bodyOut, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(bodyOut)
+		if logger := log.FromContext(r.Context()).WithName("workspace-files"); logger.Enabled() {
+			logger.Info("knowledge base file written",
+				"worker", name, "path", path, "caller", caller.Username,
+				"role", caller.Role, "bytes", len(payload.Content), "create", !exists)
+		}
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity:
+		// Pass through verbatim: invalid path (400), file vanished between
+		// probe and write (404), ETag mismatch — file changed on disk (409),
+		// or content rejected upstream (422).
+		bodyOut, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(bodyOut)
+	default:
+		bodyOut, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		httputil.WriteError(w, http.StatusBadGateway, fmt.Sprintf("workspace files API error (status %d): %s", resp.StatusCode, string(bodyOut)))
 	}
 }

@@ -128,6 +128,7 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	// --- Worker knowledge base files (read-only MEMORY.md / memory/** / digest/** inspection; proxy to the worker's qwenpaw app) ---
 	wfh := NewWorkspaceFilesHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix)
 	mux.Handle("GET /api/v1/workers/{name}/workspace-files/{sub}", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(wfh.proxyWorkspaceFiles)))
+	mux.Handle("PUT /api/v1/workers/{name}/workspace-files/file-content", mw.RequireAuthz(authpkg.ActionWorkspaceFilesWrite, "worker", nameFn)(http.HandlerFunc(wfh.proxyWorkspaceFileWrite)))
 
 	// W-PR-2: human intervention + lifecycle (write endpoints). All writes go
 	// through RequireAuthz ActionUpdate + "project" so the authorizer's
