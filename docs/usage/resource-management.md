@@ -179,6 +179,18 @@ When the Controller receives a Worker resource, it executes:
 
 **Status fields (subset):** `status.observedGeneration`, `status.matrixUserID`, `status.roomID`, `status.containerState`, `status.lastHeartbeat`, `status.message`, `status.exposedPorts` (per-port `domain` after expose).
 
+### Worker Updates by Role (API)
+
+`PUT /api/v1/workers/{name}` is a merge-patch: only fields present in the body are changed. What each role may update:
+
+| Role | Scope | Fields |
+|------|-------|--------|
+| admin / manager | any worker | all fields |
+| team leader | workers in their team | all fields |
+| L2 human (`permissionLevel: 2`) | workers in `accessibleTeams` only | `skills` |
+
+L2 humans manage the built-in skill assignments of the workers they coordinate without escalating to the admin. `remoteSkills` and `mcpServers` are not L2-writable yet: the MCP path can exfiltrate the gateway consumer key (the generator attaches `Authorization: Bearer <gatewayKey>` to every MCP entry), so both fields return `400` for L2 callers until the elevated-capability design lands (see the L2 permission design issue #1220). Other fields — `model`, `image`, `soul`, `agents`, `runtime`, `package`, `expose`, `channelPolicy`, `resources`, `containerManaged`, `state` — stay in the team owner's domain; a body that touches them is rejected with `400`. Out-of-scope workers (cross-team or standalone) are invisible to L2 humans on both read and update (`404`), keeping the endpoint probe-resistant. See [L2 Human Worker-Scoped Write](../design/l2-worker-scoped-write.md).
+
 ## Team
 
 A Team is AgentTeams's collaboration unit, consisting of one Team Leader and one or more Team Workers. The Manager delegates tasks to the Team Leader, who handles decomposition, assignment, and aggregation — achieving team-level autonomy.

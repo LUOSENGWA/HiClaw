@@ -15,6 +15,7 @@ type CreateWorkerRequest struct {
 	Soul          string                             `json:"soul,omitempty"`
 	Agents        string                             `json:"agents,omitempty"`
 	Skills        []string                           `json:"skills,omitempty"`
+	RemoteSkills  []v1beta1.RemoteSkillSource        `json:"remoteSkills,omitempty"`
 	McpServers    []v1beta1.MCPServer                `json:"mcpServers,omitempty"`
 	Package       string                             `json:"package,omitempty"`
 	Expose        []v1beta1.ExposePort               `json:"expose,omitempty"`
@@ -39,6 +40,7 @@ type UpdateWorkerRequest struct {
 	Soul          string                             `json:"soul,omitempty"`
 	Agents        string                             `json:"agents,omitempty"`
 	Skills        []string                           `json:"skills,omitempty"`
+	RemoteSkills  []v1beta1.RemoteSkillSource        `json:"remoteSkills,omitempty"`
 	McpServers    []v1beta1.MCPServer                `json:"mcpServers,omitempty"`
 	Package       string                             `json:"package,omitempty"`
 	Expose        []v1beta1.ExposePort               `json:"expose,omitempty"`
@@ -195,6 +197,7 @@ type CreateManagerRequest struct {
 	Soul          string                             `json:"soul,omitempty"`
 	Agents        string                             `json:"agents,omitempty"`
 	Skills        []string                           `json:"skills,omitempty"`
+	RemoteSkills  []v1beta1.RemoteSkillSource        `json:"remoteSkills,omitempty"`
 	McpServers    []v1beta1.MCPServer                `json:"mcpServers,omitempty"`
 	Package       string                             `json:"package,omitempty"`
 	Config        *v1beta1.ManagerConfig             `json:"config,omitempty"`
@@ -210,6 +213,7 @@ type UpdateManagerRequest struct {
 	Soul          string                             `json:"soul,omitempty"`
 	Agents        string                             `json:"agents,omitempty"`
 	Skills        []string                           `json:"skills,omitempty"`
+	RemoteSkills  []v1beta1.RemoteSkillSource        `json:"remoteSkills,omitempty"`
 	McpServers    []v1beta1.MCPServer                `json:"mcpServers,omitempty"`
 	Package       string                             `json:"package,omitempty"`
 	Config        *v1beta1.ManagerConfig             `json:"config,omitempty"`
