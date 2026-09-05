@@ -23,11 +23,14 @@ func TestAuthorizer_ManagerAllowsEverything(t *testing.T) {
 	}
 }
 
-// TestAuthorizer_HumanReadOnly guards the L2 security boundary: an L2 human
+// TestAuthorizer_HumanScoped guards the L2 security boundary: an L2 human
 // (RoleHuman) may read projects/teams/workers in scope, may update projects in
-// scope (W-PR-2: pause/resume/replan/lifecycle, code-level requireSameTeam),
-// but must NOT manage workers, refresh credentials, or mutate teams.
-func TestAuthorizer_HumanReadOnly(t *testing.T) {
+// scope (pause/resume/replan/lifecycle, code-level requireSameTeam), and may
+// update workers in scope (self-service skill / MCP config — the middleware
+// cannot resolve worker -> team, so the UpdateWorker handler enforces the real
+// boundary). They must NOT create/delete workers, wake/sleep them, refresh
+// credentials, or mutate teams.
+func TestAuthorizer_HumanScoped(t *testing.T) {
 	az := NewAuthorizer()
 	caller := &CallerIdentity{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}}
 
@@ -39,6 +42,8 @@ func TestAuthorizer_HumanReadOnly(t *testing.T) {
 		{Action: ActionGet, ResourceKind: "team"},
 		{Action: ActionList, ResourceKind: "worker"},
 		{Action: ActionGet, ResourceKind: "worker"},
+		{Action: ActionUpdate, ResourceKind: "worker", ResourceTeam: "market-team"},
+		{Action: ActionUpdate, ResourceKind: "worker"},
 		{Action: ActionGet, ResourceKind: "status"},
 	}
 	for _, req := range allowed {
@@ -49,7 +54,8 @@ func TestAuthorizer_HumanReadOnly(t *testing.T) {
 
 	denied := []AuthzRequest{
 		{Action: ActionCreate, ResourceKind: "worker"},
-		{Action: ActionUpdate, ResourceKind: "worker"},
+		{Action: ActionUpdate, ResourceKind: "worker", ResourceTeam: "another-team"},
+		{Action: ActionDelete, ResourceKind: "worker"},
 		{Action: ActionWake, ResourceKind: "worker"},
 		{Action: ActionSleep, ResourceKind: "worker"},
 		{Action: ActionRefreshMatrixToken, ResourceKind: "credentials"},
