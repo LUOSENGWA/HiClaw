@@ -128,10 +128,23 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	ckh := NewCheckpointHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix)
 	mux.Handle("GET /api/v1/workers/{name}/checkpoints/{sub}", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(ckh.proxyCheckpoint)))
 
-	// --- Worker knowledge base files (read-only MEMORY.md / memory/** / digest/** inspection; proxy to the worker's qwenpaw app) ---
+// --- Worker knowledge base files (read-only MEMORY.md / memory/** / digest/** inspection; proxy to the worker's qwenpaw app) ---
 	wfh := NewWorkspaceFilesHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix)
 	mux.Handle("GET /api/v1/workers/{name}/workspace-files/{sub}", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(wfh.proxyWorkspaceFiles)))
 	mux.Handle("PUT /api/v1/workers/{name}/workspace-files/file-content", mw.RequireAuthz(authpkg.ActionWorkspaceFilesWrite, "worker", nameFn)(http.HandlerFunc(wfh.proxyWorkspaceFileWrite)))
+// Worker runtime-config proxy (qwenpaw running-config: 5-tab settings +
+	// Loop Engine catalog/status + custom-loop CRUD). runtime-aware (400 for
+	// non-qwenpaw), L2 team-scoped, 5-tab field whitelist for L2 writes, and
+	// loop-change notification (@leader + @changer) on custom-loop writes.
+	rch := NewRuntimeConfigHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix, deps.MatrixClient)
+	mux.Handle("GET /api/v1/workers/{name}/runtime-config", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
+	mux.Handle("PUT /api/v1/workers/{name}/runtime-config", mw.RequireAuthz(authpkg.ActionUpdate, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
+	mux.Handle("GET /api/v1/workers/{name}/loops", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
+	mux.Handle("GET /api/v1/workers/{name}/loops/status", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
+	mux.Handle("GET /api/v1/workers/{name}/loops/custom", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
+	mux.Handle("POST /api/v1/workers/{name}/loops/custom", mw.RequireAuthz(authpkg.ActionUpdate, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
+	mux.Handle("PUT /api/v1/workers/{name}/loops/custom/{loop}", mw.RequireAuthz(authpkg.ActionUpdate, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
+	mux.Handle("DELETE /api/v1/workers/{name}/loops/custom/{loop}", mw.RequireAuthz(authpkg.ActionDelete, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
 
 	// --- Worker tool approval (team-scoped; proxy to the worker's qwenpaw app) ---
 	ah := NewApprovalHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix)
