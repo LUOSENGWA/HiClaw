@@ -231,8 +231,10 @@ type taskInspection struct {
 	Trace        taskTraceHint `json:"trace,omitempty"`
 }
 
-// taskTraceHint names the tracing attributes a UI/backend can filter on. No
-// URL is constructed here: the tracing backend is deployment-specific.
+// taskTraceHint is a tracing-backend filter hint: project_id / task_id are
+// the values to match against the span attributes agentteams.project.id /
+// agentteams.task.id, which worker entry spans already carry. No URL is
+// constructed here: the tracing backend is deployment-specific.
 type taskTraceHint struct {
 	ProjectID string `json:"project_id"`
 	TaskID    string `json:"task_id"`

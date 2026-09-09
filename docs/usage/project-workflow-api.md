@@ -81,7 +81,7 @@ Optional query parameters:
 | `includeTasks` | `bool` | When `true`, also read each task's TaskMeta (`shared/tasks/{id}/meta.json`) and attach a `tasks_detail` array with spec/result/deliverable fields. Default `false` keeps the response lightweight. |
 | `format` | `string` | Response format. Default (absent or empty) returns the JSON snapshot above. `format=mermaid` returns the same snapshot rendered as a Mermaid flowchart (`text/plain`, no `tasks_detail` — rendering needs only nodes/edges/next). Any other value returns `400`. |
 
-Mermaid output (`?format=mermaid`) mirrors LangGraph's `draw_mermaid` helper: each node label is `name: status`, next/ready nodes get the `ready` highlight class, and every other node gets a status class (`pending` / `delegated` / `inProgress` / `completed` / `revision` / `blocked`). All classDefs are emitted so the graph renders standalone. Example:
+Mermaid output (`?format=mermaid`) mirrors LangGraph's `draw_mermaid` helper: each node label is `name: status`, next/ready nodes get the `ready` highlight class, and every other node gets a status class (`pending` / `delegated` / `inProgress` / `completed` / `revision` / `blocked`). All classDefs are emitted so the graph renders standalone. Task titles and ids are user-controlled, so they are sanitized for mermaid safety: newlines become `<br>`, double quotes become `#quot;`, backslashes are dropped, and other control characters become spaces; a task id containing characters outside `[A-Za-z0-9_-]` is mapped to a collision-safe node id (labels keep the original text). A malformed title therefore can never alter the rendered graph structure. Example:
 
 ```text
 flowchart LR
@@ -229,9 +229,10 @@ Field notes:
   entries; it is empty until the workflow transition engine lands
   (design: agentscope-ai/AgentTeams#1223). Malformed entries are skipped,
   never an error.
-- `trace` carries only the tracing attribute names (`agentteams.project.id`
-  / `agentteams.task.id`, present on worker entry spans) — no backend URL is
-  constructed here; the tracing backend is deployment-specific.
+- `trace` is a tracing-backend filter hint: its `project_id` / `task_id` are
+  the values to match against the span attributes `agentteams.project.id` /
+  `agentteams.task.id`, which worker entry spans already carry. No backend
+  URL is constructed here; the tracing backend is deployment-specific.
 - TaskMeta is read from the project's owning scope only (team prefix first,
   global prefix only for standalone projects) — the same no-cross-scope
   fallback rule as `tasks_detail`.

@@ -65,7 +65,7 @@ Controller 提供两个只读端点，把 TeamHarness 项目状态
 | `includeTasks` | `bool` | 为 `true` 时同时读取每个任务的 TaskMeta（`shared/tasks/{id}/meta.json`），在响应中附加 `tasks_detail` 数组（spec/result/交付物字段）。默认 `false` 保持响应轻量。 |
 | `format` | `string` | 响应格式。缺省返回上方 JSON 快照；`format=mermaid` 返回同一快照渲染的 Mermaid 流程图（`text/plain`，不含 `tasks_detail`——渲染只需 nodes/edges/next）。其他值返回 `400`。 |
 
-Mermaid 输出（`?format=mermaid`）对齐 LangGraph 的 `draw_mermaid` 助手：每个节点标签为 `name: status`，next/ready 节点高亮 `ready`，其余节点按状态着色（`pending` / `delegated` / `inProgress` / `completed` / `revision` / `blocked`）。所有 classDef 都会输出，图可独立渲染。
+Mermaid 输出（`?format=mermaid`）对齐 LangGraph 的 `draw_mermaid` 助手：每个节点标签为 `name: status`，next/ready 节点高亮 `ready`，其余节点按状态着色（`pending` / `delegated` / `inProgress` / `completed` / `revision` / `blocked`）。所有 classDef 都会输出，图可独立渲染。任务标题与 ID 为用户可控输入，渲染前做 mermaid 安全归一：换行→`<br>`、双引号→`#quot;`、反斜杠丢弃、其他控制字符→空格；含 `[A-Za-z0-9_-]` 之外字符的 task ID 映射为防冲突节点 ID（标签保留原文）。畸形标题因此不可能改变渲染出的图结构。
 
 响应 `200 OK`：
 
@@ -184,7 +184,7 @@ GET /api/v1/projects/{id}/tasks/{taskId}?team=alpha-team
 
 - `status`：TaskMeta 存在时为**原始**状态（与 `?includeTasks=true` 的 `tasks_detail` 同语义）；TaskMeta 缺失时回退到图节点归一化状态（`pending | delegated | in-progress | completed | revision | blocked`）。
 - `history`：由 TeamHarness taskflow（及 controller 的 cancel 路径）append-only 维护的已接受状态迁移审计，上限 50 条；工作流状态机落地（设计：agentscope-ai/AgentTeams#1223）前为空。畸形条目跳过，不报错。
-- `trace` 只携带 tracing 属性名（`agentteams.project.id` / `agentteams.task.id`，worker entry span 已带）——不构造后端 URL，tracing 后端是部署特定的。
+- `trace` 是 tracing 后端的过滤提示：其 `project_id` / `task_id` 用于匹配 span 属性 `agentteams.project.id` / `agentteams.task.id`（worker entry span 已携带这两个属性）。本端点不构造后端 URL，tracing 后端是部署特定的。
 - TaskMeta 只从项目所属 scope 读取（team 前缀优先，global 前缀仅 standalone 项目兜底）——与 `tasks_detail` 相同的禁止跨 scope 回退规则。
 
 错误：`400`（task id 缺失/非法）、`404`（项目不存在——对限定读者隐藏存在性——或任务不在该项目图中）、`500`（存储读取失败）。
