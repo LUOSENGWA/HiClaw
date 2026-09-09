@@ -1465,6 +1465,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
                 "dependsOn": [],
             }]},
         })
+        os.environ["AGENTTEAMS_WORKER_ROLE"] = "leader"
         delegated = payload("taskflow", {
             "role": "leader",
             "action": "delegate_task",
@@ -1477,6 +1478,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         })
         if not delegated.get("ok"):
             raise AssertionError(f"delegate_task failed for {tid}: {delegated!r}")
+        os.environ["AGENTTEAMS_WORKER_ROLE"] = "worker"
         acked = payload("taskflow", {
             "role": "worker",
             "action": "ack_task",
@@ -1490,6 +1492,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         return pid
 
     def _lifecycle_submit(tid, status, summary="Done."):
+        os.environ["AGENTTEAMS_WORKER_ROLE"] = "worker"
         return payload("taskflow", {
             "role": "worker",
             "action": "submit_task",
@@ -1566,10 +1569,11 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         os.environ.pop("TEAMHARNESS_TEST_EXCLUDE_LEADER_FROM_ROOM", None)
 
     # --- Per-status first-line token + @initiator human mention. ---
+    # #1183 vocabulary: PARTIAL/FAILED removed, INTERRUPTED added.
     for status, token in (
+        ("REVISION_NEEDED", "TASK_REVISION_NEEDED"),
         ("BLOCKED", "TASK_BLOCKED"),
         ("INTERRUPTED", "TASK_INTERRUPTED"),
-        ("REVISION_NEEDED", "TASK_REVISION_NEEDED"),
     ):
         tid = f"tok-{status.lower()}"
         _lifecycle_setup(tid)
@@ -1605,6 +1609,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         "action": "submit_task",
         "payload": {"taskId": bad_tid, "status": "MAYBE", "summary": "Not a real status."},
     })
+    # #1183 validator message: "unsupported result status: MAYBE".
     if bad.get("ok") or "result status" not in str(bad.get("error", "")):
         raise AssertionError(f"submit_task must reject unknown statuses: {bad!r}")
     bad_meta = json.loads(
@@ -1681,7 +1686,10 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     })
     if not att_close.get("ok") or (att_close.get("attention") or {}).get("resolved") is not True:
         raise AssertionError(f"explicit resolved=true must close the open loop: {att_close!r}")
+    # #1183: accept requires the recorded submission identity; the runtime
+    # role (env) overrides the payload role, so re-assert leader here.
     att_submitted = _lifecycle_submit(att_tid, "BLOCKED", "Blocked on storage.")
+    os.environ["AGENTTEAMS_WORKER_ROLE"] = "leader"
     accepted = payload("projectflow", {
         "role": "leader",
         "action": "accept_task_result",
@@ -1689,7 +1697,9 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
             "projectId": att_pid,
             "taskId": att_tid,
             "submissionId": att_submitted["task"]["submission_id"],
+            "accepted": True,
             "resultStatus": "BLOCKED",
+            "summary": "Blocked on storage.",
         },
     })
     if not accepted.get("ok"):
@@ -1702,6 +1712,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         raise AssertionError(f"accept_task_result must resolve outstanding attention: {att_meta.get('attention')!r}")
     can_tid = "att-cancel"
     can_pid = _lifecycle_setup(can_tid)
+    os.environ["AGENTTEAMS_WORKER_ROLE"] = "leader"
     cancelled = payload("taskflow", {
         "role": "leader",
         "action": "cancel_task",
@@ -1709,6 +1720,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     })
     if not cancelled.get("ok"):
         raise AssertionError(f"cancel_task failed: {cancelled!r}")
+    os.environ["AGENTTEAMS_WORKER_ROLE"] = "worker"
     att5 = payload("taskflow", {
         "role": "worker",
         "action": "request_attention",
