@@ -3415,18 +3415,16 @@ def _accept_task_result(arguments: dict[str, Any], payload: dict[str, Any]) -> d
         raise ValueError("task not found in project plan")
     # Accepting the result resolves ALL outstanding attention requests
     # on the task: the leader's decision closed the loop, so no room
-    # ping on this task counts as an open loop anymore.
-    task_state = _read_json(_task_state_path(arguments, task_id), {})
-    if isinstance(task_state, dict) and task_state:
-        attention = task_state.get("attention")
+    # ping on this task counts as an open loop anymore.  Resolve in place
+    # on the task_meta dict — the terminal status write below persists it
+    # in the same write (a separate read-modify-write here would be
+    # clobbered by that later write of the older dict).
+    if isinstance(task_meta, dict) and task_meta:
+        attention = task_meta.get("attention")
         if isinstance(attention, list):
-            attention_changed = False
             for item in attention:
                 if isinstance(item, dict) and not item.get("resolved"):
                     item["resolved"] = True
-                    attention_changed = True
-            if attention_changed:
-                _write_task(arguments, task_state)
     result_status = str(result_status_value or "SUCCESS")
     if node_status == "completed":
         project["requester_report"] = {
@@ -5274,6 +5272,14 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     exclude=["spec.md", "base/"],
                     result_paths=deliverables,
                 )
+                if not synced:
+                    return _sync_failure_result({
+                        "tool": "taskflow",
+                        "action": action,
+                        "task": task,
+                        "reused": True,
+                        "publishedArtifacts": [],
+                    }, "submit_task")
                 result = {
                     "ok": True,
                     "tool": "taskflow",
@@ -5281,7 +5287,14 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     "task": task,
                     "reused": True,
                     "publishedArtifacts": [],
-                    "synced": synced,
+                    "synced": True,
+                    "notification": _task_completion_notification(
+                        arguments,
+                        task,
+                        task_id,
+                        status,
+                        summary,
+                    ),
                     "notificationNeeded": _notification_needed(
                         "submit_task",
                         {"project_id": task.get("project_id", "")},
@@ -5289,8 +5302,6 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         summary=f"submit_task: {task_id} ({status})",
                     ),
                 }
-                if not synced:
-                    return _sync_failure_result(result, "submit_task")
                 return result
             task_dir = _task_dir(arguments, task_id)
             task_dir.mkdir(parents=True, exist_ok=True)
@@ -5365,19 +5376,20 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 result_paths=deliverables,
             )
             if not synced:
-                return {
-                    "ok": False,
-                    "retryable": True,
+                # #1183 contract: retryable failure carries statePersisted;
+                # #1206 v2 contract: the completion notification is withheld
+                # until the retry succeeds (the guard above withholds it).
+                failed = _sync_failure_result({
                     "tool": "taskflow",
                     "action": action,
                     "task": task,
-                    "error": (
-                        "shared storage sync failed after submit; the completion "
-                        "notification was withheld. Local task state is already "
-                        "submitted — retry submit_task (idempotent) once storage "
-                        "recovers."
-                    ),
-                }
+                    "publishedArtifacts": published_artifacts,
+                }, "submit_task")
+                failed["error"] += (
+                    "; the completion notification was withheld — retry "
+                    "submit_task (idempotent) once storage recovers"
+                )
+                return failed
             notification = _task_completion_notification(
                 arguments,
                 task,

@@ -39,8 +39,13 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     # Test hook: fail the push (mirror <local> <remote>) for the named
     # task only — pre-action pulls keep working (used to exercise the
     # submit sync-failure withholding path).
-    if [ "$1" = "mirror" ] && [ -n "${TEAMHARNESS_TEST_FAIL_SYNC_TASK:-}" ] && [ "$3" = "mock/shared/tasks/${TEAMHARNESS_TEST_FAIL_SYNC_TASK}/" ]; then
-      exit 1
+    if [ "$1" = "mirror" -o "$1" = "cp" ] && [ -n "${TEAMHARNESS_TEST_FAIL_SYNC_TASK:-}" ]; then
+      # #1183's per-file sync pushes via `mc cp <local> <remote>` (files) and
+      # `mc mirror <local> <remote>` (dirs); match any remote path under the
+      # failing task dir.
+      case "$3" in
+        "mock/shared/tasks/${TEAMHARNESS_TEST_FAIL_SYNC_TASK}/"*) exit 1 ;;
+      esac
     fi
     if [ "$1" = "mirror" ] && [ "$2" = "mock/shared/tasks/remote-001/" ]; then
       mkdir -p "$3"
@@ -1422,6 +1427,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
                 "dependsOn": [],
             }]},
         })
+        os.environ["AGENTTEAMS_WORKER_ROLE"] = "leader"
         delegated = payload("taskflow", {
             "role": "leader",
             "action": "delegate_task",
@@ -1434,6 +1440,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         })
         if not delegated.get("ok"):
             raise AssertionError(f"delegate_task failed for {tid}: {delegated!r}")
+        os.environ["AGENTTEAMS_WORKER_ROLE"] = "worker"
         acked = payload("taskflow", {
             "role": "worker",
             "action": "ack_task",
@@ -1447,6 +1454,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         return pid
 
     def _lifecycle_submit(tid, status, summary="Done."):
+        os.environ["AGENTTEAMS_WORKER_ROLE"] = "worker"
         return payload("taskflow", {
             "role": "worker",
             "action": "submit_task",
@@ -1477,10 +1485,11 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         raise AssertionError(f"retry after storage recovery must send the notification: {order_retry!r}")
 
     # --- Per-status first-line token + @initiator human mention. ---
+    # #1183 vocabulary: PARTIAL/FAILED removed, INTERRUPTED added.
     for status, token in (
-        ("PARTIAL", "TASK_PARTIAL"),
-        ("FAILED", "TASK_FAILED"),
         ("REVISION_NEEDED", "TASK_REVISION_NEEDED"),
+        ("BLOCKED", "TASK_BLOCKED"),
+        ("INTERRUPTED", "TASK_INTERRUPTED"),
     ):
         tid = f"tok-{status.lower()}"
         _lifecycle_setup(tid)
@@ -1516,7 +1525,8 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         "action": "submit_task",
         "payload": {"taskId": bad_tid, "status": "MAYBE", "summary": "Not a real status."},
     })
-    if bad.get("ok") or "invalid status" not in str(bad.get("error", "")):
+    # #1183 validator message: "unsupported result status: MAYBE".
+    if bad.get("ok") or "result status" not in str(bad.get("error", "")):
         raise AssertionError(f"submit_task must reject unknown statuses: {bad!r}")
     bad_meta = json.loads(
         (pathlib.Path("#{workspace}") / f"shared/tasks/{bad_tid}/meta.json").read_text(encoding="utf-8")
@@ -1524,23 +1534,25 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     if bad_meta.get("result_status") == "MAYBE":
         raise AssertionError(f"rejected status must not be persisted: {bad_meta!r}")
 
-    # --- Re-submission with a changed status sends a new event. ---
+    # --- #1183 digest fencing: a same-status resubmit reuses the recorded
+    #     event; a changed-status resubmit conflicts (leader decision or a
+    #     new task required). 628ca0c9 expected a changed-status resubmit to
+    #     send a fresh event; #1183's submission fence supersedes that path. ---
     ch_tid = "tok-resubmit"
     _lifecycle_setup(ch_tid)
-    first = _lifecycle_submit(ch_tid, "FAILED", "First pass failed.")
+    first = _lifecycle_submit(ch_tid, "BLOCKED", "First pass blocked.")
     n1 = (first.get("notification") or {}).get("eventId")
     if not first.get("ok") or (first.get("notification") or {}).get("sent") is not True or not n1:
-        raise AssertionError(f"first FAILED submit must notify: {first!r}")
-    second = _lifecycle_submit(ch_tid, "SUCCESS", "Fixed on resubmit.")
-    n2 = (second.get("notification") or {}).get("eventId")
-    if not second.get("ok") or (second.get("notification") or {}).get("sent") is not True or not n2 or n2 == n1:
-        raise AssertionError(f"changed-status resubmit must send a new event: {second!r} (first={n1}, second={n2})")
-    if len([ev for ev in matrix["events"] if f"submit-{ch_tid}-" in ev["path"]]) != 2:
-        raise AssertionError("changed-status resubmit must not reuse the old event")
-    same = _lifecycle_submit(ch_tid, "SUCCESS", "Idempotent same-status resubmit.")
+        raise AssertionError(f"first BLOCKED submit must notify: {first!r}")
+    changed = _lifecycle_submit(ch_tid, "SUCCESS", "Fixed on resubmit.")
+    if changed.get("ok") or "conflicts" not in str(changed.get("error", "")):
+        raise AssertionError(f"changed-status resubmit must conflict under the digest fence: {changed!r}")
+    if len([ev for ev in matrix["events"] if f"submit-{ch_tid}-" in ev["path"]]) != 1:
+        raise AssertionError(f"conflicting resubmit must not send an event: {matrix['events']!r}")
+    same = _lifecycle_submit(ch_tid, "BLOCKED", "First pass blocked.")
     if (same.get("notification") or {}).get("reused") is not True:
         raise AssertionError(f"same-status resubmit must reuse the event: {same!r}")
-    if (same.get("notification") or {}).get("eventId") != n2:
+    if (same.get("notification") or {}).get("eventId") != n1:
         raise AssertionError(f"same-status resubmit must reuse the same event id: {same!r}")
 
     # --- request_attention: in-flight ping, idempotent, terminal guard,
@@ -1586,11 +1598,20 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     })
     if not att_close.get("ok") or (att_close.get("attention") or {}).get("resolved") is not True:
         raise AssertionError(f"explicit resolved=true must close the open loop: {att_close!r}")
-    _lifecycle_submit(att_tid, "BLOCKED", "Blocked on storage.")
+    # #1183: accept requires the recorded submission identity.
+    att_sub = _lifecycle_submit(att_tid, "BLOCKED", "Blocked on storage.")
+    os.environ["AGENTTEAMS_WORKER_ROLE"] = "leader"
     accepted = payload("projectflow", {
         "role": "leader",
         "action": "accept_task_result",
-        "payload": {"projectId": att_pid, "taskId": att_tid, "resultStatus": "BLOCKED"},
+        "payload": {
+            "projectId": att_pid,
+            "taskId": att_tid,
+            "submissionId": att_sub["task"]["submission_id"],
+            "accepted": True,
+            "resultStatus": "BLOCKED",
+            "summary": "Blocked on storage.",
+        },
     })
     if not accepted.get("ok"):
         raise AssertionError(f"accept_task_result failed: {accepted!r}")
@@ -1602,6 +1623,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         raise AssertionError(f"accept_task_result must resolve outstanding attention: {att_meta.get('attention')!r}")
     can_tid = "att-cancel"
     can_pid = _lifecycle_setup(can_tid)
+    os.environ["AGENTTEAMS_WORKER_ROLE"] = "leader"
     cancelled = payload("taskflow", {
         "role": "leader",
         "action": "cancel_task",
@@ -1609,6 +1631,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     })
     if not cancelled.get("ok"):
         raise AssertionError(f"cancel_task failed: {cancelled!r}")
+    os.environ["AGENTTEAMS_WORKER_ROLE"] = "worker"
     att5 = payload("taskflow", {
         "role": "worker",
         "action": "request_attention",
