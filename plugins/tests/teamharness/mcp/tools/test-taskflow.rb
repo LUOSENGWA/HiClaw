@@ -568,6 +568,9 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         raise AssertionError(f"context submit_task file event missing attachment relation: {context_file_event!r}")
 
     secret_task_id = "secret-artifact-01"
+    # The task is not in the project plan, so the assignee must be explicit:
+    # without an assignment target the delegation stays prepared (no
+    # notification) and the tightened ack/submit guards reject it.
     payload("taskflow", {
         "role": "leader",
         "action": "delegate_task",
@@ -575,6 +578,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
             "projectId": project_id,
             "taskId": secret_task_id,
             "roomId": "room:!team:example.test",
+            "assignedTo": "@worker-a:example.test",
             "spec": "Submit a result with one sensitive deliverable.",
         },
     })

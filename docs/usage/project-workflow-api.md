@@ -78,7 +78,7 @@ Optional query parameters:
 
 | Parameter | Type | Meaning |
 |:--|:--|:--|
-| `includeTasks` | `bool` | When `true`, also read each task's TaskMeta (`shared/tasks/{id}/meta.json`) and attach a `tasks_detail` array with spec/result/deliverable fields and the opaque `submission_id` fence. Default `false` keeps the response lightweight. |
+| `includeTasks` | `bool` | When `true`, also read each task's TaskMeta (`shared/tasks/{id}/meta.json`) and attach a `tasks_detail` array with spec/result/deliverable fields, the opaque `submission_id` fence, and the transition `history` audit trail (omitted for metas that predate it). Default `false` keeps the response lightweight. |
 | `format` | `string` | Response format. Default (absent or empty) returns the JSON snapshot above. `format=mermaid` returns the same snapshot rendered as a Mermaid flowchart (`text/plain`, no `tasks_detail` — rendering needs only nodes/edges/next). Any other value returns `400`. |
 
 Mermaid output (`?format=mermaid`) mirrors LangGraph's `draw_mermaid` helper: each node label is `name: status`, next/ready nodes get the `ready` highlight class, and every other node gets a status class (`pending` / `delegated` / `inProgress` / `completed` / `revision` / `blocked`). All classDefs are emitted so the graph renders standalone. Task titles and ids are user-controlled, so they are sanitized for mermaid safety: newlines become `<br>`, double quotes become `#quot;`, backslashes are dropped, and other control characters become spaces; a task id containing characters outside `[A-Za-z0-9_-]` is mapped to a collision-safe node id (labels keep the original text). A malformed title therefore can never alter the rendered graph structure. Example:
@@ -91,6 +91,27 @@ flowchart LR
     classDef ready fill:#d4edda,stroke:#28a745;
     ...
 ```
+
+Each `tasks_detail[]` entry carries `history: []` — the task's auditable
+state transitions recorded by the TeamHarness transition engine, oldest
+first. Entry shape:
+
+```json
+{
+  "ts": "2026-09-09T10:00:05Z",
+  "from": "assigned",
+  "to": "in_progress",
+  "action": "ack_task",
+  "actor": "worker:default",
+  "note": ""
+}
+```
+
+`action` is one of `delegate_task`, `ack_task`, `submit_task`,
+`accept_task_result`, `cancel_task`, `progress`; `actor` is `role:account`
+(MCP transitions) or the authorization actor (controller cancellations).
+The allowed transitions are defined by the shared contract
+`plugins/teamharness/contracts/task-transitions.json`.
 
 Response `200 OK`:
 
@@ -461,6 +482,69 @@ Error responses:
 | `400` | Missing project id / malformed timestamp. |
 | `403` | Authenticated but the role cannot read projects at all (e.g. Worker). |
 | `404` | Project or snapshot not found / caller does not own it (existence hidden). |
+| `409` | Ambiguous project id across teams; retry with `?team=`. |
+| `500` | K8s or object-store failure. |
+
+### `GET /api/v1/projects/{id}/events`
+
+Returns the project's **task transition timeline** — a read-time
+aggregation of every task's `history` array (the same audit trail
+`?includeTasks=true` exposes per task), merged into one **ascending** list.
+No new storage: the endpoint reads the task metas on demand and does not
+add a write-side hook. Project-level intervention events are **not** part
+of this timeline — use `GET /history` for those; the two are
+complementary.
+
+Query parameters:
+
+| Param | Type | Default | Meaning |
+|:--|:--|:--|:--|
+| `team` | string | — | Optional team qualifier, same semantics as the other read endpoints. |
+| `limit` | int | `50` | Page size. Capped at `200`; values `< 1` are rejected `400`. |
+| `cursor` | string | — | Opaque offset from a previous page's `next_cursor`; pass it back to continue. |
+
+Response:
+
+```json
+{
+  "project_id": "demo-project-001",
+  "events": [
+    {
+      "ts": "2026-09-09T10:00:00Z",
+      "task_id": "t1",
+      "from": "planned",
+      "to": "prepared",
+      "action": "delegate_task",
+      "actor": "leader:default"
+    },
+    {
+      "ts": "2026-09-09T10:00:05Z",
+      "task_id": "t1",
+      "from": "assigned",
+      "to": "in_progress",
+      "action": "ack_task",
+      "actor": "worker:default",
+      "note": "starting"
+    }
+  ],
+  "next_cursor": "2"
+}
+```
+
+- `events` is **oldest first**; the shared second-resolution timestamps are
+  tie-broken by `task_id`, then `action`, so paging is deterministic.
+- `next_cursor` is empty when the tail was reached; an empty project
+  returns `200` with `"events": []`.
+- Task metas are read from the project's owning scope only — no
+  cross-scope fallback (same rule as `tasks_detail`).
+
+Error responses:
+
+| Code | Meaning |
+|:--|:--|
+| `400` | Missing project id / invalid `limit` or `cursor`. |
+| `403` | Authenticated but the role cannot read projects at all (e.g. Worker). |
+| `404` | Project not found / caller does not own it (existence hidden). |
 | `409` | Ambiguous project id across teams; retry with `?team=`. |
 | `500` | K8s or object-store failure. |
 
