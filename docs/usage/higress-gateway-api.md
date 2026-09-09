@@ -10,6 +10,13 @@ gateway (the **control plane**).
 - **Control plane** — the Higress Console REST API that the `agentteams-controller`
   and legacy Manager scripts use to configure routes, consumers, and MCP servers.
 
+> **Version anchor.** This reference documents the behavior of Higress **2.2.1**, the
+> version pinned by AgentTeams (`agentteams-controller/Dockerfile.embedded`,
+> `helm/agentteams/Chart.yaml`). Upstream Higress has since released 2.2.4, which adds
+> the MCP 2026-07-28 protocol standard (2.2.3) and SSE transport path fixes (2.2.4);
+> those are new capabilities, not changes to the endpoints described here. If AgentTeams
+> upgrades past 2.2.2, re-validate the MCP servers section against the upstream changelog.
+
 ## Default domains and ports
 
 | Resource | Default domain | In-container port | Host port (installer) |

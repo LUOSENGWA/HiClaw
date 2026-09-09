@@ -9,6 +9,12 @@ Console API（**控制面**）。
 - **控制面** —— `agentteams-controller` 和旧版 Manager 脚本用于配置路由、Consumer 和
   MCP Server 的 Higress Console REST API。
 
+> **版本锚点。** 本文档描述 AgentTeams 锁定的 Higress **2.2.1** 版本行为
+> （见 `agentteams-controller/Dockerfile.embedded`、`helm/agentteams/Chart.yaml`）。
+> 上游 Higress 已发布 2.2.4，新增 MCP 2026-07-28 协议标准（2.2.3）和 SSE transport
+> 路径修复（2.2.4）；这些是新增能力，不改变本文描述的端点。若 AgentTeams 升级到
+> 2.2.2 之后，请按上游 changelog 重新核对 MCP 服务器一节。
+
 ## 默认域名与端口
 
 | 资源 | 默认域名 | 容器内端口 | 宿主机端口（安装器） |
