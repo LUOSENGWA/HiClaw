@@ -80,9 +80,10 @@ mcporter --transport http \
   call list_repos '{"owner": "test"}'
 ```
 
-MCP 访问同样受 per-consumer 授权控制（MCP Server 上的 `consumerAuthInfo`）。注册由
-controller（嵌入式栈）或旧版 `setup-higress.sh` / `setup-mcp-server.sh` 脚本
-（≤v1.0.9 Manager 镜像）完成；参见 `manager/agent/skills/mcp-server-management/`。
+MCP 访问同样受 per-consumer 授权控制（MCP Server 上的 `consumerAuthInfo`）。网关侧注册
+由 `setup-higress.sh`（嵌入式栈 bootstrap）或 `setup-mcp-server.sh`（Manager skill 脚本）
+完成；controller 本身**不**调用 Higress MCP Console API——它只生成 Worker 的 mcporter
+客户端配置。参见 `manager/agent/skills/mcp-server-management/`。
 
 ### 3. 暴露的 Worker 端口（服务发布）
 
@@ -135,7 +136,8 @@ Consumer key 由 controller 按 Manager/Worker 分别生成，并注入为
 
 controller 和旧版脚本通过 Higress Console REST API（容器内 `http://127.0.0.1:8001`）
 管理网关。使用 session-cookie 认证：`POST /system/init` 初始化 admin 账号，
-`POST /session/login` 获取 cookie。
+`POST /session/login` 获取 cookie。MCP 相关端点（`/v1/mcpServer`、`/v1/mcpServer/consumers`）
+只由 shell 脚本调用，不由 controller 的 Go 代码调用。
 
 | 端点 | 方法 | 用途 |
 |------|------|------|
@@ -165,7 +167,7 @@ AI 路由上的 Consumer 授权是 reconciler 的职责——initializer 从不�
 
 ## 相关文档
 
-- [架构总览](architecture.md) —— Higress 在系统中的角色。
+- [架构总览](../design/architecture.md) —— Higress 在系统中的角色。
 - [Worker 使用指南](worker-guide.md) —— 从 Worker 排查 LLM / MCP 连通性。
-- [Kubernetes 原生编排](k8s-native-agent-orch.md) —— LLM/MCP 安全模型。
+- [Kubernetes 原生编排](../design/k8s-native-orchestration.md) —— LLM/MCP 安全模型。
 - [开发指南](development.md) —— 贡献者的 Higress 配置指引。

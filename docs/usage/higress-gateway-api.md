@@ -88,9 +88,10 @@ mcporter --transport http \
 ```
 
 MCP access is also governed by per-consumer authorization (`consumerAuthInfo` on the
-MCP server). Registration is handled by the controller (embedded stacks) or by the
-legacy `setup-higress.sh` / `setup-mcp-server.sh` scripts (≤v1.0.9 Manager images);
-see `manager/agent/skills/mcp-server-management/`.
+MCP server). Gateway-side registration is handled by `setup-higress.sh` (embedded stack
+bootstrap) or the `setup-mcp-server.sh` Manager skill script; the controller itself does
+**not** call the Higress MCP Console API — it only generates the Worker's mcporter client
+config. See `manager/agent/skills/mcp-server-management/`.
 
 ### 3. Exposed Worker ports (service publishing)
 
@@ -146,7 +147,9 @@ AI routes is scoped per consumer through `authConfig.allowedConsumers`.
 
 The controller and legacy scripts manage the gateway through the Higress Console REST
 API (in-container `http://127.0.0.1:8001`). Session-cookie auth: `POST /system/init`
-bootstraps the admin account, `POST /session/login` obtains the cookie.
+bootstraps the admin account, `POST /session/login` obtains the cookie. The MCP-related
+endpoints (`/v1/mcpServer`, `/v1/mcpServer/consumers`) are called only by the shell
+scripts, not by the controller's Go code.
 
 | Endpoint | Method(s) | Purpose |
 |----------|-----------|---------|
@@ -176,7 +179,7 @@ initializer never writes `authConfig.allowedConsumers` (see `EnsureAIRoute` in
 
 ## Related
 
-- [Architecture overview](architecture.md) — role of Higress in the system.
+- [Architecture overview](../design/architecture.md) — role of Higress in the system.
 - [Worker guide](worker-guide.md) — troubleshooting LLM / MCP connectivity from a Worker.
-- [Kubernetes-native orchestration](k8s-native-agent-orch.md) — LLM/MCP security model.
+- [Kubernetes-native orchestration](../design/k8s-native-orchestration.md) — LLM/MCP security model.
 - [Development](development.md) — Higress configuration guidance for contributors.
