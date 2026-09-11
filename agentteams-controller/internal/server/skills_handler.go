@@ -37,6 +37,7 @@ type SkillInfo struct {
 	Source       string             `json:"source"` // "builtin" | "shared"
 	Version      string             `json:"version,omitempty"` // builtin only: SKILL.md frontmatter version
 	Requirements *SkillRequirements `json:"requirements,omitempty"` // builtin only: frontmatter requires block
+	UpdatedAt    string             `json:"updated_at,omitempty"` // shared only: last listing timestamp (RFC3339 UTC)
 	Agents       []string           `json:"agents,omitempty"`   // builtin only: template dirs providing the skill
 	Runtimes     []string           `json:"runtimes,omitempty"` // runtimes for which the skill is available
 }
@@ -69,8 +70,9 @@ type SkillListResponse struct {
 // workers) plus the deployment-wide shared skills staged under
 // agents/global/skills/. It never reads skill content beyond the SKILL.md
 // frontmatter (name/description/version/requires) of builtin skills; the
-// shared half is name-only by design (list-on-read, no per-skill object
-// fetches — shared SKILL.md metadata is a v2 candidate).
+// shared half is name + listing timestamp by design (list-on-read, no
+// per-skill object fetches — shared SKILL.md metadata such as description,
+// version, and requires is a v2 candidate).
 type SkillsHandler struct {
 	workerAgentDir string
 	oss            oss.StorageClient
@@ -130,10 +132,13 @@ func (h *SkillsHandler) ListSkills(w http.ResponseWriter, r *http.Request) {
 	// failure (prefix absent, storage down) degrades to an empty shared set
 	// rather than failing the whole catalog. Directory entries only (mc ls
 	// marks them with a trailing "/"); bare files and dot-entries are
-	// non-skill artifacts. Builtin names win on collision.
+	// non-skill artifacts. Builtin names win on collision. Shared entries
+	// carry UpdatedAt from the listing when the backend exposes it (the mc
+	// ls line date; "" when unparseable) — no per-skill object fetch.
 	if h.oss != nil {
-		if entries, err := h.oss.ListObjects(r.Context(), globalSkillsPrefix); err == nil {
-			for _, raw := range entries {
+		if entries, err := h.oss.ListObjectsDetailed(r.Context(), globalSkillsPrefix); err == nil {
+			for _, entry := range entries {
+				raw := entry.Name
 				if !strings.HasSuffix(raw, "/") {
 					continue
 				}
@@ -145,9 +150,10 @@ func (h *SkillsHandler) ListSkills(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				skills[name] = &SkillInfo{
-					Name:     name,
-					Source:   "shared",
-					Runtimes: append([]string{}, service.AllWorkerRuntimes...),
+					Name:      name,
+					Source:    "shared",
+					UpdatedAt: entry.UpdatedAt,
+					Runtimes:  append([]string{}, service.AllWorkerRuntimes...),
 				}
 			}
 		}

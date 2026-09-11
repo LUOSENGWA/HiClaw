@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss/ossfake"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/service"
@@ -201,7 +202,7 @@ func TestSkillsCatalogFieldDiscipline(t *testing.T) {
 	if payload.Total != len(payload.Skills) {
 		t.Fatalf("total = %d, entries = %d", payload.Total, len(payload.Skills))
 	}
-	allowed := map[string]bool{"name": true, "description": true, "source": true, "version": true, "requirements": true, "agents": true, "runtimes": true}
+	allowed := map[string]bool{"name": true, "description": true, "source": true, "version": true, "requirements": true, "updated_at": true, "agents": true, "runtimes": true}
 	for _, entry := range payload.Skills {
 		for k := range entry {
 			if !allowed[k] {
@@ -307,6 +308,33 @@ func TestSkillsCatalogFrontmatterExtension(t *testing.T) {
 	plain := skillByName(t, skills, "plain-skill")
 	if plain.Version != "" || plain.Requirements != nil {
 		t.Errorf("plain-skill = %+v, want version/requirements omitted", plain)
+	}
+}
+
+// TestSkillsCatalogSharedUpdatedAt pins that shared entries carry the
+// listing timestamp (the fake's fixed write clock) and that builtin entries
+// never do (updated_at is shared-only metadata).
+func TestSkillsCatalogSharedUpdatedAt(t *testing.T) {
+	base := t.TempDir()
+	skillRoot := filepath.Join(base, "worker-agent", "skills")
+	writeSkill(t, skillRoot, "built-in", "A builtin skill.")
+
+	fakeOSS := ossfake.NewMemory()
+	if err := fakeOSS.PutObject(context.Background(), "agents/global/skills/team-report/SKILL.md", []byte("---\nname: team-report\n---\n")); err != nil {
+		t.Fatal(err)
+	}
+	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), &mcLikeOSS{Memory: fakeOSS})
+	skills := decodeSkills(t, getSkills(t, h))
+
+	shared := skillByName(t, skills, "team-report")
+	want := fakeOSS.LastWriteTime().UTC().Format(time.RFC3339)
+	if shared.UpdatedAt != want {
+		t.Errorf("shared updated_at = %q, want %q", shared.UpdatedAt, want)
+	}
+
+	builtin := skillByName(t, skills, "built-in")
+	if builtin.UpdatedAt != "" {
+		t.Errorf("builtin updated_at = %q, want omitted", builtin.UpdatedAt)
 	}
 }
 
