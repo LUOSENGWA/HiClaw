@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/httputil"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/service"
@@ -34,12 +35,12 @@ const globalSkillsPrefix = "agents/global/skills/"
 type SkillInfo struct {
 	Name         string             `json:"name"`
 	Description  string             `json:"description,omitempty"`
-	Source       string             `json:"source"` // "builtin" | "shared"
-	Version      string             `json:"version,omitempty"` // builtin only: SKILL.md frontmatter version
+	Source       string             `json:"source"`                 // "builtin" | "shared"
+	Version      string             `json:"version,omitempty"`      // builtin only: SKILL.md frontmatter version
 	Requirements *SkillRequirements `json:"requirements,omitempty"` // builtin only: frontmatter requires block
-	UpdatedAt    string             `json:"updated_at,omitempty"` // shared only: last listing timestamp (RFC3339 UTC)
-	Agents       []string           `json:"agents,omitempty"`   // builtin only: template dirs providing the skill
-	Runtimes     []string           `json:"runtimes,omitempty"` // runtimes for which the skill is available
+	UpdatedAt    string             `json:"updated_at,omitempty"`   // shared only: last listing timestamp (RFC3339 UTC)
+	Agents       []string           `json:"agents,omitempty"`       // builtin only: template dirs providing the skill
+	Runtimes     []string           `json:"runtimes,omitempty"`     // runtimes for which the skill is available
 }
 
 // SkillRequirements mirrors the SKILL.md "requires" declaration
@@ -83,7 +84,20 @@ func NewSkillsHandler(workerAgentDir string, o oss.StorageClient) *SkillsHandler
 }
 
 // ListSkills handles GET /api/v1/skills.
+//
+// Access: admin (L1) only. The catalog exposes the deployment-level
+// ("individual") skill layer, which is managed by the admin. Non-admin
+// callers (L2 humans, team leaders, workers, manager) are meant to use the
+// team-scoped catalog (?team=) that ships with the team-skills work; no
+// team scope exists yet, so they are rejected with a self-explanatory 400
+// instead of a silent partial view.
 func (h *SkillsHandler) ListSkills(w http.ResponseWriter, r *http.Request) {
+	caller := auth.CallerFromContext(r.Context())
+	if caller == nil || caller.Role != auth.RoleAdmin {
+		httputil.WriteError(w, http.StatusBadRequest, "team scope required")
+		return
+	}
+
 	skills := map[string]*SkillInfo{}
 
 	for _, tmpl := range h.builtinTemplates() {

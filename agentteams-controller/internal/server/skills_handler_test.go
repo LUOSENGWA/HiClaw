@@ -8,9 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss/ossfake"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/service"
 )
@@ -70,7 +72,8 @@ func newSkillsRig(t *testing.T) (*SkillsHandler, *mcLikeOSS, string) {
 
 func getSkills(t *testing.T, h *SkillsHandler) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/skills", nil)
+	req := withCaller(httptest.NewRequest(http.MethodGet, "/api/v1/skills", nil),
+		&authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
 	rec := httptest.NewRecorder()
 	h.ListSkills(rec, req)
 	return rec
@@ -238,6 +241,49 @@ func TestSkillsCatalogNoTemplateDir(t *testing.T) {
 	if len(skills) != 1 || skills[0].Name != "shared-kb" || skills[0].Source != "shared" {
 		t.Fatalf("skills = %v, want shared-only [shared-kb]", skills)
 	}
+}
+
+// TestSkills_NonAdminNoTeam_400 locks the two-layer skill model contract:
+// the deployment-level catalog is admin (L1) only. L2 humans, team leaders,
+// workers, and the manager are meant to use the team-scoped catalog
+// (?team=), which is not available yet — so a team-less request from a
+// non-admin is rejected with a self-explanatory 400 (the positive admin
+// 200 path is covered by TestSkillsCatalogGolden; per the #1214 discipline
+// both sides are asserted).
+func TestSkills_NonAdminNoTeam_400(t *testing.T) {
+	cases := []struct {
+		name   string
+		caller *authpkg.CallerIdentity
+	}{
+		{"l2-human", &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"market-team"}}},
+		{"team-leader", &authpkg.CallerIdentity{Role: authpkg.RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"}},
+		{"worker", &authpkg.CallerIdentity{Role: authpkg.RoleWorker, Username: "alpha-worker-1"}},
+		{"manager", &authpkg.CallerIdentity{Role: authpkg.RoleManager, Username: "manager"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _, _ := newSkillsRig(t)
+			req := withCaller(httptest.NewRequest(http.MethodGet, "/api/v1/skills", nil), tc.caller)
+			rec := httptest.NewRecorder()
+			h.ListSkills(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %s)", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "team scope required") {
+				t.Fatalf("error not self-explanatory: %s", rec.Body.String())
+			}
+		})
+	}
+
+	t.Run("no-caller", func(t *testing.T) {
+		h, _, _ := newSkillsRig(t)
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/skills", nil)
+		rec := httptest.NewRecorder()
+		h.ListSkills(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", rec.Code)
+		}
+	})
 }
 
 // writeSkillWithFrontmatter writes a skill dir whose SKILL.md carries the
