@@ -65,11 +65,13 @@ assignment in `spec.skills`. Consequently, deleting
 
 ### No content access
 
-Only frontmatter metadata of builtin skills is read (shared skills are
-listed by name only in v1). Skill bodies and registry credentials are never
-exposed; the endpoint performs no registry calls. The response schema is
-deliberately limited to `name` / `description` / `source` / `agents` /
-`runtimes` (pinned by `TestSkillsCatalogFieldDiscipline`).
+Only frontmatter metadata of builtin skills is read
+(`name` / `description` / `version` / `requires`); shared skills are listed
+by name + `updated_at` (the listing timestamp) only. Skill bodies and
+registry credentials are never exposed; the endpoint performs no registry
+calls. The response schema is deliberately limited to `name` /
+`description` / `source` / `version` / `requirements` / `updated_at` /
+`agents` / `runtimes` (pinned by `TestSkillsCatalogFieldDiscipline`).
 
 ## Contract
 
@@ -78,14 +80,27 @@ deliberately limited to `name` / `description` / `source` / `agents` /
 ```json
 {
   "skills": [
-    {"name": "file-sync", "description": "Sync files with centralized storage.", "source": "builtin", "agents": ["copaw-worker-agent", "worker-agent"], "runtimes": ["copaw", "deepseek-harness", "openclaw", "openhuman", "qwenpaw"]},
-    {"name": "shared-kb", "source": "shared", "runtimes": ["copaw", "deepseek-harness", "hermes", "openclaw", "openhuman", "qwenpaw"]}
+    {"name": "file-sync", "description": "Sync files with centralized storage.", "source": "builtin", "version": "1.0.0", "requirements": {"require_bins": ["mc"]}, "agents": ["copaw-worker-agent", "worker-agent"], "runtimes": ["copaw", "deepseek-harness", "openclaw", "openhuman", "qwenpaw"]},
+    {"name": "shared-kb", "source": "shared", "updated_at": "2026-09-11T08:00:00Z", "runtimes": ["copaw", "deepseek-harness", "hermes", "openclaw", "openhuman", "qwenpaw"]}
   ],
   "total": 2
 }
 ```
 
 - `source` is `"builtin"` or `"shared"`.
+- `version` (builtin only) is the SKILL.md frontmatter `version` (top-level,
+  falling back to `metadata.version`); omitted when undeclared.
+- `requirements` (builtin only) mirrors the frontmatter `requires`
+  declaration (`require_bins` / `require_envs` / `require_mcps`), parsed
+  with QwenPaw 2.2.x semantics (`metadata.{openclaw,qwenpaw,clawdbot}.requires`
+  shadows `metadata.requires`, which shadows top-level `requires`; a bare
+  list is shorthand for `bins`). Enforcement is runtime-dependent: the
+  qwenpaw 2.2.x registry gates skill activation on it; other runtimes have
+  no equivalent gate yet — the field is exposed so workbenches can warn
+  before assignment.
+- `updated_at` (shared only, RFC3339 UTC) is the listing timestamp when the
+  backend exposes it; omitted when unparseable. Builtin entries never
+  carry it.
 - `agents` is present for builtin skills (sorted, deduplicated template
   directory names).
 - `runtimes` is sorted. For builtin skills it is the set of runtimes whose
@@ -93,8 +108,10 @@ deliberately limited to `name` / `description` / `source` / `agents` /
   (any worker can be given a shared skill via per-worker distribution).
 - Output is sorted by `name`; missing template directories (deployment
   without some runtimes) are silently skipped.
-- Errors: none expected; a backend read failure degrades to the remaining
-  half. No `4xx` paths.
+- Errors: a backend read failure degrades to the remaining half (`200`).
+  `400 team scope required` — non-admin callers: the catalog is the
+  deployment-level (individual) skill layer, L1-only (see Authorization);
+  the team-scoped read (`?team=`) follows with the team-skills work.
 
 ### Known limitation (tracked, out of v1)
 
@@ -108,12 +125,14 @@ assignments accordingly.
 
 ## Authorization
 
-`ActionList` on the `skills` resource kind. The catalog is metadata-only
-(skill names/descriptions, no PII, no credentials), so it is available to
-admins, managers, team leaders, and team-scoped humans; worker service
-accounts are denied. No scope filtering — availability is deployment-wide,
-and per-worker assignment remains a separate (write) concern via
-`PUT /workers`.
+`ActionList` on the `skills` resource kind (any other action is denied, not
+defaulted). The catalog exposes the deployment-level ("individual") skill
+layer, which is managed by the admin, so the handler enforces an **admin
+(L1) only** role gate: non-admin callers (L2 humans, team leaders, workers,
+manager) receive `400 team scope required` — the team-scoped catalog
+(`?team=`) ships with the team-skills work (tracked in #1221). The response
+is metadata-only (no PII, no credentials); per-worker assignment remains a
+separate (write) concern via `PUT /workers`.
 
 ## Out of scope (v1)
 
@@ -133,7 +152,14 @@ and per-worker assignment remains a separate (write) concern via
   entries; builtin-wins-on-collision; bare files and dot-entries skipped),
   template→runtime mapping consistency against `service.BuiltinAgentDir`
   for every (role, runtime) pair, response field discipline (no unexpected
-  fields), shared-half degradation on OSS list failure, empty
-  `WorkerAgentDir` → shared-only catalog.
+  fields), frontmatter extension (`version` + `requires` in
+  metadata-namespace / top-level / bare-list forms, namespace shadowing
+  precedence, omitempty for undeclared skills), shared `updated_at`
+  propagation (backend-supplied timestamp; builtin entries never carry
+  it), non-admin no-team rejection (L2 human / team leader / worker /
+  manager / missing caller → `400` with the self-explanatory message; the
+  positive admin `200` path is pinned by the golden test), shared-half
+  degradation on OSS list failure, empty `WorkerAgentDir` → shared-only
+  catalog.
 - `internal/auth/authorizer_test.go` — authorization matrix for the
   `skills` resource kind.

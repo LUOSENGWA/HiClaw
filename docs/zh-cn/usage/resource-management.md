@@ -144,7 +144,7 @@ Manager 会先上传并验证 `SKILL.md`，再更新 `spec.skills`。QwenPaw Wor
 - **`source: "builtin"`**——agent 模板自带的内置技能（取自各 `SKILL.md` frontmatter 的 name + description，`agents` 列出提供该技能的模板，`runtimes` 列出支持的运行时）。模板→运行时的映射取自 deployer 自身的 `BuiltinAgentDir` 选择逻辑，因此目录永远与 Worker 实际接收的内置技能一致、不会漂移。
 - **`source: "shared"`**——Dashboard 技能上传流程暂存到 `agents/global/skills/` 下的技能，可分发到任意 Worker。该前缀是**暂存区而非分发通道**：删除其中某个条目只会把它从目录和 Dashboard 全局区移除，**不会**触碰已分发的 per-worker 副本或既有的 `spec.skills` 分配（无级联）。
 
-输出按名称排序；端点只暴露元数据——不读技能正文、不访问注册表、不泄露凭据。admin、manager、团队 Leader、团队范围人类用户均可访问。设计见 [Skill Catalog API](../design/skill-catalog-api.md)。
+输出按名称排序；端点只暴露元数据——不读技能正文、不访问注册表、不泄露凭据。条目含 `name`/`description`/`source` 及 `version`/`requirements`（builtin）与 `updated_at`（shared）。**仅 admin（L1）可访问**；非 admin 调用方收到 `400 team scope required`（团队范围读 `?team=` 后续交付）。设计见 [Skill Catalog API](../design/skill-catalog-api.md)。
 
 ### 带自定义包的 Worker
 
