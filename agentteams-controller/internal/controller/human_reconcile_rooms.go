@@ -3,6 +3,9 @@ package controller
 import (
 	"context"
 
+	"github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
+	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/matrix"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -46,7 +49,7 @@ func (r *HumanReconciler) reconcileHumanRooms(ctx context.Context, s *humanScope
 
 	powerLevel := humanRoomPowerLevel(h.Spec.PermissionLevel)
 
-	for rid := range desired {
+	for rid, origin := range desired {
 		alreadyMember := false
 		if _, ok := observed[rid]; ok {
 			alreadyMember = true
@@ -78,26 +81,107 @@ func (r *HumanReconciler) reconcileHumanRooms(ctx context.Context, s *humanScope
 		// levels accounted for human members, leaving them at the implicit
 		// level 0 and 403 on room operations (rename, invite). Non-fatal
 		// per this file's error policy; the next cycle retries.
-		if err := r.Provisioner.EnsureRoomPowerLevel(ctx, rid, matrixUserID, powerLevel); err != nil {
-			logger.Error(err, "failed to ensure human power level", "room", rid, "level", powerLevel)
+		//
+		// The grant must run as an actor actually authorized in the room:
+		// TeamAdmin-owned rooms do not include the homeserver admin, so
+		// the default admin identity would be rejected with M_FORBIDDEN.
+		actorToken := r.roomActorToken(ctx, origin, h.Namespace)
+		grantErr := r.Provisioner.EnsureRoomPowerLevel(ctx, rid, matrixUserID, powerLevel, actorToken, "")
+		if matrix.IsForbidden(grantErr) {
+			// An M_FORBIDDEN on the actor write is the homeserver's
+			// strict-greater rule: the actor's level is not above the
+			// human's CURRENT level, i.e. an equal-level demotion (a
+			// former L1 human at 100 being lowered to 50). The sender's
+			// OWN entry is exempt from that rule, so retry with the
+			// human's own token — lazily, so steady-state cycles never
+			// issue a Matrix Login.
+			if token := r.ensureUserToken(ctx, s); token != "" {
+				if retryErr := r.Provisioner.EnsureRoomPowerLevel(ctx, rid, matrixUserID, powerLevel, actorToken, token); retryErr == nil {
+					grantErr = nil
+				} else {
+					logger.Error(retryErr, "failed to ensure human power level via self-write", "room", rid, "level", powerLevel)
+				}
+			}
+		}
+		if grantErr != nil {
+			logger.Error(grantErr, "failed to ensure human power level", "room", rid, "level", powerLevel)
 		}
 	}
 
-	// Removals: in-place filter. A failed kick keeps the room so the
+	// Removals: in-place filter. A failed revocation keeps the room so the
 	// next reconcile retries, matching pre-refactor behavior.
+	//
+	// Revocation chain — each stage covers what the previous cannot:
+	//  1. kick as the homeserver admin: works for rooms the admin is a
+	//     member of when the target's level is below the admin's;
+	//  2. self-leave with the human's own token: always authorized for a
+	//     joined member regardless of power levels (spec room-auth rule:
+	//     a user may leave their own room) — the only in-band revocation
+	//     for an equal-level (100) human, and the only one that works in
+	//     rooms the admin is not in (TeamAdmin-owned rooms);
+	//  3. the Tuwunel admin bot force-leave: last resort when the human
+	//     token is unavailable (stale password). Like the team-reconcile
+	//     usage, a confirmed command delivery is treated as resolved.
 	kept := next[:0]
 	for _, rid := range next {
 		if _, ok := desired[rid]; ok {
 			kept = append(kept, rid)
 			continue
 		}
-		if err := r.Provisioner.KickFromRoom(ctx, rid, matrixUserID, "access revoked"); err != nil {
-			logger.Error(err, "failed to kick human from room", "room", rid)
-			kept = append(kept, rid)
+		if err := r.Provisioner.KickFromRoom(ctx, rid, matrixUserID, "access revoked"); err == nil {
+			continue // kicked, or the user was already out
+		} else {
+			logger.V(1).Info("admin kick rejected; trying revocation fallbacks", "room", rid, "err", err.Error())
+		}
+		removed := false
+		if token := r.ensureUserToken(ctx, s); token != "" {
+			if lerr := r.Provisioner.LeaveRoomAs(ctx, rid, token); lerr == nil {
+				removed = true
+			} else {
+				logger.Error(lerr, "self-leave failed", "room", rid)
+			}
+		}
+		if !removed {
+			if ferr := r.Provisioner.ForceLeaveRoom(ctx, matrixUserID, rid); ferr == nil {
+				removed = true
+			} else {
+				logger.Error(ferr, "force-leave failed", "room", rid)
+			}
+		}
+		if !removed {
+			kept = append(kept, rid) // keep for the next cycle's retry
 		}
 	}
 
 	h.Status.Rooms = kept
+}
+
+// roomActorToken returns the access token of the actor authorized to read
+// and write state in the room described by origin. Teams with a TeamAdmin
+// configured own their team room (the homeserver admin is deliberately not
+// a member), so grants there must run as that admin; every other room
+// (worker DM rooms, teams without an admin) keeps the default
+// homeserver-admin actor (""). An unavailable actor (admin human not
+// provisioned, login failed) degrades to the default — the grant then 403s
+// and is retried next cycle rather than silently skipping.
+func (r *HumanReconciler) roomActorToken(ctx context.Context, origin humanRoomOrigin, namespace string) string {
+	if origin.teamName == "" {
+		return ""
+	}
+	var team v1beta1.Team
+	if err := r.Client.Get(ctx, client.ObjectKey{Name: origin.teamName, Namespace: namespace}, &team); err != nil {
+		return ""
+	}
+	if team.Spec.Admin == nil {
+		return ""
+	}
+	actor, err := resolveTeamAdminActor(ctx, r.Client, r.Provisioner, &team)
+	if err != nil {
+		log.FromContext(ctx).V(1).Info("team admin actor unavailable; power grant uses the default admin and may be rejected",
+			"team", origin.teamName, "err", err.Error())
+		return ""
+	}
+	return actor.Token
 }
 
 // humanRoomPowerLevel maps the Human CR permission level to the Matrix power

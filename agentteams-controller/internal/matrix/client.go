@@ -25,6 +25,47 @@ import (
 // instead of logging it as a hard error.
 var ErrAppServiceNotReady = errors.New("matrix appservice token not active yet")
 
+// APIError is a non-2xx Matrix response whose body carried a decoded
+// errcode (e.g. M_FORBIDDEN for an authorization rejection). Callers that
+// need to react to a specific rejection (retry with a different actor,
+// fall back to a self-operation, ...) should test with errors.As /
+// IsForbidden instead of pattern-matching on error text.
+type APIError struct {
+	StatusCode int
+	ErrCode    string
+	Message    string
+}
+
+func (e *APIError) Error() string {
+	if e.ErrCode != "" {
+		return fmt.Sprintf("HTTP %d %s: %s", e.StatusCode, e.ErrCode, e.Message)
+	}
+	return fmt.Sprintf("HTTP %d", e.StatusCode)
+}
+
+// IsForbidden reports whether err is (or wraps) a Matrix M_FORBIDDEN
+// response — the homeserver's authorization rejection (insufficient power
+// level, sender not a member of the room, equal-power kick/demotion, ...).
+func IsForbidden(err error) bool {
+	var ae *APIError
+	return errors.As(err, &ae) && ae.StatusCode == http.StatusForbidden && ae.ErrCode == "M_FORBIDDEN"
+}
+
+// apiErrorFromBody builds an *APIError from a non-2xx status line and the
+// response body ({"errcode": "...", "error": "..."} when decodable).
+func apiErrorFromBody(statusCode int, respBody []byte) *APIError {
+	ae := &APIError{StatusCode: statusCode}
+	var decoded struct {
+		ErrCode string `json:"errcode"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(respBody, &decoded); err == nil {
+		ae.ErrCode = decoded.ErrCode
+		ae.Message = decoded.Error
+	}
+	return ae
+}
+
 // Client abstracts Matrix homeserver operations.
 // Implementations: TuwunelClient (current), future SynapseClient.
 type Client interface {
@@ -61,11 +102,14 @@ type Client interface {
 	SetRoomState(ctx context.Context, roomID, eventType, stateKey string, content map[string]interface{}, userToken string) error
 
 	// GetRoomState reads the content of a single state event from a room
-	// using the homeserver-admin identity (the event's `content` object,
-	// not the full event envelope). A room that has never had the event
-	// set (e.g. legacy rooms with no m.room.power_levels) yields (nil, nil)
-	// rather than an error; any other failure is returned.
-	GetRoomState(ctx context.Context, roomID, eventType, stateKey string) (map[string]interface{}, error)
+	// (the event's `content` object, not the full event envelope). The
+	// read uses userToken when non-empty, otherwise the homeserver-admin
+	// identity — state reads are membership-scoped, so rooms the admin is
+	// not in (e.g. TeamAdmin-owned rooms) must be read with a token of a
+	// member. A room that has never had the event set (e.g. legacy rooms
+	// with no m.room.power_levels) yields (nil, nil) rather than an error;
+	// any other failure (including M_FORBIDDEN) is returned.
+	GetRoomState(ctx context.Context, roomID, eventType, stateKey, userToken string) (map[string]interface{}, error)
 
 	// JoinRoom makes the user identified by token join the given room.
 	JoinRoom(ctx context.Context, roomID, userToken string) error
@@ -754,16 +798,20 @@ func (c *TuwunelClient) SetRoomState(ctx context.Context, roomID, eventType, sta
 		return fmt.Errorf("set room state %s %s: %w", roomID, eventType, err)
 	}
 	if statusCode != http.StatusOK && statusCode != http.StatusCreated {
-		return fmt.Errorf("set room state %s %s: HTTP %d: %s",
-			roomID, eventType, statusCode, truncate(respBody, 500))
+		return fmt.Errorf("set room state %s %s: %w",
+			roomID, eventType, apiErrorFromBody(statusCode, respBody))
 	}
 	return nil
 }
 
-func (c *TuwunelClient) GetRoomState(ctx context.Context, roomID, eventType, stateKey string) (map[string]interface{}, error) {
-	token, err := c.ensureAdminToken(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("get room state %s %s: %w", roomID, eventType, err)
+func (c *TuwunelClient) GetRoomState(ctx context.Context, roomID, eventType, stateKey, userToken string) (map[string]interface{}, error) {
+	token := userToken
+	if token == "" {
+		var err error
+		token, err = c.ensureAdminToken(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("get room state %s %s: %w", roomID, eventType, err)
+		}
 	}
 	encodedRoom := encodeRoomID(roomID)
 	// Always include the state-key segment (trailing slash when the key is
@@ -779,8 +827,8 @@ func (c *TuwunelClient) GetRoomState(ctx context.Context, roomID, eventType, sta
 		return nil, nil // state event never set on this room
 	}
 	if statusCode != http.StatusOK {
-		return nil, fmt.Errorf("get room state %s %s: HTTP %d: %s",
-			roomID, eventType, statusCode, truncate(respBody, 500))
+		return nil, fmt.Errorf("get room state %s %s: %w",
+			roomID, eventType, apiErrorFromBody(statusCode, respBody))
 	}
 	// The state endpoint returns the state CONTENT object directly
 	// (e.g. {"users":{...},"ban":50}), not an event envelope — decode
@@ -823,7 +871,11 @@ func (c *TuwunelClient) LeaveRoom(ctx context.Context, roomID, userToken string)
 		return fmt.Errorf("leave room %s: %w", roomID, err)
 	}
 	if statusCode != http.StatusOK && statusCode != http.StatusCreated {
-		return fmt.Errorf("leave room %s: HTTP %d: %s", roomID, statusCode, truncate(respBody, 500))
+		// Idempotent: the user is not (or no longer) in the room.
+		if statusCode == http.StatusNotFound {
+			return nil
+		}
+		return fmt.Errorf("leave room %s: %w", roomID, apiErrorFromBody(statusCode, respBody))
 	}
 	return nil
 }
@@ -1045,19 +1097,28 @@ func (c *TuwunelClient) KickFromRoomWithToken(ctx context.Context, roomID, userI
 	if statusCode == http.StatusOK || statusCode == http.StatusCreated {
 		return nil
 	}
-	// Idempotent: user not in the room (or already left).
+	// Idempotent: target not in the room (or already left). Some servers
+	// answer this with a 403 message instead of a 404.
 	if statusCode == http.StatusNotFound {
 		return nil
 	}
 	if statusCode == http.StatusForbidden && resp.ErrCode == "M_FORBIDDEN" {
 		lower := strings.ToLower(resp.Error)
-		if strings.Contains(lower, "not in") || strings.Contains(lower, "not a member") ||
-			strings.Contains(lower, "cannot kick") {
+		if strings.Contains(lower, "not in") || strings.Contains(lower, "not a member") {
 			return nil
 		}
 	}
-	return fmt.Errorf("kick %s from %s: HTTP %d %s %s: %s",
-		userID, roomID, statusCode, resp.ErrCode, resp.Error, truncate(respBody, 500))
+	// Any other 403 is an authorization failure and is NEVER an idempotent
+	// success: the kicker is not a member of the room, or the homeserver
+	// rejected the kick because the target's power level is not strictly
+	// below the kicker's (spec room-auth rule: a kick requires the target's
+	// level to be less than the sender's). Silently returning nil here is
+	// what used to make equal-power kicks ("cannot kick ...") look
+	// successful — the caller then dropped the room from status while the
+	// user stayed in it. Callers must fall back (self-leave with the
+	// target's own token, or the admin-bot force-leave).
+	return fmt.Errorf("kick %s from %s: %w",
+		userID, roomID, apiErrorFromBody(statusCode, respBody))
 }
 
 // ListJoinedRooms returns the room IDs joined by the user identified by

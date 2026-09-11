@@ -52,7 +52,7 @@ reconcile after deployment without any manual backfill.
     rooms — a system-wide policy change out of scope for this PR.
 - The grant is a **merge**, never a replace: `Provisioner.
   EnsureRoomPowerLevel` reads the current `m.room.power_levels`
-  (`matrix.Client.GetRoomState`, new — admin identity, 404 → empty state),
+  (`matrix.Client.GetRoomState`, new — actor token with admin fallback, 404 → empty state),
   adds/raises the human's entry in `users`, preserves every other user and
   every non-user setting (`users_default`, `state_default`, `ban`, …), and
   writes back only when the level actually changed. Steady state = one GET
@@ -75,6 +75,56 @@ level 100 to the creation-time override. Rooms created before this change
 are healed one-time by the Manager (a `PUT m.room.power_levels` per room) —
 a one-off operations task, not part of this PR.
 
+## Authorization: actor selection and the equal-level deadlock
+
+The homeserver enforces room-auth rules that a plain "write with the admin
+token" cannot assume away (spec v8 rules; the fake in
+`provisioner_team_test.go` enforces the same rules, so tests prove the
+controller survives a real homeserver):
+
+- **Strict-greater on other users' entries (rule 9.6).** A sender may
+  change or remove another user's `users` entry only if the sender's level
+  is **strictly greater** than the target's CURRENT level. A sender at 100
+  therefore cannot demote a former L1 human who sits at 100. The sender's
+  OWN entry is exempt — a self-demotion is always authorized (downward).
+  On room version 12+ the creator holds an infinite level and is never
+  blocked; production rooms are v1–11, where the deadlock is real.
+- **Kicks (rule 4.5.4).** The kicker needs at least the `kick` level
+  (50) AND the target's level strictly below the kicker's — an equal-power
+  kick is rejected. A user may always leave their own room (4.5.1).
+- **Membership-scoped state access.** Reading or writing room state as a
+  non-member is rejected — including the homeserver admin in
+  **TeamAdmin-owned rooms**, where `ProvisionTeamRooms` deliberately
+  creates and reconciles as the TeamAdmin and leaves the admin out.
+
+Consequences implemented by this PR:
+
+1. **Actor selection.** `GetRoomState` / `SetRoomState` accept an explicit
+   token ("" = homeserver admin, as before). The human reconciler
+   annotates each desired room with its origin; a team room of a team with
+   `spec.admin` is granted as that TeamAdmin (token resolved from the
+   admin Human via the shared `resolveTeamAdminActor`), every other room
+   keeps the default admin actor.
+2. **Equal-level demotion → self-write fallback.** `EnsureRoomPowerLevel`
+   writes as the actor; on `M_FORBIDDEN` it retries with the human's own
+   token (`selfToken`), whose own entry is exempt from 9.6. The reconciler
+   fetches that token **lazily** (only after the 403), so steady-state
+   cycles still issue no Matrix Login.
+3. **Revocation chain** (removal from the desired set), each stage covering
+   what the previous cannot:
+   1. kick as the homeserver admin (rooms it is in, target below 100);
+   2. **self-leave** with the human's own token (always authorized, any
+      room, any level — the only in-band path for an equal-level 100);
+   3. the Tuwunel admin-bot force-leave (token unavailable / stale
+      password). A confirmed command delivery is treated as resolved,
+      matching the team-reconcile convention.
+4. **Kick idempotency fix.** `KickFromRoomWithToken` used to swallow a
+   403 `cannot kick ...` as success, which made an equal-power kick look
+   like a removal: the room was dropped from `status.rooms` while the
+   user stayed in it. Only a 404 / "not in room" answer is idempotent;
+   every other 403 is returned as a decodable `M_FORBIDDEN`
+   (`matrix.APIError` / `matrix.IsForbidden`) so callers can fall back.
+
 ## What is not changed
 
 - Worker / team / DM room creation keeps its existing power levels
@@ -87,17 +137,45 @@ a one-off operations task, not part of this PR.
 
 - `internal/matrix/client_test.go` — `TestGetRoomState`: returns the state
   **content** (not the event envelope) with the admin token; missing state
-  → `(nil, nil)`, not an error.
-- `internal/service/provisioner_power_test.go`: legacy room → write with
-  the user's level; existing users merged and untouched; extension fields
-  (`events`, `invite`, `notifications`) preserved through the write — only
-  the target users entry is mutated; exact-match level → no write;
-  **demotion revokes: a user at 100 granted 50 is lowered to 50**; read
-  error propagates with no write; state without a `users` map handled;
-  second grant preserves the first (JSON round-trip semantics).
+  → `(nil, nil)`, not an error. `TestGetRoomState_WithUserToken` (explicit
+  token authenticates as that token, not the admin),
+  `TestGetRoomState_Forbidden` / `TestSetRoomState_Forbidden` (non-member /
+  rejected writes surface a decodable `M_FORBIDDEN` via
+  `matrix.IsForbidden`), `TestKickFromRoom_EqualPowerForbidden` (403
+  `cannot kick` is an error, not a silent success — the old swallowing
+  branch is gone), `TestLeaveRoom_IdempotentNotFound`.
+- `internal/service/provisioner_power_test.go` (run against the
+  **authorization-aware** fake, which enforces the spec rules above — a
+  permissive double would not have caught either P1): legacy room → write
+  with the user's level; existing users merged and untouched; extension
+  fields (`events`, `invite`, `notifications`) preserved through the write
+  — only the target users entry is mutated; exact-match level → no write;
+  read error propagates with no write; state without a `users` map
+  handled; second grant preserves the first (JSON round-trip semantics);
+  **equal-level demotion** — `TestEnsureRoomPowerLevel_DemotionRevokesLevel`
+  (actor 100 vs human 100: the actor write is rejected by enforced 9.6 and
+  the self-write with the human's own token completes the 100 → 50),
+  `TestEnsureRoomPowerLevel_EqualLevelDemotionWithoutSelfTokenFails`
+  (no self token → `M_FORBIDDEN` surfaced, state unchanged — no silent
+  success), `TestEnsureRoomPowerLevel_SimpleGrantIsSingleActorWrite`
+  (0 → 50 is a plain actor write, one attempt),
+  `TestEnsureRoomPowerLevel_TeamAdminOwnedRoom` (admin read of a
+  TeamAdmin-owned room → `M_FORBIDDEN`; team-admin actor reads and writes
+  the grant), `TestEnsureRoomPowerLevel_TeamAdminRoomEqualLevelDemotion`
+  (same 9.6 wall as the team-admin actor, self fallback completes it).
 - `internal/controller/human_controller_test.go`:
   `TestHumanReconciler_PowerLevelMapping` (level 1 → 100 in both a new room
   and an already-observed room; grant targets the human's Matrix ID),
   `TestHumanReconciler_PowerLevelL2GetsDefault` (level 2 → 50),
   `TestHumanReconciler_PowerLevelErrorNonFatal` (grant failure does not
-  block the reconcile; room still recorded).
+  block the reconcile; room still recorded),
+  `TestHumanReconciler_PowerGrantUsesTeamAdminActor` (team room granted
+  with the TeamAdmin's token, worker room with the default admin; admin
+  token resolved via login as the admin human),
+  `TestHumanReconciler_EqualLevelDemotionSelfWriteFallback` (403 → retry
+  with the human's own token; login issued lazily, exactly once),
+  `TestHumanReconciler_PowerGrantNoLoginOnSuccess` (no 403 → no login),
+  `TestHumanReconciler_RevocationSelfLeaveFallback` (kick rejected →
+  self-leave with the human token → room dropped),
+  `TestHumanReconciler_RevocationForceLeaveLastResort` (stale password,
+  no self token → admin-bot force-leave → room dropped).

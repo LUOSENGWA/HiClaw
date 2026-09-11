@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync/atomic"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -15,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
+	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/matrix"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/service"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/test/testutil/mocks"
 )
@@ -719,7 +721,7 @@ func TestHumanReconciler_PowerLevelErrorNonFatal(t *testing.T) {
 	human.Finalizers = []string{finalizerName}
 
 	rig := newHumanRig(t, human, worker)
-	rig.prov.EnsureRoomPowerLevelFn = func(ctx context.Context, roomID, userID string, level int) error {
+	rig.prov.EnsureRoomPowerLevelFn = func(ctx context.Context, roomID, userID string, level int, actorToken, selfToken string) error {
 		return fmt.Errorf("matrix unavailable")
 	}
 
@@ -729,5 +731,213 @@ func TestHumanReconciler_PowerLevelErrorNonFatal(t *testing.T) {
 	}
 	if len(out.Status.Rooms) != 1 || out.Status.Rooms[0] != "!room-w1:localhost" {
 		t.Errorf("room not recorded despite power failure: %v", out.Status.Rooms)
+	}
+}
+
+// A TeamAdmin-owned team room must be granted with the team admin's token
+// (the homeserver admin is not a member of those rooms), while worker DM
+// rooms keep the default admin actor.
+func TestHumanReconciler_PowerGrantUsesTeamAdminActor(t *testing.T) {
+	worker := newReadyWorker("w1", "!room-w1:localhost")
+	team := newReadyTeam("t1", "!room-t1:localhost")
+	team.Spec.Admin = &v1beta1.TeamAdminSpec{Name: "ada", MatrixUserID: "@ada:localhost"}
+	adminHuman := newHuman("ada", v1beta1.HumanSpec{})
+	adminHuman.Status.MatrixUserID = "@ada:localhost"
+	adminHuman.Status.InitialPassword = "ada-pw"
+	adminHuman.Status.Phase = "Active"
+
+	human := newHuman("alice", v1beta1.HumanSpec{
+		PermissionLevel:   2,
+		AccessibleWorkers: []string{"w1"},
+		AccessibleTeams:   []string{"t1"},
+	})
+	human.Status.MatrixUserID = "@alice:localhost"
+	human.Status.InitialPassword = "alice-pw"
+	human.Status.Rooms = []string{"!room-w1:localhost"}
+	human.Status.Phase = "Active"
+	human.Finalizers = []string{finalizerName}
+
+	var adminLogins atomic.Int32
+	rig := newHumanRig(t, human, worker, team, adminHuman)
+	rig.prov.LoginWithPasswordFn = func(ctx context.Context, name, password string) (string, error) {
+		switch name {
+		case "ada":
+			adminLogins.Add(1)
+			return "teamadmin-token", nil
+		case "alice":
+			return "alice-token", nil
+		}
+		return "", fmt.Errorf("unexpected login %s", name)
+	}
+
+	out, _, err := rig.reconcile("alice")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	byRoom := map[string]string{}
+	for _, c := range rig.prov.Calls.EnsureRoomPowerLevel {
+		byRoom[c.RoomID] = c.ActorToken
+	}
+	if got := byRoom["!room-t1:localhost"]; got != "teamadmin-token" {
+		t.Errorf("team room actor=%q, want teamadmin-token (calls=%+v)", got, rig.prov.Calls.EnsureRoomPowerLevel)
+	}
+	if got := byRoom["!room-w1:localhost"]; got != "" {
+		t.Errorf("worker room actor=%q, want default admin (\"\")", got)
+	}
+	if adminLogins.Load() == 0 {
+		t.Error("team admin token was never resolved via login")
+	}
+	if len(out.Status.Rooms) != 2 {
+		t.Errorf("Status.Rooms=%v, want both rooms", out.Status.Rooms)
+	}
+}
+
+// Steady-state: an equal-level demotion (actor 403 on the strict-greater
+// rule) must be retried with the human's OWN token — lazily, i.e. the
+// login happens only after the 403.
+func TestHumanReconciler_EqualLevelDemotionSelfWriteFallback(t *testing.T) {
+	worker := newReadyWorker("w1", "!room-w1:localhost")
+	human := newHuman("carol", v1beta1.HumanSpec{
+		PermissionLevel:   2,
+		AccessibleWorkers: []string{"w1"},
+	})
+	human.Status.MatrixUserID = "@carol:localhost"
+	human.Status.InitialPassword = "stored-pw"
+	human.Status.Rooms = []string{"!room-w1:localhost"} // already a member
+	human.Status.Phase = "Active"
+	human.Finalizers = []string{finalizerName}
+
+	var logins atomic.Int32
+	rig := newHumanRig(t, human, worker)
+	rig.prov.EnsureRoomPowerLevelFn = func(ctx context.Context, roomID, userID string, level int, actorToken, selfToken string) error {
+		if selfToken == "" {
+			// The homeserver's strict-greater rule rejects the actor's
+			// equal-level demotion.
+			return &matrix.APIError{StatusCode: 403, ErrCode: "M_FORBIDDEN", Message: "target level not below sender"}
+		}
+		return nil
+	}
+	rig.prov.LoginWithPasswordFn = func(ctx context.Context, name, password string) (string, error) {
+		logins.Add(1)
+		return "carol-token", nil
+	}
+
+	if _, _, err := rig.reconcile("carol"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	calls := rig.prov.Calls.EnsureRoomPowerLevel
+	if len(calls) != 2 {
+		t.Fatalf("power calls=%d, want 2 (actor + self), got %+v", len(calls), calls)
+	}
+	if calls[0].SelfToken != "" {
+		t.Errorf("first attempt must not carry a self token: %+v", calls[0])
+	}
+	if calls[1].SelfToken != "carol-token" {
+		t.Errorf("retry must use the human's own token, got %q", calls[1].SelfToken)
+	}
+	if logins.Load() != 1 {
+		t.Errorf("logins=%d, want exactly 1 (lazy, after the 403)", logins.Load())
+	}
+}
+
+// Steady-state: when the grant never 403s, no login is issued.
+func TestHumanReconciler_PowerGrantNoLoginOnSuccess(t *testing.T) {
+	worker := newReadyWorker("w1", "!room-w1:localhost")
+	human := newHuman("carol", v1beta1.HumanSpec{
+		PermissionLevel:   2,
+		AccessibleWorkers: []string{"w1"},
+	})
+	human.Status.MatrixUserID = "@carol:localhost"
+	human.Status.InitialPassword = "stored-pw"
+	human.Status.Rooms = []string{"!room-w1:localhost"}
+	human.Status.Phase = "Active"
+	human.Finalizers = []string{finalizerName}
+
+	var logins atomic.Int32
+	rig := newHumanRig(t, human, worker)
+	rig.prov.LoginWithPasswordFn = func(ctx context.Context, name, password string) (string, error) {
+		logins.Add(1)
+		return "carol-token", nil
+	}
+
+	if _, _, err := rig.reconcile("carol"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if logins.Load() != 0 {
+		t.Errorf("logins=%d, want 0 (no 403, no login)", logins.Load())
+	}
+}
+
+// Revocation: when the admin kick is rejected (equal-power, or the admin
+// is not a member), the human leaves with their own token and the room is
+// dropped from status.
+func TestHumanReconciler_RevocationSelfLeaveFallback(t *testing.T) {
+	human := newHuman("dave", v1beta1.HumanSpec{})
+	human.Status.MatrixUserID = "@dave:localhost"
+	human.Status.InitialPassword = "stored-pw"
+	human.Status.Rooms = []string{"!room-gone:localhost"} // no longer desired
+	human.Status.Phase = "Active"
+	human.Finalizers = []string{finalizerName}
+
+	var leaves []string
+	rig := newHumanRig(t, human)
+	rig.prov.KickFromRoomFn = func(ctx context.Context, roomID, userID, reason string) error {
+		return &matrix.APIError{StatusCode: 403, ErrCode: "M_FORBIDDEN", Message: "cannot kick: target power level not below kicker"}
+	}
+	rig.prov.LoginWithPasswordFn = func(ctx context.Context, name, password string) (string, error) {
+		return "dave-token", nil
+	}
+	rig.prov.LeaveRoomAsFn = func(ctx context.Context, roomID, userToken string) error {
+		leaves = append(leaves, roomID+"/"+userToken)
+		return nil
+	}
+
+	out, _, err := rig.reconcile("dave")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(rig.prov.Calls.KickFromRoom) != 1 {
+		t.Fatalf("kick calls=%+v, want 1", rig.prov.Calls.KickFromRoom)
+	}
+	if len(leaves) != 1 || leaves[0] != "!room-gone:localhost/dave-token" {
+		t.Errorf("self-leave=%v, want [!room-gone:localhost/dave-token]", leaves)
+	}
+	if len(out.Status.Rooms) != 0 {
+		t.Errorf("Status.Rooms=%v, want empty (revoked)", out.Status.Rooms)
+	}
+}
+
+// Revocation: with no usable human token, the admin-bot force-leave is
+// the last resort.
+func TestHumanReconciler_RevocationForceLeaveLastResort(t *testing.T) {
+	human := newHuman("erin", v1beta1.HumanSpec{})
+	human.Status.MatrixUserID = "@erin:localhost"
+	human.Status.InitialPassword = "stale-pw"
+	human.Status.Rooms = []string{"!room-gone:localhost"}
+	human.Status.Phase = "Active"
+	human.Finalizers = []string{finalizerName}
+
+	var forced []string
+	rig := newHumanRig(t, human)
+	rig.prov.KickFromRoomFn = func(ctx context.Context, roomID, userID, reason string) error {
+		return &matrix.APIError{StatusCode: 403, ErrCode: "M_FORBIDDEN", Message: "cannot kick: target power level not below kicker"}
+	}
+	rig.prov.LoginWithPasswordFn = func(ctx context.Context, name, password string) (string, error) {
+		return "", errors.New("password stale: M_FORBIDDEN from homeserver login")
+	}
+	rig.prov.ForceLeaveRoomFn = func(ctx context.Context, userID, roomID string) error {
+		forced = append(forced, roomID+"/"+userID)
+		return nil
+	}
+
+	out, _, err := rig.reconcile("erin")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(forced) != 1 || forced[0] != "!room-gone:localhost/@erin:localhost" {
+		t.Errorf("force-leave=%v, want [!room-gone:localhost/@erin:localhost]", forced)
+	}
+	if len(out.Status.Rooms) != 0 {
+		t.Errorf("Status.Rooms=%v, want empty (revoked)", out.Status.Rooms)
 	}
 }

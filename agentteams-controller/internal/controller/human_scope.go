@@ -56,24 +56,35 @@ func computeHumanPhase(h *v1beta1.Human, reconcileErr error) string {
 	return "Active"
 }
 
+// humanRoomOrigin records where a desired room came from so the room phase
+// can pick an actor authorized to write that room's state: a TeamAdmin
+// owns the team room of a team that configures an Admin (the homeserver
+// admin is deliberately not a member of those rooms), while worker DM
+// rooms and teams without an Admin keep the default homeserver-admin actor.
+type humanRoomOrigin struct {
+	teamName   string // non-empty for team rooms (team.Status.TeamRoomID)
+	workerName string // non-empty for worker DM rooms (worker.Status.RoomID)
+}
+
 // buildDesiredHumanRooms resolves Spec.AccessibleWorkers / AccessibleTeams
 // into the set of Matrix room IDs the human should currently be a member
-// of. Workers/Teams that don't exist or haven't finished provisioning
-// (empty Status.RoomID / TeamRoomID) are simply skipped — they'll be
-// picked up on a later reconcile once their rooms materialize.
+// of, annotated with each room's origin. Workers/Teams that don't exist or
+// haven't finished provisioning (empty Status.RoomID / TeamRoomID) are
+// simply skipped — they'll be picked up on a later reconcile once their
+// rooms materialize.
 //
-// Returned as a set (map-to-empty-struct) rather than a slice because
-// the reconciler does membership comparisons against the observed
-// Status.Rooms set.
-func buildDesiredHumanRooms(ctx context.Context, c client.Client, h *v1beta1.Human) map[string]struct{} {
-	desired := make(map[string]struct{})
+// Returned as a map (roomID -> origin) rather than a slice because the
+// reconciler does membership comparisons against the observed Status.Rooms
+// set and needs the origin to choose the room-state actor.
+func buildDesiredHumanRooms(ctx context.Context, c client.Client, h *v1beta1.Human) map[string]humanRoomOrigin {
+	desired := make(map[string]humanRoomOrigin)
 	for _, workerName := range h.Spec.AccessibleWorkers {
 		var worker v1beta1.Worker
 		if err := c.Get(ctx, client.ObjectKey{Name: workerName, Namespace: h.Namespace}, &worker); err != nil {
 			continue
 		}
 		if worker.Status.RoomID != "" {
-			desired[worker.Status.RoomID] = struct{}{}
+			desired[worker.Status.RoomID] = humanRoomOrigin{workerName: workerName}
 		}
 	}
 	for _, teamName := range h.Spec.AccessibleTeams {
@@ -82,7 +93,7 @@ func buildDesiredHumanRooms(ctx context.Context, c client.Client, h *v1beta1.Hum
 			continue
 		}
 		if team.Status.TeamRoomID != "" {
-			desired[team.Status.TeamRoomID] = struct{}{}
+			desired[team.Status.TeamRoomID] = humanRoomOrigin{teamName: teamName}
 		}
 	}
 	return desired

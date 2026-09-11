@@ -581,7 +581,7 @@ func TestGetRoomState(t *testing.T) {
 
 	c := NewTuwunelClient(Config{ServerURL: server.URL, Domain: "d"}, server.Client())
 
-	st, err := c.GetRoomState(context.Background(), "!room:d", "m.room.power_levels", "")
+	st, err := c.GetRoomState(context.Background(), "!room:d", "m.room.power_levels", "", "")
 	if err != nil {
 		t.Fatalf("GetRoomState: %v", err)
 	}
@@ -591,7 +591,7 @@ func TestGetRoomState(t *testing.T) {
 	}
 
 	// A room that never had the state set yields (nil, nil), not an error.
-	st, err = c.GetRoomState(context.Background(), "!room:d", "room.meta", "")
+	st, err = c.GetRoomState(context.Background(), "!room:d", "room.meta", "", "")
 	if err != nil {
 		t.Fatalf("missing state must not error: %v", err)
 	}
@@ -1102,5 +1102,160 @@ func TestGeneratePassword(t *testing.T) {
 	p2, _ := GeneratePassword(16)
 	if p1 == p2 {
 		t.Error("two generated passwords should not be equal")
+	}
+}
+
+// A state read with an explicit user token must authenticate as that
+// token, not the homeserver admin — TeamAdmin-owned rooms reject the
+// admin (not a member) and require a member's token.
+func TestGetRoomState_WithUserToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/_matrix/client/v3/rooms/!room:d/state/m.room.power_levels/":
+			if auth := r.Header.Get("Authorization"); auth != "Bearer teamadmin-token" {
+				t.Errorf("Authorization = %q, want Bearer teamadmin-token", auth)
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"users": map[string]interface{}{"@a:d": 100.0},
+			})
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := NewTuwunelClient(Config{ServerURL: server.URL, Domain: "d"}, server.Client())
+	st, err := c.GetRoomState(context.Background(), "!room:d", "m.room.power_levels", "", "teamadmin-token")
+	if err != nil {
+		t.Fatalf("GetRoomState: %v", err)
+	}
+	if st["users"] == nil {
+		t.Fatalf("unexpected state: %#v", st)
+	}
+}
+
+// A rejected state write (e.g. the strict-greater power-level rule, or a
+// non-member actor) must surface as a decodable M_FORBIDDEN so callers
+// can detect it with matrix.IsForbidden and fall back to an authorized
+// actor / self-write.
+func TestSetRoomState_Forbidden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/_matrix/client/v3/login":
+			adminLoginHandler(t, w)
+		case "/_matrix/client/v3/rooms/!room:d/state/m.room.power_levels/":
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{
+				"errcode": "M_FORBIDDEN",
+				"error":   "You don't have permission to modify that state.",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := NewTuwunelClient(Config{
+		ServerURL: server.URL, Domain: "d", AdminUser: "admin", AdminPassword: "pw",
+	}, server.Client())
+	err := c.SetRoomState(context.Background(), "!room:d", "m.room.power_levels", "",
+		map[string]interface{}{"users": map[string]interface{}{"@a:d": 50.0}}, "")
+	if err == nil {
+		t.Fatal("expected M_FORBIDDEN, got nil")
+	}
+	if !IsForbidden(err) {
+		t.Fatalf("IsForbidden(%v) = false, want true", err)
+	}
+}
+
+// A state read by a non-member actor (the homeserver admin in a
+// TeamAdmin-owned room) surfaces M_FORBIDDEN rather than a generic error.
+func TestGetRoomState_Forbidden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/_matrix/client/v3/login":
+			adminLoginHandler(t, w)
+		case "/_matrix/client/v3/rooms/!room:d/state/m.room.power_levels/":
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{
+				"errcode": "M_FORBIDDEN",
+				"error":   "You are not a member of that room.",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := NewTuwunelClient(Config{
+		ServerURL: server.URL, Domain: "d", AdminUser: "admin", AdminPassword: "pw",
+	}, server.Client())
+	_, err := c.GetRoomState(context.Background(), "!room:d", "m.room.power_levels", "", "")
+	if err == nil {
+		t.Fatal("expected M_FORBIDDEN, got nil")
+	}
+	if !IsForbidden(err) {
+		t.Fatalf("IsForbidden(%v) = false, want true", err)
+	}
+}
+
+// Regression: an equal-power kick rejection ("cannot kick ...", 403) must
+// be returned as an error — the old message-sniffing branch treated it as
+// idempotent success, which made the caller drop the room from status
+// while the user stayed in it.
+func TestKickFromRoom_EqualPowerForbidden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/_matrix/client/v3/login":
+			adminLoginHandler(t, w)
+		case "/_matrix/client/v3/rooms/!room:d/kick":
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{
+				"errcode": "M_FORBIDDEN",
+				"error":   "Cannot kick @alice:d: their power level is not below yours.",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := NewTuwunelClient(Config{
+		ServerURL: server.URL, Domain: "d", AdminUser: "admin", AdminPassword: "pw",
+	}, server.Client())
+	err := c.KickFromRoom(context.Background(), "!room:d", "@alice:d", "access revoked")
+	if err == nil {
+		t.Fatal("equal-power kick rejection must be an error, got nil")
+	}
+	if !IsForbidden(err) {
+		t.Fatalf("IsForbidden(%v) = false, want true", err)
+	}
+}
+
+// Leaving a room you are not (or no longer) in is idempotent.
+func TestLeaveRoom_IdempotentNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/_matrix/client/v3/login":
+			adminLoginHandler(t, w)
+		case "/_matrix/client/v3/rooms/!room:d/leave":
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{
+				"errcode": "M_NOT_FOUND",
+				"error":   "Not a member of that room.",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := NewTuwunelClient(Config{
+		ServerURL: server.URL, Domain: "d", AdminUser: "admin", AdminPassword: "pw",
+	}, server.Client())
+	if err := c.LeaveRoom(context.Background(), "!room:d", ""); err != nil {
+		t.Errorf("expected nil for not-in-room, got %v", err)
 	}
 }

@@ -30,7 +30,9 @@ type MockHumanProvisioner struct {
 	InviteToRoomFn         func(ctx context.Context, roomID, userID string) error
 	JoinRoomAsFn           func(ctx context.Context, roomID, userToken string) error
 	KickFromRoomFn         func(ctx context.Context, roomID, userID, reason string) error
-	EnsureRoomPowerLevelFn func(ctx context.Context, roomID, userID string, level int) error
+	KickFromRoomAsFn       func(ctx context.Context, roomID, userID, reason, actorToken string) error
+	LeaveRoomAsFn          func(ctx context.Context, roomID, userToken string) error
+	EnsureRoomPowerLevelFn func(ctx context.Context, roomID, userID string, level int, actorToken, selfToken string) error
 	ForceLeaveRoomFn       func(ctx context.Context, userID, roomID string) error
 	DeactivateHumanUserFn  func(ctx context.Context, userID string) error
 	SetDisplayNameFn       func(ctx context.Context, userID, accessToken, displayName string) error
@@ -52,6 +54,8 @@ type MockHumanProvisioner struct {
 		InviteToRoom           []RoomMembershipCall
 		JoinRoomAs             []JoinRoomAsCall
 		KickFromRoom           []KickFromRoomCall
+		KickFromRoomAs         []KickFromRoomCall
+		LeaveRoomAs            []JoinRoomAsCall
 		ForceLeaveRoom         []ForceLeaveRoomCall
 		DeactivateHumanUser    []string
 		EnsureRoomPowerLevel   []EnsureRoomPowerLevelCall
@@ -64,6 +68,10 @@ type EnsureRoomPowerLevelCall struct {
 	RoomID string
 	UserID string
 	Level  int
+	// ActorToken / SelfToken record which identities the grant ran as
+	// ("" = homeserver-admin default actor).
+	ActorToken string
+	SelfToken  string
 }
 
 // LoginAsHumanCall records the (name, password) pair passed to LoginAsHuman.
@@ -140,6 +148,8 @@ func (m *MockHumanProvisioner) Reset() {
 	m.InviteToRoomFn = nil
 	m.JoinRoomAsFn = nil
 	m.KickFromRoomFn = nil
+	m.KickFromRoomAsFn = nil
+	m.LeaveRoomAsFn = nil
 	m.ForceLeaveRoomFn = nil
 	m.DeactivateHumanUserFn = nil
 	m.SetDisplayNameFn = nil
@@ -166,6 +176,8 @@ func (m *MockHumanProvisioner) clearCallsLocked() {
 		InviteToRoom           []RoomMembershipCall
 		JoinRoomAs             []JoinRoomAsCall
 		KickFromRoom           []KickFromRoomCall
+		KickFromRoomAs         []KickFromRoomCall
+		LeaveRoomAs            []JoinRoomAsCall
 		ForceLeaveRoom         []ForceLeaveRoomCall
 		DeactivateHumanUser    []string
 		EnsureRoomPowerLevel   []EnsureRoomPowerLevelCall
@@ -340,13 +352,35 @@ func (m *MockHumanProvisioner) DeactivateHumanUser(ctx context.Context, userID s
 	return nil
 }
 
-func (m *MockHumanProvisioner) EnsureRoomPowerLevel(ctx context.Context, roomID, userID string, level int) error {
+func (m *MockHumanProvisioner) EnsureRoomPowerLevel(ctx context.Context, roomID, userID string, level int, actorToken, selfToken string) error {
 	m.mu.Lock()
-	m.Calls.EnsureRoomPowerLevel = append(m.Calls.EnsureRoomPowerLevel, EnsureRoomPowerLevelCall{RoomID: roomID, UserID: userID, Level: level})
+	m.Calls.EnsureRoomPowerLevel = append(m.Calls.EnsureRoomPowerLevel, EnsureRoomPowerLevelCall{RoomID: roomID, UserID: userID, Level: level, ActorToken: actorToken, SelfToken: selfToken})
 	fn := m.EnsureRoomPowerLevelFn
 	m.mu.Unlock()
 	if fn != nil {
-		return fn(ctx, roomID, userID, level)
+		return fn(ctx, roomID, userID, level, actorToken, selfToken)
+	}
+	return nil
+}
+
+func (m *MockHumanProvisioner) KickFromRoomAs(ctx context.Context, roomID, userID, reason, actorToken string) error {
+	m.mu.Lock()
+	m.Calls.KickFromRoomAs = append(m.Calls.KickFromRoomAs, KickFromRoomCall{RoomID: roomID, UserID: userID, Reason: reason})
+	fn := m.KickFromRoomAsFn
+	m.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, roomID, userID, reason, actorToken)
+	}
+	return nil
+}
+
+func (m *MockHumanProvisioner) LeaveRoomAs(ctx context.Context, roomID, userToken string) error {
+	m.mu.Lock()
+	m.Calls.LeaveRoomAs = append(m.Calls.LeaveRoomAs, JoinRoomAsCall{RoomID: roomID, UserToken: userToken})
+	fn := m.LeaveRoomAsFn
+	m.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, roomID, userToken)
 	}
 	return nil
 }
