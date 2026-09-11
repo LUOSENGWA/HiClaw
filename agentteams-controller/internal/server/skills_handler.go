@@ -10,6 +10,7 @@ import (
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/httputil"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/service"
+	"gopkg.in/yaml.v3"
 )
 
 // globalSkillsPrefix is the deployment-wide skill staging area maintained by
@@ -31,11 +32,29 @@ const globalSkillsPrefix = "agents/global/skills/"
 // identity/availability only — never skill content, credentials, or
 // registry connection details.
 type SkillInfo struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description,omitempty"`
-	Source      string   `json:"source"` // "builtin" | "shared"
-	Agents      []string `json:"agents,omitempty"`   // builtin only: template dirs providing the skill
-	Runtimes    []string `json:"runtimes,omitempty"` // runtimes for which the skill is available
+	Name         string             `json:"name"`
+	Description  string             `json:"description,omitempty"`
+	Source       string             `json:"source"` // "builtin" | "shared"
+	Version      string             `json:"version,omitempty"` // builtin only: SKILL.md frontmatter version
+	Requirements *SkillRequirements `json:"requirements,omitempty"` // builtin only: frontmatter requires block
+	Agents       []string           `json:"agents,omitempty"`   // builtin only: template dirs providing the skill
+	Runtimes     []string           `json:"runtimes,omitempty"` // runtimes for which the skill is available
+}
+
+// SkillRequirements mirrors the SKILL.md "requires" declaration
+// (top-level or under metadata.{openclaw,qwenpaw,clawdbot}): the binaries,
+// env vars, and MCP server names the skill needs at runtime. The three
+// metadata namespaces are the conventions the OpenClaw, QwenPaw, and
+// Clawdbot runtimes each honour when parsing skill frontmatter. The catalog
+// exposes them so workbenches can warn before assignment; enforcement is
+// runtime-dependent (the qwenpaw 2.2.x registry gates skill activation on
+// require_bins/envs/mcps; other runtimes in AllWorkerRuntimes have no
+// equivalent gate yet, so a satisfied declaration is necessary but not
+// sufficient there).
+type SkillRequirements struct {
+	RequireBins []string `json:"require_bins,omitempty"`
+	RequireEnvs []string `json:"require_envs,omitempty"`
+	RequireMcps []string `json:"require_mcps,omitempty"`
 }
 
 // SkillListResponse is the payload of GET /api/v1/skills.
@@ -49,7 +68,9 @@ type SkillListResponse struct {
 // from service.BuiltinAgentDir, the same function the Deployer uses to seed
 // workers) plus the deployment-wide shared skills staged under
 // agents/global/skills/. It never reads skill content beyond the SKILL.md
-// frontmatter (name/description) of builtin skills.
+// frontmatter (name/description/version/requires) of builtin skills; the
+// shared half is name-only by design (list-on-read, no per-skill object
+// fetches — shared SKILL.md metadata is a v2 candidate).
 type SkillsHandler struct {
 	workerAgentDir string
 	oss            oss.StorageClient
@@ -73,7 +94,7 @@ func (h *SkillsHandler) ListSkills(w http.ResponseWriter, r *http.Request) {
 			if !entry.IsDir() {
 				continue
 			}
-			name, description := parseSkillFrontmatter(filepath.Join(skillRoot, entry.Name(), "SKILL.md"))
+			name, description, version, requirements := parseSkillFrontmatter(filepath.Join(skillRoot, entry.Name(), "SKILL.md"))
 			if name == "" {
 				name = entry.Name()
 			}
@@ -84,15 +105,23 @@ func (h *SkillsHandler) ListSkills(w http.ResponseWriter, r *http.Request) {
 					if info.Description == "" {
 						info.Description = description
 					}
+					if info.Version == "" {
+						info.Version = version
+					}
+					if info.Requirements == nil {
+						info.Requirements = requirements
+					}
 				}
 				continue
 			}
 			skills[name] = &SkillInfo{
-				Name:        name,
-				Description: description,
-				Source:      "builtin",
-				Agents:      []string{tmpl.dirName},
-				Runtimes:    append([]string{}, tmpl.runtimes...),
+				Name:         name,
+				Description:  description,
+				Version:      version,
+				Requirements: requirements,
+				Source:       "builtin",
+				Agents:       []string{tmpl.dirName},
+				Runtimes:     append([]string{}, tmpl.runtimes...),
 			}
 		}
 	}
@@ -176,30 +205,139 @@ func (h *SkillsHandler) builtinTemplates() []builtinTemplate {
 	return out
 }
 
-// parseSkillFrontmatter extracts name/description from the YAML frontmatter
-// of a SKILL.md. Returns ("", "") when the file or frontmatter is missing —
-// callers fall back to the directory name.
-func parseSkillFrontmatter(path string) (name, description string) {
+// requirementsNamespaces are the provider metadata namespaces QwenPaw 2.2.x
+// honours for the skill "requires" block (store.py
+// _REQUIREMENTS_METADATA_NAMESPACES). Kept in sync with the worker-side
+// parser so catalog declarations match runtime enforcement.
+var requirementsNamespaces = []string{"openclaw", "qwenpaw", "clawdbot"}
+
+// parseSkillFrontmatter extracts the catalog-relevant fields from the YAML
+// frontmatter of a SKILL.md: name, description, version (top-level or under
+// metadata), and the "requires" block (top-level, or under
+// metadata.{openclaw,qwenpaw,clawdbot}). Returns zero values when the file or
+// frontmatter is missing — callers fall back to the directory name. The
+// parser is intentionally lenient: malformed frontmatter yields whatever
+// fields decode cleanly, mirroring the worker-side tolerance.
+func parseSkillFrontmatter(path string) (name, description, version string, requirements *SkillRequirements) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", ""
+		return "", "", "", nil
 	}
-	lines := strings.Split(string(data), "\n")
+	block := frontmatterBlock(string(data))
+	if block == "" {
+		return "", "", "", nil
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(block), &doc); err != nil {
+		return "", "", "", nil
+	}
+	strVal := func(v any) string {
+		if s, ok := v.(string); ok {
+			return strings.TrimSpace(s)
+		}
+		return ""
+	}
+	name = strVal(doc["name"])
+	description = strVal(doc["description"])
+	version = strVal(doc["version"])
+	if version == "" {
+		if meta, ok := doc["metadata"].(map[string]any); ok {
+			version = strVal(meta["version"])
+		}
+	}
+	requirements = parseRequires(doc)
+	return name, description, version, requirements
+}
+
+// frontmatterBlock returns the text between the leading "---" line and the
+// next "---" line, or "" when the file has no frontmatter.
+func frontmatterBlock(content string) string {
+	lines := strings.Split(content, "\n")
 	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "---" {
-		return "", ""
+		return ""
 	}
+	var fm []string
 	for _, line := range lines[1:] {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "---" {
-			break
+		if strings.TrimSpace(line) == "---" {
+			return strings.Join(fm, "\n")
 		}
-		if v, ok := strings.CutPrefix(trimmed, "name:"); ok {
-			name = strings.TrimSpace(v)
-		} else if v, ok := strings.CutPrefix(trimmed, "description:"); ok {
-			description = strings.TrimSpace(v)
+		fm = append(fm, line)
+	}
+	return ""
+}
+
+// parseRequires resolves the "requires" declaration with the same precedence
+// as QwenPaw 2.2.x: metadata.{openclaw,qwenpaw,clawdbot}.requires first,
+// then metadata.requires, then top-level requires. A bare list is shorthand
+// for bins. Returns nil when no requires block is declared or it carries no
+// usable entries.
+func parseRequires(doc map[string]any) *SkillRequirements {
+	var raw any
+	if meta, ok := doc["metadata"].(map[string]any); ok {
+		for _, ns := range requirementsNamespaces {
+			if p, ok := meta[ns].(map[string]any); ok {
+				if r, ok := p["requires"]; ok && r != nil {
+					raw = r
+					break
+				}
+			}
+		}
+		if raw == nil {
+			if r, ok := meta["requires"]; ok {
+				raw = r
+			}
 		}
 	}
-	return name, description
+	if raw == nil {
+		raw = doc["requires"]
+	}
+	if raw == nil {
+		return nil
+	}
+	req := &SkillRequirements{}
+	take := func(v any) []string {
+		var out []string
+		switch t := v.(type) {
+		case []any:
+			for _, x := range t {
+				out = append(out, stringItems(x)...)
+			}
+		case string:
+			out = append(out, t)
+		}
+		seen := map[string]bool{}
+		var res []string
+		for _, s := range out {
+			s = strings.TrimSpace(s)
+			if s != "" && !seen[s] {
+				seen[s] = true
+				res = append(res, s)
+			}
+		}
+		return res
+	}
+	switch t := raw.(type) {
+	case []any:
+		req.RequireBins = take(t)
+	case map[string]any:
+		req.RequireBins = take(t["bins"])
+		req.RequireEnvs = take(t["env"])
+		req.RequireMcps = take(t["mcp"])
+	}
+	if len(req.RequireBins) == 0 && len(req.RequireEnvs) == 0 && len(req.RequireMcps) == 0 {
+		return nil
+	}
+	sort.Strings(req.RequireBins)
+	sort.Strings(req.RequireEnvs)
+	sort.Strings(req.RequireMcps)
+	return req
+}
+
+func stringItems(v any) []string {
+	if s, ok := v.(string); ok {
+		return []string{s}
+	}
+	return nil
 }
 
 func appendUniqueStrings(list []string, s string) []string {

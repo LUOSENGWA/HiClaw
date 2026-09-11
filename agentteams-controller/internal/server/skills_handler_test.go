@@ -201,7 +201,7 @@ func TestSkillsCatalogFieldDiscipline(t *testing.T) {
 	if payload.Total != len(payload.Skills) {
 		t.Fatalf("total = %d, entries = %d", payload.Total, len(payload.Skills))
 	}
-	allowed := map[string]bool{"name": true, "description": true, "source": true, "agents": true, "runtimes": true}
+	allowed := map[string]bool{"name": true, "description": true, "source": true, "version": true, "requirements": true, "agents": true, "runtimes": true}
 	for _, entry := range payload.Skills {
 		for k := range entry {
 			if !allowed[k] {
@@ -236,6 +236,105 @@ func TestSkillsCatalogNoTemplateDir(t *testing.T) {
 	skills := decodeSkills(t, getSkills(t, h))
 	if len(skills) != 1 || skills[0].Name != "shared-kb" || skills[0].Source != "shared" {
 		t.Fatalf("skills = %v, want shared-only [shared-kb]", skills)
+	}
+}
+
+// writeSkillWithFrontmatter writes a skill dir whose SKILL.md carries the
+// given raw frontmatter block (unquoted, caller controls exact YAML).
+func writeSkillWithFrontmatter(t *testing.T, dir, name, frontmatter string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, name), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := "---\n" + frontmatter + "---\n\n# " + name + "\n"
+	if err := os.WriteFile(filepath.Join(dir, name, "SKILL.md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSkillsCatalogFrontmatterExtension covers the version + requires
+// declarations, following QwenPaw 2.2.x semantics: metadata namespace
+// requires win over top-level, a bare list is shorthand for bins, and
+// entries that declare nothing keep the fields omitted (omitempty).
+func TestSkillsCatalogFrontmatterExtension(t *testing.T) {
+	base := t.TempDir()
+	skillRoot := filepath.Join(base, "worker-agent", "skills")
+
+	writeSkillWithFrontmatter(t, skillRoot, "full-skill",
+		"name: full-skill\n"+
+			"description: Declares everything.\n"+
+			"version: 1.2.0\n"+
+			"metadata:\n"+
+			"  qwenpaw:\n"+
+			"    requires:\n"+
+			"      bins: [ffmpeg, curl]\n"+
+			"      env: [API_KEY]\n"+
+			"      mcp: [web-search]\n")
+	writeSkillWithFrontmatter(t, skillRoot, "bins-only",
+		"name: bins-only\n"+
+			"description: Top-level bare list.\n"+
+			"requires: [git, jq]\n")
+	writeSkill(t, skillRoot, "plain-skill", "Declares nothing.")
+
+	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), &mcLikeOSS{Memory: ossfake.NewMemory()})
+	skills := decodeSkills(t, getSkills(t, h))
+
+	full := skillByName(t, skills, "full-skill")
+	if full.Version != "1.2.0" {
+		t.Errorf("full-skill version = %q, want 1.2.0", full.Version)
+	}
+	if full.Requirements == nil {
+		t.Fatalf("full-skill requirements = nil, want populated")
+	}
+	if want := []string{"curl", "ffmpeg"}; !reflect.DeepEqual(full.Requirements.RequireBins, want) {
+		t.Errorf("require_bins = %v, want %v", full.Requirements.RequireBins, want)
+	}
+	if want := []string{"API_KEY"}; !reflect.DeepEqual(full.Requirements.RequireEnvs, want) {
+		t.Errorf("require_envs = %v, want %v", full.Requirements.RequireEnvs, want)
+	}
+	if want := []string{"web-search"}; !reflect.DeepEqual(full.Requirements.RequireMcps, want) {
+		t.Errorf("require_mcps = %v, want %v", full.Requirements.RequireMcps, want)
+	}
+
+	bins := skillByName(t, skills, "bins-only")
+	if bins.Requirements == nil {
+		t.Fatalf("bins-only requirements = nil, want populated")
+	}
+	if want := []string{"git", "jq"}; !reflect.DeepEqual(bins.Requirements.RequireBins, want) {
+		t.Errorf("require_bins = %v, want %v", bins.Requirements.RequireBins, want)
+	}
+
+	plain := skillByName(t, skills, "plain-skill")
+	if plain.Version != "" || plain.Requirements != nil {
+		t.Errorf("plain-skill = %+v, want version/requirements omitted", plain)
+	}
+}
+
+// TestSkillsCatalogRequiresNamespacePrecedence pins the 2.2.x rule: a
+// namespace requires block shadows the top-level one.
+func TestSkillsCatalogRequiresNamespacePrecedence(t *testing.T) {
+	base := t.TempDir()
+	skillRoot := filepath.Join(base, "worker-agent", "skills")
+	writeSkillWithFrontmatter(t, skillRoot, "ns-skill",
+		"name: ns-skill\n"+
+			"description: Namespace wins.\n"+
+			"requires: [top-level-bin]\n"+
+			"metadata:\n"+
+			"  openclaw:\n"+
+			"    requires:\n"+
+			"      mcp: [ns-mcp]\n")
+	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), &mcLikeOSS{Memory: ossfake.NewMemory()})
+	skills := decodeSkills(t, getSkills(t, h))
+
+	ns := skillByName(t, skills, "ns-skill")
+	if ns.Requirements == nil {
+		t.Fatal("ns-skill requirements = nil")
+	}
+	if len(ns.Requirements.RequireBins) != 0 {
+		t.Errorf("require_bins = %v, want empty (namespace shadows top-level)", ns.Requirements.RequireBins)
+	}
+	if want := []string{"ns-mcp"}; !reflect.DeepEqual(ns.Requirements.RequireMcps, want) {
+		t.Errorf("require_mcps = %v, want %v", ns.Requirements.RequireMcps, want)
 	}
 }
 
