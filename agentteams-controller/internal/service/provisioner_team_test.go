@@ -241,6 +241,9 @@ func (f *fakeTeamMatrix) SendMessageAsAdmin(context.Context, string, string) err
 
 func (f *fakeTeamMatrix) Login(context.Context, string, string) (string, error) { return "", nil }
 
+// InvalidateUserToken is a no-op: the fake holds no login-token cache.
+func (f *fakeTeamMatrix) InvalidateUserToken(string) {}
+
 func (f *fakeTeamMatrix) SetDisplayName(context.Context, string, string, string) error { return nil }
 
 func (f *fakeTeamMatrix) AdminCommand(_ context.Context, cmd string) error {

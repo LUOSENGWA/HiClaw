@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -190,6 +191,12 @@ type Client interface {
 	// they can still log in via Element.
 	SetPasswordAsAdmin(ctx context.Context, userID, password string) error
 
+	// InvalidateUserToken discards any cached login token for the user so
+	// the next Login issues a fresh one. Implementations that cache /login
+	// tokens must call it (or be called after) operations that can
+	// invalidate access tokens: password reset, account deactivation.
+	InvalidateUserToken(userID string)
+
 	// RegisterAppService registers an Application Service with the homeserver
 	// via the admin bot command. Includes smoke-test-first idempotency and
 	// unregister-before-register fallback for safe token rotation.
@@ -226,12 +233,32 @@ type SyncMessagesResult struct {
 	Events    []MessageEvent
 }
 
+// loginTokenEntry is one cached /login access token.
+type loginTokenEntry struct {
+	token     string
+	expiresAt time.Time
+}
+
 // TuwunelClient implements Client for Tuwunel (conduwuit) homeservers.
 type TuwunelClient struct {
 	config      Config
 	http        *http.Client
 	adminToken  atomic.Value // cached admin access token (string)
 	adminRoomID atomic.Value // cached admin room ID (string), resolved from #admins:<domain>
+
+	// userLoginCache caches /login access tokens per full Matrix user ID,
+	// so repeated actor resolutions (the TeamAdmin token on every human
+	// room grant and every team reconcile, the human's own token on
+	// every join) do not issue a Matrix Login on every cycle. The admin
+	// token is cached separately (adminToken).
+	userLoginCache map[string]loginTokenEntry
+	userLoginMu    sync.Mutex
+	// loginTokenTTL bounds how long a cached login token is trusted.
+	// In-band invalidators (password reset, deactivation) call
+	// InvalidateUserToken; out-of-band invalidation (server-side revoke,
+	// logout-everywhere) self-heals on TTL expiry. Exposed as a field
+	// (not a const) so tests can collapse it.
+	loginTokenTTL time.Duration
 
 	// orphanRetryBaseDelay is the base backoff between Login retries
 	// after issuing an admin reset-password command. Exposed as a field
@@ -247,8 +274,39 @@ func NewTuwunelClient(cfg Config, httpClient *http.Client) *TuwunelClient {
 	return &TuwunelClient{
 		config:               cfg,
 		http:                 httpClient,
+		loginTokenTTL:        30 * time.Minute,
 		orphanRetryBaseDelay: 500 * time.Millisecond,
 	}
+}
+
+// cachedLoginToken returns the cached /login token for userID if it has
+// not expired.
+func (c *TuwunelClient) cachedLoginToken(userID string) (string, bool) {
+	c.userLoginMu.Lock()
+	defer c.userLoginMu.Unlock()
+	e, ok := c.userLoginCache[userID]
+	if !ok || time.Now().After(e.expiresAt) {
+		return "", false
+	}
+	return e.token, true
+}
+
+func (c *TuwunelClient) storeLoginToken(userID, token string) {
+	c.userLoginMu.Lock()
+	defer c.userLoginMu.Unlock()
+	if c.userLoginCache == nil {
+		c.userLoginCache = make(map[string]loginTokenEntry)
+	}
+	c.userLoginCache[userID] = loginTokenEntry{token: token, expiresAt: time.Now().Add(c.loginTokenTTL)}
+}
+
+// InvalidateUserToken discards any cached /login token for the user so the
+// next Login issues a fresh one. Call it after any operation that can
+// invalidate access tokens (password reset, account deactivation).
+func (c *TuwunelClient) InvalidateUserToken(userID string) {
+	c.userLoginMu.Lock()
+	defer c.userLoginMu.Unlock()
+	delete(c.userLoginCache, userID)
 }
 
 func (c *TuwunelClient) UserID(localpart string) string {
@@ -314,8 +372,10 @@ func (c *TuwunelClient) EnsureUser(ctx context.Context, req EnsureUserRequest) (
 		return nil, fmt.Errorf("register user %s: %s (%s)", req.Username, regResp.ErrCode, regResp.Error)
 	}
 
-	// Registration failed with M_USER_IN_USE — try login
-	token, err := c.Login(ctx, req.Username, password)
+	// Registration failed with M_USER_IN_USE — try login. loginFresh: this
+	// login doubles as an account-liveness check; a cached (possibly dead)
+	// token must not short-circuit the orphan recovery below.
+	token, err := c.loginFresh(ctx, req.Username, password)
 	if err == nil {
 		return &UserCredentials{
 			UserID:      c.UserID(req.Username),
@@ -337,6 +397,9 @@ func (c *TuwunelClient) EnsureUser(ctx context.Context, req EnsureUserRequest) (
 		return nil, fmt.Errorf("user %s exists but login failed (%v) and orphan recovery failed: %w",
 			req.Username, err, adminErr)
 	}
+	// The password just changed: any cached token is suspect — force the
+	// retry loop below to go to the homeserver.
+	c.InvalidateUserToken(userID)
 
 	const maxAttempts = 5
 	baseDelay := c.orphanRetryBaseDelay
@@ -350,7 +413,7 @@ func (c *TuwunelClient) EnsureUser(ctx context.Context, req EnsureUserRequest) (
 			return nil, ctx.Err()
 		case <-time.After(baseDelay * time.Duration(attempt)):
 		}
-		token, lastErr = c.Login(ctx, req.Username, password)
+		token, lastErr = c.loginFresh(ctx, req.Username, password)
 		if lastErr == nil {
 			return &UserCredentials{
 				UserID:      userID,
@@ -365,6 +428,22 @@ func (c *TuwunelClient) EnsureUser(ctx context.Context, req EnsureUserRequest) (
 }
 
 func (c *TuwunelClient) Login(ctx context.Context, username, password string) (string, error) {
+	// Cache hit: the token was obtained by a previous successful login for
+	// this user and is still within the TTL. No HTTP call is issued.
+	userID := c.UserID(username)
+	if token, ok := c.cachedLoginToken(userID); ok {
+		return token, nil
+	}
+	return c.loginFresh(ctx, username, password)
+}
+
+// loginFresh always goes to the homeserver and stores the result in the
+// cache. Callers whose login doubles as an account-liveness check (the
+// EnsureUser orphan-recovery path) must use it directly: a cached token
+// may be dead (account deactivated out-of-band) and must not short-
+// circuit the recovery flow.
+func (c *TuwunelClient) loginFresh(ctx context.Context, username, password string) (string, error) {
+	userID := c.UserID(username)
 	body := map[string]interface{}{
 		"type": "m.login.password",
 		"identifier": map[string]string{
@@ -388,6 +467,7 @@ func (c *TuwunelClient) Login(ctx context.Context, username, password string) (s
 	if resp.AccessToken == "" {
 		return "", fmt.Errorf("login %s: empty access token", username)
 	}
+	c.storeLoginToken(userID, resp.AccessToken)
 	return resp.AccessToken, nil
 }
 
@@ -426,10 +506,12 @@ func (c *TuwunelClient) EnsureAppServiceUser(ctx context.Context, username strin
 		}, nil
 	}
 
-	// User already exists → fall back to AS login
+	// User already exists → fall back to AS login. loginAppServiceFresh:
+	// this login doubles as an account-liveness check; a cached (possibly
+	// dead) token must not short-circuit deactivation handling.
 	if regResp.ErrCode == "M_USER_IN_USE" {
 		logger.Info("Matrix account already exists; falling back to AppService login", "httpStatus", statusCode)
-		token, loginErr := c.LoginAppServiceUser(ctx, username)
+		token, loginErr := c.loginAppServiceFresh(ctx, username)
 		if loginErr != nil {
 			if errors.Is(loginErr, ErrAppServiceNotReady) {
 				logger.Info("Matrix AppService token not active yet during login fallback; will retry")
@@ -464,6 +546,18 @@ func (c *TuwunelClient) EnsureAppServiceUser(ctx context.Context, username strin
 // Service login flow. The as_token authenticates the request; no user password
 // is needed.
 func (c *TuwunelClient) LoginAppServiceUser(ctx context.Context, username string) (string, error) {
+	// Cache hit: same TTL semantics as the password Login — no HTTP call.
+	userID := c.UserID(username)
+	if token, ok := c.cachedLoginToken(userID); ok {
+		return token, nil
+	}
+	return c.loginAppServiceFresh(ctx, username)
+}
+
+// loginAppServiceFresh is the AppService variant of loginFresh (see its
+// doc for why liveness-checking callers must bypass the cache).
+func (c *TuwunelClient) loginAppServiceFresh(ctx context.Context, username string) (string, error) {
+	userID := c.UserID(username)
 	body := map[string]interface{}{
 		"type": "m.login.application_service",
 		"identifier": map[string]string{
@@ -492,6 +586,7 @@ func (c *TuwunelClient) LoginAppServiceUser(ctx context.Context, username string
 	if resp.AccessToken == "" {
 		return "", fmt.Errorf("AS login %s: empty access token", username)
 	}
+	c.storeLoginToken(userID, resp.AccessToken)
 	return resp.AccessToken, nil
 }
 
@@ -500,7 +595,14 @@ func (c *TuwunelClient) LoginAppServiceUser(ctx context.Context, username string
 // so they can still log in via Element with username/password.
 func (c *TuwunelClient) SetPasswordAsAdmin(ctx context.Context, userID, password string) error {
 	cmd := fmt.Sprintf("!admin users reset-password %s %s", userID, password)
-	return c.AdminCommand(ctx, cmd)
+	if err := c.AdminCommand(ctx, cmd); err != nil {
+		return err
+	}
+	// A password reset may invalidate the user's existing access tokens
+	// (see the provisioner's "clear cached AS token" convention): drop any
+	// cached one so the next Login goes to the homeserver.
+	c.InvalidateUserToken(userID)
+	return nil
 }
 
 // doJSONWithASToken performs an HTTP request authenticated with the AppService

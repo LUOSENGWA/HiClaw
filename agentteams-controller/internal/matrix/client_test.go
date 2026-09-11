@@ -3,6 +3,7 @@ package matrix
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -1257,5 +1258,230 @@ func TestLeaveRoom_IdempotentNotFound(t *testing.T) {
 	}, server.Client())
 	if err := c.LeaveRoom(context.Background(), "!room:d", ""); err != nil {
 		t.Errorf("expected nil for not-in-room, got %v", err)
+	}
+}
+
+// Login caching: a successful login caches the token per user; a second
+// login for the same user is served from the cache (no HTTP), while a
+// different user still goes to the homeserver.
+func TestLogin_TokenCachedPerUser(t *testing.T) {
+	var logins atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/_matrix/client/v3/login" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		n := logins.Add(1)
+		json.NewEncoder(w).Encode(map[string]string{"access_token": fmt.Sprintf("tok-%d", n)})
+	}))
+	defer server.Close()
+
+	c := NewTuwunelClient(Config{ServerURL: server.URL, Domain: "d"}, server.Client())
+
+	tok1, err := c.Login(context.Background(), "alice", "pw")
+	if err != nil {
+		t.Fatalf("login 1: %v", err)
+	}
+	if logins.Load() != 1 {
+		t.Fatalf("logins=%d, want 1", logins.Load())
+	}
+	tok2, err := c.Login(context.Background(), "alice", "pw")
+	if err != nil {
+		t.Fatalf("login 2: %v", err)
+	}
+	if tok2 != tok1 {
+		t.Errorf("cached token = %q, want %q (no second login)", tok2, tok1)
+	}
+	if logins.Load() != 1 {
+		t.Errorf("logins=%d, want 1 (per-user cache)", logins.Load())
+	}
+	if _, err := c.Login(context.Background(), "bob", "pw"); err != nil {
+		t.Fatalf("login bob: %v", err)
+	}
+	if logins.Load() != 2 {
+		t.Errorf("logins=%d, want 2 (different user)", logins.Load())
+	}
+}
+
+// Login caching: an expired cache entry goes back to the homeserver.
+func TestLogin_TokenCacheExpires(t *testing.T) {
+	var logins atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/_matrix/client/v3/login" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		n := logins.Add(1)
+		json.NewEncoder(w).Encode(map[string]string{"access_token": fmt.Sprintf("tok-%d", n)})
+	}))
+	defer server.Close()
+
+	c := NewTuwunelClient(Config{ServerURL: server.URL, Domain: "d"}, server.Client())
+	if _, err := c.Login(context.Background(), "alice", "pw"); err != nil {
+		t.Fatalf("login 1: %v", err)
+	}
+	// White-box: expire the cached entry (same package).
+	c.userLoginMu.Lock()
+	e := c.userLoginCache[c.UserID("alice")]
+	e.expiresAt = time.Now().Add(-time.Second)
+	c.userLoginCache[c.UserID("alice")] = e
+	c.userLoginMu.Unlock()
+	if _, err := c.Login(context.Background(), "alice", "pw"); err != nil {
+		t.Fatalf("login 2: %v", err)
+	}
+	if logins.Load() != 2 {
+		t.Errorf("logins=%d, want 2 after TTL expiry", logins.Load())
+	}
+}
+
+// Login caching: the AppService impersonation login caches the same way.
+func TestLogin_AppServiceTokenCached(t *testing.T) {
+	var logins atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/_matrix/client/v3/login" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		n := logins.Add(1)
+		json.NewEncoder(w).Encode(map[string]string{"access_token": fmt.Sprintf("as-tok-%d", n)})
+	}))
+	defer server.Close()
+
+	c := NewTuwunelClient(Config{ServerURL: server.URL, Domain: "d", AppServiceToken: "as"}, server.Client())
+	tok1, err := c.LoginAppServiceUser(context.Background(), "carol")
+	if err != nil {
+		t.Fatalf("AS login 1: %v", err)
+	}
+	tok2, err := c.LoginAppServiceUser(context.Background(), "carol")
+	if err != nil {
+		t.Fatalf("AS login 2: %v", err)
+	}
+	if tok2 != tok1 {
+		t.Errorf("cached AS token = %q, want %q", tok2, tok1)
+	}
+	if logins.Load() != 1 {
+		t.Errorf("logins=%d, want 1 (AS per-user cache)", logins.Load())
+	}
+}
+
+// InvalidateUserToken: an explicit invalidation forces a fresh login.
+func TestInvalidateUserToken_FreshLogin(t *testing.T) {
+	var logins atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/_matrix/client/v3/login" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		n := logins.Add(1)
+		json.NewEncoder(w).Encode(map[string]string{"access_token": fmt.Sprintf("tok-%d", n)})
+	}))
+	defer server.Close()
+
+	c := NewTuwunelClient(Config{ServerURL: server.URL, Domain: "d"}, server.Client())
+	if _, err := c.Login(context.Background(), "dave", "pw"); err != nil {
+		t.Fatalf("login 1: %v", err)
+	}
+	c.InvalidateUserToken(c.UserID("dave"))
+	if _, err := c.Login(context.Background(), "dave", "pw"); err != nil {
+		t.Fatalf("login 2: %v", err)
+	}
+	if logins.Load() != 2 {
+		t.Errorf("logins=%d, want 2 after invalidation", logins.Load())
+	}
+}
+
+// Regression: a STALE cached token (account deactivated out-of-band) must
+// not short-circuit orphan recovery. EnsureUser must reach the homeserver,
+// see the failed login, issue the reset-password command, and return a
+// fresh token — not the cached dead one.
+func TestEnsureUser_OrphanRecovery_IgnoresStaleCachedToken(t *testing.T) {
+	var (
+		bobLoginCalls int32
+		adminSendHit  int32
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/_matrix/client/v3/register":
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"errcode": "M_USER_IN_USE",
+				"error":   "User ID already taken",
+			})
+
+		case r.URL.Path == "/_matrix/client/v3/login":
+			var body struct {
+				Identifier struct {
+					User string `json:"user"`
+				} `json:"identifier"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.Identifier.User == "admin" {
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]string{"access_token": "admin-token"})
+				return
+			}
+			// bob: first login fails (stale password), retry succeeds.
+			n := atomic.AddInt32(&bobLoginCalls, 1)
+			if n <= 1 {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]string{
+					"errcode": "M_FORBIDDEN",
+					"error":   "Invalid password",
+				})
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"access_token": "fresh-token"})
+
+		case r.URL.Path == "/_matrix/client/v3/directory/room/#admins:test.domain":
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"room_id": "!admins:test.domain"})
+
+		case r.Method == http.MethodPut &&
+			len(r.URL.Path) > len("/_matrix/client/v3/rooms/") &&
+			r.URL.Path[:len("/_matrix/client/v3/rooms/")] == "/_matrix/client/v3/rooms/":
+			atomic.AddInt32(&adminSendHit, 1)
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"event_id":"$evt"}`))
+
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := NewTuwunelClient(Config{
+		ServerURL:         server.URL,
+		Domain:            "test.domain",
+		RegistrationToken: "reg",
+		AdminUser:         "admin",
+		AdminPassword:     "adminpw",
+	}, server.Client())
+	c.orphanRetryBaseDelay = time.Millisecond
+
+	// A previously successful login left a cached token; the account was
+	// since deactivated, so that token is dead.
+	c.storeLoginToken(c.UserID("bob"), "stale-token")
+
+	creds, err := c.EnsureUser(context.Background(), EnsureUserRequest{
+		Username: "bob",
+		Password: "bobpw",
+	})
+	if err != nil {
+		t.Fatalf("EnsureUser: %v", err)
+	}
+	if creds.AccessToken == "stale-token" {
+		t.Error("EnsureUser returned the cached dead token — orphan recovery was skipped")
+	}
+	if creds.AccessToken != "fresh-token" {
+		t.Errorf("AccessToken = %q, want fresh-token", creds.AccessToken)
+	}
+	if atomic.LoadInt32(&bobLoginCalls) < 2 {
+		t.Errorf("bob login calls=%d, want >=2 (fail then retry via orphan recovery)", bobLoginCalls)
+	}
+	if atomic.LoadInt32(&adminSendHit) == 0 {
+		t.Error("expected the reset-password admin command to be sent")
 	}
 }

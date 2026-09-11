@@ -221,5 +221,12 @@ func (p *Provisioner) ForceLeaveRoom(ctx context.Context, userID, roomID string)
 func (p *Provisioner) DeactivateHumanUser(ctx context.Context, userID string) error {
 	cmd := fmt.Sprintf("!admin users deactivate %s", userID)
 	log.FromContext(ctx).Info("sending tuwunel human deactivate admin command", "user", userID, "command", cmd)
-	return p.matrix.AdminCommand(ctx, cmd)
+	if err := p.matrix.AdminCommand(ctx, cmd); err != nil {
+		return err
+	}
+	// Deactivation kills the account's access tokens: drop any cached one
+	// so a later re-provisioning of the same username re-logins fresh
+	// (and hits orphan recovery if the account is gone).
+	p.matrix.InvalidateUserToken(userID)
+	return nil
 }

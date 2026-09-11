@@ -124,27 +124,32 @@ Consequences implemented by this PR:
    user stayed in it. Only a 404 / "not in room" answer is idempotent;
    every other 403 is returned as a decodable `M_FORBIDDEN`
    (`matrix.APIError` / `matrix.IsForbidden`) so callers can fall back.
+5. **Login-token cache (steady-state logins).** `TuwunelClient` caches
+   `/login` access tokens per user for 30 minutes (password and
+   AppService-impersonation logins alike), so the per-cycle TeamAdmin
+   actor resolution — and the human's own token resolution — issue no
+   Matrix Login in steady state. In-band token invalidators clear the
+   entry: password reset (orphan recovery, `SetPasswordAsAdmin`) and
+   account deactivation; out-of-band invalidation (server-side revoke,
+   logout-everywhere) self-heals on TTL expiry. Logins that double as an
+   account-liveness check (the existing-account fallbacks in
+   `EnsureUser` / `EnsureAppServiceUser`, which drive orphan recovery)
+   always go to the homeserver, so a cached dead token can never
+   short-circuit the recovery flow.
 
 Known limitations (documented, all non-fatal / retry or documented-stuck):
 
-1. **TeamAdmin actor token is re-resolved every reconcile cycle** (no
-   cross-cycle cache): in steady state, each 5-minute cycle issues one
-   Matrix login per (human, team room of a team with `spec.admin`).
-   Deliberate: a fresh login self-heals immediately after a password
-   change; a TTL cache is a possible follow-up if this becomes load.
-   This matches the pre-existing team-reconcile behaviour, which also
-   resolves the TeamAdmin actor token on every team reconcile.
-2. **A level-100 human whose Matrix password is unavailable cannot be
+1. **A level-100 human whose Matrix password is unavailable cannot be
    demoted.** The actor write is rejected (9.6, equal level) and there is
    no self token, so the demotion is retried every cycle without effect.
    Matrix provides no out-of-band equal-level demotion. *Removal* from
    the room is unaffected (admin-bot force-leave still works).
-3. **Removing `spec.admin` from a team whose room already exists** leaves
+2. **Removing `spec.admin` from a team whose room already exists** leaves
    that room owned by the former TeamAdmin (the homeserver admin is not a
    member): actor selection falls back to the admin identity, the grant
    403s, and is retried every cycle without effect. Revocation is
    unaffected (self-leave / force-leave still work).
-4. **The revocation chain starts from a homeserver-admin kick.** A
+3. **The revocation chain starts from a homeserver-admin kick.** A
    removed room is by definition no longer in the desired set, and its
    origin is not recorded in `status`, so an actor-scoped kick
    (`KickFromRoomAs`) cannot be chosen yet; it is in place for when
@@ -168,7 +173,14 @@ Known limitations (documented, all non-fatal / retry or documented-stuck):
   rejected writes surface a decodable `M_FORBIDDEN` via
   `matrix.IsForbidden`), `TestKickFromRoom_EqualPowerForbidden` (403
   `cannot kick` is an error, not a silent success — the old swallowing
-  branch is gone), `TestLeaveRoom_IdempotentNotFound`.
+  branch is gone), `TestLeaveRoom_IdempotentNotFound`,
+  `TestLogin_TokenCachedPerUser` (per-user cache: second login is served
+  from cache, no HTTP; different user still goes to the homeserver),
+  `TestLogin_TokenCacheExpires` (TTL expiry → fresh login),
+  `TestLogin_AppServiceTokenCached`, `TestInvalidateUserToken_FreshLogin`,
+  `TestEnsureUser_OrphanRecovery_IgnoresStaleCachedToken` (a stale cached
+  token does NOT short-circuit orphan recovery — liveness-check logins
+  bypass the cache and the reset-password flow completes).
 - `internal/service/provisioner_power_test.go` (run against the
   **authorization-aware** fake, which enforces the spec rules above — a
   permissive double would not have caught either P1): legacy room → write
