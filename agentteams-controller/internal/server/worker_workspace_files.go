@@ -117,11 +117,11 @@ var workspaceFileSubpaths = map[string]bool{
 	"file-download": true,
 }
 
-// workspaceFileWriteSubpaths are the subpaths served by the PUT handler.
-var workspaceFileWriteSubpaths = map[string]bool{
-	"file-content": true,
-}
-
+// The write subpath is not a map-checked path value: the PUT route is the
+// fixed literal /api/v1/workers/{name}/workspace-files/file-content
+// registered in http.go (no {sub} capture), so the route table is the single
+// source of truth and proxyWorkspaceFileWrite reads no sub path value.
+//
 // kbFileRoots are the top-level single files addressable by the
 // file-metadata / file-content subpaths.
 var kbFileRoots = []string{"MEMORY.md"}
@@ -444,15 +444,16 @@ func (h *WorkspaceFilesHandler) upstreamKBFileExists(ctx context.Context, baseUR
 // write body is capped at kbMaxFileLimit (1 MiB, the read chunk cap).
 func (h *WorkspaceFilesHandler) proxyWorkspaceFileWrite(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	sub := r.PathValue("sub")
 	if name == "" || !workerNamePattern.MatchString(name) {
 		httputil.WriteError(w, http.StatusBadRequest, "worker name is required and must be a valid DNS label")
 		return
 	}
-	if !workspaceFileWriteSubpaths[sub] {
-		httputil.WriteError(w, http.StatusBadRequest, "unsupported workspace file write subpath")
-		return
-	}
+	// The registered route is the fixed literal
+	// /api/v1/workers/{name}/workspace-files/file-content (see http.go) — the
+	// PUT route has no {sub} capture, so no sub path value is read here.
+	// (Review P1: the previous code read r.PathValue("sub"), which was always
+	// "" on the registered route, so every authorized write was rejected with
+	// 400 "unsupported workspace file write subpath" before the worker lookup.)
 	if h.kubeMode != "embedded" {
 		httputil.WriteError(w, http.StatusServiceUnavailable, "worker workspace file inspection requires embedded mode")
 		return

@@ -1022,3 +1022,55 @@ func TestWorkspaceFilesDownload_SensitivePathRejected(t *testing.T) {
 		}
 	}
 }
+
+// TestWorkspaceFilesWrite_RouteAcceptsAuthorizedWrite is the regression test
+// for the P1 review finding on this PR: the registered PUT route is the fixed
+// literal /api/v1/workers/{name}/workspace-files/file-content (http.go) with
+// no {sub} capture, but the handler used to read r.PathValue("sub") — always
+// "" on the registered route — and rejected every authorized write with 400
+// "unsupported workspace file write subpath" before any worker lookup. The
+// requests below go through the actual NewHTTPServer(...).Mux registration,
+// with no SetPathValue shims.
+func TestWorkspaceFilesWrite_RouteAcceptsAuthorizedWrite(t *testing.T) {
+	scheme := newProjectTestScheme(t)
+	k8s := fake.NewClientBuilder().WithScheme(scheme).
+		WithRuntimeObjects(kbWorkerFixture("market-team", "market-writer")...).Build()
+	enricher := authpkg.NewCREnricher(k8s, "default")
+	mw := authpkg.NewMiddleware(&alwaysAdminAuth{}, enricher, authpkg.NewAuthorizer(), k8s, "default")
+	srv := NewHTTPServer(":0", ServerDeps{
+		Client:    k8s,
+		Namespace: "default",
+		KubeMode:  "embedded",
+		AuthMw:    mw,
+	})
+
+	const body = `{"content":"# market memory"}`
+
+	// 1) Existing worker (admin): must pass routing + authz + validation and
+	//    reach the upstream probe — 502 against the dead worker pod URL in
+	//    the test environment, never the phantom-sub 400.
+	req := httptest.NewRequest(http.MethodPut,
+		"/api/v1/workers/market-writer/workspace-files/file-content?path=MEMORY.md",
+		strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sa-token")
+	rec := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec, req)
+	if rec.Code == http.StatusBadRequest && strings.Contains(rec.Body.String(), "unsupported workspace file write subpath") {
+		t.Fatalf("P1 regression: authorized write rejected by the phantom sub check: %s", rec.Body.String())
+	}
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s, want 502 (upstream probe against the dead pod URL) — the request must reach the worker/upstream stage", rec.Code, rec.Body.String())
+	}
+
+	// 2) Unknown worker: routing + authz pass and the worker lookup runs —
+	//    404 from the lookup proves the request went past the route level.
+	req2 := httptest.NewRequest(http.MethodPut,
+		"/api/v1/workers/ghost-writer/workspace-files/file-content?path=MEMORY.md",
+		strings.NewReader(body))
+	req2.Header.Set("Authorization", "Bearer sa-token")
+	rec2 := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("unknown worker status=%d body=%s, want 404 from the worker lookup", rec2.Code, rec2.Body.String())
+	}
+}
