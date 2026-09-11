@@ -125,6 +125,31 @@ Consequences implemented by this PR:
    every other 403 is returned as a decodable `M_FORBIDDEN`
    (`matrix.APIError` / `matrix.IsForbidden`) so callers can fall back.
 
+Known limitations (documented, all non-fatal / retry or documented-stuck):
+
+1. **TeamAdmin actor token is re-resolved every reconcile cycle** (no
+   cross-cycle cache): in steady state, each 5-minute cycle issues one
+   Matrix login per (human, team room of a team with `spec.admin`).
+   Deliberate: a fresh login self-heals immediately after a password
+   change; a TTL cache is a possible follow-up if this becomes load.
+   This matches the pre-existing team-reconcile behaviour, which also
+   resolves the TeamAdmin actor token on every team reconcile.
+2. **A level-100 human whose Matrix password is unavailable cannot be
+   demoted.** The actor write is rejected (9.6, equal level) and there is
+   no self token, so the demotion is retried every cycle without effect.
+   Matrix provides no out-of-band equal-level demotion. *Removal* from
+   the room is unaffected (admin-bot force-leave still works).
+3. **Removing `spec.admin` from a team whose room already exists** leaves
+   that room owned by the former TeamAdmin (the homeserver admin is not a
+   member): actor selection falls back to the admin identity, the grant
+   403s, and is retried every cycle without effect. Revocation is
+   unaffected (self-leave / force-leave still work).
+4. **The revocation chain starts from a homeserver-admin kick.** A
+   removed room is by definition no longer in the desired set, and its
+   origin is not recorded in `status`, so an actor-scoped kick
+   (`KickFromRoomAs`) cannot be chosen yet; it is in place for when
+   origin tracking lands in status.
+
 ## What is not changed
 
 - Worker / team / DM room creation keeps its existing power levels
