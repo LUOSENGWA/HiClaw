@@ -136,6 +136,20 @@ Consequences implemented by this PR:
    `EnsureUser` / `EnsureAppServiceUser`, which drive orphan recovery)
    always go to the homeserver, so a cached dead token can never
    short-circuit the recovery flow.
+6. **The human desired-room set recognizes team membership.**
+   `buildDesiredHumanRooms` includes, beyond `spec.accessibleTeams`, the
+   team rooms of teams where the human is `spec.admin` or appears in
+   `spec.humanMembers`. Load-bearing: `syncTeamRoomHumanStatuses` (team
+   reconciler) writes the team room into the admin's / members'
+   `status.rooms` WITHOUT touching their `spec.accessibleTeams`; a
+   human-side desired set built from `accessibleTeams` alone would let
+   the access-revocation path kick the team admin out of their own team
+   room, and the team would then fail on join
+   (`M_FORBIDDEN: cannot join a room that is not public` — the admin is
+   deliberately excluded from the team-room invite list by the
+   creator-join design) on every reconcile: a permanent deadlock.
+   Regression tests: `TestHumanReconciler_TeamAdminRoomNotRevoked` /
+   `TestHumanReconciler_HumanMemberRoomNotRevoked`.
 
 Known limitations (documented, all non-fatal / retry or documented-stuck):
 

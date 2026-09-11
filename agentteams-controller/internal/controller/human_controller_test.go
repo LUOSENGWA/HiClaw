@@ -344,6 +344,82 @@ func TestHumanReconciler_Update_RevokeRoom(t *testing.T) {
 	}
 }
 
+// TestHumanReconciler_TeamAdminRoomNotRevoked pins the CI test-19
+// regression (join-403 deadlock): the team reconciler's
+// syncTeamRoomHumanStatuses writes the team room into the spec.admin's
+// Status.Rooms without touching the admin's AccessibleTeams. The
+// access-revocation path must therefore treat the admin's team room as
+// desired — not "access revoked". Without the team-membership leg in
+// buildDesiredHumanRooms the admin gets self-left out of their own team
+// room, and the team then fails on join (M_FORBIDDEN: cannot join a room
+// that is not public) on every reconcile because the admin is
+// deliberately excluded from the team-room invite list.
+func TestHumanReconciler_TeamAdminRoomNotRevoked(t *testing.T) {
+	team := newReadyTeam("t1", "!room-t1:localhost")
+	team.Spec.Admin = &v1beta1.TeamAdminSpec{Name: "alice"}
+	human := newHuman("alice", v1beta1.HumanSpec{})
+	human.Status.MatrixUserID = "@alice:localhost"
+	human.Status.InitialPassword = "stored-pw"
+	// The team reconciler already synced the room into Status.Rooms.
+	human.Status.Rooms = []string{"!room-t1:localhost"}
+	human.Status.Phase = "Active"
+	human.Finalizers = []string{finalizerName}
+
+	rig := newHumanRig(t, human, team)
+
+	out, _, err := rig.reconcile("alice")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(rig.prov.Calls.KickFromRoom) != 0 {
+		t.Errorf("no admin kick expected for the admin's own team room, got %+v", rig.prov.Calls.KickFromRoom)
+	}
+	if len(rig.prov.Calls.KickFromRoomAs) != 0 {
+		t.Errorf("no actor kick expected, got %+v", rig.prov.Calls.KickFromRoomAs)
+	}
+	if len(rig.prov.Calls.LeaveRoomAs) != 0 {
+		t.Errorf("no self-leave expected, got %+v", rig.prov.Calls.LeaveRoomAs)
+	}
+	if len(rig.prov.Calls.ForceLeaveRoom) != 0 {
+		t.Errorf("no force-leave expected, got %+v", rig.prov.Calls.ForceLeaveRoom)
+	}
+	if len(out.Status.Rooms) != 1 || out.Status.Rooms[0] != "!room-t1:localhost" {
+		t.Errorf("Status.Rooms=%v, want [!room-t1:localhost] retained", out.Status.Rooms)
+	}
+}
+
+// TestHumanReconciler_HumanMemberRoomNotRevoked is the humanMembers variant
+// of TestHumanReconciler_TeamAdminRoomNotRevoked: a human listed in
+// team.Spec.HumanMembers (and mirrored into the team's members by the
+// team reconciler) must also keep their team room even when their own
+// AccessibleTeams is empty.
+func TestHumanReconciler_HumanMemberRoomNotRevoked(t *testing.T) {
+	team := newReadyTeam("t1", "!room-t1:localhost")
+	team.Spec.HumanMembers = []v1beta1.TeamMemberSpec{{Name: "bob", MatrixUserID: "@bob:localhost"}}
+	human := newHuman("bob", v1beta1.HumanSpec{})
+	human.Status.MatrixUserID = "@bob:localhost"
+	human.Status.InitialPassword = "stored-pw"
+	human.Status.Rooms = []string{"!room-t1:localhost"}
+	human.Status.Phase = "Active"
+	human.Finalizers = []string{finalizerName}
+
+	rig := newHumanRig(t, human, team)
+
+	out, _, err := rig.reconcile("bob")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(rig.prov.Calls.KickFromRoom) != 0 {
+		t.Errorf("no kick expected for a humanMember's team room, got %+v", rig.prov.Calls.KickFromRoom)
+	}
+	if len(rig.prov.Calls.LeaveRoomAs) != 0 {
+		t.Errorf("no self-leave expected, got %+v", rig.prov.Calls.LeaveRoomAs)
+	}
+	if len(out.Status.Rooms) != 1 || out.Status.Rooms[0] != "!room-t1:localhost" {
+		t.Errorf("Status.Rooms=%v, want [!room-t1:localhost] retained", out.Status.Rooms)
+	}
+}
+
 // TestHumanReconciler_Update_PendingResource exercises the case where
 // an AccessibleWorker references a Worker CR whose Status.RoomID is not
 // yet populated (still provisioning). The reconciler must not invite

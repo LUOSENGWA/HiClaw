@@ -67,8 +67,9 @@ type humanRoomOrigin struct {
 }
 
 // buildDesiredHumanRooms resolves Spec.AccessibleWorkers / AccessibleTeams
-// into the set of Matrix room IDs the human should currently be a member
-// of, annotated with each room's origin. Workers/Teams that don't exist or
+// plus team membership (spec.admin / spec.humanMembers) into the set of
+// Matrix room IDs the human should currently be a member of, annotated
+// with each room's origin. Workers/Teams that don't exist or
 // haven't finished provisioning (empty Status.RoomID / TeamRoomID) are
 // simply skipped — they'll be picked up on a later reconcile once their
 // rooms materialize.
@@ -87,13 +88,39 @@ func buildDesiredHumanRooms(ctx context.Context, c client.Client, h *v1beta1.Hum
 			desired[worker.Status.RoomID] = humanRoomOrigin{workerName: workerName}
 		}
 	}
-	for _, teamName := range h.Spec.AccessibleTeams {
-		var team v1beta1.Team
-		if err := c.Get(ctx, client.ObjectKey{Name: teamName, Namespace: h.Namespace}, &team); err != nil {
-			continue
-		}
-		if team.Status.TeamRoomID != "" {
-			desired[team.Status.TeamRoomID] = humanRoomOrigin{teamName: teamName}
+	// Team rooms: a human belongs to a team's room when the team names
+	// them (spec.admin / spec.humanMembers) or the human names the team
+	// (spec.accessibleTeams). The team-membership leg is load-bearing:
+	// syncTeamRoomHumanStatuses writes the team room into the admin's and
+	// human members' Status.Rooms WITHOUT touching their AccessibleTeams,
+	// so a desired set built from AccessibleTeams alone would let the
+	// access-revocation path kick the team admin out of their own team
+	// room — and, because the admin is deliberately excluded from the
+	// team-room invite list (creator-join design in ProvisionTeamRooms),
+	// the team would then fail on join (M_FORBIDDEN: cannot join a room
+	// that is not public) on every reconcile.
+	var teams v1beta1.TeamList
+	if err := c.List(ctx, &teams, client.InNamespace(h.Namespace)); err == nil {
+		for i := range teams.Items {
+			tm := &teams.Items[i]
+			if tm.Status.TeamRoomID == "" {
+				continue
+			}
+			belongs := containsString(h.Spec.AccessibleTeams, tm.Name)
+			if !belongs && tm.Spec.Admin != nil && tm.Spec.Admin.Name == h.Name {
+				belongs = true
+			}
+			if !belongs {
+				for _, m := range tm.Spec.HumanMembers {
+					if m.Name == h.Name || (m.MatrixUserID != "" && m.MatrixUserID == h.Status.MatrixUserID) {
+						belongs = true
+						break
+					}
+				}
+			}
+			if belongs {
+				desired[tm.Status.TeamRoomID] = humanRoomOrigin{teamName: tm.Name}
+			}
 		}
 	}
 	return desired
