@@ -1017,3 +1017,75 @@ func TestHumanReconciler_RevocationForceLeaveLastResort(t *testing.T) {
 		t.Errorf("Status.Rooms=%v, want empty (revoked)", out.Status.Rooms)
 	}
 }
+
+// Regression (CI test-19 join-403 deadlock, 2nd wave): the team names the
+// human as admin and its room is already in the human's Status.Rooms
+// (written by syncTeamRoomHumanStatuses), but the team's
+// Status.TeamRoomID is not yet visible in the cache (informer lag right
+// after team provisioning). The room's origin is unresolved while the
+// human holds a team membership claim -> the revocation path must DEFER
+// the kick for one cycle. Kicking here evicts the team admin from their
+// own team room; with the admin excluded from the invite list
+// (creator-join design), every later team reconcile then fails on join
+// (M_FORBIDDEN: cannot join a room that is not public) forever.
+func TestHumanReconciler_RevocationDeferredWhileTeamRoomUnresolved(t *testing.T) {
+	team := &v1beta1.Team{
+		ObjectMeta: metav1.ObjectMeta{Name: "team-alpha", Namespace: "default"},
+		Spec:       v1beta1.TeamSpec{Admin: &v1beta1.TeamAdminSpec{Name: "dave"}},
+		// Status.TeamRoomID intentionally empty: room not yet visible.
+	}
+	human := newHuman("dave", v1beta1.HumanSpec{})
+	human.Status.MatrixUserID = "@dave:localhost"
+	human.Status.InitialPassword = "stored-pw"
+	human.Status.Rooms = []string{"!team-new:localhost"}
+	human.Status.Phase = "Active"
+	human.Finalizers = []string{finalizerName}
+
+	rig := newHumanRig(t, human, team)
+	out, _, err := rig.reconcile("dave")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(rig.prov.Calls.KickFromRoom) != 0 {
+		t.Fatalf("kick calls=%+v, want 0 (deferred while claim unresolved)", rig.prov.Calls.KickFromRoom)
+	}
+	if len(out.Status.Rooms) != 1 || out.Status.Rooms[0] != "!team-new:localhost" {
+		t.Errorf("Status.Rooms=%v, want [!team-new:localhost] (kept for next cycle)", out.Status.Rooms)
+	}
+}
+
+// Control: the deferral must not mask a genuine revocation. The human
+// holds an unresolved claim on team-new (room not visible) but the room
+// in Status.Rooms belongs to team-old, whose Status.TeamRoomID IS
+// visible and which no longer names the human -> known origin, not
+// desired -> the kick proceeds immediately.
+func TestHumanReconciler_RevocationProceedsForKnownOriginTeamRoom(t *testing.T) {
+	teamOld := &v1beta1.Team{
+		ObjectMeta: metav1.ObjectMeta{Name: "team-old", Namespace: "default"},
+		Spec:       v1beta1.TeamSpec{}, // admin removed: human no longer belongs
+		Status:     v1beta1.TeamStatus{TeamRoomID: "!old-room:localhost"},
+	}
+	teamNew := &v1beta1.Team{
+		ObjectMeta: metav1.ObjectMeta{Name: "team-new", Namespace: "default"},
+		Spec:       v1beta1.TeamSpec{Admin: &v1beta1.TeamAdminSpec{Name: "dave"}},
+		// Status.TeamRoomID intentionally empty: room not yet visible.
+	}
+	human := newHuman("dave", v1beta1.HumanSpec{})
+	human.Status.MatrixUserID = "@dave:localhost"
+	human.Status.InitialPassword = "stored-pw"
+	human.Status.Rooms = []string{"!old-room:localhost"}
+	human.Status.Phase = "Active"
+	human.Finalizers = []string{finalizerName}
+
+	rig := newHumanRig(t, human, teamOld, teamNew)
+	out, _, err := rig.reconcile("dave")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(rig.prov.Calls.KickFromRoom) != 1 {
+		t.Fatalf("kick calls=%+v, want 1 (known-origin revocation stays prompt)", rig.prov.Calls.KickFromRoom)
+	}
+	if len(out.Status.Rooms) != 0 {
+		t.Errorf("Status.Rooms=%v, want empty (revoked)", out.Status.Rooms)
+	}
+}

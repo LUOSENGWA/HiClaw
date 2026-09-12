@@ -150,6 +150,27 @@ Consequences implemented by this PR:
    creator-join design) on every reconcile: a permanent deadlock.
    Regression tests: `TestHumanReconciler_TeamAdminRoomNotRevoked` /
    `TestHumanReconciler_HumanMemberRoomNotRevoked`.
+7. **The revocation path never kicks a room whose origin it cannot
+   resolve while a team membership claim is pending.** Item 6 closes the
+   steady-state case (room visible in the team status). A residual
+   status-lag window remained: right after team provisioning,
+   `syncTeamRoomHumanStatuses` writes the new team room into the admin's
+   `status.rooms` BEFORE the team's `status.teamRoomID` is visible in the
+   human reconciler's cache (informer lag across objects). In that window
+   the room is in `status.rooms` but no visible Team/Worker claims it —
+   an UNKNOWN origin — and the revocation path kicked it anyway,
+   evicting the team admin from their own team room; every later team
+   reconcile then failed on join (`M_FORBIDDEN: cannot join a room that
+   is not public`) until the 180s test-19 timeout (CI SHARD_C 4/5).
+   `teamRoomRevocationLag` detects the window (human is `spec.admin` /
+   `spec.humanMembers` of a team whose room is not yet visible) and
+   defers the kick of unknown-origin rooms for one cycle — by then the
+   team status is visible and the origin resolves: still belonging →
+   desired (kept), genuinely revoked → kicked. Known-origin revocations
+   (visible team/worker rooms the human no longer belongs to) stay
+   prompt. Regression tests:
+   `TestHumanReconciler_RevocationDeferredWhileTeamRoomUnresolved` /
+   `TestHumanReconciler_RevocationProceedsForKnownOriginTeamRoom`.
 
 Known limitations (documented, all non-fatal / retry or documented-stuck):
 
@@ -229,4 +250,10 @@ Known limitations (documented, all non-fatal / retry or documented-stuck):
   `TestHumanReconciler_RevocationSelfLeaveFallback` (kick rejected →
   self-leave with the human token → room dropped),
   `TestHumanReconciler_RevocationForceLeaveLastResort` (stale password,
-  no self token → admin-bot force-leave → room dropped).
+  no self token → admin-bot force-leave → room dropped),
+  `TestHumanReconciler_RevocationDeferredWhileTeamRoomUnresolved`
+  (team names the human as admin, room in `status.rooms`, team
+  `status.teamRoomID` not yet visible → kick deferred, room kept),
+  `TestHumanReconciler_RevocationProceedsForKnownOriginTeamRoom`
+  (claim pending on another team, but the revoked room's origin IS
+  visible → kick proceeds immediately).

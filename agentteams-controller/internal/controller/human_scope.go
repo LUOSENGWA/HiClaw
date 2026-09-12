@@ -125,3 +125,61 @@ func buildDesiredHumanRooms(ctx context.Context, c client.Client, h *v1beta1.Hum
 	}
 	return desired
 }
+
+// teamRoomRevocationLag reports whether the revocation path must defer
+// kicks of rooms whose origin cannot currently be resolved, and returns
+// the set of room IDs currently visible in the cache (team
+// Status.TeamRoomID + worker Status.RoomID).
+//
+// Right after team provisioning, syncTeamRoomHumanStatuses writes the new
+// team room into the admin's / human members' Status.Rooms BEFORE the
+// team's Status.TeamRoomID is visible in this reconciler's cache
+// (informer lag across objects). While that window is open, a room in
+// Status.Rooms that no visible Team/Worker claims has an UNKNOWN origin:
+// it is the new team's room, not an orphan. Kicking it would evict the
+// team admin from their own team room — and, because the admin is
+// deliberately excluded from the team-room invite list (creator-join
+// design in ProvisionTeamRooms), every later team reconcile would then
+// fail on join (M_FORBIDDEN: cannot join a room that is not public): a
+// permanent deadlock (CI test-19). So while the human holds a team
+// membership claim (spec.admin / spec.humanMembers) against a team whose
+// room is not yet visible, unknown-origin rooms are kept for one more
+// cycle. By then the team status is visible and the origin resolves:
+// still belonging -> the room is desired (kept); genuinely revoked ->
+// kicked as usual. Known-origin rooms (visible team/worker rooms the
+// human no longer belongs to) are kicked immediately, even inside the
+// window, so access revocation stays prompt.
+func teamRoomRevocationLag(ctx context.Context, c client.Client, h *v1beta1.Human) (deferUnknown bool, knownRoomIDs map[string]struct{}) {
+	knownRoomIDs = make(map[string]struct{})
+	var teams v1beta1.TeamList
+	if err := c.List(ctx, &teams, client.InNamespace(h.Namespace)); err != nil {
+		return false, knownRoomIDs
+	}
+	unresolvedClaim := false
+	for i := range teams.Items {
+		tm := &teams.Items[i]
+		if tm.Status.TeamRoomID != "" {
+			knownRoomIDs[tm.Status.TeamRoomID] = struct{}{}
+			continue
+		}
+		if tm.Spec.Admin != nil && tm.Spec.Admin.Name == h.Name {
+			unresolvedClaim = true
+		} else {
+			for _, m := range tm.Spec.HumanMembers {
+				if m.Name == h.Name || (m.MatrixUserID != "" && m.MatrixUserID == h.Status.MatrixUserID) {
+					unresolvedClaim = true
+					break
+				}
+			}
+		}
+	}
+	var workers v1beta1.WorkerList
+	if err := c.List(ctx, &workers, client.InNamespace(h.Namespace)); err == nil {
+		for i := range workers.Items {
+			if workers.Items[i].Status.RoomID != "" {
+				knownRoomIDs[workers.Items[i].Status.RoomID] = struct{}{}
+			}
+		}
+	}
+	return unresolvedClaim, knownRoomIDs
+}

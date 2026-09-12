@@ -122,11 +122,26 @@ func (r *HumanReconciler) reconcileHumanRooms(ctx context.Context, s *humanScope
 	//  3. the Tuwunel admin bot force-leave: last resort when the human
 	//     token is unavailable (stale password). Like the team-reconcile
 	//     usage, a confirmed command delivery is treated as resolved.
+	deferUnknown, knownRoomIDs := teamRoomRevocationLag(ctx, r.Client, h)
 	kept := next[:0]
 	for _, rid := range next {
 		if _, ok := desired[rid]; ok {
 			kept = append(kept, rid)
 			continue
+		}
+		if deferUnknown {
+			if _, known := knownRoomIDs[rid]; !known {
+				// Origin unresolved while the human holds a team membership
+				// claim whose room is not yet visible: this may be that
+				// team's brand-new room (status-lag window right after
+				// team provisioning). Defer the kick to the next cycle
+				// instead of evicting the team admin from their own team
+				// room — that deadlock would surface as join-403 on every
+				// later team reconcile (CI test-19).
+				logger.V(1).Info("deferring kick: room origin unresolved, team room claim pending", "room", rid)
+				kept = append(kept, rid)
+				continue
+			}
 		}
 		if err := r.Provisioner.KickFromRoom(ctx, rid, matrixUserID, "access revoked"); err == nil {
 			continue // kicked, or the user was already out
