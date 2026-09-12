@@ -63,6 +63,9 @@ Controller 提供两个只读端点，把 TeamHarness 项目状态
 | 参数 | 类型 | 含义 |
 |:--|:--|:--|
 | `includeTasks` | `bool` | 为 `true` 时同时读取每个任务的 TaskMeta（`shared/tasks/{id}/meta.json`），在响应中附加 `tasks_detail` 数组（spec/result/交付物字段）。默认 `false` 保持响应轻量。 |
+| `format` | `string` | 响应格式。缺省返回上方 JSON 快照；`format=mermaid` 返回同一快照渲染的 Mermaid 流程图（`text/plain`，不含 `tasks_detail`——渲染只需 nodes/edges/next）。其他值返回 `400`。 |
+
+Mermaid 输出（`?format=mermaid`）对齐 LangGraph 的 `draw_mermaid` 助手：每个节点标签为 `name: status`，next/ready 节点高亮 `ready`，其余节点按状态着色（`pending` / `delegated` / `inProgress` / `completed` / `revision` / `blocked`）。所有 classDef 都会输出，图可独立渲染。任务标题与 ID 为用户可控输入，渲染前做 mermaid 安全归一：换行→`<br>`、双引号→`#quot;`、反斜杠丢弃、其他控制字符→空格；含 `[A-Za-z0-9_-]` 之外字符的 task ID 映射为防冲突节点 ID（标签保留原文）。畸形标题因此不可能改变渲染出的图结构。
 
 响应 `200 OK`：
 
@@ -146,6 +149,46 @@ Controller 提供两个只读端点，把 TeamHarness 项目状态
 | `404` | 项目不存在（所有扫描前缀下都无 meta.json）——**或**调用者是限定读者（团队 leader / L2 人类）且不拥有该项目（隐藏存在性以防 id 枚举）。 |
 | `500` | K8s 或对象存储故障。 |
 
+### `GET /api/v1/projects/{id}/tasks/{taskId}`
+
+单任务节点级检视：聚合该任务的图节点（状态/负责人/依赖）、TaskMeta（spec/摘要/结果/交付物）、append-only 状态迁移历史，以及指向 tracing 后端的 trace 提示。
+
+```text
+GET /api/v1/projects/{id}/tasks/{taskId}?team=alpha-team
+```
+
+响应 `200 OK`：
+
+```json
+{
+  "task_id": "t1",
+  "project_id": "demo-project-001",
+  "status": "in-progress",
+  "spec_path": "shared/tasks/t1/spec.md",
+  "assigned_to": "@w1:matrix.local",
+  "summary": "Alpha report done",
+  "result_status": "SUCCESS",
+  "result_path": "shared/tasks/t1/result.md",
+  "deliverables": [{"type": "file", "path": "shared/tasks/t1/output.pdf"}],
+  "history": [
+    {"ts": "2026-09-05T01:00:00Z", "from": "", "to": "planned", "actor": "manager", "action": "create"},
+    {"ts": "2026-09-05T02:00:00Z", "from": "planned", "to": "in_progress", "actor": "w1", "action": "ack_task"},
+    {"ts": "2026-09-05T03:00:00Z", "from": "in_progress", "to": "submitted", "actor": "w1", "action": "submit_task"}
+  ],
+  "dependencies": [],
+  "trace": {"project_id": "demo-project-001", "task_id": "t1"}
+}
+```
+
+字段说明：
+
+- `status`：TaskMeta 存在时为**原始**状态（与 `?includeTasks=true` 的 `tasks_detail` 同语义）；TaskMeta 缺失时回退到图节点归一化状态（`pending | delegated | in-progress | completed | revision | blocked`）。
+- `history`：由 TeamHarness taskflow（及 controller 的 cancel 路径）append-only 维护的已接受状态迁移审计，上限 50 条；工作流状态机落地（设计：agentscope-ai/AgentTeams#1223）前为空。畸形条目跳过，不报错。
+- `trace` 是 tracing 后端的过滤提示：其 `project_id` / `task_id` 用于匹配 span 属性 `agentteams.project.id` / `agentteams.task.id`（worker entry span 已携带这两个属性）。本端点不构造后端 URL，tracing 后端是部署特定的。
+- TaskMeta 只从项目所属 scope 读取（team 前缀优先，global 前缀仅 standalone 项目兜底）——与 `tasks_detail` 相同的禁止跨 scope 回退规则。
+
+错误：`400`（task id 缺失/非法）、`404`（项目不存在——对限定读者隐藏存在性——或任务不在该项目图中）、`500`（存储读取失败）。
+
 ### `GET /api/v1/projects/{id}/tasks/{taskId}/artifact`
 
 下载一个任务的一个产物，为 dashboard 和 console 插件补全「交付物 → 下载 → 审 → 接受」闭环。
@@ -169,7 +212,7 @@ Controller 提供两个只读端点，把 TeamHarness 项目状态
 | `404` | 项目不存在 / 调用者不拥有它（隐藏存在性）/ 任务不在项目图中 / 任务没有已发布产物 / 请求路径不是已声明产物 / 产物文件缺失 / 产物路径被拒绝。 |
 | `500` | K8s 或对象存储故障。 |
 
-## 人类干预与生命周期端点（W-PR-2）
+## 人类干预与生命周期端点（写 API）
 
 上面的只读端点之外，还有让人类干预 agent 编排工作流的写端点。所有写入都经过
 **代码级授权**：中间件拒绝跨团队写入（authorizer `requireSameTeam`），handler
@@ -298,14 +341,23 @@ agt get projects                      # 列出全部
 agt get projects --team biz-team      # 按团队过滤
 agt get projects demo-project-001     # 工作流详情
 agt get projects demo-project-001 -o json
-agt get projects demo-project-001 --mermaid   # 渲染 DAG 为 mermaid
+agt get projects demo-project-001 --mermaid   # 渲染 DAG 为 mermaid（含状态着色）
+```
+
+`--mermaid` 与 API 的 `?format=mermaid` 使用同一渲染器：next/ready 节点高亮，其余节点按状态着色。
+
+节点级检视暂无专门 CLI 子命令，直接用 API：
+
+```bash
+curl -H "Authorization: Bearer $AGENTTEAMS_AUTH_TOKEN" \
+  "$AGENTTEAMS_API_BASE/api/v1/projects/demo-project-001/tasks/t1"
 ```
 
 CLI 原样转发配置的 bearer 令牌（`AGENTTEAMS_AUTH_TOKEN` 或
 `AGENTTEAMS_AUTH_TOKEN_FILE`），所以 L2 人类也可以用——把任一变量指向自己的
 Matrix 访问令牌即可，无需单独的 CLI 认证模式。
 
-### `agt project`（W-PR-2 写命令）
+### `agt project`（写命令）
 
 `agt project` 包装写端点，人类无需 raw curl 即可干预：
 
@@ -319,3 +371,105 @@ agt project complete demo-project-001
 ```
 
 同样的 bearer 令牌转发适用（L2 人类用 Matrix 令牌）。
+
+## Worker 知识库（工作区文件）端点
+
+Controller 代理每个 worker 的 QwenPaw app（QwenPaw ≥ 2.1）的四个端点，
+让 L2 人类与前端可以查看——并在 Human CR 允许时更新——worker 的知识库：
+长期记忆文件 `MEMORY.md`、日记目录树 `memory/` 与沉淀知识目录树 `digest/`。
+
+| 端点 | 含义 |
+|:--|:--|
+| `GET /api/v1/workers/{name}/workspace-files/tree` | 分页列出某个知识目录：`?path=`（必填，`memory` / `digest` 或其子路径），可选 `?cursor=`（不透明串）与 `?limit=`（1..500）。返回 `{directory, entries[], has_more, next_cursor}`。 |
+| `GET /api/v1/workers/{name}/workspace-files/file-metadata` | `?path=`（必填，允许的知识库文件）：`{etag, modified_at, path, preview_kind, size}`。 |
+| `GET /api/v1/workers/{name}/workspace-files/file-content` | `?path=`（必填）加可选 `?offset=`（≥0）与 `?limit=`（1..1048576）：有界 UTF-8 分块 `{content, eof, next_offset, truncated, etag, ...}`——`truncated` 为真时用 `offset=next_offset` 续读。 |
+| `PUT /api/v1/workers/{name}/workspace-files/file-content` | 保存一个知识库文件：`?path=`（必填），body `{"content": "<文本>"}`（≤1 MiB，非空），`If-Match` 请求头（并发规则见下）。返回新的 `{etag, path, size}`。 |
+| `GET /api/v1/workers/{name}/workspace-files/file-download` | 以附件形式流式下载一个知识库文件：`?path=`（必填）。透传上游 `Content-Disposition` / `Content-Length` / `ETag` 头。 |
+
+- **范围**：与 `GET /api/v1/workers/{name}` 相同的 worker 读授权——团队
+  leader / L2 人类只能看自己可访问团队内的 worker；未知或越权 worker 一律
+  隐藏为 `404`。
+- **写范围**：`PUT file-content` 对 admin/manager 全团队开放；L2 人类仅可写
+  自己团队内的 worker，且 `Human.spec.workspaceFileAccess` 显式为
+  `"readwrite"`（缺省/未设置即 `read` 只读——Controller 升级不会静默授予
+  既有用户写权限；L1 把字段设为 `readwrite` 即授予）。团队 leader 在本 API
+  上保持只读。跨团队写隐藏 worker 为 `404`（存在性不可探测）；范围内但无
+  写权限的调用得到明确的 `403`。
+- **并发（ETag）**：写之前代理先探测 `file-metadata`。文件已存在时
+  `If-Match` 头必填（worker 会向自己的记忆文件自动追加，无条件覆盖即丢
+  更新）；新建文件时不得携带。上游 ETag 不匹配原样透传 `409`——重新加载
+  后重试。
+- **写限制**：body 上限 1 MiB（与读分块上限一致），`content` 必须为非空
+  字符串，每次成功写均由 controller 审计记录（worker、路径、调用者、字节
+  数）。
+- **`workspaceFileAccess`（Human CRD 字段）**：`read` | `readwrite`
+  （缺省为 `read`，写权限为显式 opt-in）——L1 可逐用户授予/收回的团队知识
+  库文件写权限。建 Human 时（`agt apply`）与 `PUT /api/v1/humans/{name}`
+  均可设置（后者随 humans-update PR 把该字段纳入可更新集）。
+- **路径白名单（知识边界）**：只放行 `MEMORY.md`、`memory/**` 与
+  `digest/**`（读写同界）。工作区内其他一切位置——`SOUL.md`、`PROFILE.md`、`TODO.md`、
+  `checkpoints/`、`skills/`，以及所有 dot 目录（`.copaw/agent.json` 承载
+  worker 凭据）——在请求到达 worker 之前即被 `400` 拒绝。根目录按完整首段
+  精确匹配，`memories/` 与 `memoryX/` 不构成 `memory/` 的前缀。文件根只能是
+  单个顶层文件：`MEMORY.md` 可寻址，但 `MEMORY.md/foo` 被拒（它是文件而非
+  目录——嵌套文件必须在 `memory/` 或 `digest/` 下）。
+- **root 固定**：QwenPaw 的 `root=workspace` 参数（agent 自身存储根，相对
+  于 `root=project` 即主绑定项目目录）由服务端固定，不属于客户端查询面。
+- **仅 embedded 模式**：端点经共享 docker 网络代理 worker 的 qwenpaw app，
+  地址解析与 checkpoint 端点相同（生效容器前缀 + system-wins 控制台端口）。
+  kube 模式返回 `503`。
+- **版本门（404 透传）**：worker 运行 QwenPaw < 2.1 时没有工作区文件
+  路由，所有请求均为上游 `404` 原样透传。区分"worker 版本过旧"与"文件不
+  存在"的方法：探测 `file-metadata?path=MEMORY.md`——该文件在每个已初始
+  化的 QwenPaw 工作区中都存在，因此这里的 `404` 表示 worker 为 2.1 以下
+  （或工作区未初始化），其余 `404` 即普通文件缺失。
+- **Runtime 范围**：端点面向运行 QwenPaw app 的 worker（`qwenpaw`
+  runtime）。其他 runtime 的 worker 没有 QwenPaw 工作区 API：该 runtime 的
+  应用若在服务 console 端口，代理原样透传其响应（通常 `404`）；无人监听
+  时返回 `502`。MEMORY.md 探测因此只对 QwenPaw worker 有意义。
+- 转发为固定子路径（tree / file-metadata / file-content GET+PUT /
+  file-download）+ 严格查询白名单——不是通用反向代理。multipart 的
+  `file-upload` 端点与工作区 API 的其余面均不可达。
+
+错误响应：
+
+| 码 | 含义 |
+|:--|:--|
+| `400` | worker 名非法 / 不支持的子路径或查询参数 / 路径不在知识白名单内 / `limit` 或 `offset` 越界 /（写）`If-Match` 缺失或误用、body 超限或为空。 |
+| `403` | （仅写）范围内但无写权限的调用者——只读人类或团队 leader。 |
+| `404` | worker 不存在或不在调用方团队内（存在性隐藏）；或（透传）文件不存在——见上方版本门探测。 |
+| `409` / `416` | （透传）读取期间或写入等待期间文件被修改（ETag 不匹配——重载重试）/ offset 超出文件末尾。 |
+| `502` | worker app 不可达，或上游错误（状态码回显在 body 中）。 |
+| `503` | kube 模式（无稳定的 worker pod DNS 可代理）。 |
+
+## Worker 工具审批端点
+
+每个 QwenPaw worker 的 agent profile 带一个工具执行安全级别（`agent.json` 的
+`approval_level`），决定哪些工具调用自动执行、哪些暂停等人工审批。Controller
+代理 worker 的 `/workspace/running-config` API 的最小读写面，L2 人类可管理
+自己团队内 worker 的该级别：
+
+| 端点 | 含义 |
+|:--|:--|
+| `GET /api/v1/workers/{name}/approval` | 当前级别：`{"approval_level": "AUTO"}`。 |
+| `PUT /api/v1/workers/{name}/approval` | 设置级别。Body：`{"approval_level": "STRICT"}`。 |
+
+- **档位**：`STRICT`（所有工具需审批）/ `SMART`（低风险工具自动放行）/
+  `AUTO`（仅受管工具——上游默认）/ `OFF`（关闭守卫）。其他值在触碰 worker
+  之前即被 `400` 拒绝（上游模型不校验取值，代理是校验边界）。
+- **OFF 为提权档**：`approval_level=OFF` 会完全关闭 Tool Guard，属安全策略
+  操作而非普通配置。默认 L2 人类设 `OFF` 得 `403`——只能在受管档位
+  （`STRICT`/`SMART`/`AUTO`）间切换；`OFF` 需 L2 权限设计（#1220）定义的
+  提权工具审批能力、由 admin 显式授予，该能力模型落地前 admin/manager 保留
+  全档位。
+- **写范围**：`PUT` 对 admin/manager 全团队开放；L2 人类仅可设自己团队内
+  worker——跨团队隐藏为 `404`（存在性不可探测）。团队 leader 保持只读
+  （`PUT` 得 `403`，与知识库写 API 同界）。
+- **安全写**：上游 `PUT /workspace/running-config` 持久化*完整*运行配置对象，
+  代理执行 GET→仅改 `approval_level`→PUT 回全量；其余字段原样往返。上游
+  `409`（并发配置变更）透传，客户端以新 `GET` 重试。
+- **仅 embedded 模式**：worker 寻址与 checkpoint 代理相同（有效容器前缀 +
+  系统优先端口）。kube 模式返回 `503`。
+- **降级**：无 running-config 路由的旧版 QwenPaw worker 原样透传上游
+  `404`（版本门）。
+- 每次成功变更记审计日志（worker、新级别、调用者、角色）。
