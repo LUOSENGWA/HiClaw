@@ -345,6 +345,18 @@ class QwenPawApiClient:
                     f"/api/models/{urllib.parse.quote(provider_id, safe='')}/models",
                     model_payload,
                 )
+            else:
+                # An already-registered entry keeps whatever capability
+                # state it was stored with (often an earlier self-probe
+                # result); the app exposes no in-place update for those
+                # fields, so converge them only when the stored values
+                # actually drift from the desired ones.
+                self._reconcile_existing_model(
+                    provider_id,
+                    provider,
+                    model,
+                    model_payload,
+                )
         config_payload: dict[str, Any] = {"chat_model": chat_model}
         if api_key:
             config_payload["api_key"] = api_key
@@ -388,7 +400,86 @@ class QwenPawApiClient:
             raise QwenPawApiError("QwenPaw provider model readback mismatch")
         if base_url and str(provider.get("base_url") or "").rstrip("/") != base_url.rstrip("/"):
             raise QwenPawApiError("QwenPaw provider base URL readback mismatch")
+        stored = self._find_model_entry(provider, model)
+        if stored is not None:
+            mismatched = sorted(
+                key
+                for key in (
+                    "supports_image",
+                    "supports_video",
+                    "supports_multimodal",
+                    "probe_source",
+                )
+                if key in model_payload and stored.get(key) != model_payload[key]
+            )
+            if mismatched:
+                raise QwenPawApiError(
+                    f"QwenPaw model capability readback mismatch: "
+                    f"{', '.join(mismatched)}"
+                )
         return actual
+
+    @staticmethod
+    def _find_model_entry(
+        provider: dict[str, Any],
+        model: str,
+    ) -> Optional[dict[str, Any]]:
+        """Find the stored entry for ``model`` across ``models`` and
+        ``extra_models`` (the two lists a provider persists user models
+        in)."""
+        return next(
+            (
+                item
+                for item in list(provider.get("models") or [])
+                + list(provider.get("extra_models") or [])
+                if str(item.get("id")) == model
+            ),
+            None,
+        )
+
+    def _reconcile_existing_model(
+        self,
+        provider_id: str,
+        provider: dict[str, Any],
+        model: str,
+        model_payload: dict[str, Any],
+    ) -> None:
+        """Converge capability fields on an already-registered model entry.
+
+        The pinned QwenPaw app has no endpoint that updates an existing
+        model entry's capability fields: ``POST /api/models/{pid}/models``
+        rejects a duplicate id, and ``PUT .../models/{mid}/config`` only
+        carries generation parameters. The only available convergence is
+        delete + re-add, so it is used sparingly — only when a desired
+        capability value actually differs from the stored one. Steady
+        state stays a no-op, so repeated worker updates do not churn the
+        entry.
+        """
+        desired = {
+            key: model_payload[key]
+            for key in (
+                "supports_image",
+                "supports_video",
+                "supports_multimodal",
+                "probe_source",
+            )
+            if key in model_payload
+        }
+        if not desired:
+            return
+        entry = self._find_model_entry(provider, model)
+        if entry is None or all(
+            entry.get(key) == value for key, value in desired.items()
+        ):
+            return
+        base = f"/api/models/{urllib.parse.quote(provider_id, safe='')}/models"
+        self._request("DELETE", f"{base}/{urllib.parse.quote(model, safe='')}")
+        readd = dict(model_payload)
+        if entry.get("name"):
+            # Re-add must not downgrade a human-readable display name to
+            # the bare model id.
+            readd["name"] = entry["name"]
+        self._request("POST", base, readd)
 
     def configure_agent(
         self,

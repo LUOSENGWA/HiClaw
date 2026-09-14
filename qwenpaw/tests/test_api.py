@@ -1,4 +1,5 @@
 import json
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
@@ -30,6 +31,7 @@ class _ApiHandler(BaseHTTPRequestHandler):
     toggle_conflicts = 0
     providers = {}
     active_llm = None
+    model_deletes = 0
 
     def log_message(self, _format, *_args):
         return
@@ -140,6 +142,19 @@ class _ApiHandler(BaseHTTPRequestHandler):
             if provider is None:
                 self._reply(404, {"detail": "missing"})
                 return
+            # Real contract: the app rejects a duplicate model id instead
+            # of upserting (Provider.add_model -> "already exists").
+            existing = {
+                str(entry.get("id"))
+                for entry in provider.get("models", [])
+                + provider.get("extra_models", [])
+            }
+            if payload.get("id") in existing:
+                self._reply(
+                    404,
+                    {"detail": f"Model '{payload.get('id')}' already exists"},
+                )
+                return
             provider["extra_models"].append(payload)
             self._reply(201, provider)
             return
@@ -175,6 +190,27 @@ class _ApiHandler(BaseHTTPRequestHandler):
             key = self.path.removeprefix("/api/mcp/")
             type(self).mcp.pop(key, None)
             self._reply(200, {"success": True})
+            return
+        if self.path.startswith("/api/models/"):
+            # Real contract (Provider.delete_model): removes the entry from
+            # models + extra_models and remembers it in removed_model_ids
+            # (a later re-add succeeds).
+            rest = self.path.removeprefix("/api/models/")
+            provider_id, sep, model_id = rest.partition("/models/")
+            provider = type(self).providers.get(urllib.parse.unquote(provider_id))
+            if not sep or provider is None:
+                self._reply(404, {"detail": "missing"})
+                return
+            model_id = urllib.parse.unquote(model_id)
+            for list_name in ("models", "extra_models"):
+                provider[list_name] = [
+                    entry
+                    for entry in provider.get(list_name, [])
+                    if str(entry.get("id")) != model_id
+                ]
+            provider.setdefault("removed_model_ids", []).append(model_id)
+            type(self).model_deletes += 1
+            self._reply(200, provider)
             return
         self._reply(404, {"detail": "missing"})
 
@@ -217,6 +253,7 @@ def api_url():
     _ApiHandler.toggle_conflicts = 0
     _ApiHandler.providers = {}
     _ApiHandler.active_llm = None
+    _ApiHandler.model_deletes = 0
     server = ThreadingHTTPServer(("127.0.0.1", 0), _ApiHandler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -423,3 +460,86 @@ def test_configure_active_model_existing_provider_appends_model_with_capabilitie
     assert added["supports_image"] is True
     assert added["supports_multimodal"] is True
     assert added["probe_source"] == "manual"
+
+
+def test_configure_active_model_existing_model_updates_stale_capabilities(
+    api_url,
+):
+    """Regression: an already-registered entry must converge to the
+    desired capability fields, not keep its previous self-probed state."""
+    _ApiHandler.providers["agentteams-gateway"] = {
+        "id": "agentteams-gateway",
+        "name": "AgentTeams Gateway",
+        "base_url": "http://gateway.example.com/v1",
+        "models": [
+            {
+                "id": "qwen3.6-plus",
+                "name": "Qwen3.6 Plus",
+                "supports_image": False,
+                "supports_video": False,
+                "supports_multimodal": False,
+                "probe_source": "probed",
+            },
+        ],
+        "extra_models": [],
+    }
+    client = QwenPawApiClient(api_url)
+
+    client.configure_active_model(
+        "agentteams-gateway",
+        "qwen3.6-plus",
+        base_url="http://gateway.example.com/v1",
+        api_key="secret",
+        supports_image=True,
+        supports_video=False,
+        supports_multimodal=True,
+        probe_source="documentation",
+    )
+
+    provider = _ApiHandler.providers["agentteams-gateway"]
+    entries = provider["models"] + provider["extra_models"]
+    assert [entry["id"] for entry in entries] == ["qwen3.6-plus"]
+    updated = entries[0]
+    assert updated["supports_image"] is True
+    assert updated["supports_video"] is False
+    assert updated["supports_multimodal"] is True
+    assert updated["probe_source"] == "documentation"
+    # The human-readable display name must survive the re-add.
+    assert updated["name"] == "Qwen3.6 Plus"
+    assert _ApiHandler.model_deletes == 1
+
+
+def test_configure_active_model_existing_model_no_drift_is_noop(api_url):
+    """Steady state: desired values already stored -> no delete/re-add
+    churn on repeated worker updates."""
+    _ApiHandler.providers["agentteams-gateway"] = {
+        "id": "agentteams-gateway",
+        "name": "AgentTeams Gateway",
+        "base_url": "http://gateway.example.com/v1",
+        "models": [
+            {
+                "id": "qwen3.6-plus",
+                "name": "Qwen3.6 Plus",
+                "supports_image": True,
+                "supports_multimodal": True,
+                "probe_source": "documentation",
+            },
+        ],
+        "extra_models": [],
+    }
+    client = QwenPawApiClient(api_url)
+
+    client.configure_active_model(
+        "agentteams-gateway",
+        "qwen3.6-plus",
+        base_url="http://gateway.example.com/v1",
+        api_key="secret",
+        supports_image=True,
+        supports_multimodal=True,
+        probe_source="documentation",
+    )
+
+    assert _ApiHandler.model_deletes == 0
+    provider = _ApiHandler.providers["agentteams-gateway"]
+    assert provider["models"][0]["supports_image"] is True
+    assert provider["extra_models"] == []
