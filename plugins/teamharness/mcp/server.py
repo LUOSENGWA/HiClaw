@@ -396,7 +396,11 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "or Project Work mode is selected: create quick projects, create "
             "projects, plan or update DAG and Loop work, query ready nodes, "
             "and record loop iterations. Do not use for ordinary direct "
-            "replies or one-off checks."
+            "replies or one-off checks. complete_project persists the "
+            "terminal state locally and syncs it to shared storage before "
+            "the PROJECT_COMPLETED event is emitted; if that sync fails the "
+            "action returns a retryable failure with the event withheld, so "
+            "retry it once storage recovers."
         ),
         "inputSchema": {
             "type": "object",
