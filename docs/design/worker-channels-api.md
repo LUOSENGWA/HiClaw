@@ -116,21 +116,35 @@ curl -s http://127.0.0.1:8090/api/v1/workers/daily-luo/channels/schemas \
 
 ## QwenPaw version contract
 
-The pinned QwenPaw 2.0.1 release exposes its config API under
-`/api/config/channels/...` — the path the worker's own client
-(`qwenpaw_worker/api.py`) and the integration coverage use. This proxy
-forwards to exactly that prefixed contract;
-`TestChannelsUpstreamPathsMatchWorkerContract` pins every forwarded path
-against it, so any future worker API move fails the test instead of
-silently 404-ing at runtime.
+This proxy is **version-agnostic**: it forwards to a fixed, prefixed path
+(`/api/config/channels/...`) and contains no version logic, so no specific
+QwenPaw pin is required to merge or run it. That path is the contract the
+worker's own client (`qwenpaw_worker/api.py`) and the integration coverage
+use, and `TestChannelsUpstreamPathsMatchWorkerContract` pins every
+forwarded path against it, so any future worker API move fails the test
+instead of silently 404-ing at runtime.
 
-Two 2.0.1-specific gaps and how this API handles them:
+The **9-route minimum contract** has been verified directly against the
+official PyPI release wheels (hash-checked), all exposing the identical
+paths under the `/api` mount:
 
-- **`conflict-check` is not exposed by the 2.0.1 worker** (no such route
-  in the worker client or server). Rather than ship a dead endpoint, this
-  proxy deliberately does not offer it. When a future QwenPaw release
-  adds the route, re-adding the proxy endpoint is a one-line table entry
-  plus the existing handler shape.
+| QwenPaw release | 9 forwarded routes | `conflict-check` |
+|---|---|---|
+| 2.0.1 (2026-07-24) | all present, identical paths | absent (zero references in the package) |
+| 2.2.0 (2026-09-03) | all present, identical paths | present (`config.py:379`) |
+| 2.2.1 (2026-09-11) | all present, identical paths | present (`config.py:379`; router byte-identical to 2.2.0) |
+
+So the API works unchanged on any QwenPaw across the 2.0.1 → 2.2.1 range:
+
+- **`conflict-check` is an additive 2.2.x-only route.** 2.0.x workers do
+  not expose it. Rather than ship a dead endpoint on a 2.0.x pin, this
+  proxy deliberately does not offer it yet; re-adding the proxy endpoint
+  after a 2.2.x pin is a one-line table entry plus the existing handler
+  shape (tracked as a small follow-up, not a dependency of this PR).
+- **Version gate by pass-through.** On a QwenPaw build without the
+  channel router at all, the upstream's own `404` detail is returned
+  verbatim, so callers see a distinguishable, upstream-sourced failure
+  instead of a silent proxy error.
 - **MinIO read-back timing.** `X-AgentTeams-MinIO-Persisted` reports
   convergence of the worker's push-loop against the MinIO baseline within
   a bounded window; `false` means "not yet converged", not "write failed"

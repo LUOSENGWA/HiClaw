@@ -1009,7 +1009,7 @@ curl -s -X PUT http://127.0.0.1:8090/api/v1/workers/{name}/channels/qq \
 # → 200，body 原样返回，X-AgentTeams-MinIO-Persisted: true|false|skipped
 ```
 
-`schemas` 路由返回各频道的表单定义（字段名、类型、label、options），前端据此渲染接入表单，无需 per-channel 代码。（2.0.1 worker 不提供 `conflict-check` 路由，本 API 因此刻意不代理该路由——见 `docs/design/worker-channels-api.md` 的版本契约一节。）
+`schemas` 路由返回各频道的表单定义（字段名、类型、label、options），前端据此渲染接入表单，无需 per-channel 代码。（`conflict-check` 为 2.2.x 附加路由，2.0.x worker 不暴露，待 2.2.x pin 后以小 follow-up 补上——见 `docs/design/worker-channels-api.md` 的版本契约一节。）
 
 | 角色 | 读 | 写（`PUT` / `restart`） |
 |------|----|-------------------------|

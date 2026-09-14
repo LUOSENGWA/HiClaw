@@ -400,7 +400,9 @@ func TestChannelsRestart_Forwards(t *testing.T) {
 // expectations below are written from the worker client, not from this
 // handler file — if the worker API ever moves, the worker client and this
 // table change together, and this test catches proxy drift in both
-// directions (missing or extra prefix).
+// directions (missing or extra prefix). The table is the version-agnostic
+// minimum contract: the 9 routes are identical across the official QwenPaw
+// 2.0.1 / 2.2.0 / 2.2.1 releases (verified against the PyPI wheels).
 func TestChannelsUpstreamPathsMatchWorkerContract(t *testing.T) {
 	cases := []struct {
 		name     string

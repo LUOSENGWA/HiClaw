@@ -20,10 +20,12 @@ package server
 //
 // Upstream contract: requests are forwarded to the worker's qwenpaw config
 // API under /api/config/channels/... — the path the worker's own client
-// (qwenpaw_worker/api.py) and integration coverage use. The pinned
-// QwenPaw 2.0.1 release does not expose a conflict-check route, so this
-// proxy does not offer one either (see the version-contract section of
-// docs/design/worker-channels-api.md).
+// (qwenpaw_worker/api.py) and integration coverage use. The proxy is
+// version-agnostic: this 9-route contract is identical across the official
+// QwenPaw 2.0.1 / 2.2.0 / 2.2.1 releases (see the version-contract section
+// of docs/design/worker-channels-api.md). conflict-check is an additive
+// 2.2.x-only route, so this proxy does not offer it yet (small follow-up
+// once a 2.2.x pin lands).
 //
 // Design notes (full contract in docs/design/worker-channels-api.md):
 //
