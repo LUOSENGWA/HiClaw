@@ -76,9 +76,16 @@ type WorkerResponse struct {
 	MatrixUserID     string                     `json:"matrixUserID,omitempty"`
 	RoomID           string                     `json:"roomID,omitempty"`
 	Message          string                     `json:"message,omitempty"`
-	ExposedPorts     []ExposedPortInfo          `json:"exposedPorts,omitempty"`
-	Team             string                     `json:"team,omitempty"`
-	Role             string                     `json:"role,omitempty"`
+	LastActiveAt     string                     `json:"lastActiveAt,omitempty"`
+	// AgentStatus is the runtime task-level state reported by the worker
+	// heartbeat: "idle" / "running" / "disabled"; empty = not reported.
+	AgentStatus      string            `json:"agentStatus,omitempty"`
+	RunningTaskCount *int              `json:"runningTaskCount,omitempty"`
+	LastRunAt        string            `json:"lastRunAt,omitempty"`
+	LastFinishAt     string            `json:"lastFinishAt,omitempty"`
+	ExposedPorts     []ExposedPortInfo `json:"exposedPorts,omitempty"`
+	Team             string            `json:"team,omitempty"`
+	Role             string            `json:"role,omitempty"`
 }
 
 type ExposedPortInfo struct {

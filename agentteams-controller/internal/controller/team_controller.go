@@ -721,6 +721,8 @@ func syncTeamMemberStatus(ms *v1beta1.TeamMemberStatus, member teamWorkerMember)
 	ms.ContainerState = member.worker.Status.ContainerState
 	ms.Message = member.worker.Status.Message
 	ms.LastActiveAt = member.worker.Status.LastActiveAt
+	ms.AgentStatus = member.worker.Status.AgentStatus
+	ms.LastFinishAt = member.worker.Status.LastFinishAt
 	ms.LastHeartbeat = member.worker.Status.LastHeartbeat
 	ms.ExposedPorts = member.worker.Status.ExposedPorts
 }
