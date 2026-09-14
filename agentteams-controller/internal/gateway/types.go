@@ -29,6 +29,20 @@ type AIRoute struct {
 	AllowedConsumers []string `json:"allowedConsumers,omitempty"`
 }
 
+// AIRouteUpstream is a single upstream (provider) serving an AI route.
+type AIRouteUpstream struct {
+	Provider string `json:"provider"`
+	Weight   int    `json:"weight,omitempty"`
+}
+
+// AIRouteInfo is a read-only view of a configured AI route. The route name is
+// the model alias that Worker/Manager CRs reference in their model field.
+type AIRouteInfo struct {
+	Name             string            `json:"name"`
+	Upstreams        []AIRouteUpstream `json:"upstreams,omitempty"`
+	AllowedConsumers []string          `json:"allowedConsumers,omitempty"`
+}
+
 // PortExposeRequest describes a port to expose through the gateway.
 type PortExposeRequest struct {
 	WorkerName  string // worker identifier

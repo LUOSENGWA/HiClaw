@@ -1,6 +1,9 @@
 package server
 
-import v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
+import (
+	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
+	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/gateway"
+)
 
 // --- Worker API types ---
 
@@ -256,6 +259,16 @@ type ConsumerResponse struct {
 	ConsumerID string `json:"consumer_id"`
 	APIKey     string `json:"api_key,omitempty"`
 	Status     string `json:"status"`
+}
+
+// ModelListResponse is the read-only model catalog returned by
+// GET /api/v1/models. Each entry is an AI route: the route name is the model
+// alias used in Worker/Manager model fields, upstreams are the providers
+// serving it, and allowedConsumers are the gateway consumers authorized on
+// the route.
+type ModelListResponse struct {
+	Models []gateway.AIRouteInfo `json:"models"`
+	Total  int                   `json:"total"`
 }
 
 // --- Lifecycle API types ---
