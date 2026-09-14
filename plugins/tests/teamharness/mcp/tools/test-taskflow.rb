@@ -42,6 +42,13 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     if [ "$1" = "mirror" ] && [ -n "${TEAMHARNESS_TEST_FAIL_SYNC_TASK:-}" ] && [ "$3" = "mock/shared/tasks/${TEAMHARNESS_TEST_FAIL_SYNC_TASK}/" ]; then
       exit 1
     fi
+    # Test hook: fail the project-dir push (mirror <local> <remote>) for
+    # the named project only — pre-action meta.json pulls (mc cp) keep
+    # working (exercises the complete_project sync-failure withholding
+    # path).
+    if [ "$1" = "mirror" ] && [ -n "${TEAMHARNESS_TEST_FAIL_SYNC_PROJECT:-}" ] && [ "$3" = "mock/shared/projects/${TEAMHARNESS_TEST_FAIL_SYNC_PROJECT}/" ]; then
+      exit 1
+    fi
     if [ "$1" = "mirror" ] && [ "$2" = "mock/shared/tasks/remote-001/" ]; then
       mkdir -p "$3"
       cp -a "#{remote_task}/." "$3"
@@ -1675,6 +1682,8 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     })
     if not comp.get("ok"):
         raise AssertionError(f"complete_project failed: {comp!r}")
+    if comp.get("synced") is not True:
+        raise AssertionError(f"complete_project must report the successful sync: {comp!r}")
     note = (comp.get("project") or {}).get("projectNotification") or {}
     if note.get("sent") is not True:
         raise AssertionError(f"complete_project must send PROJECT_COMPLETED: {note!r}")
@@ -1696,6 +1705,57 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         raise AssertionError(f"retried complete_project must reuse the event: {note2!r}")
     if len([ev for ev in matrix["events"] if f"project-{comp_pid}-" in ev["path"]]) != 1:
         raise AssertionError("retried complete_project must not send a second event")
+
+    # --- P0 ordering (PR review 2026-09-14): a failed shared-storage
+    #     sync withholds PROJECT_COMPLETED and returns a retryable
+    #     failure. No event may go out before the completed state is
+    #     durable, and no projectCompletionEventId may be recorded in
+    #     that window (a retry must not reuse a notification whose
+    #     persisted state never landed). After recovery the idempotent
+    #     retry delivers the event exactly once. ---
+    ofail_tid = "order-fail-task"
+    ofail_pid = _lifecycle_setup(ofail_tid)
+    _lifecycle_submit(ofail_tid, "SUCCESS", "Order-fail work done.")
+    os.environ["TEAMHARNESS_TEST_FAIL_SYNC_PROJECT"] = ofail_pid
+    try:
+        ofail = payload("projectflow", {
+            "action": "complete_project",
+            "payload": {"projectId": ofail_pid},
+        })
+    finally:
+        os.environ.pop("TEAMHARNESS_TEST_FAIL_SYNC_PROJECT", None)
+    if ofail.get("ok") is not False:
+        raise AssertionError(f"failed project sync must not report ok: {ofail!r}")
+    if ofail.get("retryable") is not True:
+        raise AssertionError(f"failed project sync must be retryable: {ofail!r}")
+    if "notification" in ofail or (ofail.get("project") or {}).get("projectNotification"):
+        raise AssertionError(f"failed project sync must withhold PROJECT_COMPLETED: {ofail!r}")
+    ofail_meta_path = pathlib.Path("#{workspace}") / f"shared/projects/{ofail_pid}/meta.json"
+    ofail_meta = json.loads(ofail_meta_path.read_text(encoding="utf-8"))
+    if ofail_meta.get("status") != "completed":
+        raise AssertionError(f"local project state must be completed despite the sync failure: {ofail_meta!r}")
+    if ofail_meta.get("projectCompletionEventId"):
+        raise AssertionError(f"no event id may be recorded before durable state: {ofail_meta!r}")
+    if len([ev for ev in matrix["events"] if f"project-{ofail_pid}-" in ev["path"]]) != 0:
+        raise AssertionError(f"PROJECT_COMPLETED must not be sent before sync succeeds: {ofail!r}")
+    ofail_retry = payload("projectflow", {
+        "action": "complete_project",
+        "payload": {"projectId": ofail_pid},
+    })
+    if not ofail_retry.get("ok") or ofail_retry.get("synced") is not True:
+        raise AssertionError(f"project retry after storage recovery must succeed: {ofail_retry!r}")
+    ofail_note = (ofail_retry.get("project") or {}).get("projectNotification") or {}
+    if ofail_note.get("sent") is not True:
+        raise AssertionError(f"project retry after storage recovery must send PROJECT_COMPLETED: {ofail_retry!r}")
+    if ofail_note.get("reused") is True:
+        raise AssertionError(f"the withheld event must not be 'reused' from the failed attempt: {ofail_retry!r}")
+    if len([ev for ev in matrix["events"] if f"project-{ofail_pid}-" in ev["path"]]) != 1:
+        raise AssertionError(f"project retry after recovery must send exactly one event: {ofail_retry!r}")
+    ofail_meta2 = json.loads(ofail_meta_path.read_text(encoding="utf-8"))
+    if not ofail_meta2.get("projectCompletionEventId"):
+        raise AssertionError(f"event id must be persisted once the state is durable: {ofail_meta2!r}")
+    if ofail_meta2.get("projectCompletionEventId") != ofail_note.get("eventId"):
+        raise AssertionError(f"persisted event id must match the sent event: {ofail_meta2!r}")
 
     matrix_server.shutdown()
     matrix_server.server_close()

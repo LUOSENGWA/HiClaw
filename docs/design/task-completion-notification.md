@@ -150,6 +150,9 @@ storage → only then notify**.
   `{"sent": false, "skipped"?: true, "error": "..."}` and the submit
   still completes: `ok: true`, `status: "submitted"`, artifacts
   published, state synced.
+- The same ordering applies to `complete_project` (2026-09-14 review):
+  terminal project state → project-dir sync → `PROJECT_COMPLETED`
+  only after a successful sync (see the section below).
 - The existing `notificationNeeded` hint is **kept** — it also drives
   the requester reply-route report, which the code-level line
   intentionally does not cover (different room/audience).
@@ -187,29 +190,39 @@ Routing-salience note: v1 delivers all attention in the task room
 (room @mentions). A dedicated DM step for humans (higher salience) is
 recorded as a follow-up in the PR, not in this change.
 
-### `PROJECT_COMPLETED` on `complete_project` (v2)
+### `PROJECT_COMPLETED` on `complete_project` (v2, sync-first per the 2026-09-14 review)
 
 `complete_project` previously only wrote state; a finished project
-waited for the next incident to surface. It now sends a best-effort
-room event before the state write:
+waited for the next incident to surface. It now sends a room event
+under the same P0 ordering as submit: local terminal state → sync
+shared storage → only then notify:
 
 - **Contract line**: `@leader PROJECT_COMPLETED: <project-id> -
   Project completed: <title>`; mentions leader + human members.
 - Room resolution: first task `room_id` in the plan, falling back to
   the project `source_room_id` when it is a Matrix room.
+- **Sync failure** → `ok: false`, `retryable: true`, **no event at
+  all** and no `projectCompletionEventId` recorded — a retry must not
+  reuse a notification whose completed state never reached shared
+  storage. The local state is already `completed`, so the retry is
+  idempotent: the event is sent exactly once, on the first sync that
+  succeeds.
+- **Notification-level failure** (no room, no leader, no Matrix env,
+  membership missing, HTTP error) stays best-effort: the event is
+  skipped with a clear error and `complete_project` still returns
+  `ok: true` (the state is already persisted and synced).
 - **Idempotent**: `projectCompletionEventId` is persisted on the
-  project state (txn `project-<project-id>-success`); a retried
-  `complete_project` reuses the recorded event.
-- Never blocks the terminal project write (same best-effort guards as
-  completion events).
+  project state only after a successful send (txn
+  `project-<project-id>-success`); a retried `complete_project`
+  reuses the recorded event.
 
 ## Changes
 
 | File | Change |
 |:--|:--|
-| `plugins/teamharness/mcp/server.py` | v1: `_team_leader_matrix_id()`, `_send_task_completion_notification()`, `_task_completion_notification()`; `submit_task` branch adds `notification` to the response. v2: `_TASK_COMPLETION_EVENT_TOKENS` + per-status first-line rendering + status-scoped txn + `completionEventStatus` (status-scoped reuse); `_team_human_matrix_ids()` @initiator mentions; `submit_task` status validation + sync-before-notify ordering (retryable failure withholds the notification); new `request_attention` action + `_send_attention_notification()` (idempotent per kind, terminal guard, sync-first); `accept_task_result` auto-resolves outstanding attention; `_send_project_completion_notification()` + idempotent `projectCompletionEventId` on `complete_project` |
+| `plugins/teamharness/mcp/server.py` | v1: `_team_leader_matrix_id()`, `_send_task_completion_notification()`, `_task_completion_notification()`; `submit_task` branch adds `notification` to the response. v2: `_TASK_COMPLETION_EVENT_TOKENS` + per-status first-line rendering + status-scoped txn + `completionEventStatus` (status-scoped reuse); `_team_human_matrix_ids()` @initiator mentions; `submit_task` status validation + sync-before-notify ordering (retryable failure withholds the notification); new `request_attention` action + `_send_attention_notification()` (idempotent per kind, terminal guard, sync-first); `accept_task_result` auto-resolves outstanding attention; `_send_project_completion_notification()` + `complete_project` sync-before-notify ordering (a failed sync withholds the event and returns a retryable failure; `projectCompletionEventId` is persisted only after a successful send) |
 | `plugins/teamharness/skills/team/task-execution/SKILL.md` | contract section rewritten: code-generated per-status event lines (worker no longer hand-sends the completion line), status list extended to the full accepted set, `request_attention` documented as the in-flight decision path |
-| `plugins/tests/teamharness/mcp/tools/test-taskflow.rb` | runtime config gains the team roster; fake Matrix server gains a `submit-` fault-injection branch; `mc` shim gains a `TEAMHARNESS_TEST_FAIL_SYNC_TASK` hook; new assertions (see below); context file-event selection made mxcUri-based instead of positional (the last event is no longer guaranteed to be a file event) |
+| `plugins/tests/teamharness/mcp/tools/test-taskflow.rb` | runtime config gains the team roster; fake Matrix server gains a `submit-` fault-injection branch; `mc` shim gains `TEAMHARNESS_TEST_FAIL_SYNC_TASK` / `TEAMHARNESS_TEST_FAIL_SYNC_PROJECT` push-failure hooks; new assertions (see below); context file-event selection made mxcUri-based instead of positional (the last event is no longer guaranteed to be a file event) |
 
 ## Tests (contract, `test-taskflow.rb`)
 
@@ -251,6 +264,13 @@ v2 additions (issue #1229):
 11. **PROJECT_COMPLETED**: `complete_project` sends the
     `PROJECT_COMPLETED` line with leader + human mentions; a retried
     `complete_project` reuses the recorded event.
+12. **P0 ordering on complete_project** (2026-09-14 review): `mc`
+    shim forced to fail the project-dir push → `complete_project`
+    returns `ok: false` / `retryable: true` with **no notification**,
+    **no `PROJECT_COMPLETED` event**, and no `projectCompletionEventId`
+    recorded (local state is still `completed`); the idempotent retry
+    after storage recovery sends the event exactly once and persists
+    the event id.
 
 ## Open questions
 

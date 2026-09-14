@@ -3950,26 +3950,56 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     loop["status"] = "completed"
                     project["loop"] = loop
             project_dir = _project_dir(arguments, project_id)
+            _write_json(state_path, project)
+            _write_project_plan(project_dir, project)
+            # P0 ordering (PR review 2026-09-14): the terminal state is
+            # persisted locally first, then pushed to shared storage, and
+            # only after a successful sync does the PROJECT_COMPLETED
+            # attention event go out. A failed sync withholds the event
+            # and returns a retryable failure — the leader is never woken
+            # by a completion whose state it cannot read, and no
+            # projectCompletionEventId is recorded without durable state.
+            synced = _sync_project(arguments, project_id)
+            if action == "complete_project" and not synced:
+                return {
+                    "ok": False,
+                    "retryable": True,
+                    "tool": "projectflow",
+                    "action": action,
+                    "project": project,
+                    "error": (
+                        "shared storage sync failed after complete_project; the "
+                        "PROJECT_COMPLETED notification was withheld. Local "
+                        "project state is already completed — retry "
+                        "complete_project (idempotent) once storage recovers."
+                    ),
+                }
             if action == "complete_project":
                 # Code-level PROJECT_COMPLETED attention event (PR review
                 # 2026-09-05): the leader and the human members see a
                 # finished project in the room instead of waiting for the
-                # next incident. Best-effort — it never blocks the
-                # terminal project write. Runs before the state write so
-                # a recorded projectCompletionEventId makes a retried
-                # complete_project idempotent.
+                # next incident. Notification-level failures stay
+                # best-effort — they never block the terminal project
+                # write, which is already persisted and synced.
                 project["projectNotification"] = _send_project_completion_notification(
                     arguments, project, project_id
                 )
-            _write_json(state_path, project)
-            _write_project_plan(project_dir, project)
-            _sync_project(arguments, project_id)
+                if project.get("projectCompletionEventId"):
+                    # Persist the recorded event id (and the notification
+                    # result) so a retried complete_project reuses the
+                    # event. If this write is lost, the stable txn id
+                    # (project-<id>-success) makes the retry deduplicate
+                    # at the homeserver and re-record the id.
+                    _write_json(state_path, project)
             result = {
                 "ok": True,
                 "tool": "projectflow",
                 "action": action,
                 "project": project,
+                "synced": synced,
             }
+            if action == "complete_project":
+                result["notification"] = project.get("projectNotification")
             publish_artifacts = _payload_bool_field(payload, ("publishArtifacts", "publish_artifacts"), False)
             if action == "complete_project" and publish_artifacts and (project_dir / "result.md").is_file():
                 result["publishedArtifacts"] = _publish_project_artifacts(
@@ -4592,11 +4622,20 @@ def _send_project_completion_notification(
 ) -> dict[str, Any]:
     """Send the automatic PROJECT_COMPLETED event for complete_project.
 
-    Best-effort: every guard failure returns a ``skipped`` result and
-    never blocks the terminal project write. The event mentions the team
-    leader and the human members in the task room so the requester sees
-    project completion with the same salience as a task completion. The
-    recorded event id makes a retried complete_project idempotent.
+    The caller (complete_project) invokes this only after the terminal
+    state has been persisted locally and synced to shared storage — a
+    failed sync withholds the event at the caller and returns a
+    retryable failure instead, so this function never sends an event
+    for state that shared storage does not have. Notification-level
+    failures (no room, no leader, missing Matrix env, membership check,
+    HTTP error) return a ``skipped`` result and never block the
+    terminal project write, which is already persisted and synced. The
+    event mentions the team leader and the human members in the task
+    room so the requester sees project completion with the same
+    salience as a task completion. On a successful send the
+    projectCompletionEventId is recorded on the project object; the
+    caller persists it, and a retried complete_project reuses the
+    recorded event instead of pinging the room again.
     """
     leader = _team_leader_matrix_id()
     if not leader:
@@ -4650,6 +4689,9 @@ def _send_project_completion_notification(
         txn_prefix="project",
     )
     if notification.get("sent"):
+        # Recorded only after a successful send (the P0 ordering in
+        # complete_project guarantees the state is durable first); the
+        # caller persists it on the project state.
         project["projectCompletionEventId"] = notification.get("eventId")
     return notification
 
