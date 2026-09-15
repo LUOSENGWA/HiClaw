@@ -148,6 +148,13 @@ _MATRIX_STREAMING_FINAL_TEXT_KEY = "matrix_streaming_final_text"
 _MATRIX_FORCE_NOTICE_KEY = "matrix_force_notice"
 _MATRIX_PLACEHOLDER_THREAD_ROOT_KEY = "matrix_placeholder_thread_root"
 
+# Send alignment gate (#1244): before the final reply of a turn is
+# flushed, check whether new room events landed after the turn's context
+# snapshot.  Unaligned turns are re-triggered with the fresh context
+# instead of answering a stale conversation state.  Budgets:
+_MATRIX_SEND_GATE_MAX_RETRIGGERS = 2
+_MATRIX_SEND_GATE_MAX_WAIT_S = 600.0
+
 _TOOL_CALL_MESSAGE_TYPE_NAMES = frozenset(
     {"FUNCTION_CALL", "PLUGIN_CALL", "MCP_TOOL_CALL"},
 )
@@ -411,6 +418,8 @@ class AgentTeamsMatrixChannel(BaseChannel):
         self._sync_task: Optional[asyncio.Task] = None
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._room_histories: Dict[str, List[HistoryEntry]] = {}
+        # Send alignment gate state: room_id -> {event_id, count, deadline}.
+        self._send_gate_state: Dict[str, Dict[str, Any]] = {}
         self._dm_room_cache: Dict[str, Dict[str, Any]] = {}
         self._teamharness_task_room_cache: Dict[str, Dict[str, Any]] = {}
         self._http_client: Optional[httpx.AsyncClient] = None
@@ -2791,6 +2800,7 @@ class AgentTeamsMatrixChannel(BaseChannel):
                 "event_id": event.event_id,
                 "thread_root_event_id": event.event_id,
                 "sender_id": sender_id,
+                "is_thread_event": is_thread_event,
             },
         }
         if teamharness_self_trigger is not None:
@@ -2963,6 +2973,7 @@ class AgentTeamsMatrixChannel(BaseChannel):
                 "event_id": event.event_id,
                 "thread_root_event_id": event.event_id,
                 "sender_id": sender_id,
+                "is_thread_event": is_thread_event,
             },
         }
 
@@ -4185,6 +4196,99 @@ class AgentTeamsMatrixChannel(BaseChannel):
             await self._on_process_completed(None, to_handle, send_meta)
             self._proactive_send_state.pop(to_handle, None)
 
+    def _evaluate_send_gate(self, send_meta: Dict[str, Any], to_handle: str) -> tuple:
+        """Send alignment gate (#1244).
+
+        Returns ``(action, new_count)`` where action is:
+          - ``"ok"``: aligned (or not gated: DM / thread / no snapshot) —
+            flush the reply as usual.
+          - ``"retrigger"``: new room events landed after the turn's
+            context snapshot — drop the stale reply and re-trigger the
+            agent with the fresh context.
+          - ``"note"``: gate budget exhausted (retrigger count or
+            wall-clock deadline) — flush, then append a short note.
+        """
+        meta_dict = send_meta if isinstance(send_meta, dict) else {}
+        room_id = to_handle
+        if not meta_dict.get("is_group") or meta_dict.get("is_dm") or meta_dict.get("is_thread_event"):
+            return "ok", 0
+        turn_event_id = meta_dict.get("event_id") or ""
+        entries = self._room_histories.get(room_id) or []
+        if not entries or not turn_event_id:
+            return "ok", len(entries)
+        now = time.time()
+        state = self._send_gate_state.get(room_id)
+        if state is None or state.get("event_id") != turn_event_id:
+            # Fresh conversation turn (a real mention): new gate budget.
+            self._send_gate_state[room_id] = {
+                "event_id": turn_event_id,
+                "count": 0,
+                "deadline": now + _MATRIX_SEND_GATE_MAX_WAIT_S,
+            }
+            state = self._send_gate_state[room_id]
+        if state["count"] >= _MATRIX_SEND_GATE_MAX_RETRIGGERS or now >= state["deadline"]:
+            return "note", len(entries)
+        return "retrigger", len(entries)
+
+    async def _retrigger_for_new_context(
+        self,
+        send_meta: Dict[str, Any],
+        to_handle: str,
+        new_count: int,
+    ) -> None:
+        """Drop the stale draft and re-trigger the agent with fresh context.
+
+        The buffered room messages are baked into the re-trigger payload
+        via the normal history prepend, so the agent re-evaluates against
+        the latest conversation state.  The buffer is cleared afterwards
+        so the same messages are not prepended again on a later turn.
+        """
+        meta_dict = send_meta if isinstance(send_meta, dict) else {}
+        room_id = to_handle
+        state = self._send_gate_state.get(room_id) or {}
+        state["count"] = int(state.get("count", 0)) + 1
+        self._send_gate_state[room_id] = state
+
+        sender_id = meta_dict.get("sender_id") or self._user_id
+        nudge = (
+            f"[System] Your previous draft reply was NOT sent: {new_count} "
+            "new message(s) arrived in this room after your context "
+            "snapshot. Review the latest room state (history above) and "
+            "reply to the current conversation."
+        )
+        content_parts: list[Any] = [
+            TextContent(type=ContentType.TEXT, text=nudge),
+        ]
+        content_parts = self._apply_history_to_parts(room_id, content_parts)
+        worker_name = (self._user_id or "").split(":")[0].lstrip("@")
+        payload = {
+            "channel_id": CHANNEL_KEY,
+            "sender_id": sender_id,
+            "content_parts": content_parts,
+            "acl_sender_id": sender_id,
+            "meta": {
+                "room_id": room_id,
+                "is_dm": False,
+                "is_group": True,
+                "worker_name": worker_name,
+                "event_id": meta_dict.get("event_id"),
+                "thread_root_event_id": meta_dict.get("thread_root_event_id")
+                or meta_dict.get("event_id"),
+                "sender_id": sender_id,
+                "send_gate_retrigger": True,
+            },
+        }
+        self._room_histories.pop(room_id, None)
+        logger.info(
+            "send gate: retrigger enqueued room=%s new_messages=%s count=%s",
+            room_id,
+            new_count,
+            state["count"],
+        )
+        if self._enqueue:
+            await self._send_typing(room_id, True)
+            self._enqueue(payload)
+
     async def _on_process_completed(
         self,
         request: Any,
@@ -4192,6 +4296,10 @@ class AgentTeamsMatrixChannel(BaseChannel):
         send_meta: Dict[str, Any],
     ) -> None:
         """Edit thread root with final reply, or send directly if no thread."""
+        gate_action, gate_new_count = self._evaluate_send_gate(send_meta, to_handle)
+        if gate_action == "retrigger":
+            await self._retrigger_for_new_context(send_meta, to_handle, gate_new_count)
+            return
         pending = send_meta.pop(_MATRIX_PENDING_FINAL_MESSAGE_KEY, None)
         streaming_final_text = send_meta.pop(
             _MATRIX_STREAMING_FINAL_TEXT_KEY,
@@ -4244,6 +4352,15 @@ class AgentTeamsMatrixChannel(BaseChannel):
             await self.send(to_handle, streaming_final_text.strip(), send_meta)
         elif pending is not None:
             await self.send_message_content(to_handle, pending, send_meta)
+        if gate_action == "note":
+            await self._send_plain_text(
+                to_handle,
+                "(Note: "
+                f"{gate_new_count} new message(s) arrived in this room while "
+                "this reply was being drafted, so it may not reflect the "
+                "latest room state / 本回复起草期间房间新增 "
+                f"{gate_new_count} 条消息，可能未反映最新房间状态)",
+            )
         await self._send_typing(to_handle, False)
         base_completed = getattr(super(), "_on_process_completed", None)
         try:
