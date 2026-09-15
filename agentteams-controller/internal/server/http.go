@@ -151,6 +151,13 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	mux.Handle("GET /api/v1/workers/{name}/approval", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(ah.getWorkerApproval)))
 	mux.Handle("PUT /api/v1/workers/{name}/approval", mw.RequireAuthz(authpkg.ActionWorkerApproval, "worker", nameFn)(http.HandlerFunc(ah.updateWorkerApproval)))
 
+	// --- Worker tool settings (qwenpaw built-in tools: enable / async execution;
+	// proxy to the worker's qwenpaw app; declarative PATCH, L2 team-scoped,
+	// leaders read-only) ---
+	th := NewToolsHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix)
+	mux.Handle("GET /api/v1/workers/{name}/tools", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(th.listWorkerTools)))
+	mux.Handle("PATCH /api/v1/workers/{name}/tools/{tool}", mw.RequireAuthz(authpkg.ActionWorkerTools, "worker", nameFn)(http.HandlerFunc(th.patchWorkerTool)))
+
 	// --- Skill catalog (read-only: builtin skills per runtime + shared skills under agents/global/skills/) ---
 	skh := NewSkillsHandler(deps.WorkerAgentDir, deps.OSS)
 	mux.Handle("GET /api/v1/skills", mw.RequireAuthz(authpkg.ActionList, "skills", nil)(http.HandlerFunc(skh.ListSkills)))

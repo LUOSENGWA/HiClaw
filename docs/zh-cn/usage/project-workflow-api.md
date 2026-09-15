@@ -502,3 +502,33 @@ Controller 代理每个 worker 的 QwenPaw app（QwenPaw ≥ 2.1）的四个端�
 - **降级**：无 running-config 路由的旧版 QwenPaw worker 原样透传上游
   `404`（版本门）。
 - 每次成功变更记审计日志（worker、新级别、调用者、角色）。
+
+## Worker 工具设置端点
+
+每个 QwenPaw Worker 的 agent 配置里带一张按工具的表（`tools.builtin_tools`）：
+哪些内置工具启用、哪些异步执行。Controller 代理 Worker 本地 `/api/tools`
+API 的最小读写面，让 L2 用户管理本团队 Worker 的工具——无需 `docker exec`。
+
+| 端点 | 含义 |
+|:--|:--|
+| `GET /api/v1/workers/{name}/tools` | 工具列表：`{"tools": [ {name, enabled, description, asyncExecution, icon, requiresConfig}, ... ], "total": N}`。 |
+| `PATCH /api/v1/workers/{name}/tools/{tool}` | 声明式更新。Body：`{"enabled": bool, "asyncExecution": bool}` 的一或两者。 |
+
+- **声明式、可重试**：代理先读当前表，仅对「请求值 ≠ 当前值」的字段发起
+  Worker 本地变更（本地 toggle 端点无 body、做翻转，裸转发会在重试时双翻转）。
+  无变化的 PATCH 返回 `200` 空操作，零上游写入。
+- **只暴露状态，绝不暴露配置值**：条目含 `requiresConfig`（标志位）但不含
+  工具配置内容——其中可能含凭据。
+- **写范围**：admin/manager 可改任意 Worker；L2 用户只能改本团队 Worker——
+  跨团队 Worker 隐藏为 `404`（不可探测存在性）。团队 Leader 只读
+  （`PATCH` 得 `403`，与审批端点同一边界）。
+- **未知字段名被 `400` 拒绝**（fail-closed）；对外字段名为 camelCase
+  （`asyncExecution`、`requiresConfig`）。
+- **运行时感知**：工具设置模型是 QwenPaw 专有；其他 runtime 的 Worker 返回
+  `400`。**仅 embedded 模式**（kube 模式 `503`）。
+- **失败语义**：未知 Worker/工具 `404`；上游错误 `502`（无 `/api/tools` 路由
+  的 QwenPaw 版本为 `502` "API unavailable"）；上游列表畸形时 fail-closed 返回
+  `502`，绝不吐半份列表。
+- **生效方式**：本地变更保存 agent 配置并热加载 agent；Worker 自身的同步
+  循环把配置持久化到共享存储。
+- 每次成功变更记录审计日志（worker、工具、变更字段新旧值、调用者、角色）。

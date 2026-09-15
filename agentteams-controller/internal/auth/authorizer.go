@@ -22,7 +22,15 @@ const (
 	// allows cross-team so the handler can hide with 404 instead of the
 	// authorizer answering 403); team leaders are read-only (denied here,
 	// #1216 pattern); workers are denied by default.
-	ActionRuntimeConfig       Action = "runtime-config"
+	ActionRuntimeConfig Action = "runtime-config"
+	// ActionWorkerTools guards the qwenpaw tool-settings WRITE
+	// (PATCH /workers/{name}/tools/{tool}: enable / async-execution of
+	// built-in tools). L2 humans may write workers in their own teams
+	// (W8: the authorizer allows cross-team so the handler can hide with
+	// 404 instead of the authorizer answering 403); team leaders are
+	// read-only (denied here, #1216 pattern); workers are denied by
+	// default.
+	ActionWorkerTools         Action = "worker-tools"
 	ActionSTS                 Action = "sts"
 	ActionStatus              Action = "status"
 	ActionRefreshMatrixToken  Action = "refresh-matrix-token"
@@ -155,6 +163,13 @@ func (a *Authorizer) authorizeHuman(caller *CallerIdentity, req AuthzRequest) er
 			// handler when cross-team.
 			return nil
 		}
+		if req.Action == ActionWorkerTools {
+			// L2 humans may toggle the built-in tools of workers in their
+			// own teams (enable / async-execution). Same W8 reasoning as
+			// ActionWorkerApproval: allowed here, hidden as 404 by the
+			// handler when cross-team.
+			return nil
+		}
 		return deny(caller, req)
 
 	case "skills":
@@ -233,9 +248,10 @@ func (a *Authorizer) authorizeTeamLeaderWorkerAction(caller *CallerIdentity, req
 		return a.requireSameTeam(caller, req)
 	case ActionWake, ActionSleep, ActionEnsureReady, ActionReady, ActionStatus:
 		return a.requireSameTeam(caller, req)
-	// ActionWorkerApproval and ActionRuntimeConfig deliberately fall
-	// through to deny: team leaders are READ-ONLY for worker approval and
-	// running-config (mirrors the #1216 approval proxy).
+	// ActionWorkerApproval, ActionRuntimeConfig and ActionWorkerTools
+	// deliberately fall through to deny: team leaders are READ-ONLY for
+	// worker approval, running-config, and tool settings (mirrors the
+	// #1216 approval proxy).
 	default:
 		return deny(caller, req)
 	}
