@@ -5254,6 +5254,30 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     "delegate_task",
                     _transition_actor(arguments),
                 )
+            else:
+                # Re-delegate (a retry after a send/sync failure, or a repair
+                # /re-dispatch of a broken or revision state) must not erase
+                # the audit trail already recorded on this task: the fresh
+                # meta dict below replaces meta.json, so carry the existing
+                # entries over before the write.
+                prior_history = existing_task.get("history")
+                if isinstance(prior_history, list) and prior_history:
+                    task["history"] = list(prior_history)
+                if _delegate_from != "prepared":
+                    # Only prepared -> prepared retries are silent no-op
+                    # re-entries. Any other reachable re-entry changes the
+                    # state and is recorded so the trail stays complete: an
+                    # assigned task without eventId is the broken-state
+                    # repair path (revision and the other terminal states
+                    # are frozen upstream by the mutability guard).
+                    _append_transition_history(
+                        task,
+                        _delegate_from,
+                        "prepared",
+                        "delegate_task",
+                        _transition_actor(arguments),
+                        note="repair: assigned without eventId",
+                    )
             _write_task(arguments, task)
             # Publish task files to shared storage FIRST so a Worker that
             # receives the notification can read spec.md/meta.json. If the

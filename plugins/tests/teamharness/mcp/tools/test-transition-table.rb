@@ -385,6 +385,119 @@ Dir.mktmpdir("teamharness-transition-") do |dir|
         raise AssertionError("subd submit failed")
     must_fail(delegate("proj-subd", "t-subd"), "delegate_task: task is 'submitted'", "redelegate@submitted")
 
+    # 3c-2. Re-delegate of a prepared task (recovery after a send/sync
+    # failure) must keep the recorded audit trail instead of rebuilding
+    # meta.json from scratch.
+    new_project("proj-retry", "t-retry")
+    retry_dir = workspace / "shared/tasks/t-retry"
+    retry_dir.mkdir(parents=True, exist_ok=True)
+    (retry_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "task_id": "t-retry",
+                "project_id": "proj-retry",
+                "room_id": "room:!team:example.test",
+                "status": "prepared",
+                "spec_path": "shared/tasks/t-retry/spec.md",
+                "history": [
+                    {
+                        "ts": "2026-09-09T10:00:00Z",
+                        "from": "planned",
+                        "to": "prepared",
+                        "actor": "leader:default",
+                        "action": "delegate_task",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    if not delegate("proj-retry", "t-retry").get("ok"):
+        raise AssertionError("prepared re-delegate failed")
+    retry_history = read_meta("t-retry").get("history") or []
+    if [entry.get("from") for entry in retry_history] != ["planned", "prepared"]:
+        raise AssertionError(
+            f"prepared retry must keep the audit trail and record the new assignment: {retry_history!r}"
+        )
+
+    # 3c-3. Revision is terminal: rejecting a submission freezes the task and
+    # a re-dispatch is rejected (a revised task restarts as a new task).
+    new_project("proj-rev", "t-rev")
+    if not delegate("proj-rev", "t-rev").get("ok") or not ack("t-rev").get("ok"):
+        raise AssertionError("rev setup failed")
+    s_rev = submit("t-rev", summary="First attempt.")
+    if not s_rev.get("ok"):
+        raise AssertionError(f"rev submit failed: {s_rev!r}")
+    acc_rev = payload("projectflow", {
+        "role": "leader",
+        "action": "accept_task_result",
+        "payload": {
+            "projectId": "proj-rev",
+            "taskId": "t-rev",
+            "submissionId": s_rev["task"]["submission_id"],
+            "accepted": False,
+            "resultStatus": "SUCCESS",
+            "summary": "Redo.",
+        },
+    })
+    if not acc_rev.get("ok") or read_meta("t-rev")["status"] != "revision":
+        raise AssertionError(f"revision accept failed: {acc_rev!r}")
+    must_fail(
+        delegate("proj-rev", "t-rev"),
+        "delegate_task cannot update terminal task: revision",
+        "redelegate@revision",
+    )
+
+    # 3c-4. The assigned-without-eventId repair is explicit: re-delegating a
+    # broken assigned state records the repair edge and keeps the trail.
+    new_project("proj-repair", "t-repair")
+    repair_dir = workspace / "shared/tasks/t-repair"
+    repair_dir.mkdir(parents=True, exist_ok=True)
+    (repair_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "task_id": "t-repair",
+                "project_id": "proj-repair",
+                "room_id": "room:!team:example.test",
+                "status": "assigned",
+                "spec_path": "shared/tasks/t-repair/spec.md",
+                "history": [
+                    {
+                        "ts": "2026-09-09T10:00:00Z",
+                        "from": "planned",
+                        "to": "prepared",
+                        "actor": "leader:default",
+                        "action": "delegate_task",
+                    },
+                    {
+                        "ts": "2026-09-09T10:00:01Z",
+                        "from": "prepared",
+                        "to": "assigned",
+                        "actor": "leader:default",
+                        "action": "delegate_task",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    if not delegate("proj-repair", "t-repair").get("ok"):
+        raise AssertionError("assigned repair re-delegate failed")
+    rep_history = read_meta("t-repair").get("history") or []
+    if rep_history[0].get("from") != "planned":
+        raise AssertionError(f"repair must keep the trail head: {rep_history!r}")
+    if not any(
+        entry.get("from") == "assigned"
+        and entry.get("to") == "prepared"
+        and entry.get("note")
+        for entry in rep_history
+    ):
+        raise AssertionError(f"repair edge must be recorded with a note: {rep_history!r}")
+
     # 3d. accept only from submitted.
     acc_bad = payload("projectflow", {
         "role": "leader",
