@@ -132,6 +132,19 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	wfh := NewWorkspaceFilesHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix)
 	mux.Handle("GET /api/v1/workers/{name}/workspace-files/{sub}", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(wfh.proxyWorkspaceFiles)))
 	mux.Handle("PUT /api/v1/workers/{name}/workspace-files/file-content", mw.RequireAuthz(authpkg.ActionWorkspaceFilesWrite, "worker", nameFn)(http.HandlerFunc(wfh.proxyWorkspaceFileWrite)))
+	// Worker runtime-config proxy (qwenpaw running-config: 5-tab settings +
+	// Loop Engine catalog/status + custom-loop CRUD). runtime-aware (400 for
+	// non-qwenpaw), L2 team-scoped, 5-tab field whitelist for L2 writes, and
+	// loop-change notification (@leader + @changer) on custom-loop writes.
+	rch := NewRuntimeConfigHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix, deps.MatrixClient)
+	mux.Handle("GET /api/v1/workers/{name}/runtime-config", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
+	mux.Handle("PUT /api/v1/workers/{name}/runtime-config", mw.RequireAuthz(authpkg.ActionRuntimeConfig, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
+	mux.Handle("GET /api/v1/workers/{name}/loops", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
+	mux.Handle("GET /api/v1/workers/{name}/loops/status", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
+	mux.Handle("GET /api/v1/workers/{name}/loops/custom", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
+	mux.Handle("POST /api/v1/workers/{name}/loops/custom", mw.RequireAuthz(authpkg.ActionRuntimeConfig, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
+	mux.Handle("PUT /api/v1/workers/{name}/loops/custom/{loop}", mw.RequireAuthz(authpkg.ActionRuntimeConfig, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
+	mux.Handle("DELETE /api/v1/workers/{name}/loops/custom/{loop}", mw.RequireAuthz(authpkg.ActionRuntimeConfig, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
 
 	// --- Worker skill runtime state + preload policy (QwenPaw >= 2.2.1; proxy to the worker's qwenpaw app) ---
 	wskh := NewWorkerSkillsHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix)
