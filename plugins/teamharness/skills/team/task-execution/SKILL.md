@@ -124,7 +124,6 @@ Use one of:
 - `REVISION_NEEDED`
 - `BLOCKED`
 - `INTERRUPTED`
-- `FAILED`
 
 Use `INTERRUPTED` when execution stopped before you could finish. If your Leader
 accepts either `INTERRUPTED` or `BLOCKED`, TeamHarness records the task and plan
@@ -182,10 +181,9 @@ The event first line carries one token per result status (code-generated):
 
 ```text
 @leader-user:matrix.local TASK_COMPLETED: demo-project-001-01 - Result: shared/tasks/demo-project-001-01/result.md
-@leader-user:matrix.local TASK_PARTIAL: demo-project-001-01 - <summary>
 @leader-user:matrix.local TASK_REVISION_NEEDED: demo-project-001-01 - <summary>
 @leader-user:matrix.local TASK_BLOCKED: demo-project-001-01 - <short blocker summary>
-@leader-user:matrix.local TASK_FAILED: demo-project-001-01 - <summary>
+@leader-user:matrix.local TASK_INTERRUPTED: demo-project-001-01 - <summary>
 ```
 
 If the task spec gives an exact completion line, the code event keeps that

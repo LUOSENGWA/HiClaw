@@ -64,12 +64,6 @@ first-line token so a leader prompt can branch on the line itself:
 ```
 
 ```
-@leader TASK_PARTIAL: <task-id> - <summary>
-- Worker: @worker:matrix.local
-- Status: PARTIAL
-```
-
-```
 @leader TASK_REVISION_NEEDED: <task-id> - <summary>
 - Worker: @worker:matrix.local
 - Status: REVISION_NEEDED
@@ -82,16 +76,26 @@ first-line token so a leader prompt can branch on the line itself:
 ```
 
 ```
-@leader TASK_FAILED: <task-id> - <summary>
+@leader TASK_INTERRUPTED: <task-id> - <summary>
 - Worker: @worker:matrix.local
-- Status: FAILED
+- Status: INTERRUPTED
 ```
 
 `SUCCESS` / `SUCCESS_WITH_NOTES` keep the `TASK_COMPLETED` token and the
 `Result:` line (no `- Status:` line — the token already says it); every
 other token carries the `- Status:` line. `submit_task` validates the
-submitted status against the accepted set and rejects unknown values
-with a clear error instead of rendering a generic line.
+submitted status against the accepted set (`_validate_task_result_status`,
+#1183) and rejects unknown values with a clear error instead of rendering
+a generic line.
+
+Accepted-set note (rebase onto #1183, 2026-09-15): #1183 narrowed the
+accepted set to `{SUCCESS, SUCCESS_WITH_NOTES, REVISION_NEEDED, BLOCKED,
+INTERRUPTED}` — it **removed `FAILED` and `PARTIAL`** ("neither had an
+acceptance mapping, so it failed downstream") and added `INTERRUPTED`.
+The 5-token design in this document predates that change; the token map
+keeps defensive `TASK_PARTIAL` / `TASK_FAILED` entries so a future
+re-adding of those statuses emits the right first line without a
+follow-up change in this PR.
 
 ### Leader resolution
 
@@ -246,16 +250,21 @@ v2 additions (issue #1229):
    returns `ok: false` / `retryable: true` with **no `notification`
    field**, local state still `submitted`; the idempotent retry after
    storage recovery sends the event exactly once.
-7. **Per-status token + @initiator**: `PARTIAL` / `FAILED` /
-   `REVISION_NEEDED` each render their own first-line token +
+7. **Per-status token + @initiator**: `REVISION_NEEDED` / `BLOCKED` /
+   `INTERRUPTED` each render their own first-line token +
    `- Status:` line, and the event mentions both the leader and the
    human roster member; `SUCCESS` keeps the `Result:` line and carries
    no `- Status:` line.
 8. **Status validation**: submit with an unknown status is rejected
-   (`invalid status`) and the bad value is not persisted.
-9. **Changed-status resubmit**: `FAILED` → `SUCCESS` resubmit sends a
-   second, distinct event (no silent reuse); a same-status resubmit
-   reuses the recorded event.
+   (`unsupported result status: <value>`, #1183 helper) and the bad
+   value is not persisted.
+9. **Resubmission identity** (rebase onto #1183): the
+   durable-continuation digest fence locks a submitted task to
+   (status, summary, deliverables). An **exact retry reuses the
+   recorded event** (`reused: true`, same event id); a **changed result
+   conflicts** ("submit_task conflicts with existing submission") and
+   waits for a Leader decision — the recorded event is left intact, so
+   the idempotent retry still reuses it.
 10. **request_attention**: in-flight `approval` ping sends the
     `ATTENTION_APPROVAL` line with leader + human mentions; an
     unresolved same-kind repeat is idempotent (no second event); a
