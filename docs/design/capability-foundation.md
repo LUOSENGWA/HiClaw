@@ -99,8 +99,9 @@ writes, external source adds/updates) call the same `Record`.
 
 ## Known limitations
 
-- Single controller replica for the durable audit layer; a queryable audit
-  store (or per-event objects) is #1220 §13 Q3.
+- Single controller replica for the durable audit layer; the queryable
+  read side (`GET /api/v1/audit`) is a separate stacked PR — see
+  `docs/design/audit-events-api.md`.
 - `secret_reveal` has no v1 consumer (reserved value).
 - Identity caching: a capability change becomes visible to the affected
   human when their Matrix-token identity cache expires — the same

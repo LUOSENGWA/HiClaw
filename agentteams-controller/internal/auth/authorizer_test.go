@@ -471,3 +471,32 @@ func TestAuthorizer_WorkerTools_W8Boundary(t *testing.T) {
 		t.Error("worker self tool write should be denied")
 	}
 }
+
+// TestAuthorizer_AuditRead pins the audit route's role matrix (#1245):
+// L2 humans and team leaders may read at the authorizer level (the handler
+// is the team-scope boundary: ?team= mandatory, cross-team 404, W8
+// anti-probing); workers are denied; admin/manager pass by role baseline.
+func TestAuthorizer_AuditRead(t *testing.T) {
+	az := NewAuthorizer()
+
+	human := &CallerIdentity{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}}
+	if err := az.Authorize(human, AuthzRequest{Action: ActionGet, ResourceKind: "audit"}); err != nil {
+		t.Errorf("L2 human audit read should be allowed at the authorizer (handler enforces team scope), got: %v", err)
+	}
+	if err := az.Authorize(human, AuthzRequest{Action: ActionUpdate, ResourceKind: "audit"}); err == nil {
+		t.Error("L2 human audit write should be denied")
+	}
+
+	leader := &CallerIdentity{Role: RoleTeamLeader, Username: "market-lead", Team: "market-team"}
+	if err := az.Authorize(leader, AuthzRequest{Action: ActionGet, ResourceKind: "audit"}); err != nil {
+		t.Errorf("team-leader audit read should be allowed at the authorizer, got: %v", err)
+	}
+	if err := az.Authorize(leader, AuthzRequest{Action: ActionList, ResourceKind: "audit"}); err == nil {
+		t.Error("team-leader audit list should be denied (the route is ActionGet only)")
+	}
+
+	worker := &CallerIdentity{Role: RoleWorker, Username: "market-dev", WorkerName: "market-dev", Team: "market-team"}
+	if err := az.Authorize(worker, AuthzRequest{Action: ActionGet, ResourceKind: "audit"}); err == nil {
+		t.Error("worker audit read should be denied")
+	}
+}
