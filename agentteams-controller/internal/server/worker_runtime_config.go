@@ -3,12 +3,26 @@ package server
 // Worker runtime-config proxy (GET/PUT /api/v1/workers/{name}/runtime-config
 // + /loops + /loops/status + /loops/custom[/{loop}]).
 //
-// QwenPaw 2.x exposes its runtime-tunable "running-config" (the workbench
-// 5-tab settings: ReAct / Loop / LLM-retry / long-term-memory / tool-level,
-// plus the Loop Engine catalog, per-loop status and custom-loop CRUD) on each
-// worker's qwenpaw app at :8088. The Controller proxies these fixed subpaths
-// so L1 humans / the workbench plugin can inspect and adjust a worker's
-// runtime behavior without reaching into the docker network.
+// QwenPaw exposes its runtime-tunable "running-config" (the workbench 5-tab
+// settings: ReAct / Loop / LLM-retry / long-term-memory / tool-level, plus
+// the Loop Engine catalog, per-loop status and custom-loop CRUD) on each
+// worker's qwenpaw app at :8088. The Controller proxies these fixed
+// subpaths so L1 humans / the workbench plugin can inspect and adjust a
+// worker's runtime behavior without reaching into the docker network.
+//
+// Upstream contract (verified against the pinned qwenpaw 2.0.1 wheel,
+// still present in 2.2.x):
+//   - GET/PUT /api/workspace/running-config  (the "runtime-config" subpath;
+//     active agent resolved by the app — an AgentTeams worker is
+//     single-agent). PUT replaces the whole running section, so the proxy
+//     performs read-merge-write for partial updates (below).
+//   - GET  /api/loops
+//   - GET  /api/loops/status
+//   - GET  /api/loops/custom
+//   - POST /api/loops/custom            (201; 409 on duplicate mode id)
+//   - PUT  /api/loops/custom/{mode}     (200; 404 not found; 422 on
+//     validation / id change)
+//   - DELETE /api/loops/custom/{mode}   (204; 404 not found)
 //
 // Design (aligned with the workbench 5-tab, #1216 safe-write pattern, #1206
 // notification infra):
@@ -19,12 +33,27 @@ package server
 //     team-scoped via findTeamMember + TeamMatches — workers outside the
 //     caller's teams hide as 404 (no existence probe), mirroring CheckpointHandler.
 //   - 5-tab field whitelist: an L2 PUT runtime-config only passes the
-//     whitelisted top-level keys (ReAct/Loop/LLM-retry/long-term-memory/
-//     tool-level); unknown keys are rejected, not silently dropped (#1216).
-//     L1 PUT is passed through untouched.
-//   - loop-change notification: any write to /loops/custom (create/update/
-//     delete) notifies the team room with @leader + @changer (Matrix
-//     m.mentions). Notification is fire-and-forget (never blocks the write).
+//     whitelisted top-level keys (the workbench 5-tab fields of the qwenpaw
+//     AgentsRunningConfig model); unknown keys are rejected, not silently
+//     dropped (#1216). L1 PUT passes every key except approval_level.
+//   - approval_level is owned by the #1216 endpoint
+//     (PUT /api/v1/workers/{name}/approval) with its own safety-write and
+//     audit semantics; runtime-config rejects it for every role.
+//   - read-merge-write: PUT runtime-config reads the current running-config
+//     from the worker, merges the submitted top-level keys onto it, and
+//     writes the merged whole object back — a partial (single-tab) update
+//     never clobbers unrelated persisted settings. An update that changes
+//     nothing skips the upstream write (idempotent no-op, 200).
+//   - upstream status mapping: 2xx pass through; actionable upstream 4xx
+//     (409 conflict, 422 validation, and the per-loop 404) pass through to
+//     the client; an upstream 404 on a collection/route subpath means the
+//     pinned worker build lacks the endpoint → 502 "API unavailable";
+//     connection failures and upstream 5xx → 502.
+//   - loop-change notification: a write to /loops/custom notifies the team
+//     room with @leader + @changer (Matrix m.mentions) ONLY after the
+//     upstream write succeeded (2xx); a rejected write (409/422/404/5xx)
+//     never notifies. Notification is fire-and-forget (never blocks the
+//     write).
 //
 // Embedded mode only (worker app reachable by container name); kube mode →
 // uniform 503 (no stable in-cluster worker DNS name, and a per-worker split
@@ -34,10 +63,10 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"context"
 	"net/http"
 	"sort"
 	"strings"
@@ -53,27 +82,34 @@ import (
 
 const (
 	// runtimeConfigProxyTimeout bounds each upstream call (slightly looser
-	// than checkpoints' 5s: a PUT may take a beat to validate+persist).
+	// than checkpoints' 5s: a PUT may take a beat to validate+persist; the
+	// merge flow performs two sequential calls, GET then PUT).
 	runtimeConfigProxyTimeout = 8 * time.Second
 	// maxRuntimeConfigBody caps the request/response body we buffer (1 MiB).
 	maxRuntimeConfigBody = 1 << 20
 )
 
 // l2RuntimeConfigWhitelist is the set of top-level keys an L2 caller may
-// write via PUT runtime-config — the workbench 5-tab fields. Everything else
-// is rejected for L2 (fail-closed). L1 is unrestricted.
+// write via PUT runtime-config — the workbench 5-tab fields of the qwenpaw
+// AgentsRunningConfig model (verified against the pinned 2.0.1 wheel; all
+// present in 2.2.x). Everything else is rejected for L2 (fail-closed).
+// L1 is unrestricted except approval_level (see guardApprovalLevel).
 var l2RuntimeConfigWhitelist = map[string]bool{
-	// ReAct 循环
-	"max_iterations": true,
-	"auto_continue":  true,
-	// Loop Engine
+	// ReAct 智能体 tab
+	"max_iters": true,
+	// 智能体 Loop 设置 tab
 	"loop": true,
-	// LLM 重试
-	"max_retries": true,
-	// 长期记忆
-	"memory": true,
-	// 工具级别 / 权限
-	"tool_level": true,
+	// LLM 自动重试 tab
+	"llm_retry_enabled": true,
+	"llm_max_retries":   true,
+	"llm_backoff_base":  true,
+	"llm_backoff_cap":   true,
+	// 长期记忆 tab
+	"memory_manager_backend":   true,
+	"reme_light_memory_config": true,
+	"adbpg_memory_config":      true,
+	// 工具执行级别 tab = approval_level: intentionally NOT whitelisted —
+	// it is owned by PUT /api/v1/workers/{name}/approval (#1216).
 }
 
 // loopNotifier is the minimal Matrix surface the handler needs for loop-change
@@ -132,6 +168,18 @@ func allowedSub(sub string) bool {
 	return false
 }
 
+// upstreamSub maps the controller subpath to the worker's qwenpaw app
+// subpath. Only runtime-config is remapped: the running-config contract
+// lives under /api/workspace/ (active agent resolved by the app). Verified
+// against the pinned qwenpaw 2.0.1 wheel (/api/runtime-config does not
+// exist in 2.0.1 — see the PR contract note).
+func upstreamSub(sub string) string {
+	if sub == "runtime-config" {
+		return "workspace/running-config"
+	}
+	return sub
+}
+
 // isWrite reports whether the HTTP method mutates worker state.
 func isWrite(method string) bool {
 	return method == http.MethodPut || method == http.MethodPost || method == http.MethodDelete
@@ -144,15 +192,34 @@ func isL1(caller *authpkg.CallerIdentity) bool {
 		caller.Role != authpkg.RoleHuman
 }
 
-// filterL2RuntimeConfig enforces the 5-tab whitelist for L2 writes: every
-// top-level key must be whitelisted, else the whole write is rejected.
-func filterL2RuntimeConfig(body []byte) error {
+// bodyHasApprovalLevel reports whether the submitted JSON object tries to
+// write approval_level. It is rejected for EVERY role via runtime-config:
+// that field is owned by the #1216 endpoint (PUT /api/v1/workers/{name}/approval)
+// with its own safety-write and audit semantics — a 400 "wrong endpoint",
+// not a permission error.
+func bodyHasApprovalLevel(body []byte) bool {
+	var m map[string]interface{}
+	if err := json.Unmarshal(body, &m); err != nil {
+		return false
+	}
+	_, ok := m["approval_level"]
+	return ok
+}
+
+// validateL2RuntimeConfig enforces the L2 write contract for PUT
+// runtime-config: the body must be a non-empty JSON object and every
+// top-level key must be whitelisted (fail-closed, #1216 pattern). Callers
+// must already have rejected approval_level via bodyHasApprovalLevel.
+func validateL2RuntimeConfig(body []byte) error {
 	var m map[string]interface{}
 	if err := json.Unmarshal(body, &m); err != nil {
 		return fmt.Errorf("runtime-config body must be a JSON object")
 	}
 	if m == nil {
-		return fmt.Errorf("runtime-config body must be a non-empty JSON object")
+		return fmt.Errorf("runtime-config body must be a JSON object")
+	}
+	if len(m) == 0 {
+		return fmt.Errorf("runtime-config update is empty")
 	}
 	var allowed []string
 	for k := range l2RuntimeConfigWhitelist {
@@ -221,7 +288,7 @@ func (h *RuntimeConfigHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read the request body (for writes) and apply the L2 whitelist.
+	// Read the request body (for writes) and apply the write contract.
 	var body []byte
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
@@ -232,10 +299,17 @@ func (h *RuntimeConfigHandler) Handle(w http.ResponseWriter, r *http.Request) {
 			httputil.WriteError(w, http.StatusBadRequest, "read request body: "+err.Error())
 			return
 		}
-		if sub == "runtime-config" && r.Method == http.MethodPut && !isL1(authpkg.CallerFromContext(r.Context())) {
-			if err := filterL2RuntimeConfig(body); err != nil {
-				httputil.WriteError(w, http.StatusForbidden, err.Error())
+		if sub == "runtime-config" && r.Method == http.MethodPut {
+			if bodyHasApprovalLevel(body) {
+				httputil.WriteError(w, http.StatusBadRequest,
+					"approval_level is not writable via runtime-config — use PUT /api/v1/workers/{name}/approval (#1216)")
 				return
+			}
+			if !isL1(authpkg.CallerFromContext(r.Context())) {
+				if err := validateL2RuntimeConfig(body); err != nil {
+					httputil.WriteError(w, http.StatusForbidden, err.Error())
+					return
+				}
 			}
 		}
 	default:
@@ -243,52 +317,165 @@ func (h *RuntimeConfigHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// PUT runtime-config is read-merge-write: the upstream PUT replaces the
+	// whole running section, so a partial (single-tab) body must be merged
+	// onto the current config first (see mergeRuntimeConfig).
+	var loopSubmitted bool
+	if sub == "runtime-config" && r.Method == http.MethodPut {
+		// L1 bodies are not pre-validated for shape; reject a non-object
+		// body here as 400 (a 502 from the merge flow would be wrong for
+		// a client error).
+		var submittedMap map[string]interface{}
+		if err := json.Unmarshal(body, &submittedMap); err != nil || submittedMap == nil {
+			httputil.WriteError(w, http.StatusBadRequest, "runtime-config body must be a JSON object")
+			return
+		}
+		loopSubmitted = submittedMap["loop"] != nil
+		merged, current, err := h.mergeRuntimeConfig(r, &worker, body)
+		if err != nil {
+			httputil.WriteError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		if merged == nil {
+			// Idempotent no-op: the update changes nothing. Return the
+			// current config as 200 without touching the worker.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(current)
+			return
+		}
+		body = merged
+	}
+
 	// Forward to the worker's qwenpaw app (fixed subpath, same base URL as
 	// CheckpointHandler: container-prefix + name + effective console port).
-	target := h.workerBaseURL(name, worker.Spec.Env) + "/api/" + sub
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
-	if err != nil {
-		httputil.WriteError(w, http.StatusInternalServerError, "build runtime-config request: "+err.Error())
-		return
-	}
-	if r.Method != http.MethodGet && r.Method != http.MethodHead && len(body) > 0 {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := h.http.Do(req)
+	target := h.workerBaseURL(name, worker.Spec.Env) + "/api/" + upstreamSub(sub)
+	resp, respBody, err := h.doUpstream(r, target, r.Method, body)
 	if err != nil {
 		httputil.WriteError(w, http.StatusBadGateway, "worker runtime-config API unreachable")
 		return
 	}
 	defer resp.Body.Close()
 
-	// Loop-change notification (fire-and-forget): any write to /loops/custom
-	// alerts the team room with @leader + @changer.
-	if isWrite(r.Method) && strings.HasPrefix(sub, "loops/custom") {
-		h.notifyLoopChange(r.Context(), name, r.Method, teamObj)
+	// Status mapping (see the header contract note): 2xx passes through;
+	// actionable upstream 4xx (409 conflict, 422 validation, and the
+	// per-loop 404 "Custom mode not found") pass through to the client;
+	// a route-level 404 (the pinned worker build lacks the endpoint) and
+	// any upstream 5xx become 502.
+	success := resp.StatusCode >= 200 && resp.StatusCode < 300
+	passThrough := success
+	if !passThrough && resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		passThrough = resp.StatusCode != http.StatusNotFound ||
+			strings.HasPrefix(sub, "loops/custom/")
 	}
-
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRuntimeConfigBody))
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusCreated:
-		w.Header().Set("Content-Type", "application/json")
+	if passThrough {
+		// Loop-change notification: only after a SUCCESSFUL (2xx) upstream
+		// write — a rejected write (409/422/404/5xx) never notifies.
+		if success && isWrite(r.Method) && strings.HasPrefix(sub, "loops/custom") {
+			verb := map[string]string{http.MethodPost: "新增", http.MethodPut: "修改", http.MethodDelete: "删除"}[r.Method]
+			h.notifyLoopChange(r.Context(), name, "custom loop", verb, teamObj)
+		}
+		if success && sub == "runtime-config" && r.Method == http.MethodPut && loopSubmitted {
+			h.notifyLoopChange(r.Context(), name, "loop 配置（running-config）", "修改", teamObj)
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "" {
+			w.Header().Set("Content-Type", ct)
+		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(respBody)
-	case http.StatusNotFound:
-		// QwenPaw build without the runtime-config router.
-		httputil.WriteError(w, http.StatusBadGateway, "runtime-config API unavailable (requires a QwenPaw build with /api/runtime-config)")
-	default:
-		errMsg := string(respBody)
-		if len(errMsg) > 500 {
-			errMsg = errMsg[:500]
-		}
-		httputil.WriteError(w, http.StatusBadGateway, fmt.Sprintf("runtime-config API error (status %d): %s", resp.StatusCode, errMsg))
+		return
 	}
+	if resp.StatusCode == http.StatusNotFound {
+		// QwenPaw build without the running-config/loops router.
+		httputil.WriteError(w, http.StatusBadGateway,
+			"runtime-config API unavailable (requires a QwenPaw build with /api/workspace/running-config and /api/loops*)")
+		return
+	}
+	if len(respBody) > 500 {
+		respBody = respBody[:500]
+	}
+	httputil.WriteError(w, http.StatusBadGateway, fmt.Sprintf("worker runtime-config error (upstream status %d): %s",
+		resp.StatusCode, string(respBody)))
 }
 
-// notifyLoopChange alerts the worker's team room about a custom-loop write,
-// mentioning the team leader and the changer. Non-fatal: any failure is
-// swallowed so the config write itself is never blocked by notification.
-func (h *RuntimeConfigHandler) notifyLoopChange(ctx context.Context, workerName, method string, team *v1beta1.Team) {
+// doUpstream performs one upstream call with the proxy timeout and returns
+// the response plus a fully-read (capped) body.
+func (h *RuntimeConfigHandler) doUpstream(r *http.Request, target, method string, body []byte) (*http.Response, []byte, error) {
+	var reader io.Reader
+	if len(body) > 0 {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(r.Context(), method, target, reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	if method != http.MethodGet && method != http.MethodHead && len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := h.http.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxRuntimeConfigBody))
+	if err != nil {
+		resp.Body.Close()
+		return nil, nil, err
+	}
+	return resp, respBody, nil
+}
+
+// mergeRuntimeConfig performs the read-merge-write flow for a PUT
+// runtime-config: fetch the current running-config, merge the submitted
+// top-level keys onto it, and — only when something changed — write the
+// merged whole object back (the upstream PUT replaces the entire running
+// section; a bare forward of a partial body would clobber unrelated
+// settings). It returns the body to forward; a nil return with a nil error
+// is the idempotent no-op (caller returns the current config as 200).
+func (h *RuntimeConfigHandler) mergeRuntimeConfig(r *http.Request, worker *v1beta1.Worker, submitted []byte) ([]byte, []byte, error) {
+	baseURL := h.workerBaseURL(worker.Name, worker.Spec.Env) + "/api/" + upstreamSub("runtime-config")
+
+	// 1. Read the current running-config.
+	curResp, curBody, err := h.doUpstream(r, baseURL, http.MethodGet, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read current runtime-config: unreachable")
+	}
+	defer curResp.Body.Close()
+	if curResp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("read current runtime-config: upstream status %d", curResp.StatusCode)
+	}
+	var current map[string]interface{}
+	if err := json.Unmarshal(curBody, &current); err != nil || current == nil {
+		return nil, nil, fmt.Errorf("read current runtime-config: response is not a JSON object")
+	}
+
+	// 2. Merge: submitted top-level keys replace their current values;
+	//    absent keys are preserved.
+	var submittedMap map[string]interface{}
+	if err := json.Unmarshal(submitted, &submittedMap); err != nil {
+		return nil, nil, fmt.Errorf("parse submitted update: not a JSON object")
+	}
+	merged := make(map[string]interface{}, len(current)+len(submittedMap))
+	for k, v := range current {
+		merged[k] = v
+	}
+	for k, v := range submittedMap {
+		merged[k] = v
+	}
+
+	curBytes, _ := json.Marshal(current)
+	mergedBytes, _ := json.Marshal(merged)
+	if bytes.Equal(curBytes, mergedBytes) {
+		return nil, curBytes, nil // no-op: nothing changed
+	}
+	return mergedBytes, curBytes, nil
+}
+
+// notifyLoopChange alerts the worker's team room about a loop change (a
+// custom-loop CRUD write or a runtime-config PUT that changed the loop
+// section), mentioning the team leader and the changer. Called only after a
+// successful (2xx) upstream write. Non-fatal: any failure is swallowed so
+// the config write itself is never blocked by notification.
+func (h *RuntimeConfigHandler) notifyLoopChange(ctx context.Context, workerName, target, verb string, team *v1beta1.Team) {
 	if h.matrix == nil || team == nil {
 		return
 	}
@@ -296,11 +483,6 @@ func (h *RuntimeConfigHandler) notifyLoopChange(ctx context.Context, workerName,
 	if room == "" {
 		return
 	}
-	verb := map[string]string{
-		http.MethodPost:   "新增",
-		http.MethodPut:    "修改",
-		http.MethodDelete: "删除",
-	}[method]
 	if verb == "" {
 		return
 	}
@@ -325,8 +507,8 @@ func (h *RuntimeConfigHandler) notifyLoopChange(ctx context.Context, workerName,
 	if len(mentions) == 0 {
 		return
 	}
-	body := fmt.Sprintf("⚠️ Loop 变更：%s 的 custom loop 被%s（runtime-config API）。@%s @%s 请确认。",
-		workerName, verb, leaderName, changerName)
+	body := fmt.Sprintf("⚠️ Loop 变更：%s 的%s被%s（runtime-config API）。@%s @%s 请确认。",
+		workerName, target, verb, leaderName, changerName)
 	_ = h.matrix.SendNotification(ctx, room, body, mentions)
 }
 
