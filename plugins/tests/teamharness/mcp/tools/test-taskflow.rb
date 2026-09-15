@@ -1788,6 +1788,68 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     if len([ev for ev in matrix["events"] if f"attention-{cl_tid}-escalation-" in ev["path"]]) != 0:
         raise AssertionError("rejected close must not ping the room")
 
+    # --- request_attention pending-record retry: one record, one event
+    #     (PR review 2026-09-15 round 3). A record whose first sync failed
+    #     has no eventId yet; the retry must reuse it (re-sync, then send
+    #     exactly one event) — never append a second record or a second
+    #     room event. ---
+    pt_tid = "att-pending-retry"
+    _lifecycle_setup(pt_tid)
+    pt_mirror = f"mirror {workspace}/shared/tasks/{pt_tid}/ mock/shared/tasks/{pt_tid}/"
+    pt_mirror_before = pathlib.Path("#{log_path}").read_text(encoding="utf-8").count(pt_mirror)
+    os.environ["TEAMHARNESS_TEST_FAIL_SYNC_TASK"] = pt_tid
+    try:
+        pt1 = payload("taskflow", {
+            "role": "worker",
+            "action": "request_attention",
+            "payload": {"taskId": pt_tid, "kind": "decision", "question": "Disk full - which file?"},
+        })
+    finally:
+        os.environ.pop("TEAMHARNESS_TEST_FAIL_SYNC_TASK", None)
+    if pt1.get("ok") is not False or pt1.get("retryable") is not True:
+        raise AssertionError(f"first sync failure must be a retryable failure: {pt1!r}")
+    pt_log1 = pathlib.Path("#{log_path}").read_text(encoding="utf-8")
+    if pt_log1.count(pt_mirror) != pt_mirror_before + 1:
+        raise AssertionError("the failed first attempt must attempt the shared sync (mc mirror)")
+    pt_meta1 = json.loads(
+        (pathlib.Path("#{workspace}") / f"shared/tasks/{pt_tid}/meta.json").read_text(encoding="utf-8")
+    )
+    pt_pending1 = [it for it in (pt_meta1.get("attention") or []) if it.get("kind") == "decision"]
+    if len(pt_pending1) != 1 or pt_pending1[0].get("resolved") or pt_pending1[0].get("eventId"):
+        raise AssertionError(f"exactly one pending (no eventId) record must remain after the failed sync: {pt_meta1.get('attention')!r}")
+    pt2 = payload("taskflow", {
+        "role": "worker",
+        "action": "request_attention",
+        "payload": {"taskId": pt_tid, "kind": "decision", "question": "Disk full - which file?"},
+    })
+    if not pt2.get("ok") or pt2.get("synced") is not True:
+        raise AssertionError(f"pending-record retry after recovery must succeed: {pt2!r}")
+    pt_ev = ((pt2.get("attention") or {}).get("notification") or {}).get("eventId")
+    if (pt2.get("attention") or {}).get("notification", {}).get("sent") is not True or not pt_ev:
+        raise AssertionError(f"pending-record retry must send exactly one event: {pt2!r}")
+    pt_meta2 = json.loads(
+        (pathlib.Path("#{workspace}") / f"shared/tasks/{pt_tid}/meta.json").read_text(encoding="utf-8")
+    )
+    pt_records2 = [it for it in (pt_meta2.get("attention") or []) if it.get("kind") == "decision"]
+    if len(pt_records2) != 1 or pt_records2[0].get("eventId") != pt_ev:
+        raise AssertionError(f"the retry must keep one record carrying the event id: {pt_meta2.get('attention')!r}")
+    if len([ev for ev in matrix["events"] if f"attention-{pt_tid}-decision-" in ev["path"]]) != 1:
+        raise AssertionError("failed first attempt + recovery retry must yield exactly one room event")
+    pt3 = payload("taskflow", {
+        "role": "worker",
+        "action": "request_attention",
+        "payload": {"taskId": pt_tid, "kind": "decision", "question": "Disk full - which file?"},
+    })
+    if not pt3.get("ok") or (pt3.get("attention") or {}).get("reused") is not True:
+        raise AssertionError(f"the third call must reuse the notified record: {pt3!r}")
+    if len([ev for ev in matrix["events"] if f"attention-{pt_tid}-decision-" in ev["path"]]) != 1:
+        raise AssertionError("reuse after recovery must not send a second event")
+    pt_meta3 = json.loads(
+        (pathlib.Path("#{workspace}") / f"shared/tasks/{pt_tid}/meta.json").read_text(encoding="utf-8")
+    )
+    if len([it for it in (pt_meta3.get("attention") or []) if it.get("kind") == "decision"]) != 1:
+        raise AssertionError(f"reuse must not create a second record: {pt_meta3.get('attention')!r}")
+
     # --- complete_project: PROJECT_COMPLETED event + idempotent retry. ---
     comp_tid = "comp-task"
     comp_pid = _lifecycle_setup(comp_tid)

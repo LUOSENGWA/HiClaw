@@ -180,11 +180,18 @@ auditable event:
 - **State**: appends an `attention` record to task meta
   (`kind / question / attempt / requestedAt / resolved / eventId?`).
   Re-requesting the same `kind` while an unresolved record exists
-  reuses the recorded event (no duplicate ping); a new kind or a new
+  reuses the recorded event (no duplicate ping); a **pending** record
+  (created but its first sync failed — no `eventId` yet) is reused on
+  retry: the retry re-syncs and sends exactly one event for it, never
+  a second record; a new kind or a new
   attempt number gets a fresh event (txn
   `attention-<task-id>-<kind>-<attempt>`).
 - **Sync-first** like submit: a failed sync withholds the notification
-  and returns a retryable failure.
+  and returns a retryable failure. A failed *first* sync leaves a
+  **pending record** (no `eventId` yet); the retry reuses it — re-sync,
+  then send and persist exactly one event (deterministic txn) — and
+  must never create a second record or a second event (2026-09-15
+  round-3 review).
 - **Close is sync-first too** (2026-09-15 review): an explicit
   `resolved: true` marks the record resolved locally, pushes the task
   dir, and only then reports success. A failed close-sync returns a
@@ -277,6 +284,8 @@ v2 additions (issue #1229):
 10. **request_attention**: in-flight `approval` ping sends the
     `ATTENTION_APPROVAL` line with leader + human mentions; an
     unresolved same-kind repeat is idempotent (no second event); a
+    same-kind retry after a failed first sync reuses the pending
+    record (one record, one event); a
     different kind is not reused; a terminal (cancelled) task is
     rejected; `accept_task_result` resolves the outstanding records.
     Close contract (2026-09-15 review): a `resolved: true` close is

@@ -5564,13 +5564,22 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     },
                     "synced": True,
                 }
+            # One open loop per kind: an unresolved same-kind record is
+            # the loop. An already-notified one (has eventId) is a plain
+            # reuse — no new ping. A pending one (created but its first
+            # sync failed, so it has no eventId yet) is retried: re-sync
+            # and then send/persist exactly one event for it (deterministic
+            # transaction id); a retry must never append a second record
+            # or send a second event.
+            pending = None
             for existing in reversed(attention):
                 if (
-                    isinstance(existing, dict)
-                    and not existing.get("resolved")
-                    and str(existing.get("kind") or "") == kind
-                    and existing.get("eventId")
+                    not isinstance(existing, dict)
+                    or existing.get("resolved")
+                    or str(existing.get("kind") or "") != kind
                 ):
+                    continue
+                if existing.get("eventId"):
                     return {
                         "ok": True,
                         "tool": "taskflow",
@@ -5587,35 +5596,58 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         },
                         "synced": True,
                     }
-            attempt = sum(
-                1 for item in attention if isinstance(item, dict) and item.get("kind") == kind
-            ) + 1
-            record: dict[str, Any] = {
-                "kind": kind,
-                "question": question[:500],
-                "attempt": attempt,
-                "requestedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                # explicit resolved=true never reaches the new-record path
-                # (handled above): a freshly raised record is always open.
-                "resolved": False,
-            }
-            attention.append(record)
-            task["attention"] = attention
-            _write_task(arguments, task)
-            synced = _sync_task(arguments, task_id, exclude=["spec.md", "base/"])
-            if not synced:
-                return {
-                    "ok": False,
-                    "retryable": True,
-                    "tool": "taskflow",
-                    "action": action,
-                    "task": task,
-                    "error": (
-                        "shared storage sync failed after request_attention; the "
-                        "attention notification was withheld. Local attention state "
-                        "is recorded — retry request_attention (idempotent)."
-                    ),
+                if pending is None:
+                    pending = existing
+            if pending is not None:
+                record = pending
+                attempt = int(record.get("attempt") or 1)
+                question = str(record.get("question") or question)
+                synced = _sync_task(arguments, task_id, exclude=["spec.md", "base/"])
+                if not synced:
+                    return {
+                        "ok": False,
+                        "retryable": True,
+                        "tool": "taskflow",
+                        "action": action,
+                        "task": task,
+                        "error": (
+                            "shared storage sync failed while retrying the pending "
+                            f"attention record of kind '{kind}'; the attention "
+                            "notification was withheld. The pending record is reused "
+                            "on retry (idempotent: no second record, no second "
+                            "event)."
+                        ),
+                    }
+            else:
+                attempt = sum(
+                    1 for item in attention if isinstance(item, dict) and item.get("kind") == kind
+                ) + 1
+                record: dict[str, Any] = {
+                    "kind": kind,
+                    "question": question[:500],
+                    "attempt": attempt,
+                    "requestedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    # explicit resolved=true never reaches the new-record path
+                    # (handled above): a freshly raised record is always open.
+                    "resolved": False,
                 }
+                attention.append(record)
+                task["attention"] = attention
+                _write_task(arguments, task)
+                synced = _sync_task(arguments, task_id, exclude=["spec.md", "base/"])
+                if not synced:
+                    return {
+                        "ok": False,
+                        "retryable": True,
+                        "tool": "taskflow",
+                        "action": action,
+                        "task": task,
+                        "error": (
+                            "shared storage sync failed after request_attention; the "
+                            "attention notification was withheld. Local attention state "
+                            "is recorded — retry request_attention (idempotent)."
+                        ),
+                    }
             room_id = str(task.get("room_id") or "").strip()
             if not room_id:
                 notification = {
