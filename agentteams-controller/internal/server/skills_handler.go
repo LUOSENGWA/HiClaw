@@ -35,12 +35,13 @@ const globalSkillsPrefix = "agents/global/skills/"
 type SkillInfo struct {
 	Name         string             `json:"name"`
 	Description  string             `json:"description,omitempty"`
-	Source       string             `json:"source"`                 // "builtin" | "shared"
-	Version      string             `json:"version,omitempty"`      // builtin only: SKILL.md frontmatter version
+	Source       string             `json:"source"`                 // "builtin" | "shared" | "plugin"
+	Version      string             `json:"version,omitempty"`      // builtin: SKILL.md frontmatter version; plugin: frontmatter version, falling back to the plugin package version
 	Requirements *SkillRequirements `json:"requirements,omitempty"` // builtin only: frontmatter requires block
 	UpdatedAt    string             `json:"updated_at,omitempty"`   // shared only: last listing timestamp (RFC3339 UTC)
 	Agents       []string           `json:"agents,omitempty"`       // builtin only: template dirs providing the skill
-	Runtimes     []string           `json:"runtimes,omitempty"`     // runtimes for which the skill is available
+	Plugin       string             `json:"plugin,omitempty"`       // plugin only: the plugin package providing the skill
+	Runtimes     []string           `json:"runtimes,omitempty"`     // runtimes for which the skill is available (omitted for plugin skills: availability follows the plugin's deployment)
 }
 
 // SkillRequirements mirrors the SKILL.md "requires" declaration
@@ -68,19 +69,22 @@ type SkillListResponse struct {
 // SkillsHandler serves the read-only skill catalog: built-in skills from the
 // controller's agent template directories (availability per runtime derived
 // from service.BuiltinAgentDir, the same function the Deployer uses to seed
-// workers) plus the deployment-wide shared skills staged under
+// workers), plugin-provided skills from the bundled plugin packages (their
+// plugin.yaml manifests — the same source the plugin build packages into the
+// worker images), plus the deployment-wide shared skills staged under
 // agents/global/skills/. It never reads skill content beyond the SKILL.md
-// frontmatter (name/description/version/requires) of builtin skills; the
-// shared half is name + listing timestamp by design (list-on-read, no
-// per-skill object fetches — shared SKILL.md metadata such as description,
+// frontmatter (name/description/version/requires) of builtin and plugin
+// skills; the shared half is name + listing timestamp by design (list-on-read,
+// no per-skill object fetches — shared SKILL.md metadata such as description,
 // version, and requires is a v2 candidate).
 type SkillsHandler struct {
 	workerAgentDir string
+	pluginDir      string
 	oss            oss.StorageClient
 }
 
-func NewSkillsHandler(workerAgentDir string, o oss.StorageClient) *SkillsHandler {
-	return &SkillsHandler{workerAgentDir: workerAgentDir, oss: o}
+func NewSkillsHandler(workerAgentDir, pluginDir string, o oss.StorageClient) *SkillsHandler {
+	return &SkillsHandler{workerAgentDir: workerAgentDir, pluginDir: pluginDir, oss: o}
 }
 
 // ListSkills handles GET /api/v1/skills.
@@ -140,6 +144,23 @@ func (h *SkillsHandler) ListSkills(w http.ResponseWriter, r *http.Request) {
 				Runtimes:     append([]string{}, tmpl.runtimes...),
 			}
 		}
+	}
+
+	// Plugin half: skills shipped inside plugin packages, discovered from
+	// each package's plugin.yaml manifest — the same source the plugin
+	// build packages into the worker images — not from worker state. The
+	// plugin dir is baked into the controller image (Dockerfile COPY); a
+	// missing dir or a manifest without a skills block degrades to zero
+	// plugin entries rather than failing the catalog. Builtin names win on
+	// collision (as with the shared half); plugin entries carry no
+	// Runtimes/Agents (availability follows the plugin's deployment, not
+	// per-worker assignment) and are read-only by construction (the catalog
+	// has no write path).
+	for _, ps := range h.pluginSkills() {
+		if _, ok := skills[ps.Name]; ok {
+			continue // builtin (or earlier plugin) wins on collision
+		}
+		skills[ps.Name] = ps
 	}
 
 	// Shared half: directory entries under agents/global/skills/. A listing
@@ -221,6 +242,137 @@ func (h *SkillsHandler) builtinTemplates() []builtinTemplate {
 		t := byDir[dir]
 		sort.Strings(t.runtimes)
 		out = append(out, *t)
+	}
+	return out
+}
+
+// pluginSkill is one declared skill of a plugin package: the manifest entry
+// (id + path) plus the SKILL.md frontmatter it resolves to.
+type pluginSkill struct {
+	Plugin  string // plugin package name (manifest metadata.name, else dir name)
+	ID      string // manifest id (fallback catalog name)
+	Path    string // manifest path, relative to the plugin dir
+	Version string // plugin package version (fallback catalog version)
+	Dir     string // plugin dir (absolute, for SKILL.md lookup)
+}
+
+// pluginSkills reads the bundled plugin packages under h.pluginDir and
+// returns one SkillInfo per manifest-declared skill. Discovery is
+// manifest-driven: a skill appears iff its plugin's plugin.yaml declares
+// it (unlisted SKILL.md directories do not leak into the catalog).
+// The dir is read-on-request like the template dirs: a missing dir, a
+// malformed manifest, or a missing SKILL.md degrades that plugin (or that
+// one skill) to absence, never an error.
+func (h *SkillsHandler) pluginSkills() []*SkillInfo {
+	if h.pluginDir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(h.pluginDir)
+	if err != nil {
+		return nil // dir not baked into this image/controller layout
+	}
+	var out []*SkillInfo
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		pluginDir := filepath.Join(h.pluginDir, entry.Name())
+		manifest, ok := parsePluginManifest(filepath.Join(pluginDir, "plugin.yaml"))
+		if !ok {
+			continue // not a plugin package
+		}
+		name := manifest.Name
+		if name == "" {
+			name = entry.Name()
+		}
+		for _, ps := range manifestSkills(manifest, pluginDir, name) {
+			if ps.Path == "" {
+				continue
+			}
+			name, description, version, _ := parseSkillFrontmatter(filepath.Join(ps.Dir, ps.Path, "SKILL.md"))
+			if name == "" {
+				name = ps.ID
+			}
+			if version == "" {
+				version = ps.Version
+			}
+			out = append(out, &SkillInfo{
+				Name:        name,
+				Description: description,
+				Version:     version,
+				Source:      "plugin",
+				Plugin:      ps.Plugin,
+			})
+		}
+	}
+	return out
+}
+
+// pluginManifest is the catalog-relevant slice of a plugin.yaml
+// (kind: AgentTeamPlugin): the package identity and its declared skills.
+type pluginManifest struct {
+	Name     string
+	Version  string
+	manifest map[string]any
+}
+
+// parsePluginManifest loads plugin.yaml and returns the manifest when the
+// file parses; ok=false for a missing/unreadable file or a non-map YAML
+// document (the caller skips the directory — it is not a plugin package).
+func parsePluginManifest(path string) (pluginManifest, bool) {
+	var m pluginManifest
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return m, false
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return m, false
+	}
+	if meta, ok := doc["metadata"].(map[string]any); ok {
+		if s, ok := meta["name"].(string); ok {
+			m.Name = s
+		}
+		if s, ok := meta["version"].(string); ok {
+			m.Version = s
+		}
+	}
+	m.manifest = doc
+	return m, true
+}
+
+// manifestSkills expands the manifest's skills block
+// (skills: {group: [{id, path, roles...}, ...]}) into positioned entries.
+// Unknown groups and malformed entries are skipped, not fatal.
+func manifestSkills(m pluginManifest, pluginDir, pluginName string) []pluginSkill {
+	var out []pluginSkill
+	skillsBlock, ok := m.manifest["skills"].(map[string]any)
+	if !ok {
+		return out
+	}
+	for _, group := range skillsBlock {
+		items, ok := group.([]any)
+		if !ok {
+			continue
+		}
+		for _, item := range items {
+			entry, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			id, _ := entry["id"].(string)
+			path, _ := entry["path"].(string)
+			if id == "" || path == "" {
+				continue
+			}
+			out = append(out, pluginSkill{
+				Plugin:  pluginName,
+				ID:      id,
+				Path:    path,
+				Version: m.Version,
+				Dir:     pluginDir,
+			})
+		}
 	}
 	return out
 }

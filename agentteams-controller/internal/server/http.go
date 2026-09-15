@@ -37,6 +37,7 @@ type ServerDeps struct {
 
 	DefaultWorkerRuntime string // install-time default for Worker create requests
 	WorkerAgentDir       string // source of builtin agent templates (skill catalog)
+	PluginDir            string // bundled plugin packages (skill catalog plugin source); empty = no plugin entries
 }
 
 // HTTPServer serves the unified controller REST API.
@@ -168,7 +169,7 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	mux.Handle("PATCH /api/v1/workers/{name}/tools/{tool}", mw.RequireAuthz(authpkg.ActionWorkerTools, "worker", nameFn)(http.HandlerFunc(th.patchWorkerTool)))
 
 	// --- Skill catalog (read-only: builtin skills per runtime + shared skills under agents/global/skills/) ---
-	skh := NewSkillsHandler(deps.WorkerAgentDir, deps.OSS)
+	skh := NewSkillsHandler(deps.WorkerAgentDir, deps.PluginDir, deps.OSS)
 	mux.Handle("GET /api/v1/skills", mw.RequireAuthz(authpkg.ActionList, "skills", nil)(http.HandlerFunc(skh.ListSkills)))
 
 	// --- Worker channels (channel configuration; proxy to the worker's qwenpaw app) ---
