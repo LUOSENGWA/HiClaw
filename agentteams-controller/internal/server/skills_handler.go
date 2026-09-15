@@ -222,10 +222,10 @@ const maxSkillUploadBytes = 64 << 20
 
 var skillNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
 
-// validateSkillName enforces the skill-directory naming rule: lowercase
+// validateSkillDirectoryName enforces the skill-directory naming rule: lowercase
 // kebab-case, at most 64 characters (the name doubles as the storage
 // directory name, so it must stay a safe path component).
-func validateSkillName(name string) error {
+func validateSkillDirectoryName(name string) error {
 	if !skillNameRe.MatchString(name) {
 		return fmt.Errorf("skill name %q is invalid: must match %s", name, skillNameRe.String())
 	}
@@ -306,7 +306,7 @@ func extractSkillZip(data []byte) (name string, files map[string][]byte, err err
 	if name == "" {
 		return "", nil, errors.New("the zip is empty")
 	}
-	if err := validateSkillName(name); err != nil {
+	if err := validateSkillDirectoryName(name); err != nil {
 		return "", nil, err
 	}
 	skillMD, ok := out["SKILL.md"]
