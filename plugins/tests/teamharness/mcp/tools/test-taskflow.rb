@@ -1717,6 +1717,77 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     if att5.get("ok"):
         raise AssertionError(f"request_attention must reject a terminal task: {att5!r}")
 
+    # --- request_attention close: sync-first + first-call rejection
+    #     (PR review 2026-09-15). A close must not report success before
+    #     the resolved state is durable in shared storage, and a
+    #     resolved=true call with no same-kind record must be rejected
+    #     instead of creating a pre-resolved record that still pings. ---
+    cl_tid = "att-close-sync"
+    cl_pid = _lifecycle_setup(cl_tid)
+    cl1 = payload("taskflow", {
+        "role": "worker",
+        "action": "request_attention",
+        "payload": {"taskId": cl_tid, "kind": "decision", "question": "Storage full - drop or keep?"},
+    })
+    cl1_ev = ((cl1.get("attention") or {}).get("notification") or {}).get("eventId")
+    if not cl1.get("ok") or (cl1.get("attention") or {}).get("notification", {}).get("sent") is not True or not cl1_ev:
+        raise AssertionError(f"close-test setup ping must be sent: {cl1!r}")
+    cl_mirror = f"mirror {workspace}/shared/tasks/{cl_tid}/ mock/shared/tasks/{cl_tid}/"
+    cl_mirror_before = pathlib.Path("#{log_path}").read_text(encoding="utf-8").count(cl_mirror)
+    os.environ["TEAMHARNESS_TEST_FAIL_SYNC_TASK"] = cl_tid
+    try:
+        cl_close = payload("taskflow", {
+            "role": "worker",
+            "action": "request_attention",
+            "payload": {"taskId": cl_tid, "kind": "decision", "question": "Storage full - drop or keep?", "resolved": True},
+        })
+    finally:
+        os.environ.pop("TEAMHARNESS_TEST_FAIL_SYNC_TASK", None)
+    if cl_close.get("ok") is not False:
+        raise AssertionError(f"close with a failed sync must not report ok: {cl_close!r}")
+    if cl_close.get("retryable") is not True or cl_close.get("synced") is not False:
+        raise AssertionError(f"close with a failed sync must be a retryable failure: {cl_close!r}")
+    if len([ev for ev in matrix["events"] if f"attention-{cl_tid}-decision-" in ev["path"]]) != 1:
+        raise AssertionError("closing an open loop must not send a new event")
+    cl_log = pathlib.Path("#{log_path}").read_text(encoding="utf-8")
+    if cl_log.count(cl_mirror) != cl_mirror_before + 1:
+        raise AssertionError("a close must attempt the shared-storage sync (mc mirror) even when it fails")
+    cl_close2 = payload("taskflow", {
+        "role": "worker",
+        "action": "request_attention",
+        "payload": {"taskId": cl_tid, "kind": "decision", "question": "Storage full - drop or keep?", "resolved": True},
+    })
+    if not cl_close2.get("ok") or cl_close2.get("synced") is not True:
+        raise AssertionError(f"close retry after storage recovery must succeed: {cl_close2!r}")
+    if (cl_close2.get("attention") or {}).get("resolved") is not True:
+        raise AssertionError(f"close retry must report the loop resolved: {cl_close2!r}")
+    if (cl_close2.get("attention") or {}).get("eventId") != cl1_ev:
+        raise AssertionError(f"close retry must close the original event: {cl_close2!r}")
+    cl_shared2 = json.loads(
+        (pathlib.Path("#{workspace}") / f"shared/tasks/{cl_tid}/meta.json").read_text(encoding="utf-8")
+    )
+    cl_unresolved = [it for it in (cl_shared2.get("attention") or []) if not it.get("resolved")]
+    if cl_unresolved:
+        raise AssertionError(f"shared meta.json must be resolved after the close retry: {cl_shared2.get('attention')!r}")
+    if len([ev for ev in matrix["events"] if f"attention-{cl_tid}-decision-" in ev["path"]]) != 1:
+        raise AssertionError("close retry must not send a second event")
+    if len([it for it in (cl_shared2.get("attention") or []) if it.get("kind") == "decision"]) != 1:
+        raise AssertionError(f"close retry must not create a new record: {cl_shared2.get('attention')!r}")
+    cl3 = payload("taskflow", {
+        "role": "worker",
+        "action": "request_attention",
+        "payload": {"taskId": cl_tid, "kind": "escalation", "question": "Never asked.", "resolved": True},
+    })
+    if cl3.get("ok") or "no attention record" not in str(cl3.get("error", "")):
+        raise AssertionError(f"first-call resolved=true must be rejected: {cl3!r}")
+    cl_meta3 = json.loads(
+        (pathlib.Path("#{workspace}") / f"shared/tasks/{cl_tid}/meta.json").read_text(encoding="utf-8")
+    )
+    if [it for it in (cl_meta3.get("attention") or []) if it.get("kind") == "escalation"]:
+        raise AssertionError(f"rejected close must not record anything: {cl_meta3.get('attention')!r}")
+    if len([ev for ev in matrix["events"] if f"attention-{cl_tid}-escalation-" in ev["path"]]) != 0:
+        raise AssertionError("rejected close must not ping the room")
+
     # --- complete_project: PROJECT_COMPLETED event + idempotent retry. ---
     comp_tid = "comp-task"
     comp_pid = _lifecycle_setup(comp_tid)

@@ -194,4 +194,7 @@ submission.
 While the task is still in flight and you need a human decision (approval /
 decision / escalation) instead of guessing, call `taskflow` with
 `action: request_attention` (payload: `kind`, `question`). Do not rely on
-the human noticing an ambient room message.
+the human noticing an ambient room message. Once the decision is made,
+close the loop by calling again with the same `kind` plus
+`resolved: true` — closing needs an existing record of that kind (it is
+rejected without one) and reuses the original event (no new ping).

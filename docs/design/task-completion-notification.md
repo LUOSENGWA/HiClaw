@@ -185,10 +185,19 @@ auditable event:
   `attention-<task-id>-<kind>-<attempt>`).
 - **Sync-first** like submit: a failed sync withholds the notification
   and returns a retryable failure.
+- **Close is sync-first too** (2026-09-15 review): an explicit
+  `resolved: true` marks the record resolved locally, pushes the task
+  dir, and only then reports success. A failed close-sync returns a
+  retryable failure; the idempotent retry re-syncs the resolved state
+  (no new ping, no new record). A `resolved: true` call with **no
+  same-kind record** is rejected (error, nothing recorded, no ping):
+  there is no open loop to close, and pre-creating a resolved record
+  would still send the new attention ping, contradicting the "close
+  without a new ping" contract.
 - **Resolution**: `accept_task_result` marks **all** unresolved
   attention records on the task `resolved: true` (the leader's decision
   closed the loop), or an explicit `resolved: true` call closes a
-  record early.
+  record early (sync-first, see above).
 
 Routing-salience note: v1 delivers all attention in the task room
 (room @mentions). A dedicated DM step for humans (higher salience) is
@@ -270,6 +279,12 @@ v2 additions (issue #1229):
     unresolved same-kind repeat is idempotent (no second event); a
     different kind is not reused; a terminal (cancelled) task is
     rejected; `accept_task_result` resolves the outstanding records.
+    Close contract (2026-09-15 review): a `resolved: true` close is
+    sync-first — a failed close-sync returns `ok: false` /
+    `retryable: true` and the idempotent retry re-syncs the resolved
+    state (no new ping, no new record); a first call with
+    `resolved: true` and no same-kind record is rejected (no phantom
+    record, no ping).
 11. **PROJECT_COMPLETED**: `complete_project` sends the
     `PROJECT_COMPLETED` line with leader + human mentions; a retried
     `complete_project` reuses the recorded event.

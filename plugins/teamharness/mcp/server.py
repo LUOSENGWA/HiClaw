@@ -505,7 +505,10 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "description": (
                         "Task lifecycle operation. request_attention pulls a human "
                         "decision (kind: approval / decision / escalation / other) "
-                        "out of the group chat while the task is still in flight."
+                        "out of the group chat while the task is still in flight. "
+                        "Pass payload.resolved=true to close the open record of "
+                        "that kind (no new ping); the call is rejected when no "
+                        "record of that kind exists."
                     ),
                 },
                 "projectId": {
@@ -5480,8 +5483,87 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             # Idempotent per kind while unresolved: re-requesting the same
             # kind before it was resolved reuses the recorded event instead
             # of pinging the room again. An explicit resolved=true closes
-            # the open loop early (no new ping).
+            # the open loop early (no new ping) and is sync-first like
+            # submit_task: the resolved state must land in shared storage
+            # before the caller is told the loop is closed.
             explicit_resolve = bool(payload.get("resolved", False))
+            if explicit_resolve:
+                # Target the most recent unresolved same-kind record. If
+                # every same-kind record is already resolved, re-affirm the
+                # latest one: this is the idempotent retry path after a
+                # sync failure on a previous close (the local record is
+                # already resolved, so the retry must re-sync rather than
+                # raise a new record or ping). A call with no same-kind
+                # record at all is rejected — there is no open loop to
+                # close, and pre-creating a resolved record would still
+                # ping the room, contradicting "close without a new ping".
+                target = None
+                for existing in reversed(attention):
+                    if (
+                        isinstance(existing, dict)
+                        and str(existing.get("kind") or "") == kind
+                        and not existing.get("resolved")
+                    ):
+                        target = existing
+                        break
+                if target is None:
+                    for existing in reversed(attention):
+                        if (
+                            isinstance(existing, dict)
+                            and str(existing.get("kind") or "") == kind
+                            and existing.get("eventId")
+                        ):
+                            target = existing
+                            break
+                if target is None:
+                    raise ValueError(
+                        f"no attention record of kind '{kind}' to resolve; "
+                        "call request_attention without resolved to raise one"
+                    )
+                target["resolved"] = True
+                _write_task(arguments, task)
+                synced = _sync_task(arguments, task_id, exclude=["spec.md", "base/"])
+                event_id = str(target.get("eventId") or "") or None
+                if not synced:
+                    return {
+                        "ok": False,
+                        "retryable": True,
+                        "tool": "taskflow",
+                        "action": action,
+                        "task": task,
+                        "attention": {
+                            "kind": kind,
+                            "resolved": True,
+                            "eventId": event_id,
+                        },
+                        "synced": False,
+                        "statePersisted": True,
+                        "error": (
+                            "shared storage sync failed after the attention "
+                            f"record of kind '{kind}' was resolved locally; "
+                            "the shared meta.json may still show it "
+                            "unresolved. Retry request_attention with the "
+                            "same payload (idempotent: no new ping is sent)."
+                        ),
+                    }
+                return {
+                    "ok": True,
+                    "tool": "taskflow",
+                    "action": action,
+                    "task": task,
+                    "attention": {
+                        "kind": kind,
+                        "resolved": True,
+                        "eventId": event_id,
+                        "notification": {
+                            "sent": event_id is not None,
+                            "eventId": event_id,
+                            "reused": True,
+                            "resolved": True,
+                        },
+                    },
+                    "synced": True,
+                }
             for existing in reversed(attention):
                 if (
                     isinstance(existing, dict)
@@ -5489,27 +5571,6 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     and str(existing.get("kind") or "") == kind
                     and existing.get("eventId")
                 ):
-                    if explicit_resolve:
-                        existing["resolved"] = True
-                        _write_task(arguments, task)
-                        return {
-                            "ok": True,
-                            "tool": "taskflow",
-                            "action": action,
-                            "task": task,
-                            "attention": {
-                                "kind": kind,
-                                "resolved": True,
-                                "eventId": str(existing["eventId"]),
-                                "notification": {
-                                    "sent": True,
-                                    "eventId": str(existing["eventId"]),
-                                    "reused": True,
-                                    "resolved": True,
-                                },
-                            },
-                            "synced": True,
-                        }
                     return {
                         "ok": True,
                         "tool": "taskflow",
@@ -5534,7 +5595,9 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 "question": question[:500],
                 "attempt": attempt,
                 "requestedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "resolved": bool(payload.get("resolved", False)),
+                # explicit resolved=true never reaches the new-record path
+                # (handled above): a freshly raised record is always open.
+                "resolved": False,
             }
             attention.append(record)
             task["attention"] = attention
