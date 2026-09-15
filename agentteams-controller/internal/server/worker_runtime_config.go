@@ -10,6 +10,8 @@ package server
 // subpaths so L1 humans / the workbench plugin can inspect and adjust a
 // worker's runtime behavior without reaching into the docker network.
 //
+// Contract re-verified against the pinned qwenpaw 2.0.1 wheel on 2026-09-15 (PR #1231 review).
+//
 // Upstream contract (verified against the pinned qwenpaw 2.0.1 wheel,
 // still present in 2.2.x):
 //   - GET/PUT /api/workspace/running-config  (the "runtime-config" subpath;
