@@ -78,7 +78,7 @@ Optional query parameters:
 
 | Parameter | Type | Meaning |
 |:--|:--|:--|
-| `includeTasks` | `bool` | When `true`, also read each task's TaskMeta (`shared/tasks/{id}/meta.json`) and attach a `tasks_detail` array with spec/result/deliverable fields. Default `false` keeps the response lightweight. |
+| `includeTasks` | `bool` | When `true`, also read each task's TaskMeta (`shared/tasks/{id}/meta.json`) and attach a `tasks_detail` array with spec/result/deliverable fields and the opaque `submission_id` fence. Default `false` keeps the response lightweight. |
 | `format` | `string` | Response format. Default (absent or empty) returns the JSON snapshot above. `format=mermaid` returns the same snapshot rendered as a Mermaid flowchart (`text/plain`, no `tasks_detail` — rendering needs only nodes/edges/next). Any other value returns `400`. |
 
 Mermaid output (`?format=mermaid`) mirrors LangGraph's `draw_mermaid` helper: each node label is `name: status`, next/ready nodes get the `ready` highlight class, and every other node gets a status class (`pending` / `delegated` / `inProgress` / `completed` / `revision` / `blocked`). All classDefs are emitted so the graph renders standalone. Task titles and ids are user-controlled, so they are sanitized for mermaid safety: newlines become `<br>`, double quotes become `#quot;`, backslashes are dropped, and other control characters become spaces; a task id containing characters outside `[A-Za-z0-9_-]` is mapped to a collision-safe node id (labels keep the original text). A malformed title therefore can never alter the rendered graph structure. Example:
@@ -136,6 +136,7 @@ Response `200 OK`:
       "assigned_to": "@w1:matrix.local",
       "summary": "Alpha report done",
       "result_status": "SUCCESS",
+      "submission_id": "submission-123",
       "deliverables": [{"type": "file", "path": "shared/tasks/t1/output.pdf"}],
       "result_path": "shared/tasks/t1/result.md"
     }
@@ -146,7 +147,8 @@ Response `200 OK`:
 `tasks_detail` is only present when `?includeTasks=true`. It surfaces the
 TaskMeta fields that the project-level `nodes[]` summary does not carry:
 `spec_path` (task spec file), `summary` / `result_status` / `result_path`
-(submission result), `deliverables` (artifact list) and `cancel_reason`.
+(submission result), `deliverables` (artifact list), `cancel_reason`, and the
+opaque `submission_id` used to fence accept/cancel decisions.
 TaskMeta is read from the project's owning scope only: team projects read
 `teams/{team}/shared/tasks/{id}/meta.json`, standalone projects read
 `shared/tasks/{id}/meta.json`. There is no cross-scope fallback, and a
@@ -220,6 +222,8 @@ Response `200 OK`:
 
 Field notes:
 
+- `submission_id`, when present in TaskMeta, is returned verbatim. Pass it as
+  `submissionId` when cancelling that submission.
 - `status` is the **raw** TaskMeta status when TaskMeta exists (same
   semantics as `tasks_detail` with `?includeTasks=true`); when TaskMeta is
   absent it falls back to the normalized graph-node status
@@ -622,16 +626,42 @@ unknown dependencies, and dependency cycles are rejected with `400`.
 Preconditions (`409`): `plan_type` must be `dag` (loop replans go through
 `record_loop_iteration`), status must be `active`, and no task may be
 `in_progress`/`submitted`. Response `200` returns the updated workflow.
+Tasks with a persisted cancellation decision keep that decision when retained
+in a replan. They cannot be reopened or removed and then re-added under the
+same task id; create a new task id for replacement work.
 
 ### `POST /api/v1/projects/{id}/tasks/{taskId}/cancel`
 
-Cancel a single task. Body requires `reason` (and optional
-`replacementTaskId`). The task must be mutable — a terminal task
-(completed/revision/blocked/cancelled) is rejected with `409`. The task's
-`TaskMeta` is stamped `status=cancelled` + `cancel_reason` and the project
-node status is updated. Response `200` returns the updated workflow.
-Errors: `400` missing reason; `404` task not in project / task meta
-missing; `409` terminal task.
+Cancel a single task:
+
+```json
+{
+  "reason": "no longer needed",
+  "replacementTaskId": "replacement-01",
+  "submissionId": "submission-123"
+}
+```
+
+`reason` is required and `replacementTaskId` is optional. `submissionId` is
+conditionally required: when TaskMeta already has `submission_id`, callers
+must send that exact opaque value. Missing, invented, or stale identities are
+rejected before either ProjectMeta or TaskMeta is changed.
+
+On success, the project node and TaskMeta become `cancelled`; TaskMeta records
+stable `cancel_reason` / `replacement_task_id` / `cancelled_at` fields and
+resolves an existing pending continuation as `cancelled` without changing its
+`delivery_id`. Repeating the same cancellation is idempotent. A different
+reason, replacement task, or submission identity conflicts with the committed
+decision. Tasks already `completed`, `revision`, or `blocked` cannot be
+cancelled. Response `200` returns the updated workflow.
+
+The Controller writes a small cancellation decision envelope into the project
+node before writing TaskMeta. If the second write fails, an identical retry can
+finish the TaskMeta/continuation update; a retry with a different reason,
+replacement, or submission identity is rejected.
+
+Errors: `400` missing reason or invalid replacement task id; `404` task not in project / task meta missing;
+`409` terminal task, submission fence failure, or conflicting cancellation.
 
 ### `POST /api/v1/projects/{id}/complete`
 
@@ -679,6 +709,7 @@ agt get projects                      # list all
 agt get projects --team biz-team      # filter by team
 agt get projects demo-project-001     # workflow detail
 agt get projects demo-project-001 -o json
+agt get projects demo-project-001 --include-tasks -o json
 agt get projects demo-project-001 --mermaid   # render DAG as mermaid (status classes)
 ```
 
@@ -698,6 +729,9 @@ or `AGENTTEAMS_AUTH_TOKEN_FILE`) verbatim, so an L2 human can also use it by
 pointing either variable at their own Matrix access token — no separate CLI
 auth mode is needed.
 
+`--include-tasks` requires `-o json`; the default detail view does not render
+raw TaskMeta fields.
+
 ### `agt project` (the lifecycle write API write commands)
 
 `agt project` wraps the write endpoints so a human can intervene without
@@ -708,7 +742,8 @@ agt project create --title "New project" --team biz-team --source matrix
 agt project pause demo-project-001 --reason "customer review"
 agt project resume demo-project-001
 agt project replan demo-project-001 --tasks tasks.json   # JSON array file
-agt project cancel demo-project-001 demo-project-001-01 --reason "no longer needed"
+agt project cancel demo-project-001 demo-project-001-01 \
+  --reason "no longer needed" --submission-id submission-123 --team biz-team
 agt project complete demo-project-001
 ```
 
@@ -752,4 +787,143 @@ Error responses:
 | `400` | Invalid worker name / unsupported subpath or query parameter / invalid `limit`. |
 | `404` | Worker not found / caller does not own it (existence hidden). |
 | `502` | Worker app unreachable, pre-2.1 checkpoint API, or upstream error. |
+| `503` | Kube mode (no stable worker pod DNS to proxy). |
+
+## Worker knowledge base (workspace files) endpoints
+
+The Controller proxies four endpoints of each worker's QwenPaw app
+(QwenPaw ≥ 2.1) so L2 humans and frontends can inspect — and, where the
+caller's Human CR permits, update — a worker's knowledge base: the
+long-term memory file `MEMORY.md`, the daily note tree `memory/`, and the
+distilled knowledge tree `digest/`.
+
+| Endpoint | Meaning |
+|:--|:--|
+| `GET /api/v1/workers/{name}/workspace-files/tree` | Paginated listing of one knowledge directory: `?path=` (required, `memory` / `digest` or any subpath of them), optional `?cursor=` (opaque) and `?limit=` (1..500). Returns `{directory, entries[], has_more, next_cursor}`. |
+| `GET /api/v1/workers/{name}/workspace-files/file-metadata` | `?path=` (required, an allowed knowledge file): `{etag, modified_at, path, preview_kind, size}`. |
+| `GET /api/v1/workers/{name}/workspace-files/file-content` | `?path=` (required) plus optional `?offset=` (≥0) and `?limit=` (1..1048576): a bounded UTF-8 chunk `{content, eof, next_offset, truncated, etag, ...}` — continue with `offset=next_offset` while `truncated` is true. |
+| `PUT /api/v1/workers/{name}/workspace-files/file-content` | Save one knowledge file: `?path=` (required), body `{"content": "<text>"}` (1 MiB cap, non-empty) and the `If-Match` header (see the concurrency rule below). Returns the new `{etag, path, size}`. |
+| `GET /api/v1/workers/{name}/workspace-files/file-download` | Stream one knowledge file as an attachment: `?path=` (required). Forwards the upstream `Content-Disposition` / `Content-Length` / `ETag` headers. |
+
+- **Scope**: same worker read authorization as `GET /api/v1/workers/{name}`
+  and the checkpoint endpoints — team leaders / L2 humans only see workers
+  in their accessible teams; unknown or out-of-scope workers are hidden as
+  `404`.
+- **Write scope**: `PUT file-content` is allowed for admin/manager (any
+  team); an L2 human may write only workers in their own teams while
+  `Human.spec.workspaceFileAccess` is explicitly `"readwrite"` — the
+  default is `read` (an empty or unset value means read-only), so a
+  controller upgrade cannot silently grant pre-existing humans write
+  access; L1 grants a user write access by setting the field to
+  `readwrite`. Team leaders stay read-only on this API. Cross-team writes
+  hide the worker as `404` (existence must not be probeable); an in-scope
+  caller without write permission gets an explicit `403`.
+- **Concurrency (ETag)**: before a write the proxy probes `file-metadata`.
+  For an existing file the `If-Match` header is mandatory (a worker
+  auto-appends to its memory files, so an unconditional overwrite would be
+  a lost update) and for a new file it must be absent. An upstream ETag
+  mismatch passes through as `409` — reload the file and retry.
+- **Write limits**: the body is capped at 1 MiB (the read chunk cap),
+  `content` must be a non-empty string, and every successful write is
+  audit-logged by the controller (worker, path, caller, byte count).
+- **`workspaceFileAccess` (Human CRD field)**: `read` | `readwrite`
+  (default is `read` when empty — write is an explicit opt-in) — the
+  per-user read/write permission L1 can set on a human's access to team
+  knowledge base files. Settable at human creation (`agt apply`) and
+  through `PUT /api/v1/humans/{name}` (that update API carries the field
+  in its updatable set, shipped with the humans-update PR).
+- **Path allowlist (knowledge boundary)**: only `MEMORY.md`,
+  `memory/**` and `digest/**` are addressable — for reads and writes
+  alike. Every other workspace
+  location — `SOUL.md`, `PROFILE.md`, `TODO.md`, `checkpoints/`, `skills/`,
+  and all dot directories (`.copaw/agent.json` carries the worker's
+  credentials) — is rejected with `400` before the request reaches the
+  worker. Roots match on the exact first segment, so `memories/` and
+  `memoryX/` are not prefixes of `memory/`. File roots are single
+  top-level files: `MEMORY.md` is addressable, but `MEMORY.md/foo` is
+  rejected (`MEMORY.md` is one file, not a directory — nested files must
+  live under `memory/` or `digest/`).
+- **Root pinned**: the QwenPaw `root=workspace` parameter (the agent's own
+  storage root, as opposed to `root=project`, the primary bound project
+  directory) is fixed server-side and is not part of the client query
+  surface.
+- **Embedded mode only**: the endpoints proxy the worker's qwenpaw app
+  inside the shared docker network, using the effective container prefix
+  and the system-wins console port — the same address resolution as the
+  checkpoint endpoints. In kube mode they return `503`.
+- **Version gate (passthrough 404)**: a worker running QwenPaw < 2.1 has no
+  workspace file router, so every request is an upstream `404` passed
+  through verbatim. To distinguish "worker too old" from "file missing",
+  probe `file-metadata?path=MEMORY.md` — that file exists in every
+  initialized QwenPaw workspace, so a `404` there means the worker is
+  pre-2.1 (or its workspace is not initialized) while other `404`s are
+  plain missing files.
+- **Runtime scope**: the endpoints target workers running the QwenPaw app
+  (`qwenpaw` runtime). Workers on other runtimes have no QwenPaw workspace
+  API: when that runtime's app serves the console port the proxy passes its
+  response through verbatim (typically `404`); when nothing listens it
+  returns `502`. The MEMORY.md probe is therefore only meaningful for
+  QwenPaw workers.
+- Forwarding is fixed-path (tree / file-metadata / file-content GET+PUT /
+  file-download) with a strict query whitelist — not a generic reverse
+  proxy. The multipart `file-upload` endpoint and the rest of the
+  workspace API surface remain unreachable.
+
+## Worker tool-approval endpoints
+
+Each QwenPaw worker's agent profile carries a tool-execution security level
+(`approval_level` in the worker's `agent.json`) that decides which tool calls
+run automatically and which pause for a human approval. The Controller
+proxies a minimal read/write surface of the worker's
+`/workspace/running-config` API so L2 humans can manage this level for
+workers in their own teams:
+
+| Endpoint | Meaning |
+|:--|:--|
+| `GET /api/v1/workers/{name}/approval` | Current level: `{"approval_level": "AUTO"}`. |
+| `PUT /api/v1/workers/{name}/approval` | Set the level. Body: `{"approval_level": "STRICT"}`. |
+
+- **Levels**: `STRICT` (every tool call needs approval) / `SMART` (low-risk
+  tools auto-allowed) / `AUTO` (only guarded tools — the upstream default) /
+  `OFF` (guard disabled). Any other value is rejected with `400` before the
+  worker is touched (the upstream model does not validate the value — the
+  proxy is the validation boundary).
+- **OFF is elevated**: `approval_level=OFF` disables Tool Guard entirely, so
+  it is a security-policy operation rather than ordinary configuration.
+  Default L2 humans get `403` on `OFF` — they may switch among the guarded
+  levels (`STRICT`/`SMART`/`AUTO`) only. `OFF` requires the elevated
+  tool-approval capability that the L2 permission design (#1220) defines and
+  admins grant explicitly; admin/manager keep the full range until that
+  capability model lands.
+- **Write scope**: `PUT` is allowed for admin/manager (any team); an L2 human
+  may set only workers in their own teams — cross-team workers hide as `404`
+  (existence is not probeable). Team leaders stay read-only (`403` on `PUT`,
+  the same boundary as the knowledge base write API).
+- **Safe write**: the upstream `PUT /workspace/running-config` persists the
+  *full* running-config object, so the proxy performs GET → change only
+  `approval_level` → PUT the whole object back; every other field round trips
+  verbatim. An upstream `409` (concurrent config change) is passed through so
+  clients retry with a fresh `GET`.
+- **Embedded mode only**: same worker addressing as the checkpoint proxy
+  (effective container prefix + system-wins console port). Kube mode returns
+  `503`.
+- **Degradation**: a worker on a QwenPaw version without the running-config
+  router surfaces the upstream `404` verbatim (version gate).
+- Every successful change is audit-logged (worker, new level, caller, role).
+
+Error responses:
+
+| Code | Meaning |
+|:--|:--|
+| `400` | Invalid worker name / unsupported subpath or query parameter / path outside the knowledge allowlist / out-of-bounds `limit` or `offset` / (write) missing or misplaced `If-Match`, over-size or empty body. |
+| `403` | (write only) in-scope caller without write permission — read-only human or team leader. |
+| `404` | Worker not found or not in the caller's teams (existence hidden); or (passthrough) the file does not exist — see the version-gate probe above. |
+| `409` / `416` | (passthrough) the file changed while being read / while waiting for the write (ETag mismatch — reload and retry) / offset beyond end of file. |
+| `502` | Worker app unreachable, or an upstream error (status echoed in the body). |
+
+| `400` | Invalid worker name / invalid request body / `approval_level` not in the fixed set. |
+| `403` | Team leader attempting `PUT` (read-only) / L2 human setting `OFF` (elevated capability required, #1220). |
+| `404` | Worker not found / caller does not own it (existence hidden) / pre-2.x worker (version gate, passthrough). |
+| `409` | Concurrent upstream config change (retry with a fresh `GET`). |
+| `502` | Worker app unreachable or upstream error. |
 | `503` | Kube mode (no stable worker pod DNS to proxy). |

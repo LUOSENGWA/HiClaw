@@ -45,6 +45,12 @@ func TestAuthorizer_HumanScoped(t *testing.T) {
 		{Action: ActionUpdate, ResourceKind: "worker", ResourceTeam: "market-team"},
 		{Action: ActionUpdate, ResourceKind: "worker"},
 		{Action: ActionGet, ResourceKind: "status"},
+		// W3②-rw: the knowledge base write action is allowed at the
+		// authorizer level even cross-team (ResourceTeam filled by the
+		// middleware) — a denial here would leak worker existence via 403
+		// (W8 anti-probing). The handler is the real boundary (404).
+		{Action: ActionWorkspaceFilesWrite, ResourceKind: "worker"},
+		{Action: ActionWorkspaceFilesWrite, ResourceKind: "worker", ResourceTeam: "another-team"},
 	}
 	for _, req := range allowed {
 		if err := az.Authorize(caller, req); err != nil {
@@ -67,6 +73,52 @@ func TestAuthorizer_HumanScoped(t *testing.T) {
 	for _, req := range denied {
 		if err := az.Authorize(caller, req); err == nil {
 			t.Errorf("L2 human must be denied %s %s, got nil error", req.Action, req.ResourceKind)
+		}
+	}
+}
+
+// TestAuthorizer_HumanUpdateAdminOnly guards the human permission-update
+// boundary: only admin/manager may PUT /api/v1/humans/{name}.
+func TestAuthorizer_HumanUpdateAdminOnly(t *testing.T) {
+	az := NewAuthorizer()
+	allowed := []CallerIdentity{
+		{Role: RoleAdmin, Username: "admin"},
+		{Role: RoleManager, Username: "manager"},
+	}
+	for i := range allowed {
+		if err := az.Authorize(&allowed[i], AuthzRequest{Action: ActionUpdate, ResourceKind: "human", ResourceName: "maizong"}); err != nil {
+			t.Errorf("%s should be allowed to update humans, got: %v", allowed[i].Role, err)
+		}
+	}
+	denied := []CallerIdentity{
+		{Role: RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"},
+		{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}},
+		{Role: RoleWorker, Username: "alpha-dev", Team: "alpha-team"},
+	}
+	for i := range denied {
+		if err := az.Authorize(&denied[i], AuthzRequest{Action: ActionUpdate, ResourceKind: "human", ResourceName: "maizong"}); err == nil {
+			t.Errorf("%s must be denied updating humans", denied[i].Role)
+		}
+	}
+}
+
+// TestAuthorizer_SkillsListOnly pins the skill catalog boundary: the skills
+// resource is read-only and grants exactly ActionList — any other action
+// (including ActionGet) is denied rather than defaulted.
+func TestAuthorizer_SkillsListOnly(t *testing.T) {
+	az := NewAuthorizer()
+	roles := []*CallerIdentity{
+		{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}},
+		{Role: RoleTeamLeader, Username: "market-lead", Team: "market-team"},
+	}
+	for _, caller := range roles {
+		if err := az.Authorize(caller, AuthzRequest{Action: ActionList, ResourceKind: "skills"}); err != nil {
+			t.Errorf("%s: ActionList on skills should be allowed, got: %v", caller.Role, err)
+		}
+		for _, action := range []Action{ActionGet, ActionCreate, ActionUpdate, ActionDelete} {
+			if err := az.Authorize(caller, AuthzRequest{Action: action, ResourceKind: "skills"}); err == nil {
+				t.Errorf("%s: %s on skills must be denied, got nil error", caller.Role, action)
+			}
 		}
 	}
 }
@@ -266,5 +318,72 @@ func TestAuthorizer_WorkerProjectDenied(t *testing.T) {
 		if err := az.Authorize(caller, req); err == nil {
 			t.Errorf("worker %s %s should be denied", req.Action, req.ResourceKind)
 		}
+	}
+}
+
+func TestAuthorizer_WorkerApproval_W8Boundary(t *testing.T) {
+	az := NewAuthorizer()
+	human := &CallerIdentity{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}}
+
+	// W8: like ActionGet, the approval write is allowed at the authorizer
+	// even cross-team, so the handler can hide it as 404 — a 403 from the
+	// middleware would let a scoped caller probe which workers exist in
+	// other teams. The handler is the real boundary.
+	for _, req := range []AuthzRequest{
+		{Action: ActionWorkerApproval, ResourceKind: "worker", ResourceName: "market-analyst", ResourceTeam: "market-team"},
+		{Action: ActionWorkerApproval, ResourceKind: "worker", ResourceName: "biz-analyst", ResourceTeam: "biz-team"},
+	} {
+		if err := az.Authorize(human, req); err != nil {
+			t.Errorf("L2 human approval write %s/%s should be allowed at the authorizer (handler hides cross-team as 404), got: %v", req.ResourceName, req.ResourceTeam, err)
+		}
+	}
+
+	// The leader is read-only on the approval API: the write action is
+	// denied (their reads still go through ActionGet).
+	leader := &CallerIdentity{Role: RoleTeamLeader, Username: "market-analyst", Team: "market-team"}
+	if err := az.Authorize(leader, AuthzRequest{Action: ActionWorkerApproval, ResourceKind: "worker", ResourceName: "market-analyst", ResourceTeam: "market-team"}); err == nil {
+		t.Error("team-leader approval write should be denied (read-only)")
+	}
+
+	// Workers never expose the approval action on their own resources.
+	worker := &CallerIdentity{Role: RoleWorker, Username: "market-analyst", WorkerName: "market-analyst"}
+	if err := az.Authorize(worker, AuthzRequest{Action: ActionWorkerApproval, ResourceKind: "worker", ResourceName: "market-analyst"}); err == nil {
+		t.Error("worker self approval write should be denied")
+	}
+}
+
+// TestAuthorize_RuntimeConfig pins the W8 decision for the qwenpaw
+// running-config proxy writes: the L2 human write action is allowed at the
+// authorizer even cross-team (the handler hides it as 404 — a 403 from the
+// middleware would let a scoped caller probe which workers exist in other
+// teams); team leaders are read-only (write denied, read via ActionGet);
+// workers are denied outright.
+func TestAuthorize_RuntimeConfig(t *testing.T) {
+	az := NewAuthorizer()
+	human := &CallerIdentity{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}}
+
+	for _, req := range []AuthzRequest{
+		{Action: ActionRuntimeConfig, ResourceKind: "worker", ResourceName: "market-analyst", ResourceTeam: "market-team"},
+		{Action: ActionRuntimeConfig, ResourceKind: "worker", ResourceName: "biz-analyst", ResourceTeam: "biz-team"},
+	} {
+		if err := az.Authorize(human, req); err != nil {
+			t.Errorf("L2 human runtime-config write %s/%s should be allowed at the authorizer (handler hides cross-team as 404), got: %v", req.ResourceName, req.ResourceTeam, err)
+		}
+	}
+
+	// The leader is read-only on the running-config API: the write action is
+	// denied, the read still goes through ActionGet.
+	leader := &CallerIdentity{Role: RoleTeamLeader, Username: "market-analyst", Team: "market-team"}
+	if err := az.Authorize(leader, AuthzRequest{Action: ActionRuntimeConfig, ResourceKind: "worker", ResourceName: "market-analyst", ResourceTeam: "market-team"}); err == nil {
+		t.Error("team-leader runtime-config write should be denied (read-only)")
+	}
+	if err := az.Authorize(leader, AuthzRequest{Action: ActionGet, ResourceKind: "worker", ResourceName: "market-analyst", ResourceTeam: "market-team"}); err != nil {
+		t.Errorf("team-leader runtime-config read should be allowed (same team), got: %v", err)
+	}
+
+	// Workers never expose the runtime-config action on their own resources.
+	worker := &CallerIdentity{Role: RoleWorker, Username: "market-analyst", WorkerName: "market-analyst"}
+	if err := az.Authorize(worker, AuthzRequest{Action: ActionRuntimeConfig, ResourceKind: "worker", ResourceName: "market-analyst"}); err == nil {
+		t.Error("worker self runtime-config write should be denied")
 	}
 }

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -554,6 +555,132 @@ func (h *ResourceHandler) GetHuman(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httputil.WriteJSON(w, http.StatusOK, humanToResponse(&human))
+}
+
+func (h *ResourceHandler) UpdateHuman(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		httputil.WriteError(w, http.StatusBadRequest, "human name is required")
+		return
+	}
+
+	var req UpdateHumanRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+
+	ctx := r.Context()
+	for attempt := 0; attempt < k8sUpdateMaxRetries; attempt++ {
+		var human v1beta1.Human
+		if err := h.client.Get(ctx, client.ObjectKey{Name: name, Namespace: h.namespace}, &human); err != nil {
+			writeK8sError(w, "get human for update", err)
+			return
+		}
+
+		if req.PermissionLevel != nil && (*req.PermissionLevel < 1 || *req.PermissionLevel > 3) {
+			httputil.WriteError(w, http.StatusBadRequest, "permissionLevel must be 1 (admin), 2 (team), or 3 (worker)")
+			return
+		}
+		if err := h.validateHumanReferences(ctx, req.AccessibleTeams, req.AccessibleWorkers); err != nil {
+			if errors.Is(err, errDanglingReference) {
+				httputil.WriteError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			// Backend lookup failure (K8s API timeout, permission, or
+			// service error): a server problem, not a client error.
+			writeK8sError(w, "validate human references", err)
+			return
+		}
+
+		if req.DisplayName != nil {
+			human.Spec.DisplayName = *req.DisplayName
+		}
+		if req.Email != nil {
+			human.Spec.Email = *req.Email
+		}
+		if req.PermissionLevel != nil {
+			human.Spec.PermissionLevel = *req.PermissionLevel
+		}
+		if req.AccessibleTeams != nil {
+			human.Spec.AccessibleTeams = *req.AccessibleTeams
+		}
+		if req.AccessibleWorkers != nil {
+			human.Spec.AccessibleWorkers = *req.AccessibleWorkers
+		}
+		if req.Note != nil {
+			human.Spec.Note = *req.Note
+		}
+
+		if err := h.client.Update(ctx, &human); err != nil {
+			if apierrors.IsConflict(err) && attempt+1 < k8sUpdateMaxRetries {
+				time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+				continue
+			}
+			writeK8sError(w, "update human", err)
+			return
+		}
+
+		httputil.WriteJSON(w, http.StatusOK, humanToResponse(&human))
+		return
+	}
+}
+
+// errDanglingReference marks validation errors where a referenced Team or
+// Worker does not exist (a client error, mapped to 400 by the caller).
+// Any other error from validateHumanReferences is a backend lookup
+// failure (mapped to a server error).
+var errDanglingReference = errors.New("dangling reference")
+
+// validateHumanReferences rejects permission grants that point at missing
+// Teams or Workers: a dangling reference silently widens nothing but leaves
+// the human unable to reach a resource they believe they can. Missing
+// references are returned wrapped in errDanglingReference; backend lookup
+// failures (List/Get errors other than NotFound) are returned unwrapped so
+// the caller can surface them as a server error instead of a 400.
+func (h *ResourceHandler) validateHumanReferences(ctx context.Context, teams *[]string, workers *[]string) error {
+	if teams != nil {
+		var teamList v1beta1.TeamList
+		if err := h.client.List(ctx, &teamList, client.InNamespace(h.namespace)); err != nil {
+			return fmt.Errorf("list teams: %w", err)
+		}
+		existing := make(map[string]struct{}, len(teamList.Items))
+		for i := range teamList.Items {
+			existing[teamList.Items[i].Name] = struct{}{}
+		}
+		var missing []string
+		for _, t := range *teams {
+			if t == "" {
+				continue
+			}
+			if _, ok := existing[t]; !ok {
+				missing = append(missing, t)
+			}
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("%w: accessibleTeams references missing teams: %s", errDanglingReference, strings.Join(missing, ", "))
+		}
+	}
+	if workers != nil {
+		var missing []string
+		for _, wn := range *workers {
+			if wn == "" {
+				continue
+			}
+			var worker v1beta1.Worker
+			if err := h.client.Get(ctx, client.ObjectKey{Name: wn, Namespace: h.namespace}, &worker); err != nil {
+				if apierrors.IsNotFound(err) {
+					missing = append(missing, wn)
+					continue
+				}
+				return fmt.Errorf("get worker %s: %w", wn, err)
+			}
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("%w: accessibleWorkers references missing workers: %s", errDanglingReference, strings.Join(missing, ", "))
+		}
+	}
+	return nil
 }
 
 func (h *ResourceHandler) ListHumans(w http.ResponseWriter, r *http.Request) {

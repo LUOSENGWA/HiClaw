@@ -6,19 +6,28 @@ import "fmt"
 type Action string
 
 const (
-	ActionCreate             Action = "create"
-	ActionUpdate             Action = "update"
-	ActionDelete             Action = "delete"
-	ActionGet                Action = "get"
-	ActionList               Action = "list"
-	ActionWake               Action = "wake"
-	ActionSleep              Action = "sleep"
-	ActionEnsureReady        Action = "ensure-ready"
-	ActionReady              Action = "ready"
-	ActionSTS                Action = "sts"
-	ActionStatus             Action = "status"
-	ActionRefreshMatrixToken Action = "refresh-matrix-token"
-	ActionGateway            Action = "gateway"
+	ActionCreate         Action = "create"
+	ActionUpdate         Action = "update"
+	ActionDelete         Action = "delete"
+	ActionGet            Action = "get"
+	ActionList           Action = "list"
+	ActionWake           Action = "wake"
+	ActionSleep          Action = "sleep"
+	ActionEnsureReady    Action = "ensure-ready"
+	ActionReady          Action = "ready"
+	ActionWorkerApproval Action = "worker-approval"
+	// ActionRuntimeConfig guards the qwenpaw running-config proxy WRITES
+	// (PUT /workers/{name}/runtime-config and the /loops/custom mutations).
+	// L2 humans may write workers in their own teams (W8: the authorizer
+	// allows cross-team so the handler can hide with 404 instead of the
+	// authorizer answering 403); team leaders are read-only (denied here,
+	// #1216 pattern); workers are denied by default.
+	ActionRuntimeConfig       Action = "runtime-config"
+	ActionSTS                 Action = "sts"
+	ActionStatus              Action = "status"
+	ActionRefreshMatrixToken  Action = "refresh-matrix-token"
+	ActionGateway             Action = "gateway"
+	ActionWorkspaceFilesWrite Action = "workspace-files-write"
 )
 
 // AuthzRequest describes the resource being accessed.
@@ -114,6 +123,47 @@ func (a *Authorizer) authorizeHuman(caller *CallerIdentity, req AuthzRequest) er
 		if req.Action == ActionUpdate {
 			return a.requireSameTeam(caller, req)
 		}
+		if req.Action == ActionWorkspaceFilesWrite {
+			// W3②-rw: L2 humans may write knowledge base files of workers
+			// in their own teams. Like ActionGet/ActionList this action is
+			// NOT rejected cross-team at the authorizer level: the
+			// middleware resolves the worker's team, and a 403 here would
+			// let a scoped caller probe which workers exist in other teams
+			// (W8 anti-probing). The handler is the real boundary — it
+			// hides cross-team workers as 404 and enforces the per-user
+			// workspaceFileAccess flag and the knowledge base allowlist.
+			return nil
+		}
+		if req.Action == ActionWorkerApproval {
+			// L2 humans may change the tool-approval level of workers in
+			// their own teams. Like ActionGet this action is NOT rejected
+			// cross-team at the authorizer level: a 403 here would let a
+			// scoped caller probe which workers exist in other teams
+			// (W8 anti-probing). All real enforcement happens in the
+			// HANDLER, not in this authorizer/middleware:
+			// ApprovalHandler.approvalScope performs the worker→team
+			// resolution, hides cross-team and standalone workers as
+			// 404, and denies team leaders (read-only). The authorizer
+			// deliberately allows so the handler can hide with 404
+			// instead of the authorizer answering 403.
+			return nil
+		}
+		if req.Action == ActionRuntimeConfig {
+			// L2 humans may write the running-config of workers in their
+			// own teams (the workbench 5-tab). Same W8 reasoning as
+			// ActionWorkerApproval: allowed here, hidden as 404 by the
+			// handler when cross-team.
+			return nil
+		}
+		return deny(caller, req)
+
+	case "skills":
+		// Read-only skill catalog (name/description metadata); no PII,
+		// scope-independent. Only the list action is granted — any other
+		// action on this resource is denied, not defaulted.
+		if req.Action == ActionList {
+			return nil
+		}
 		return deny(caller, req)
 
 	default:
@@ -141,6 +191,15 @@ func (a *Authorizer) authorizeTeamLeader(caller *CallerIdentity, req AuthzReques
 		// calling identity, and these routes never embed a target ResourceName
 		// (the handler uses caller.Username), so no requireSelf check is needed.
 		if req.Action == ActionSTS || req.Action == ActionRefreshMatrixToken {
+			return nil
+		}
+		return deny(caller, req)
+
+	case "skills":
+		// Read-only skill catalog (name/description metadata); no PII,
+		// scope-independent. Only the list action is granted — any other
+		// action on this resource is denied, not defaulted.
+		if req.Action == ActionList {
 			return nil
 		}
 		return deny(caller, req)
@@ -174,6 +233,9 @@ func (a *Authorizer) authorizeTeamLeaderWorkerAction(caller *CallerIdentity, req
 		return a.requireSameTeam(caller, req)
 	case ActionWake, ActionSleep, ActionEnsureReady, ActionReady, ActionStatus:
 		return a.requireSameTeam(caller, req)
+	// ActionWorkerApproval and ActionRuntimeConfig deliberately fall
+	// through to deny: team leaders are READ-ONLY for worker approval and
+	// running-config (mirrors the #1216 approval proxy).
 	default:
 		return deny(caller, req)
 	}
