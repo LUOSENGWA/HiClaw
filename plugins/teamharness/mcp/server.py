@@ -3503,12 +3503,6 @@ def _accept_task_result(arguments: dict[str, Any], payload: dict[str, Any]) -> d
         )
         task_meta["status"] = node_status
         _resolve_task_continuation(task_meta, node_status)
-        # Carry the resolved attention list (closed above, possibly
-        # after the entry-time task load) into the final task write so
-        # the leader-side mutation cannot clobber the closed loops.
-        freshest_task = _read_json(_task_state_path(arguments, task_id), {})
-        if isinstance(freshest_task, dict) and isinstance(freshest_task.get("attention"), list):
-            task_meta["attention"] = freshest_task["attention"]
         try:
             _write_task(arguments, task_meta)
         except OSError as exc:
