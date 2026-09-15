@@ -120,20 +120,29 @@ func (c *Client) appendJSONL(ctx context.Context, ev Event) error {
 			}
 		}
 
+		// Stat before get: if a concurrent writer commits between the two
+		// calls, the body read below is NEWER than the captured ETag, so
+		// the conditional write fails with 412 and retries (fail-safe).
+		// Reading the body first would pair a stale body with a fresh
+		// ETag and silently drop the concurrent writer's line.
 		var existing []byte
 		var etag string
-		data, gerr := c.sc.GetObject(ctx, key)
-		switch {
-		case gerr == nil:
-			existing = data
-			if meta, merr := c.sc.StatMeta(ctx, key); merr == nil {
-				etag = meta.ETag
+		if meta, merr := c.sc.StatMeta(ctx, key); merr == nil {
+			etag = meta.ETag
+			data, gerr := c.sc.GetObject(ctx, key)
+			switch {
+			case gerr == nil:
+				existing = data
+			case errors.Is(gerr, os.ErrNotExist):
+				// Deleted between stat and get: treat as a fresh object.
+				etag = ""
+			default:
+				return fmt.Errorf("audit: get %s: %w", key, gerr)
 			}
-		case errors.Is(gerr, os.ErrNotExist):
-			// New day / new object.
-		default:
-			return fmt.Errorf("audit: get %s: %w", key, gerr)
+		} else if !errors.Is(merr, os.ErrNotExist) {
+			return fmt.Errorf("audit: stat %s: %w", key, merr)
 		}
+		// merr == ErrNotExist: new day / new object; etag stays empty.
 
 		content := make([]byte, 0, len(existing)+len(line)+1)
 		content = append(content, existing...)

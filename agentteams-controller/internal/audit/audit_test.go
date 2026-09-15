@@ -130,6 +130,69 @@ func TestRecordRetriesOnETagConflict(t *testing.T) {
 	}
 }
 
+// statInterleaveOnce simulates a concurrent writer committing just before
+// the audit client's stat call observes the object - the interleaving that a
+// get-then-stat read order mishandles (stale body + fresh ETag silently
+// drops the concurrent line). A stat-first read order stays fail-safe: it
+// either writes on top of the winner or retries after a 412.
+type statInterleaveOnce struct {
+	oss.StorageClient
+	key  string
+	once bool
+}
+
+func (s *statInterleaveOnce) StatMeta(ctx context.Context, key string) (oss.ObjectMeta, error) {
+	if key == s.key && !s.once {
+		s.once = true
+		data, err := s.StorageClient.GetObject(ctx, key)
+		if err == nil {
+			if len(data) > 0 && data[len(data)-1] != '\n' {
+				data = append(data, '\n')
+			}
+			line := []byte(`{"who":"interloper","role":"admin","when":"2026-09-12T08:00:00Z","action":"capability_grant"}` + "\n")
+			_ = s.StorageClient.PutObject(ctx, key, append(data, line...))
+		}
+	}
+	return s.StorageClient.StatMeta(ctx, key)
+}
+
+func TestRecordInterleavedWriterDoesNotDropLines(t *testing.T) {
+	mem := ossfake.NewMemory()
+	c := newTestClient(t, mem)
+	c.Record(context.Background(), sampleEvent()) // line A
+
+	sc := &statInterleaveOnce{StorageClient: mem, key: "audit/2026-09-12.jsonl"}
+	c2 := newTestClient(t, sc)
+	ev := sampleEvent()
+	ev.Action = "capability_revoke"
+	c2.Record(context.Background(), ev)
+
+	data, err := mem.GetObject(context.Background(), "audit/2026-09-12.jsonl")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("interleaved writer lost a line: %d lines, want 3\n%s", len(lines), data)
+	}
+	var haveInterloper, haveRevoke bool
+	for _, line := range lines {
+		var e Event
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("line not parseable: %q: %v", line, err)
+		}
+		if e.Who == "interloper" {
+			haveInterloper = true
+		}
+		if e.Action == "capability_revoke" {
+			haveRevoke = true
+		}
+	}
+	if !haveInterloper || !haveRevoke {
+		t.Fatalf("concurrent or audit line missing (interloper=%v revoke=%v)\n%s", haveInterloper, haveRevoke, data)
+	}
+}
+
 func TestRecordGivesUpAfterRetriesWithoutPanic(t *testing.T) {
 	mem := ossfake.NewMemory()
 	c := newTestClient(t, mem)
