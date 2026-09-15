@@ -194,20 +194,6 @@ func (a *Authorizer) authorizeTeamLeader(caller *CallerIdentity, req AuthzReques
 		if req.Action == ActionSTS || req.Action == ActionRefreshMatrixToken {
 			return nil
 		}
-		if req.Action == ActionWorkerSkillPreload {
-			// Per-worker skill preload policy (QwenPaw 2.2.1): L2 humans
-			// may toggle preload on workers in their own teams. Like
-			// ActionGet this action is NOT rejected cross-team at the
-			// authorizer level: a 403 here would let a scoped caller probe
-			// which workers exist in other teams (W8 anti-probing). All
-			// real enforcement happens in the HANDLER: WorkerSkillsHandler
-			// performs the worker→team resolution and hides cross-team and
-			// standalone workers as 404. Team leaders and worker-role
-			// callers are denied at the authorizer level (default) and
-			// never reach the handler — team leaders stay read-only on
-			// skill runtime policy.
-			return nil
-		}
 		return deny(caller, req)
 
 	case "skills":

@@ -150,6 +150,26 @@ func TestAuthorizer_TeamLeaderOwnTeam(t *testing.T) {
 	}
 }
 
+// TestAuthorizer_TeamLeaderSkillPreloadReadOnly pins the skill-preload
+// boundary: team leaders stay read-only on the preload policy — the write
+// action is denied at the authorizer level (authorizeTeamLeaderWorkerAction
+// default), so the handler never runs and the caller gets an honest 403
+// rather than a handler round trip. The read action keeps the usual
+// same-team rule. The L2 human path (allowed at the authorizer level even
+// cross-team, hidden by the handler as 404) is covered by
+// TestAuthorizer_HumanScoped.
+func TestAuthorizer_TeamLeaderSkillPreloadReadOnly(t *testing.T) {
+	az := NewAuthorizer()
+	caller := &CallerIdentity{Role: RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"}
+
+	if err := az.Authorize(caller, AuthzRequest{Action: ActionWorkerSkillPreload, ResourceKind: "worker", ResourceName: "alpha-dev", ResourceTeam: "alpha-team"}); err == nil {
+		t.Error("team-leader must be denied the skill-preload write on their own team (read-only)")
+	}
+	if err := az.Authorize(caller, AuthzRequest{Action: ActionGet, ResourceKind: "worker", ResourceName: "alpha-dev", ResourceTeam: "alpha-team"}); err != nil {
+		t.Errorf("team-leader should keep read access on their own team, got: %v", err)
+	}
+}
+
 func TestAuthorizer_TeamLeaderCrossTeamDenied(t *testing.T) {
 	az := NewAuthorizer()
 	caller := &CallerIdentity{Role: RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"}
