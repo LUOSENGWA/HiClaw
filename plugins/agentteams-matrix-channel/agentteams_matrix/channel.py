@@ -4242,6 +4242,8 @@ class AgentTeamsMatrixChannel(BaseChannel):
         via the normal history prepend, so the agent re-evaluates against
         the latest conversation state.  The buffer is cleared afterwards
         so the same messages are not prepended again on a later turn.
+        The in-flight thread-root placeholder is carried over so the
+        retriggered turn reuses that message (no orphaned placeholder).
         """
         meta_dict = send_meta if isinstance(send_meta, dict) else {}
         room_id = to_handle
@@ -4261,22 +4263,34 @@ class AgentTeamsMatrixChannel(BaseChannel):
         ]
         content_parts = self._apply_history_to_parts(room_id, content_parts)
         worker_name = (self._user_id or "").split(":")[0].lstrip("@")
+        retrigger_meta: Dict[str, Any] = {
+            "room_id": room_id,
+            "is_dm": False,
+            "is_group": True,
+            "worker_name": worker_name,
+            "event_id": meta_dict.get("event_id"),
+            "thread_root_event_id": meta_dict.get("thread_root_event_id")
+            or meta_dict.get("event_id"),
+            "sender_id": sender_id,
+            "send_gate_retrigger": True,
+        }
+        # Reuse the in-flight thread-root placeholder: carrying the root id
+        # over makes the retriggered turn edit the same message instead of
+        # leaving an orphaned "处理中..." behind and posting a second
+        # placeholder (the stale draft was never flushed, so the message is
+        # still the placeholder).
+        carry_root = meta_dict.get(_MATRIX_OWN_THREAD_ROOT_KEY)
+        if carry_root:
+            retrigger_meta[_MATRIX_OWN_THREAD_ROOT_KEY] = carry_root
+            carry_meta_root = meta_dict.get(_THREAD_META_ROOT_KEY)
+            if carry_meta_root:
+                retrigger_meta[_THREAD_META_ROOT_KEY] = carry_meta_root
         payload = {
             "channel_id": CHANNEL_KEY,
             "sender_id": sender_id,
             "content_parts": content_parts,
             "acl_sender_id": sender_id,
-            "meta": {
-                "room_id": room_id,
-                "is_dm": False,
-                "is_group": True,
-                "worker_name": worker_name,
-                "event_id": meta_dict.get("event_id"),
-                "thread_root_event_id": meta_dict.get("thread_root_event_id")
-                or meta_dict.get("event_id"),
-                "sender_id": sender_id,
-                "send_gate_retrigger": True,
-            },
+            "meta": retrigger_meta,
         }
         self._room_histories.pop(room_id, None)
         logger.info(

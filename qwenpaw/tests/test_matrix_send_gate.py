@@ -11,8 +11,10 @@ import asyncio
 from unittest.mock import AsyncMock
 
 from agentteams_matrix.channel import (
+    _MATRIX_OWN_THREAD_ROOT_KEY,
     _MATRIX_PENDING_FINAL_MESSAGE_KEY,
     _MATRIX_SEND_GATE_MAX_RETRIGGERS,
+    _THREAD_META_ROOT_KEY,
     AgentTeamsMatrixChannel,
     HistoryEntry,
 )
@@ -164,3 +166,34 @@ def test_process_completed_drops_stale_reply_and_retriggers():
     # The stale pending message was dropped, not sent.
     ch._send_plain_text.assert_not_called()
     assert "stale final reply" not in str(ch.enqueued)
+
+
+def test_retrigger_carries_inflight_placeholder_root():
+    """The stale turn's in-flight thread-root placeholder must be carried
+    over: the retriggered turn edits that same message instead of leaving
+    an orphaned "处理中..." and posting a second placeholder."""
+    ch = _make_channel()
+    ch._room_histories["!room:hs.local"] = [_entry()]
+    meta = _turn_meta()
+    meta[_MATRIX_OWN_THREAD_ROOT_KEY] = "$root-placeholder"
+    meta[_THREAD_META_ROOT_KEY] = "$root-placeholder"
+
+    asyncio.run(ch._retrigger_for_new_context(meta, "!room:hs.local", 1))
+
+    payload = ch.enqueued[0]
+    assert payload["meta"][_MATRIX_OWN_THREAD_ROOT_KEY] == "$root-placeholder"
+    assert payload["meta"][_THREAD_META_ROOT_KEY] == "$root-placeholder"
+
+
+def test_retrigger_without_placeholder_root_stays_clean():
+    """A turn that never created a placeholder (e.g. gate before streaming
+    start) must not invent root keys: the retriggered turn creates its own."""
+    ch = _make_channel()
+    ch._room_histories["!room:hs.local"] = [_entry()]
+
+    asyncio.run(ch._retrigger_for_new_context(_turn_meta(), "!room:hs.local", 1))
+
+    payload = ch.enqueued[0]
+    assert _MATRIX_OWN_THREAD_ROOT_KEY not in payload["meta"]
+    # The fallback thread key still points at the turn event (normal path).
+    assert payload["meta"][_THREAD_META_ROOT_KEY] == "$turn1"
