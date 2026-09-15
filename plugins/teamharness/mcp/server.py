@@ -5323,6 +5323,28 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     exclude=["spec.md", "base/"],
                     result_paths=deliverables,
                 )
+                if not synced:
+                    return {
+                        "ok": False,
+                        "retryable": True,
+                        "tool": "taskflow",
+                        "action": action,
+                        "task": task,
+                        "reused": True,
+                        "error": (
+                            "shared storage sync failed after submit; the completion "
+                            "notification was withheld. Local task state is already "
+                            "submitted — retry submit_task (idempotent) once storage "
+                            "recovers."
+                        ),
+                    }
+                notification = _task_completion_notification(
+                    arguments,
+                    task,
+                    task_id,
+                    status,
+                    summary,
+                )
                 result = {
                     "ok": True,
                     "tool": "taskflow",
@@ -5331,6 +5353,7 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     "reused": True,
                     "publishedArtifacts": [],
                     "synced": synced,
+                    "notification": notification,
                     "notificationNeeded": _notification_needed(
                         "submit_task",
                         {"project_id": task.get("project_id", "")},
@@ -5338,8 +5361,6 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         summary=f"submit_task: {task_id} ({status})",
                     ),
                 }
-                if not synced:
-                    return _sync_failure_result(result, "submit_task")
                 return result
             task_dir = _task_dir(arguments, task_id)
             task_dir.mkdir(parents=True, exist_ok=True)
