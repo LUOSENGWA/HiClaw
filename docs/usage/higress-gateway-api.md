@@ -7,8 +7,9 @@ gateway (the **control plane**).
 
 - **Data plane** — endpoints that Workers, Managers, and external clients call to reach
   LLM providers, MCP servers, exposed Worker ports, and bundled services.
-- **Control plane** — the Higress Console REST API that the `agentteams-controller`
-  and legacy Manager scripts use to configure routes, consumers, and MCP servers.
+- **Control plane** — the Higress Console REST API used to configure routes and
+  consumers (by the `agentteams-controller` and Manager-side scripts); MCP servers
+  are registered by the Manager-side scripts only.
 
 > **Version anchor.** This reference documents the behavior of Higress **2.2.1**, the
 > version pinned by AgentTeams (`agentteams-controller/Dockerfile.embedded`,
@@ -97,7 +98,7 @@ mcporter --transport http \
 MCP access is also governed by per-consumer authorization (`consumerAuthInfo` on the
 MCP server). Gateway-side registration is handled by `setup-higress.sh` (embedded stack
 bootstrap) or the `setup-mcp-server.sh` Manager skill script; the controller itself does
-**not** call the Higress MCP Console API — it only generates the Worker's mcporter client
+**not** call the Higress MCP Console API — it only generates the Manager/Worker mcporter client
 config. See `manager/agent/skills/mcp-server-management/`.
 
 ### 3. Exposed Worker ports (service publishing)
@@ -134,7 +135,8 @@ The installer also registers routes for the services bundled with the embedded s
 | OpenClaw Console | `console-local.agentteams.io` | `/` | `openclaw-console.static:18888` (basic-auth) |
 
 These are created once on first boot by `setup-higress.sh` (non-idempotent, marker
-protected) or by the controller initializer on embedded stacks.
+protected); on embedded stacks the controller initializer additionally (idempotently)
+creates the Matrix homeserver and Element Web routes it needs.
 
 ## Authentication summary
 
@@ -152,7 +154,7 @@ AI routes is scoped per consumer through `authConfig.allowedConsumers`.
 
 ## Control plane — Higress Console API
 
-The controller and legacy scripts manage the gateway through the Higress Console REST
+The controller and Manager-side scripts manage the gateway through the Higress Console REST
 API (in-container `http://127.0.0.1:8001`). Session-cookie auth: `POST /system/init`
 bootstraps the admin account, `POST /session/login` obtains the cookie. The MCP-related
 endpoints (`/v1/mcpServer`, `/v1/mcpServer/consumers`) are called only by the shell

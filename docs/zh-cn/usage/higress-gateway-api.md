@@ -6,8 +6,8 @@ Console API（**控制面**）。
 
 - **数据面** —— Worker、Manager 和外部客户端调用 LLM Provider、MCP Server、暴露的
   Worker 端口以及内置服务的端点。
-- **控制面** —— `agentteams-controller` 和旧版 Manager 脚本用于配置路由、Consumer 和
-  MCP Server 的 Higress Console REST API。
+- **控制面** —— 用于配置路由与 Consumer 的 Higress Console REST API（由
+  `agentteams-controller` 与 Manager 侧脚本使用）；MCP Server 仅由 Manager 侧脚本注册。
 
 > **版本锚点。** 本文档描述 AgentTeams 锁定的 Higress **2.2.1** 版本行为
 > （见 `agentteams-controller/Dockerfile.embedded`、`helm/agentteams/Chart.yaml`）。
@@ -88,7 +88,7 @@ mcporter --transport http \
 
 MCP 访问同样受 per-consumer 授权控制（MCP Server 上的 `consumerAuthInfo`）。网关侧注册
 由 `setup-higress.sh`（嵌入式栈 bootstrap）或 `setup-mcp-server.sh`（Manager skill 脚本）
-完成；controller 本身**不**调用 Higress MCP Console API——它只生成 Worker 的 mcporter
+完成；controller 本身**不**调用 Higress MCP Console API——它只生成 Manager/Worker 的 mcporter
 客户端配置。参见 `manager/agent/skills/mcp-server-management/`。
 
 ### 3. 暴露的 Worker 端口（服务发布）
@@ -121,8 +121,9 @@ Higress 的 domain、service source 和 route（`agentteams-controller/internal/
 | HTTP 文件系统 | `fs-local.agentteams.io` | `/` | MinIO S3（`minio.static:9000`） |
 | OpenClaw Console | `console-local.agentteams.io` | `/` | `openclaw-console.static:18888`（basic-auth） |
 
-这些资源在首次启动时由 `setup-higress.sh`（非幂等，受 marker 保护）或嵌入式栈的
-controller initializer 创建。
+这些资源在首次启动时由 `setup-higress.sh`（非幂等，受 marker 保护）创建；
+嵌入式栈上，controller initializer 还会（幂等地）创建其所需的 Matrix 服务器与
+Element Web 路由。
 
 ## 认证方式汇总
 
@@ -140,7 +141,7 @@ Consumer key 由 controller 按 Manager/Worker 分别生成，并注入为
 
 ## 控制面 —— Higress Console API
 
-controller 和旧版脚本通过 Higress Console REST API（容器内 `http://127.0.0.1:8001`）
+controller 和 Manager 侧脚本通过 Higress Console REST API（容器内 `http://127.0.0.1:8001`）
 管理网关。使用 session-cookie 认证：`POST /system/init` 初始化 admin 账号，
 `POST /session/login` 获取 cookie。MCP 相关端点（`/v1/mcpServer`、`/v1/mcpServer/consumers`）
 只由 shell 脚本调用，不由 controller 的 Go 代码调用。
