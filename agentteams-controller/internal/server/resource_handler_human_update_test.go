@@ -258,15 +258,6 @@ func TestUpdateHuman_CapabilityChangeIsAudited(t *testing.T) {
 	}
 }
 
-func containsAll(s string, subs ...string) bool {
-	for _, sub := range subs {
-		if !strings.Contains(s, sub) {
-			return false
-		}
-	}
-	return true
-}
-
 func TestUpdateHuman_InvalidLevelRejected(t *testing.T) {
 	handler := newHumanUpdateRig(t)
 	for _, level := range []string{"0", "4", "-1"} {
