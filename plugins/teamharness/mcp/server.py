@@ -3489,6 +3489,12 @@ def _accept_task_result(arguments: dict[str, Any], payload: dict[str, Any]) -> d
     if task_meta:
         task_meta["status"] = node_status
         _resolve_task_continuation(task_meta, node_status)
+        # Carry the resolved attention list (closed above, possibly
+        # after the entry-time task load) into the final task write so
+        # the leader-side mutation cannot clobber the closed loops.
+        freshest_task = _read_json(_task_state_path(arguments, task_id), {})
+        if isinstance(freshest_task, dict) and isinstance(freshest_task.get("attention"), list):
+            task_meta["attention"] = freshest_task["attention"]
         try:
             _write_task(arguments, task_meta)
         except OSError as exc:
@@ -4197,11 +4203,9 @@ def _write_task(arguments: dict[str, Any], task: dict[str, Any]) -> None:
 ALLOWED_TASK_RESULT_STATUSES = {
     "SUCCESS",
     "SUCCESS_WITH_NOTES",
-    "PARTIAL",
     "REVISION_NEEDED",
     "BLOCKED",
     "INTERRUPTED",
-    "FAILED",
 }
 
 
@@ -4576,12 +4580,14 @@ def _team_leader_matrix_id() -> str:
 _TASK_COMPLETION_EVENT_TOKENS = {
     "SUCCESS": "TASK_COMPLETED",
     "SUCCESS_WITH_NOTES": "TASK_COMPLETED",
-    "PARTIAL": "TASK_PARTIAL",
     "REVISION_NEEDED": "TASK_REVISION_NEEDED",
     "BLOCKED": "TASK_BLOCKED",
-    "FAILED": "TASK_FAILED",
-    # Defensive only — not part of the accepted result-status contract.
     "INTERRUPTED": "TASK_INTERRUPTED",
+    # Defensive only — #1183 removed PARTIAL / FAILED from the accepted
+    # result-status set (no acceptance mapping). The entries stay so a
+    # future re-adding of those statuses emits the right first line.
+    "PARTIAL": "TASK_PARTIAL",
+    "FAILED": "TASK_FAILED",
 }
 
 
@@ -4717,19 +4723,23 @@ def _send_task_completion_notification(
 
     Publishes the completion event to the Task room with ``m.mentions``
     using the same Matrix HTTP send path as the message tool. Every
-    result status gets its own first-line contract token so leader-side
-    prompts can branch on the line itself (task-execution skill
-    contract):
+    accepted result status gets its own first-line contract token so
+    leader-side prompts can branch on the line itself (task-execution
+    skill contract; #1183's accepted set):
         @leader TASK_COMPLETED: <task-id> - Result: shared/tasks/<task-id>/result.md
-        @leader TASK_PARTIAL: <task-id> - <summary>
         @leader TASK_REVISION_NEEDED: <task-id> - <summary>
         @leader TASK_BLOCKED: <task-id> - <short blocker summary>
-        @leader TASK_FAILED: <task-id> - <summary>
+        @leader TASK_INTERRUPTED: <task-id> - <summary>
+    PARTIAL / FAILED keep defensive map entries (TASK_PARTIAL /
+    TASK_FAILED): #1183 removed them from the accepted set, so a
+    re-adding there emits the right first line without a follow-up
+    change here.
     Humans (task initiator and other non-agent members) are mentioned
     alongside the leader so the requester is routed with the same
     salience the leader is. The transaction ID is stable per task and
-    status so a retry cannot produce a duplicate event, while a
-    re-submission with a changed status produces a new one.
+    status, and the recorded event id is reused on an exact retry, so
+    the event is sent exactly once (the durable-continuation digest
+    fence rejects a resubmission with a changed result).
     """
     homeserver = os.getenv("AGENTTEAMS_MATRIX_URL", "").rstrip("/")
     token = os.getenv("AGENTTEAMS_WORKER_MATRIX_TOKEN", "")
@@ -5317,33 +5327,15 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         "reused": True,
                         "publishedArtifacts": [],
                     }, "submit_task project")
+                # P0 ordering applies to the resubmit path too: sync
+                # first, withhold the notification on a failed sync
+                # (computed only on the success path), return the
+                # retryable sync-failure result.
                 synced = _sync_task(
                     arguments,
                     task_id,
                     exclude=["spec.md", "base/"],
                     result_paths=deliverables,
-                )
-                if not synced:
-                    return {
-                        "ok": False,
-                        "retryable": True,
-                        "tool": "taskflow",
-                        "action": action,
-                        "task": task,
-                        "reused": True,
-                        "error": (
-                            "shared storage sync failed after submit; the completion "
-                            "notification was withheld. Local task state is already "
-                            "submitted — retry submit_task (idempotent) once storage "
-                            "recovers."
-                        ),
-                    }
-                notification = _task_completion_notification(
-                    arguments,
-                    task,
-                    task_id,
-                    status,
-                    summary,
                 )
                 result = {
                     "ok": True,
@@ -5353,7 +5345,6 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     "reused": True,
                     "publishedArtifacts": [],
                     "synced": synced,
-                    "notification": notification,
                     "notificationNeeded": _notification_needed(
                         "submit_task",
                         {"project_id": task.get("project_id", "")},
@@ -5361,6 +5352,15 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         summary=f"submit_task: {task_id} ({status})",
                     ),
                 }
+                if not synced:
+                    return _sync_failure_result(result, "submit_task")
+                result["notification"] = _task_completion_notification(
+                    arguments,
+                    task,
+                    task_id,
+                    status,
+                    summary,
+                )
                 return result
             task_dir = _task_dir(arguments, task_id)
             task_dir.mkdir(parents=True, exist_ok=True)
@@ -5424,7 +5424,8 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             # an attention signal, not a receipt. Sync shared storage
             # first so the leader can immediately read result.md /
             # deliverables, and only then notify. A failed sync withholds
-            # the notification and returns a retryable failure instead of
+            # the notification (it is computed only on the success path)
+            # and returns the retryable sync-failure result instead of
             # telling the leader "done" while the artifacts are
             # unreachable. The retry is idempotent (event reuse is keyed
             # by task + status).
@@ -5434,27 +5435,6 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 exclude=["spec.md", "base/"],
                 result_paths=deliverables,
             )
-            if not synced:
-                return {
-                    "ok": False,
-                    "retryable": True,
-                    "tool": "taskflow",
-                    "action": action,
-                    "task": task,
-                    "error": (
-                        "shared storage sync failed after submit; the completion "
-                        "notification was withheld. Local task state is already "
-                        "submitted — retry submit_task (idempotent) once storage "
-                        "recovers."
-                    ),
-                }
-            notification = _task_completion_notification(
-                arguments,
-                task,
-                task_id,
-                status,
-                summary,
-            )
             result = {
                 "ok": True,
                 "tool": "taskflow",
@@ -5462,7 +5442,6 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 "task": task,
                 "publishedArtifacts": published_artifacts,
                 "synced": synced,
-                "notification": notification,
                 "notificationNeeded": _notification_needed(
                     "submit_task",
                     {"project_id": task.get("project_id", "")},
@@ -5470,6 +5449,15 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     summary=f"submit_task: {task_id} ({status})",
                 ),
             }
+            if not synced:
+                return _sync_failure_result(result, "submit_task")
+            result["notification"] = _task_completion_notification(
+                arguments,
+                task,
+                task_id,
+                status,
+                summary,
+            )
             return result
 
         if action == "request_attention":
