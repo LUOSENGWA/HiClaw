@@ -32,6 +32,8 @@ class _ApiHandler(BaseHTTPRequestHandler):
     providers = {}
     active_llm = None
     model_deletes = 0
+    model_post_failures = 0
+    model_delete_failures = 0
 
     def log_message(self, _format, *_args):
         return
@@ -142,6 +144,10 @@ class _ApiHandler(BaseHTTPRequestHandler):
             if provider is None:
                 self._reply(404, {"detail": "missing"})
                 return
+            if type(self).model_post_failures:
+                type(self).model_post_failures -= 1
+                self._reply(500, {"detail": "injected: model add failed"})
+                return
             # Real contract: the app rejects a duplicate model id instead
             # of upserting (Provider.add_model -> "already exists").
             existing = {
@@ -201,6 +207,10 @@ class _ApiHandler(BaseHTTPRequestHandler):
             if not sep or provider is None:
                 self._reply(404, {"detail": "missing"})
                 return
+            if type(self).model_delete_failures:
+                type(self).model_delete_failures -= 1
+                self._reply(500, {"detail": "injected: model delete failed"})
+                return
             model_id = urllib.parse.unquote(model_id)
             for list_name in ("models", "extra_models"):
                 provider[list_name] = [
@@ -254,6 +264,8 @@ def api_url():
     _ApiHandler.providers = {}
     _ApiHandler.active_llm = None
     _ApiHandler.model_deletes = 0
+    _ApiHandler.model_post_failures = 0
+    _ApiHandler.model_delete_failures = 0
     server = ThreadingHTTPServer(("127.0.0.1", 0), _ApiHandler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -543,3 +555,126 @@ def test_configure_active_model_existing_model_no_drift_is_noop(api_url):
     provider = _ApiHandler.providers["agentteams-gateway"]
     assert provider["models"][0]["supports_image"] is True
     assert provider["extra_models"] == []
+
+
+def _seed_stale_provider() -> None:
+    _ApiHandler.providers["agentteams-gateway"] = {
+        "id": "agentteams-gateway",
+        "name": "AgentTeams Gateway",
+        "base_url": "http://gateway.example.com/v1",
+        "models": [
+            {
+                "id": "qwen3.6-plus",
+                "name": "Qwen3.6 Plus",
+                "supports_image": False,
+                "supports_video": False,
+                "supports_multimodal": False,
+                "probe_source": "probed",
+            },
+        ],
+        "extra_models": [],
+    }
+
+
+def test_configure_active_model_readd_failure_restores_original_entry(api_url):
+    """Regression: a failed re-add must not leave the Worker without its
+    previously usable model — the compensating restore brings back the
+    original entry."""
+    _seed_stale_provider()
+    _ApiHandler.model_post_failures = 1
+    client = QwenPawApiClient(api_url)
+
+    with pytest.raises(QwenPawApiError, match="restored and verified"):
+        client.configure_active_model(
+            "agentteams-gateway",
+            "qwen3.6-plus",
+            base_url="http://gateway.example.com/v1",
+            api_key="secret",
+            supports_image=True,
+            supports_video=False,
+            supports_multimodal=True,
+            probe_source="documentation",
+        )
+
+    provider = _ApiHandler.providers["agentteams-gateway"]
+    entries = provider["models"] + provider["extra_models"]
+    assert [entry["id"] for entry in entries] == ["qwen3.6-plus"]
+    # The restored entry keeps the ORIGINAL stored state, not the desired
+    # values — convergence is retried by the next update cycle.
+    assert entries[0]["supports_image"] is False
+    assert entries[0]["probe_source"] == "probed"
+    assert entries[0]["name"] == "Qwen3.6 Plus"
+    assert _ApiHandler.model_deletes == 1
+
+
+def test_configure_active_model_readd_and_restore_failure_surfaces_actionable_error(api_url):
+    """When both the re-add and the compensating restore fail, the error
+    must name the broken state and how to recover — and the very next
+    update re-registers the missing model via the add path."""
+    _seed_stale_provider()
+    _ApiHandler.model_post_failures = 2
+    client = QwenPawApiClient(api_url)
+
+    with pytest.raises(
+        QwenPawApiError,
+        match=r"no longer registered.*re-run the worker update",
+    ):
+        client.configure_active_model(
+            "agentteams-gateway",
+            "qwen3.6-plus",
+            base_url="http://gateway.example.com/v1",
+            api_key="secret",
+            supports_image=True,
+            supports_video=False,
+            supports_multimodal=True,
+            probe_source="documentation",
+        )
+
+    provider = _ApiHandler.providers["agentteams-gateway"]
+    assert provider["models"] == []
+    assert provider["extra_models"] == []
+
+    # Recovery: the next update sees the missing model and re-adds it with
+    # the desired capabilities.
+    _ApiHandler.model_post_failures = 0
+    client.configure_active_model(
+        "agentteams-gateway",
+        "qwen3.6-plus",
+        base_url="http://gateway.example.com/v1",
+        api_key="secret",
+        supports_image=True,
+        supports_video=False,
+        supports_multimodal=True,
+        probe_source="documentation",
+    )
+    entries = provider["models"] + provider["extra_models"]
+    assert [entry["id"] for entry in entries] == ["qwen3.6-plus"]
+    assert entries[0]["supports_image"] is True
+    assert entries[0]["probe_source"] == "documentation"
+
+
+def test_configure_active_model_delete_failure_keeps_entry_and_raises(api_url):
+    """A rejected DELETE must not trigger any restore: the entry is still
+    there, so the only correct outcome is the original error."""
+    _seed_stale_provider()
+    _ApiHandler.model_delete_failures = 1
+    client = QwenPawApiClient(api_url)
+
+    with pytest.raises(QwenPawApiError, match="HTTP 500"):
+        client.configure_active_model(
+            "agentteams-gateway",
+            "qwen3.6-plus",
+            base_url="http://gateway.example.com/v1",
+            api_key="secret",
+            supports_image=True,
+            supports_video=False,
+            supports_multimodal=True,
+            probe_source="documentation",
+        )
+
+    provider = _ApiHandler.providers["agentteams-gateway"]
+    entries = provider["models"] + provider["extra_models"]
+    assert [entry["id"] for entry in entries] == ["qwen3.6-plus"]
+    # Untouched: still the original stored state.
+    assert entries[0]["supports_image"] is False
+    assert _ApiHandler.model_deletes == 0

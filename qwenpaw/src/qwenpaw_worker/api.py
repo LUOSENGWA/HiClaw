@@ -454,6 +454,11 @@ class QwenPawApiClient:
         capability value actually differs from the stored one. Steady
         state stays a no-op, so repeated worker updates do not churn the
         entry.
+
+        Failure safety: the re-add is wrapped in a compensating restore —
+        if it fails after the delete, the original entry is re-posted and
+        verified, so the Worker never ends up without its previously
+        usable model; a failed restore raises an actionable error.
         """
         desired = {
             key: model_payload[key]
@@ -479,7 +484,60 @@ class QwenPawApiClient:
             # Re-add must not downgrade a human-readable display name to
             # the bare model id.
             readd["name"] = entry["name"]
-        self._request("POST", base, readd)
+        try:
+            self._request("POST", base, readd)
+        except QwenPawApiError as exc:
+            # The entry is already deleted; a failed re-add must not leave
+            # the Worker without its previously usable model.
+            self._restore_model_entry(provider_id, base, entry, exc)
+
+    def _restore_model_entry(
+        self,
+        provider_id: str,
+        base: str,
+        entry: dict[str, Any],
+        readd_error: QwenPawApiError,
+    ) -> None:
+        """Compensating restore after a failed delete + re-add.
+
+        Re-posts the original stored entry and verifies it in the
+        response, so the previously usable model comes back; the next
+        update cycle retries the convergence from the restored state.
+        Always raises: the re-add error (with the restore confirmed) when
+        recovery succeeded, or an actionable error when it did not.
+        """
+        model_id = str(entry.get("id") or "")
+        restore = dict(entry)
+        if not restore.get("name"):
+            # The add endpoint requires a name; a malformed stored entry
+            # must not block the restore.
+            restore["name"] = model_id or "model"
+        try:
+            result = self._request("POST", base, restore)
+        except QwenPawApiError as restore_error:
+            raise QwenPawApiError(
+                "QwenPaw model re-add failed "
+                f"({readd_error}) and the compensating restore of the "
+                f"original entry also failed ({restore_error}); model "
+                f"'{model_id}' is no longer registered on provider "
+                f"'{provider_id}' - re-run the worker update (or wait "
+                "for the next reconcile) to re-register it"
+            ) from readd_error
+        if not isinstance(result, dict) or self._find_model_entry(
+            result, model_id
+        ) is None:
+            raise QwenPawApiError(
+                "QwenPaw model re-add failed "
+                f"({readd_error}) and the restore response did not "
+                f"confirm the entry; model '{model_id}' may be missing "
+                f"from provider '{provider_id}' - re-run the worker "
+                "update (or wait for the next reconcile) to re-register it"
+            ) from readd_error
+        raise QwenPawApiError(
+            f"QwenPaw model re-add failed ({readd_error}); the original "
+            "model entry was restored and verified, so the previously "
+            "usable model remains available"
+        ) from readd_error
 
     def configure_agent(
         self,
