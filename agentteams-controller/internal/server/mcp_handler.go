@@ -156,7 +156,12 @@ func (h *ResourceHandler) ListMCPServers(w http.ResponseWriter, r *http.Request)
 			if name == "" {
 				continue
 			}
-			data, err := h.oss.GetObject(ctx, key)
+			// ListObjects returns names RELATIVE to the prefix (the production
+			// MinIOClient wraps `mc ls`, which prints the bare child name);
+			// GetObject needs the full key, so re-attach the registry prefix.
+			// Reading the listed name as-is would fetch the bucket root and
+			// silently drop every registry-only entry.
+			data, err := h.oss.GetObject(ctx, mcpRegistryPrefix+base)
 			if err != nil {
 				// A unreadable registry document must not fail the whole
 				// catalog; skip it (the entry simply does not appear).

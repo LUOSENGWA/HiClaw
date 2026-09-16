@@ -209,6 +209,36 @@ func TestListMCPServers_NoOSS_SharedHalfUnavailable(t *testing.T) {
 	}
 }
 
+// TestListMCPServers_ProductionListingContract pins the production
+// listing-contract regression: MinIOClient.ListObjects wraps `mc ls` and
+// returns names RELATIVE to the prefix (e.g. "github.json"). The catalog
+// must re-attach the registry prefix before GetObject — otherwise the
+// registry-only server vanishes into a silent bucket-root read failure
+// (total=0, registry_available=true) while worker-spec entries still show.
+func TestListMCPServers_ProductionListingContract(t *testing.T) {
+	scheme := newServerTestScheme(t)
+	k8s := fake.NewClientBuilder().WithScheme(scheme).Build() // no workers: registry-only
+	store := ossfake.NewMemory()
+	mcpPutRegistry(t, store, "github", `{"name":"github","url":"https://apig.example.com/mcp-servers/github/mcp","transport":"http","timeout":60,"trusted":true}`)
+
+	h := NewResourceHandler(k8s, "default", nil, "").WithOSS(store)
+	resp := mcpDecode(t, mcpGet(t, h, mcpCallerCtx(authpkg.RoleAdmin, "", nil)))
+
+	if !resp.RegistryAvailable {
+		t.Fatal("registry_available = false, want true")
+	}
+	if resp.Total != 1 {
+		t.Fatalf("total = %d, want 1 (registry-only entry lost): %+v", resp.Total, resp.Servers)
+	}
+	g := mcpFind(t, resp, "github")
+	if g.Source != "registry" || !g.Trusted || g.Timeout != 60 {
+		t.Fatalf("registry-only entry wrong: %+v", g)
+	}
+	if g.URL != "apig.example.com/mcp-servers/github/mcp" {
+		t.Fatalf("registry-only url wrong: %q", g.URL)
+	}
+}
+
 func TestListMCPServers_CorruptRegistryDocSkipped(t *testing.T) {
 	scheme := newServerTestScheme(t)
 	k8s := fake.NewClientBuilder().WithScheme(scheme).Build()
