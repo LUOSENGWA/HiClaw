@@ -270,11 +270,10 @@ func (q *Query) dailyKeys(ctx context.Context, from, to time.Time) ([]string, er
 	}
 	var keys []string
 	for _, name := range names {
-		base, ok := strings.CutPrefix(name, jsonlPrefix)
-		if !ok {
-			continue
-		}
-		dayName, ok := strings.CutSuffix(base, ".jsonl")
+		// ListObjects returns names RELATIVE to the prefix (production
+		// contract), so the daily object name is "2006-01-02.jsonl" without
+		// the audit/ prefix. dayKey below re-attaches it for GetObject.
+		dayName, ok := strings.CutSuffix(name, ".jsonl")
 		if !ok {
 			continue
 		}
