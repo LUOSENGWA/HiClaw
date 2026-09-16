@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 
+	audit "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/audit"
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/backend"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/credentials"
@@ -67,7 +68,7 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	mux.Handle("GET /api/v1/version", mw.Authenticate(http.HandlerFunc(sh.Version)))
 
 	// --- Declarative resource CRUD ---
-	rh := NewResourceHandler(deps.Client, deps.Namespace, deps.Backend, deps.ControllerName)
+	rh := NewResourceHandler(deps.Client, deps.Namespace, deps.Backend, deps.ControllerName, audit.NewClient(deps.OSS))
 	rh.defaultWorkerRuntime = deps.DefaultWorkerRuntime
 	nameFn := authpkg.NameFromPath
 
@@ -166,6 +167,22 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	// --- Skill catalog (read-only: builtin skills per runtime + shared skills under agents/global/skills/) ---
 	skh := NewSkillsHandler(deps.WorkerAgentDir, deps.OSS)
 	mux.Handle("GET /api/v1/skills", mw.RequireAuthz(authpkg.ActionList, "skills", nil)(http.HandlerFunc(skh.ListSkills)))
+
+	// --- Worker channels (channel configuration; proxy to the worker's qwenpaw app) ---
+	// Reads use ActionGet; mutations use ActionUpdate so the authorizer's
+	// worker-scoped policy applies (L2 human writes ride on the
+	// worker-scoped update rule; until it lands the middleware denies them
+	// and only admin reaches the handler). The handler is the real boundary
+	// either way: team leaders are read-only (403 on mutations) and every
+	// scoped caller is team-checked (W8: 404, never 403).
+	chh := NewChannelsHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix, deps.OSS)
+	mux.Handle("GET /api/v1/workers/{name}/channels", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(chh.getChannels)))
+	mux.Handle("GET /api/v1/workers/{name}/channels/{sub}", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(chh.getChannelResource)))
+	mux.Handle("PUT /api/v1/workers/{name}/channels/{channel}", mw.RequireAuthz(authpkg.ActionUpdate, "worker", nameFn)(http.HandlerFunc(chh.putChannel)))
+	mux.Handle("GET /api/v1/workers/{name}/channels/{channel}/health", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(chh.getChannelHealth)))
+	mux.Handle("GET /api/v1/workers/{name}/channels/{channel}/qrcode", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(chh.getChannelQrcode)))
+	mux.Handle("GET /api/v1/workers/{name}/channels/{channel}/qrcode/status", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(chh.getQrcodeStatus)))
+	mux.Handle("POST /api/v1/workers/{name}/channels/{channel}/restart", mw.RequireAuthz(authpkg.ActionUpdate, "worker", nameFn)(http.HandlerFunc(chh.restartChannel)))
 
 	// W-PR-2: human intervention + lifecycle (write endpoints). All writes go
 	// through RequireAuthz ActionUpdate + "project" so the authorizer's
