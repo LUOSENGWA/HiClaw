@@ -139,9 +139,10 @@ Manager 会先上传并验证 `SKILL.md`，再更新 `spec.skills`。QwenPaw Wor
 
 ### 技能目录 API
 
-`GET /api/v1/skills` 返回部署中可用技能的只读目录，含两类：
+`GET /api/v1/skills` 返回部署中可用技能的只读目录，含三类：
 
 - **`source: "builtin"`**——agent 模板自带的内置技能（取自各 `SKILL.md` frontmatter 的 name + description，`agents` 列出提供该技能的模板，`runtimes` 列出支持的运行时）。模板→运行时的映射取自 deployer 自身的 `BuiltinAgentDir` 选择逻辑，因此目录永远与 Worker 实际接收的内置技能一致、不会漂移。
+- **`source: "plugin"`**——随插件包分发的技能（如 TeamHarness），从各插件包的 `plugin.yaml` 清单发现——与插件构建打进 worker 镜像的同一数据源。条目携带 `plugin` 字段；只读且不可经 `spec.skills` 分配（Worker 有插件即有该技能——无 `runtimes`/`agents`/per-worker 分配字段）。
 - **`source: "shared"`**——Dashboard 技能上传流程暂存到 `agents/global/skills/` 下的技能，可分发到任意 Worker。该前缀是**暂存区而非分发通道**：删除其中某个条目只会把它从目录和 Dashboard 全局区移除，**不会**触碰已分发的 per-worker 副本或既有的 `spec.skills` 分配（无级联）。
 - **`source: "team"`**（仅 `?team=` 时）——该团队自有的技能，位于 `teams/<team>/skills/`，通过 `POST /api/v1/skills` 发布（见下文）。
 

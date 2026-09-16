@@ -93,7 +93,7 @@ func newSkillsRig(t *testing.T, scanner skillscan.SkillScanner) (*SkillsHandler,
 
 	fakeOSS := &mcLikeOSS{Memory: store}
 	dir := filepath.Join(base, "worker-agent")
-	return NewSkillsHandler(dir, fakeOSS, k8s, "default", scanner), fakeOSS, base
+	return NewSkillsHandler(dir, "", fakeOSS, k8s, "default", scanner), fakeOSS, base
 }
 
 func getSkills(t *testing.T, h *SkillsHandler) *httptest.ResponseRecorder {
@@ -615,7 +615,7 @@ func TestSkills_UploadScanGate(t *testing.T) {
 		WithScheme(newServerTestScheme(t)).
 		WithRuntimeObjects(&v1beta1.Team{ObjectMeta: metav1.ObjectMeta{Name: "market-team", Namespace: "default"}}).
 		Build()
-	hNil := NewSkillsHandler(filepath.Join(base, "worker-agent"), &mcLikeOSS{Memory: ossfake.NewMemory()}, k8s, "default", nil)
+	hNil := NewSkillsHandler(filepath.Join(base, "worker-agent"), "", &mcLikeOSS{Memory: ossfake.NewMemory()}, k8s, "default", nil)
 	if rec := postSkill(t, hNil, skAdmin, "team", "market-team", zip); rec.Code != http.StatusOK {
 		t.Errorf("nil scanner: status = %d, want 200 (best-effort)", rec.Code)
 	}
@@ -758,7 +758,7 @@ func TestSkillsCatalogFieldDiscipline(t *testing.T) {
 	if payload.Total != len(payload.Skills) {
 		t.Fatalf("total = %d, entries = %d", payload.Total, len(payload.Skills))
 	}
-	allowed := map[string]bool{"name": true, "description": true, "source": true, "version": true, "requirements": true, "updated_at": true, "agents": true, "runtimes": true}
+	allowed := map[string]bool{"name": true, "description": true, "source": true, "version": true, "requirements": true, "updated_at": true, "agents": true, "plugin": true, "runtimes": true}
 	for _, entry := range payload.Skills {
 		for k := range entry {
 			if !allowed[k] {
@@ -774,7 +774,7 @@ func TestSkillsCatalogSharedDegradesOnOSSFailure(t *testing.T) {
 	base := t.TempDir()
 	writeSkill(t, filepath.Join(base, "worker-agent", "skills"), "file-sync", "Sync files.")
 	failing := &mcLikeOSS{Memory: ossfake.NewMemory(), failList: true}
-	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), failing, nil, "default", nil)
+	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), "", failing, nil, "default", nil)
 
 	skills := decodeSkills(t, getSkills(t, h))
 	if len(skills) != 1 || skills[0].Name != "file-sync" || skills[0].Source != "builtin" {
@@ -789,7 +789,7 @@ func TestSkillsCatalogNoTemplateDir(t *testing.T) {
 	if err := store.PutObject(context.Background(), globalSkillsPrefix+"shared-kb/SKILL.md", []byte("x")); err != nil {
 		t.Fatal(err)
 	}
-	h := NewSkillsHandler("", &mcLikeOSS{Memory: store}, nil, "default", nil)
+	h := NewSkillsHandler("", "", &mcLikeOSS{Memory: store}, nil, "default", nil)
 	skills := decodeSkills(t, getSkills(t, h))
 	if len(skills) != 1 || skills[0].Name != "shared-kb" || skills[0].Source != "shared" {
 		t.Fatalf("skills = %v, want shared-only [shared-kb]", skills)
@@ -876,7 +876,7 @@ func TestSkillsCatalogFrontmatterExtension(t *testing.T) {
 			"requires: [git, jq]\n")
 	writeSkill(t, skillRoot, "plain-skill", "Declares nothing.")
 
-	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), &mcLikeOSS{Memory: ossfake.NewMemory()}, nil, "default", nil)
+	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), "", &mcLikeOSS{Memory: ossfake.NewMemory()}, nil, "default", nil)
 	skills := decodeSkills(t, getSkills(t, h))
 
 	full := skillByName(t, skills, "full-skill")
@@ -922,7 +922,7 @@ func TestSkillsCatalogSharedUpdatedAt(t *testing.T) {
 	if err := fakeOSS.PutObject(context.Background(), "agents/global/skills/team-report/SKILL.md", []byte("---\nname: team-report\n---\n")); err != nil {
 		t.Fatal(err)
 	}
-	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), &mcLikeOSS{Memory: fakeOSS}, nil, "default", nil)
+	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), "", &mcLikeOSS{Memory: fakeOSS}, nil, "default", nil)
 	skills := decodeSkills(t, getSkills(t, h))
 
 	shared := skillByName(t, skills, "team-report")
@@ -950,7 +950,7 @@ func TestSkillsCatalogRequiresNamespacePrecedence(t *testing.T) {
 			"  openclaw:\n"+
 			"    requires:\n"+
 			"      mcp: [ns-mcp]\n")
-	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), &mcLikeOSS{Memory: ossfake.NewMemory()}, nil, "default", nil)
+	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), "", &mcLikeOSS{Memory: ossfake.NewMemory()}, nil, "default", nil)
 	skills := decodeSkills(t, getSkills(t, h))
 
 	ns := skillByName(t, skills, "ns-skill")
@@ -974,6 +974,187 @@ func sortedCopy(in []string) []string {
 		}
 	}
 	return out
+}
+
+// --- Plugin source (teamharness skill visibility, #1221 addendum) ---
+
+const testPluginYAML = `apiVersion: agentteams.agentteam/v1alpha1
+kind: AgentTeamPlugin
+metadata:
+  name: teamharness
+  version: 0.1.0
+skills:
+  agent:
+    - id: mcporter
+      path: skills/agent/mcporter
+      roles: [leader, worker, manager, remote-member]
+  team:
+    - id: communication
+      path: skills/team/communication
+      roles: [leader, worker, manager, remote-member]
+`
+
+// writePluginTree lays out a minimal plugin dir:
+//
+//	plugins/teamharness/{plugin.yaml, skills/agent/mcporter, skills/team/communication, skills/team/organization}
+//	plugins/no-skills/plugin.yaml          (no skills block)
+//
+// organization/ is on disk but NOT declared in the manifest — it must not
+// appear in the catalog (manifest-driven discovery).
+func writePluginTree(t *testing.T, pluginsDir string) {
+	t.Helper()
+	th := filepath.Join(pluginsDir, "teamharness")
+	for _, d := range []string{
+		filepath.Join(th, "skills", "agent", "mcporter"),
+		filepath.Join(th, "skills", "team", "communication"),
+		filepath.Join(th, "skills", "team", "organization"),
+		filepath.Join(pluginsDir, "no-skills"),
+	} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(th, "plugin.yaml"), []byte(testPluginYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSkillFile := func(rel, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(th, rel), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// frontmatter name (runtime identity) differs from the manifest id; no
+	// version → the plugin package version must be the fallback.
+	writeSkillFile("skills/agent/mcporter/SKILL.md",
+		"---\nname: teamharness-mcporter\ndescription: Manage mcporter registries.\n---\n")
+	// frontmatter with an explicit version wins over the package version.
+	writeSkillFile("skills/team/communication/SKILL.md",
+		"---\nname: teamharness-communication\ndescription: Message delivery protocol.\nversion: 1.2.0\n---\n")
+	// On disk but NOT declared in the manifest — must not appear.
+	writeSkillFile("skills/team/organization/SKILL.md",
+		"---\nname: teamharness-organization\ndescription: Unlisted.\n---\n")
+	if err := os.WriteFile(filepath.Join(pluginsDir, "no-skills", "plugin.yaml"),
+		[]byte("metadata:\n  name: no-skills\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSkillsCatalogPluginSource(t *testing.T) {
+	base := t.TempDir()
+	pluginsDir := filepath.Join(base, "plugins")
+	writePluginTree(t, pluginsDir)
+	writeSkill(t, filepath.Join(base, "worker-agent", "skills"), "file-sync", "Sync files with centralized storage.")
+
+	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), pluginsDir, &mcLikeOSS{Memory: ossfake.NewMemory()}, nil, "default", nil)
+	skills := decodeSkills(t, getSkills(t, h))
+
+	// 1 builtin + 2 declared plugin skills (unlisted organization excluded).
+	if len(skills) != 3 {
+		t.Fatalf("want 3 skills, got %d: %+v", len(skills), skills)
+	}
+	mc := skillByName(t, skills, "teamharness-mcporter")
+	if mc.Source != "plugin" || mc.Plugin != "teamharness" {
+		t.Errorf("mcporter: source=%q plugin=%q, want plugin/teamharness", mc.Source, mc.Plugin)
+	}
+	if mc.Version != "0.1.0" {
+		t.Errorf("mcporter version = %q, want package version fallback 0.1.0", mc.Version)
+	}
+	if mc.Description != "Manage mcporter registries." {
+		t.Errorf("mcporter description = %q", mc.Description)
+	}
+	comm := skillByName(t, skills, "teamharness-communication")
+	if comm.Version != "1.2.0" {
+		t.Errorf("communication version = %q, want frontmatter version 1.2.0", comm.Version)
+	}
+	// No runtimes/agents/updated_at on plugin entries (availability follows
+	// the plugin's deployment).
+	if len(comm.Runtimes) != 0 || len(comm.Agents) != 0 || comm.UpdatedAt != "" {
+		t.Errorf("communication: plugin entry must not carry runtimes/agents/updated_at: %+v", comm)
+	}
+	for _, s := range skills {
+		if s.Name == "teamharness-organization" {
+			t.Fatalf("unlisted skill leaked into the catalog: %+v", s)
+		}
+	}
+}
+
+// TestSkillsCatalogPluginSkillMdMissing pins the reviewer repro: a
+// manifest-declared skill whose SKILL.md is missing must be omitted —
+// neither under the frontmatter name nor under the manifest-ID fallback —
+// per the documented "missing SKILL.md → absence" contract.
+func TestSkillsCatalogPluginSkillMdMissing(t *testing.T) {
+	base := t.TempDir()
+	pluginsDir := filepath.Join(base, "plugins")
+	writePluginTree(t, pluginsDir)
+	// Reviewer repro: remove skills/agent/mcporter/SKILL.md.
+	if err := os.Remove(filepath.Join(pluginsDir, "teamharness", "skills", "agent", "mcporter", "SKILL.md")); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), pluginsDir, &mcLikeOSS{Memory: ossfake.NewMemory()}, nil, "default", nil)
+	skills := decodeSkills(t, getSkills(t, h))
+
+	// Only the one plugin skill with a real SKILL.md remains
+	// (mcporter omitted, unlisted organization excluded).
+	if len(skills) != 1 {
+		t.Fatalf("want 1 skill, got %d: %+v", len(skills), skills)
+	}
+	for _, s := range skills {
+		if s.Name == "teamharness-mcporter" || s.Name == "mcporter" {
+			t.Fatalf("skill with missing SKILL.md leaked into the catalog: %+v", s)
+		}
+	}
+	if comm := skillByName(t, skills, "teamharness-communication"); comm.Source != "plugin" {
+		t.Fatalf("communication must survive: %+v", comm)
+	}
+}
+
+func TestSkillsCatalogPluginCollisionBuiltinWins(t *testing.T) {
+	base := t.TempDir()
+	pluginsDir := filepath.Join(base, "plugins")
+	writePluginTree(t, pluginsDir)
+	// A plugin skill whose frontmatter name equals a builtin skill name.
+	writeSkill(t, filepath.Join(base, "worker-agent", "skills"), "teamharness-mcporter", "Builtin wins.")
+	writeSkill(t, filepath.Join(base, "worker-agent", "skills"), "file-sync", "Sync files with centralized storage.")
+
+	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), pluginsDir, &mcLikeOSS{Memory: ossfake.NewMemory()}, nil, "default", nil)
+	skills := decodeSkills(t, getSkills(t, h))
+
+	mc := skillByName(t, skills, "teamharness-mcporter")
+	if mc.Source != "builtin" {
+		t.Fatalf("collision: builtin must win, got source=%q", mc.Source)
+	}
+	if len(skills) != 3 {
+		t.Fatalf("want 3 skills (1 builtin-collision + 2 plugin), got %d: %+v", len(skills), skills)
+	}
+}
+
+func TestSkillsCatalogPluginDirMissing(t *testing.T) {
+	base := t.TempDir()
+	writeSkill(t, filepath.Join(base, "worker-agent", "skills"), "file-sync", "Sync files with centralized storage.")
+	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), filepath.Join(base, "no-such-dir"), &mcLikeOSS{Memory: ossfake.NewMemory()}, nil, "default", nil)
+	skills := decodeSkills(t, getSkills(t, h))
+	if len(skills) != 1 || skills[0].Name != "file-sync" {
+		t.Fatalf("missing plugin dir must degrade to builtin-only, got: %+v", skills)
+	}
+}
+
+func TestSkillsCatalogPluginManifestMalformed(t *testing.T) {
+	base := t.TempDir()
+	pluginsDir := filepath.Join(base, "plugins")
+	th := filepath.Join(pluginsDir, "broken")
+	if err := os.MkdirAll(filepath.Join(th, "skills", "agent", "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(th, "plugin.yaml"), []byte("skills: [unclosed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSkill(t, filepath.Join(base, "worker-agent", "skills"), "file-sync", "Sync files with centralized storage.")
+	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), pluginsDir, &mcLikeOSS{Memory: ossfake.NewMemory()}, nil, "default", nil)
+	skills := decodeSkills(t, getSkills(t, h))
+	if len(skills) != 1 || skills[0].Name != "file-sync" {
+		t.Fatalf("malformed manifest must degrade to builtin-only, got: %+v", skills)
+	}
 }
 
 // countingScanner is a fixed-pass scanner with a call counter.
