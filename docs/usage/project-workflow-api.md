@@ -1033,3 +1033,48 @@ Error responses:
 | `409` | Concurrent upstream config change (retry with a fresh `GET`). |
 | `502` | Worker app unreachable or upstream error. |
 | `503` | Kube mode (no stable worker pod DNS to proxy). |
+
+## Worker tool-settings endpoints
+
+Each QwenPaw worker's agent profile carries a per-tool table
+(`tools.builtin_tools`): which built-in tools are enabled and which execute
+asynchronously. The Controller proxies a minimal read/write surface of the
+worker's `/api/tools` API so L2 humans can manage the tools of workers in
+their own teams — no `docker exec` required.
+
+| Endpoint | Meaning |
+|:--|:--|
+| `GET /api/v1/workers/{name}/tools` | Tool list: `{"tools": [ {name, enabled, description, asyncExecution, icon, requiresConfig}, ... ], "total": N}`. |
+| `PATCH /api/v1/workers/{name}/tools/{tool}` | Declarative update. Body: one or both of `{"enabled": bool, "asyncExecution": bool}`. |
+
+- **Declarative, retry-safe**: the proxy reads the current table first and
+  issues the worker-local mutation only for each field whose requested value
+  differs from the current one (the worker-local toggle endpoint flips state
+  without a body, so a bare forward would double-flip on a retry). A PATCH
+  that changes nothing is a `200` no-op with zero upstream writes.
+- **Concurrent-safe**: because the worker-local enabled mutation is a blind
+  toggle, the read-decide-mutate sequence runs under a per-(worker, tool)
+  lock and the mutation response is verified to carry the requested
+  `enabled` value. Two overlapping `PATCH {"enabled":true}` requests both
+  return `200` and leave the tool enabled (the second observes the first's
+  write and no-ops); a verification mismatch is a `502`, never a false `200`.
+- **State only, never configuration**: the entry exposes
+  `requiresConfig` (a flag) but never the tool's configuration values —
+  they can hold credentials.
+- **Write scope**: `PATCH` is allowed for admin/manager (any worker); an L2
+  human may patch only workers in their own teams — cross-team workers hide
+  as `404` (existence is not probeable). Team leaders stay read-only
+  (`403` on `PATCH`, the same boundary as the approval endpoint).
+- **Unknown field names are rejected** with `400` (fail-closed); the
+  controller-facing names are camelCase (`asyncExecution`, `requiresConfig`).
+- **Runtime-aware**: the tool-settings model is QwenPaw-specific; workers on
+  another runtime surface `400`. **Embedded mode only** (kube mode `503`).
+- **Failure semantics**: unknown worker/tool `404`; upstream error `502`
+  (a QwenPaw build without the `/api/tools` router is a `502` "API
+  unavailable"); a malformed upstream list fails closed with `502` rather
+  than a partial list.
+- **Live effect**: the worker-local mutation saves the agent profile and
+  hot-reloads the agent; the worker's sync loop persists the profile to the
+  shared store.
+- Every successful change is audit-logged (worker, tool, changed fields with
+  old/new values, caller, role).

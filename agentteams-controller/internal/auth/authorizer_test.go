@@ -438,3 +438,36 @@ func TestAuthorize_RuntimeConfig(t *testing.T) {
 		t.Error("worker self runtime-config write should be denied")
 	}
 }
+
+func TestAuthorizer_WorkerTools_W8Boundary(t *testing.T) {
+	az := NewAuthorizer()
+	human := &CallerIdentity{Role: RoleHuman, Username: "maizong", Teams: []string{"alpha-team"}}
+	leader := &CallerIdentity{Role: RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"}
+	worker := &CallerIdentity{Role: RoleWorker, Username: "alpha-dev", WorkerName: "alpha-dev"}
+
+	// 1. L2 human writing a CROSS-team worker: allowed at the authorizer
+	// (so the handler can hide it as 404 — the W8 anti-probing contract);
+	// the in-scope write is allowed as well.
+	for _, req := range []AuthzRequest{
+		{Action: ActionWorkerTools, ResourceKind: "worker", ResourceName: "beta-dev", ResourceTeam: "beta-team"},
+		{Action: ActionWorkerTools, ResourceKind: "worker", ResourceName: "alpha-dev", ResourceTeam: "alpha-team"},
+	} {
+		if err := az.Authorize(human, req); err != nil {
+			t.Errorf("L2 human %s on worker %q should be allowed at the authorizer, got: %v", req.Action, req.ResourceName, err)
+		}
+	}
+
+	// 2. Team leader: the write is READ-ONLY-denied (same-team or not),
+	// while the list read (ActionGet) stays allowed.
+	if err := az.Authorize(leader, AuthzRequest{Action: ActionWorkerTools, ResourceKind: "worker", ResourceName: "alpha-dev", ResourceTeam: "alpha-team"}); err == nil {
+		t.Error("team-leader worker-tools write should be denied (read-only)")
+	}
+	if err := az.Authorize(leader, AuthzRequest{Action: ActionGet, ResourceKind: "worker", ResourceName: "alpha-dev", ResourceTeam: "alpha-team"}); err != nil {
+		t.Errorf("team-leader worker-tools read should be allowed, got: %v", err)
+	}
+
+	// 3. Worker role: denied by default.
+	if err := az.Authorize(worker, AuthzRequest{Action: ActionWorkerTools, ResourceKind: "worker", ResourceName: "alpha-dev", ResourceTeam: "alpha-team"}); err == nil {
+		t.Error("worker self tool write should be denied")
+	}
+}
