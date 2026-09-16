@@ -734,6 +734,8 @@ func syncTeamMemberStatus(ms *v1beta1.TeamMemberStatus, member teamWorkerMember)
 	ms.ContainerState = member.worker.Status.ContainerState
 	ms.Message = member.worker.Status.Message
 	ms.LastActiveAt = member.worker.Status.LastActiveAt
+	ms.AgentStatus = member.worker.Status.AgentStatus
+	ms.LastFinishAt = member.worker.Status.LastFinishAt
 	ms.LastHeartbeat = member.worker.Status.LastHeartbeat
 	ms.ExposedPorts = member.worker.Status.ExposedPorts
 }
@@ -1380,8 +1382,14 @@ func (r *TeamReconciler) humanToTeamRequests(ctx context.Context, obj client.Obj
 	return reqs
 }
 
-// workerStatusChangePredicate triggers only on Worker status subresource
-// changes (Phase, MatrixUserID, RoomID) and delete events.
+// workerStatusChangePredicate triggers on Worker status subresource changes
+// (Phase, MatrixUserID, RoomID, and the task-level AgentStatus/LastFinishAt
+// reported by heartbeats) and delete events. The task-level fields matter
+// because a worker's runtime can move idle->running->idle with the container
+// phase, Matrix user ID and room all unchanged; without them the owning
+// Team's member status view stays stale until some unrelated change.
+// Heartbeat-only updates (LastHeartbeat/LastActiveAt bumps) intentionally do
+// not trigger, so per-tick heartbeats do not requeue the team.
 func workerStatusChangePredicate() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
@@ -1397,7 +1405,9 @@ func workerStatusChangePredicate() predicate.Predicate {
 				oldW.Status.ObservedGeneration != newW.Status.ObservedGeneration ||
 				oldW.Status.Phase != newW.Status.Phase ||
 				oldW.Status.MatrixUserID != newW.Status.MatrixUserID ||
-				oldW.Status.RoomID != newW.Status.RoomID
+				oldW.Status.RoomID != newW.Status.RoomID ||
+				oldW.Status.AgentStatus != newW.Status.AgentStatus ||
+				oldW.Status.LastFinishAt != newW.Status.LastFinishAt
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
 			return true

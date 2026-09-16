@@ -1009,6 +1009,11 @@ func workerToResponse(w *v1beta1.Worker) WorkerResponse {
 		MatrixUserID:     w.Status.MatrixUserID,
 		RoomID:           w.Status.RoomID,
 		Message:          w.Status.Message,
+		LastActiveAt:     w.Status.LastActiveAt,
+		AgentStatus:      w.Status.AgentStatus,
+		RunningTaskCount: w.Status.RunningTaskCount,
+		LastRunAt:        w.Status.LastRunAt,
+		LastFinishAt:     w.Status.LastFinishAt,
 	}
 	if resp.Phase == "" {
 		resp.Phase = "Pending"

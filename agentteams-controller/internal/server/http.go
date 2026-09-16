@@ -163,6 +163,13 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	mux.Handle("GET /api/v1/workers/{name}/approval", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(ah.getWorkerApproval)))
 	mux.Handle("PUT /api/v1/workers/{name}/approval", mw.RequireAuthz(authpkg.ActionWorkerApproval, "worker", nameFn)(http.HandlerFunc(ah.updateWorkerApproval)))
 
+	// --- Worker tool settings (qwenpaw built-in tools: enable / async execution;
+	// proxy to the worker's qwenpaw app; declarative PATCH, L2 team-scoped,
+	// leaders read-only) ---
+	th := NewToolsHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix)
+	mux.Handle("GET /api/v1/workers/{name}/tools", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(th.listWorkerTools)))
+	mux.Handle("PATCH /api/v1/workers/{name}/tools/{tool}", mw.RequireAuthz(authpkg.ActionWorkerTools, "worker", nameFn)(http.HandlerFunc(th.patchWorkerTool)))
+
 	// --- Skill catalog (read: builtin per runtime + shared/team layers; write: team-skill upload) ---
 	// The scanner is shared with the Deployer (one content-hash cache
 	// across upload scan ① and assign-time scan ②).
