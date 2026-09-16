@@ -28,6 +28,7 @@ const (
 	ActionRefreshMatrixToken  Action = "refresh-matrix-token"
 	ActionGateway             Action = "gateway"
 	ActionWorkspaceFilesWrite Action = "workspace-files-write"
+	ActionWorkerSkillPreload  Action = "worker-skill-preload"
 )
 
 // AuthzRequest describes the resource being accessed.
@@ -164,6 +165,20 @@ func (a *Authorizer) authorizeHuman(caller *CallerIdentity, req AuthzRequest) er
 			// own teams (the workbench 5-tab). Same W8 reasoning as
 			// ActionWorkerApproval: allowed here, hidden as 404 by the
 			// handler when cross-team.
+			return nil
+		}
+		if req.Action == ActionWorkerSkillPreload {
+			// Per-worker skill preload policy (QwenPaw 2.2.1): L2 humans
+			// may toggle preload on workers in their own teams. Like
+			// ActionGet this action is NOT rejected cross-team at the
+			// authorizer level: a 403 here would let a scoped caller probe
+			// which workers exist in other teams (W8 anti-probing). All
+			// real enforcement happens in the HANDLER: WorkerSkillsHandler
+			// performs the worker→team resolution and hides cross-team and
+			// standalone workers as 404. Team leaders and worker-role
+			// callers are denied at the authorizer level (default) and
+			// never reach the handler — team leaders stay read-only on
+			// skill runtime policy.
 			return nil
 		}
 		return deny(caller, req)
