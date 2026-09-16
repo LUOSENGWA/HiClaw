@@ -4186,7 +4186,9 @@ func TestWriteProjectMeta_SnapshotsPreviousVersion(t *testing.T) {
 	if len(children) != 1 {
 		t.Fatalf("history entries=%d, want 1", len(children))
 	}
-	snap, err := store.GetObject(context.Background(), children[0])
+	// Listed names are relative to the prefix (mc ls contract) — re-attach
+	// the history prefix for the read.
+	snap, err := store.GetObject(context.Background(), historyPrefixFor(key)+children[0])
 	if err != nil {
 		t.Fatalf("read snapshot: %v", err)
 	}
