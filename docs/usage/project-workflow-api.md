@@ -503,7 +503,7 @@ Query parameters:
 |:--|:--|:--|:--|
 | `team` | string | — | Optional team qualifier, same semantics as the other read endpoints. |
 | `limit` | int | `50` | Page size. Capped at `200`; values `< 1` are rejected `400`. |
-| `cursor` | string | — | Opaque cursor from a previous page's `next_cursor`; pass it back to continue. Encodes the page's last event, so it stays valid while new events are appended — and even while the per-task 50-entry history cap drops already-read events. |
+| `cursor` | string | — | Opaque cursor from a previous page's `next_cursor`; pass it back to continue. Encodes the page's last event identity (ts, task_id, seq), so it stays valid while new events are appended — and even while the per-task 50-entry history cap drops already-read events. |
 
 Response:
 
@@ -517,7 +517,8 @@ Response:
       "from": "planned",
       "to": "prepared",
       "action": "delegate_task",
-      "actor": "leader:default"
+      "actor": "leader:default",
+      "seq": 1
     },
     {
       "ts": "2026-09-09T10:00:05Z",
@@ -526,7 +527,8 @@ Response:
       "to": "in_progress",
       "action": "ack_task",
       "actor": "worker:default",
-      "note": "starting"
+      "note": "starting",
+      "seq": 2
     }
   ],
   "next_cursor": "eyJ0cyI6IjIwMjYt..."
@@ -534,17 +536,23 @@ Response:
 ```
 
 - `events` is **oldest first**; the shared second-resolution timestamps are
-  tie-broken by `task_id`, then `action`, so paging is deterministic.
+  tie-broken by `task_id`, and events sharing both keep the writer's append
+  order (`seq`), so paging is deterministic.
+- Every event carries `seq`, the writer-persisted per-task sequence number:
+  the stable event identity. Timestamps are second-resolution and repeated
+  progress entries are allowed, so content alone cannot identify an event.
 - `next_cursor` is empty when the tail was reached; an empty project
   returns `200` with `"events": []`.
 - `next_cursor` is an opaque, URL-safe string. The client never parses it;
-  it anchors on the page's last event by content, so appending new events
-  between page requests does not invalidate it.
+  it anchors on the page's last event by exact identity (ts, task_id, seq),
+  so appending new events between page requests does not invalidate it and
+  duplicates (same second, same content) are never skipped or repeated.
 - `cursor_expired` is `true` (with `"events": []` and no `next_cursor`)
   when the cursor's anchor event has been truncated out of the retained
-  per-task history (50 entries, oldest dropped). On that signal the
-  client must discard the cursor and re-fetch from the start; continuing
-  would otherwise skip unread events silently.
+  per-task history (50 entries, oldest dropped), or the cursor predates
+  the sequence format. On that signal the client must discard the cursor
+  and re-fetch from the start; continuing would otherwise skip unread
+  events silently.
 - Task metas are read from the project's owning scope only — no
   cross-scope fallback (same rule as `tasks_detail`).
 

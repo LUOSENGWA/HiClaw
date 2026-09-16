@@ -298,8 +298,10 @@ read-modify-write 同批写入 history 条目（actor = authzActor，重试收�
 - `GET /api/v1/projects/{id}/workflow?includeTasks=true` 的 `tasks_detail[].history` 透传
   （无 history 字段的旧 meta 不输出该字段；畸形条目跳过不报错）。
 - `GET /api/v1/projects/{id}/events?limit=&cursor=`：读时聚合全部任务 history 成升序
-  时间线（零新存储、无写侧钩子），游标 = 升序列表的不透明 offset（时间戳为秒级精度，
-  同一任务可共享 `ts`，故游标不用 `ts:task_id`）。项目级干预事件不在此端点范围
+  时间线（零新存储、无写侧钩子），游标 = 不透明事件身份（ts, task_id, seq）：
+  时间戳为秒级精度且写入端允许重复 progress，内容相等不是事件身份，故用写入端
+  持久化的每任务序号 seq（`history_seq` 计数，跨 50 条截断稳定）做精确匹配；
+  锚点被截断或游标为旧格式时返回 `cursor_expired`。项目级干预事件不在此端点范围
   （`/history` 快照端点覆盖干预审计，两者互补）。
 
 已知限制：agent 写与 controller 写同一 task meta 的既有竞态（ETag vs pull-before-write）

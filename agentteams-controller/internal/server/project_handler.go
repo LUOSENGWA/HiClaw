@@ -233,6 +233,10 @@ type taskTransition struct {
 	Action string `json:"action"`
 	Actor  string `json:"actor,omitempty"`
 	Note   string `json:"note,omitempty"`
+	// Seq is the writer-persisted per-task sequence number: unique per
+	// task, stable across the 50-entry cap truncation. Zero for pre-seq
+	// legacy entries (they order by ts + position only).
+	Seq int64 `json:"seq,omitempty"`
 }
 
 // parseTaskHistory converts the task meta `history` array into the typed
@@ -256,6 +260,11 @@ func parseTaskHistory(value any) []taskTransition {
 			Action: str(m["action"]),
 			Actor:  str(m["actor"]),
 			Note:   str(m["note"]),
+		}
+		// JSON numbers decode as float64; absent seq (legacy entries)
+		// stays 0.
+		if f, ok := m["seq"].(float64); ok {
+			t.Seq = int64(f)
 		}
 		// A lifecycle record must carry both a timestamp (so it can be
 		// ordered) and an action (so it is a real event). "from" stays
@@ -2136,57 +2145,68 @@ type projectEvent struct {
 	Actor  string `json:"actor,omitempty"`
 	Action string `json:"action"`
 	Note   string `json:"note,omitempty"`
+	// Seq: the writer-persisted event identity (see taskTransition).
+	Seq int64 `json:"seq,omitempty"`
 }
 
 // projectEventsResponse is the GET /api/v1/projects/{id}/events payload.
 //
 // next_cursor is an opaque, URL-safe string encoding the page's last
-// event (its full anchor: ts/task_id/from/to/actor/action/note). Pass it
-// back as cursor to continue. The anchor is located by content in the
-// freshly rebuilt list, so the cursor stays valid while new transitions
-// are appended at the tail and even while the per-task history cap (50
-// entries, oldest dropped) truncates events the client already read.
-// An empty next_cursor means the tail was reached.
+// event identity: (ts, task_id, seq), where seq is the writer-persisted
+// per-task sequence number. Pass it back as cursor to continue. The
+// anchor is located by exact identity in the freshly rebuilt list, so
+// the cursor stays valid while new transitions are appended at the tail
+// and even while the per-task history cap (50 entries, oldest dropped)
+// truncates events the client already read. Duplicates (same second,
+// same task, same content — permitted by the writer) carry distinct seq
+// values and are never skipped or repeated. An empty next_cursor means
+// the tail was reached.
 //
 // A bare offset cursor cannot be used: truncation shifts every offset
-// and silently skips unread events. A "ts:task_id" cursor cannot be used
-// either: timestamps are second-resolution, so several transitions of
-// one task can share both values.
+// and silently skips unread events. A content-tuple cursor cannot be
+// used either: timestamps are second-resolution and repeated progress
+// entries are allowed, so content equality is not event identity — a
+// content anchor silently skips or repeats duplicates. Cursors in the
+// pre-seq content-tuple format (no version field) are answered with
+// cursor_expired: the client re-fetches from the start.
 type projectEventsResponse struct {
 	ProjectID  string         `json:"project_id"`
 	Events     []projectEvent `json:"events"`
 	NextCursor string         `json:"next_cursor,omitempty"`
 	// CursorExpired is true when the presented cursor is well-formed but
 	// its anchor event no longer exists in the retained history (the
-	// writer's 50-entry cap truncated it away). Events is empty on such a
-	// response: the client must discard the cursor and re-fetch from the
-	// start. Offsets would instead silently skip unread events here.
+	// writer's 50-entry cap truncated it away), or the cursor predates
+	// the sequence format (its content anchor has no unambiguous
+	// identity). Events is empty on such a response: the client must
+	// discard the cursor and re-fetch from the start. Offsets would
+	// instead silently skip unread events here.
 	CursorExpired bool `json:"cursor_expired,omitempty"`
 }
 
 // eventsCursorAnchor identifies the last event of a page — the position a
-// client cursor points at. Full-field equality (including Note) locates it
-// in the rebuilt event list; per-task truncation only drops events older
-// than the anchor, which the client has already received.
+// client cursor points at. Identity is (ts, task_id, seq): seq is the
+// writer-persisted per-task sequence number (plugins/teamharness
+// _append_transition_history), unique per task and stable across the
+// 50-entry cap truncation. Content (from/to/actor/action/note) is not
+// part of the identity: timestamps are second-resolution and repeated
+// progress entries are allowed, so content equality cannot identify an
+// event. V marks the cursor format; anchors without it (pre-seq
+// content-tuple cursors) are answered with cursor_expired.
 type eventsCursorAnchor struct {
+	V      int    `json:"v"`
 	Ts     string `json:"ts"`
 	TaskID string `json:"task_id"`
-	From   string `json:"from"`
-	To     string `json:"to"`
-	Actor  string `json:"actor"`
-	Action string `json:"action"`
-	Note   string `json:"note"`
+	Seq    int64  `json:"seq"`
 }
+
+const eventsCursorVersion = 1
 
 func anchorOfEvent(e projectEvent) eventsCursorAnchor {
 	return eventsCursorAnchor{
+		V:      eventsCursorVersion,
 		Ts:     e.Ts,
 		TaskID: e.TaskID,
-		From:   e.From,
-		To:     e.To,
-		Actor:  e.Actor,
-		Action: e.Action,
-		Note:   e.Note,
+		Seq:    e.Seq,
 	}
 }
 
@@ -2201,9 +2221,9 @@ func encodeEventsCursor(e projectEvent) string {
 }
 
 // decodeEventsCursor parses a client cursor. ok=false means the value is
-// not a well-formed cursor (400); a well-formed cursor whose anchor has
-// been truncated out of the retained history is reported separately as
-// CursorExpired.
+// not well-formed (400); a well-formed cursor whose anchor has been
+// truncated out of the retained history — or whose format predates the
+// sequence version — is reported separately as CursorExpired.
 func decodeEventsCursor(raw string) (eventsCursorAnchor, bool) {
 	b, err := base64.RawURLEncoding.DecodeString(raw)
 	if err != nil {
@@ -2295,15 +2315,24 @@ func (h *ProjectHandler) GetProjectEvents(w http.ResponseWriter, r *http.Request
 
 	events := h.collectProjectEvents(r.Context(), match.meta, match.team)
 	resp := projectEventsResponse{ProjectID: projectID, Events: []projectEvent{}}
+	if hasCursor && anchor.V != eventsCursorVersion {
+		// A pre-seq (content-tuple) cursor has no unambiguous identity
+		// under the new contract; answer an explicit reset instead of
+		// matching by ambiguous content.
+		resp.CursorExpired = true
+		httputil.WriteJSON(w, http.StatusOK, resp)
+		return
+	}
 	offset := 0
 	if hasCursor {
-		// Locate the LAST occurrence of the anchor in the rebuilt list.
-		// Last (not first) so a duplicate of the anchor tuple appended
-		// after the previous page is still delivered.
+		// Exact identity match: (ts, task_id, seq) names at most one
+		// event, so there is no occurrence-direction choice — content
+		// duplicates carry distinct writer-assigned seq values.
 		found := -1
 		for i, e := range events {
-			if anchorOfEvent(e) == anchor {
+			if e.Ts == anchor.Ts && e.TaskID == anchor.TaskID && e.Seq == anchor.Seq {
 				found = i
+				break
 			}
 		}
 		if found == -1 {
@@ -2408,6 +2437,7 @@ func (h *ProjectHandler) collectProjectEvents(ctx context.Context, meta *project
 				Actor:  t.Actor,
 				Action: t.Action,
 				Note:   t.Note,
+				Seq:    t.Seq,
 			})
 		}
 	}

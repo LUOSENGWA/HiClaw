@@ -82,8 +82,12 @@ note 必填（≤200 字符，超长截断并在响应中标记 `truncated`）�
 - `GET /api/v1/projects/{id}/workflow?includeTasks=true`：`tasks_detail[].history`
   透传（旧 meta 无字段则省略；畸形条目跳过不报错）。
 - `GET /api/v1/projects/{id}/events?limit=&cursor=`：读时聚合项目内全部任务
-  history 成升序时间线（`limit` 默认 50 上限 200；`cursor` = 不透明 offset；
-  响应 `{project_id, events, next_cursor}`）。零新存储、无写侧钩子。
+  history 成升序时间线（`limit` 默认 50 上限 200；`cursor` = 不透明事件身份
+  游标（ts, task_id, seq）——seq 为写入端持久化的每任务序号（`history_seq`
+  计数，跨 50 条截断稳定），精确匹配定位、无歧义，重复事件（同秒同内容）
+  不跳过不重复；旧格式游标返回 `cursor_expired` 强制客户端重置；
+  响应 `{project_id, events, next_cursor, cursor_expired?}`）。零新存储、
+  无写侧钩子（seq 由既有的 task meta 写入路径顺带持久化）。
   权限链同 workflow/history（跨 team 访问隐藏为 404；任务 meta 只取项目属主
   scope，不做跨 scope 回退）。项目级干预事件不在此端点——`/history` 快照端点
   覆盖干预审计，两者互补。

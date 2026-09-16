@@ -4520,18 +4520,38 @@ def _append_transition_history(
     """Append a transition entry to task meta ``history`` (cap
     TASK_HISTORY_LIMIT, dropping the oldest).  Mutates in place; the caller
     persists.  No-op re-entries are not recorded unless ``record_noop``
-    (report_progress uses from == to on purpose)."""
+    (report_progress uses from == to on purpose).
+
+    Each entry carries ``seq``, the per-task monotonic sequence stored in
+    the task meta as ``history_seq``: timestamps are second-resolution and
+    repeated progress entries are allowed, so content cannot identify an
+    event, and the reader's /events cursor needs a stable identity that
+    survives cap truncation.  Legacy entries predating the field are
+    backfilled in list order on this write (append order is stable)."""
     if from_status == to_status and not record_noop:
         return
     history = task.get("history")
     if not isinstance(history, list):
         history = []
+    # Stable event identity for the /events cursor (see docstring): the
+    # counter lives on the task meta, so it survives history truncation.
+    try:
+        seq = int(task.get("history_seq") or 0)
+    except (TypeError, ValueError):
+        seq = 0
+    for existing in history:
+        if isinstance(existing, dict) and existing.get("seq") is None:
+            seq += 1
+            existing["seq"] = seq
+    seq += 1
+    task["history_seq"] = seq
     entry: dict[str, Any] = {
         "ts": _utc_timestamp(),
         "from": from_status,
         "to": to_status,
         "actor": actor,
         "action": action,
+        "seq": seq,
     }
     if note:
         entry["note"] = note

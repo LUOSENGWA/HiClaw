@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -5425,6 +5426,181 @@ func TestGetProjectEvents_PaginationTailGrowthWithoutTruncation(t *testing.T) {
 	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=4&cursor="+cursor))
 	if resp.CursorExpired || len(resp.Events) != 2 || resp.Events[0].Note != "step 9" || resp.NextCursor != "" {
 		t.Fatalf("page3=%+v, want steps 9-10, tail reached", resp)
+	}
+}
+
+// TestGetProjectEvents_DuplicateEntriesPaginateUniquely is the maintainer's
+// second reproduction: three content-identical progress entries (same
+// second, same task, same actor/action/note — the writer permits repeated
+// progress and timestamps are second-resolution) with distinct
+// writer-assigned seq values. Each event must be delivered exactly once:
+// the content anchor located the LAST occurrence and the second page came
+// back empty with cursor_expired=false, silently skipping two events.
+func TestGetProjectEvents_DuplicateEntriesPaginateUniquely(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []string{}},
+		},
+	})
+	// Content-identical entries; only the writer-assigned seq differs.
+	hist := make([]map[string]any, 0, 3)
+	for seq := int64(1); seq <= 3; seq++ {
+		hist = append(hist, map[string]any{
+			"ts": "2026-09-09T10:00:00Z", "from": "in_progress", "to": "in_progress",
+			"action": "progress", "actor": "worker:a", "note": "step done", "seq": seq,
+		})
+	}
+	putTaskMeta(store, "", "t1", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "in_progress",
+		"history": hist,
+	})
+	h := newProjectTestHandler(t, store)
+
+	var got []int64
+	cursor := ""
+	for page := 1; ; page++ {
+		q := "/api/v1/projects/p1/events?limit=1"
+		if cursor != "" {
+			q += "&cursor=" + cursor
+		}
+		resp := decodeEvents(t, doGetProjectEvents(t, h, q))
+		if resp.CursorExpired {
+			t.Fatalf("page%d: unexpected cursor_expired: %+v", page, resp)
+		}
+		if len(resp.Events) != 1 {
+			t.Fatalf("page%d=%+v, want exactly 1 event (no skip, no repeat)", page, resp)
+		}
+		if resp.Events[0].Note != "step done" || resp.Events[0].Ts != "2026-09-09T10:00:00Z" {
+			t.Fatalf("page%d[0]=%+v, want the duplicate progress entry", page, resp.Events[0])
+		}
+		got = append(got, resp.Events[0].Seq)
+		if len(got) > 3 {
+			t.Fatalf("more than 3 pages: %v (repeat or infinite loop)", got)
+		}
+		if resp.NextCursor == "" {
+			break // tail reached
+		}
+		cursor = resp.NextCursor
+	}
+	if len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
+		t.Fatalf("delivered seqs=%v, want [1 2 3] exactly once each", got)
+	}
+}
+
+// TestGetProjectEvents_DuplicatesAppendedBetweenRequests: while the client
+// is between page requests, two content-identical duplicates are appended
+// (seq 2, 3). The cursor from page 1 must continue exactly at seq 2 and
+// then deliver seq 3 — no skip, no repeat, no spurious expiry.
+func TestGetProjectEvents_DuplicatesAppendedBetweenRequests(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []string{}},
+		},
+	})
+	dupHist := func(hi int64) []map[string]any {
+		hist := make([]map[string]any, 0, hi)
+		for seq := int64(1); seq <= hi; seq++ {
+			hist = append(hist, map[string]any{
+				"ts": "2026-09-09T10:00:00Z", "from": "in_progress", "to": "in_progress",
+				"action": "progress", "actor": "worker:a", "note": "step done", "seq": seq,
+			})
+		}
+		return hist
+	}
+	putTaskMeta(store, "", "t1", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "in_progress",
+		"history": dupHist(2),
+	})
+	h := newProjectTestHandler(t, store)
+
+	// Page 1 of a 2-event list: not the tail, so a cursor is issued.
+	resp := decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=1"))
+	if len(resp.Events) != 1 || resp.Events[0].Seq != 1 || resp.NextCursor == "" {
+		t.Fatalf("page1=%+v, want seq 1 + cursor", resp)
+	}
+	cursor := resp.NextCursor
+
+	// A content-identical duplicate (seq 3) lands while the client is
+	// between requests.
+	putTaskMeta(store, "", "t1", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "in_progress",
+		"history": dupHist(3),
+	})
+	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=1&cursor="+cursor))
+	if resp.CursorExpired || len(resp.Events) != 1 || resp.Events[0].Seq != 2 || resp.NextCursor == "" {
+		t.Fatalf("page2=%+v, want exactly seq 2 + cursor", resp)
+	}
+	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=1&cursor="+resp.NextCursor))
+	if resp.CursorExpired || len(resp.Events) != 1 || resp.Events[0].Seq != 3 || resp.NextCursor != "" {
+		t.Fatalf("page3=%+v, want exactly seq 3 (the between-request duplicate) + tail reached", resp)
+	}
+}
+
+// TestGetProjectEvents_LegacyCursorVersionExpires: a well-formed cursor in
+// the pre-seq content-tuple format (no version field) must not be matched
+// ambiguously against seq-less legacy entries — it answers
+// cursor_expired and forces a clean re-fetch instead of guessing an
+// occurrence direction.
+func TestGetProjectEvents_LegacyCursorVersionExpires(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []string{}},
+		},
+	})
+	putTaskMeta(store, "", "t1", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "in_progress",
+		"history": []map[string]any{
+			{"ts": "2026-09-09T10:00:00Z", "from": "planned", "to": "prepared", "action": "delegate_task", "actor": "leader:default"},
+		},
+	})
+	h := newProjectTestHandler(t, store)
+
+	legacy := base64.RawURLEncoding.EncodeToString([]byte(`{"ts":"2026-09-09T10:00:00Z","task_id":"t1","from":"planned","to":"prepared","actor":"leader:default","action":"delegate_task","note":""}`))
+	resp := decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?cursor="+legacy))
+	if !resp.CursorExpired || len(resp.Events) != 0 || resp.NextCursor != "" {
+		t.Fatalf("legacy cursor=%+v, want cursor_expired + empty page", resp)
+	}
+	// After the reset the client re-fetches from the start.
+	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events"))
+	if resp.CursorExpired || len(resp.Events) != 1 {
+		t.Fatalf("refetch=%+v, want the retained event", resp)
+	}
+}
+
+// TestGetProjectEvents_LegacyDuplicatesStillPaginate: seq-less legacy
+// entries that are content-identical in one second still paginate without
+// silent skips — the identity match (ts, task_id, seq=0) resumes after the
+// first occurrence, so a one-event-per-page walk delivers every duplicate.
+func TestGetProjectEvents_LegacyDuplicatesStillPaginate(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []string{}},
+		},
+	})
+	putTaskMeta(store, "", "t1", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "in_progress",
+		"history": []map[string]any{
+			{"ts": "2026-09-09T10:00:00Z", "from": "in_progress", "to": "in_progress", "action": "progress", "actor": "worker:a", "note": "done"},
+			{"ts": "2026-09-09T10:00:00Z", "from": "in_progress", "to": "in_progress", "action": "progress", "actor": "worker:a", "note": "done"},
+		},
+	})
+	h := newProjectTestHandler(t, store)
+
+	resp := decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=1"))
+	if resp.CursorExpired || len(resp.Events) != 1 || resp.NextCursor == "" {
+		t.Fatalf("page1=%+v, want 1 event + cursor", resp)
+	}
+	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=1&cursor="+resp.NextCursor))
+	if resp.CursorExpired || len(resp.Events) != 1 || resp.NextCursor != "" {
+		t.Fatalf("page2=%+v, want the second duplicate (no silent skip) + tail", resp)
 	}
 }
 
