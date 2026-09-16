@@ -142,6 +142,7 @@ You can also use `spec.package` to provide a Worker package containing a `skills
 `GET /api/v1/skills` returns the read-only catalog of skills available in the deployment:
 
 - **`source: "builtin"`** — the skills shipped with the agent templates, with the providing templates listed in `agents` and the supporting runtimes in `runtimes` (derived from the deployer's own template selection, so the catalog never drifts from what workers actually receive).
+- **`source: "plugin"`** — the skills shipped inside plugin packages (e.g. TeamHarness), discovered from each package's `plugin.yaml` manifest — the same source the plugin build packages into the worker images. Entries carry the `plugin` name; they are read-only and non-assignable (a worker has the skill iff it has the plugin — no `runtimes`/`agents`/per-worker assignment field).
 - **`source: "shared"`** — the skills staged under `agents/global/skills/` by the Dashboard's skill-upload flow, available for distribution to any worker. This prefix is a staging area, not a distribution channel: deleting an entry removes it from the catalog and the Dashboard's global area but never touches already-distributed per-worker copies or existing `spec.skills` assignments (no cascade).
 - **`source: "team"`** (only with `?team=`) — the team's own skills under `teams/<team>/skills/`, published through `POST /api/v1/skills` (see below).
 

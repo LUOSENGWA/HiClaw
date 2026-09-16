@@ -669,6 +669,7 @@ func (a *App) initHTTPServer(_ context.Context) error {
 
 		DefaultWorkerRuntime: a.cfg.DefaultWorkerRuntime,
 		WorkerAgentDir:       a.cfg.WorkerAgentDir(),
+		PluginDir:            a.cfg.PluginDir(),
 		SkillScanner:         a.skillScanner,
 	})
 	return nil

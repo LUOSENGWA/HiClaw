@@ -40,6 +40,7 @@ type ServerDeps struct {
 
 	DefaultWorkerRuntime string // install-time default for Worker create requests
 	WorkerAgentDir       string // source of builtin agent templates (skill catalog)
+	PluginDir            string // bundled plugin packages (skill catalog plugin source); empty = no plugin entries
 }
 
 // HTTPServer serves the unified controller REST API.
@@ -172,10 +173,12 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	mux.Handle("GET /api/v1/workers/{name}/tools", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(th.listWorkerTools)))
 	mux.Handle("PATCH /api/v1/workers/{name}/tools/{tool}", mw.RequireAuthz(authpkg.ActionWorkerTools, "worker", nameFn)(http.HandlerFunc(th.patchWorkerTool)))
 
-	// --- Skill catalog (read: builtin per runtime + shared/team layers; write: team-skill upload) ---
+	// --- Skill catalog (read: builtin per runtime + shared/team layers +
+	// plugin-bundled skills; write: team-skill upload) ---
 	// The scanner is shared with the Deployer (one content-hash cache
 	// across upload scan ① and assign-time scan ②).
-	skh := NewSkillsHandler(deps.WorkerAgentDir, deps.OSS, deps.Client, deps.Namespace, deps.SkillScanner)
+	skh := NewSkillsHandler(deps.WorkerAgentDir, deps.PluginDir, deps.OSS, deps.Client, deps.Namespace, deps.SkillScanner)
+
 	mux.Handle("GET /api/v1/skills", mw.RequireAuthz(authpkg.ActionList, "skills", nil)(http.HandlerFunc(skh.ListSkills)))
 	mux.Handle("POST /api/v1/skills", mw.RequireAuthz(authpkg.ActionSkillPublish, "skills", nil)(http.HandlerFunc(skh.UploadSkill)))
 
