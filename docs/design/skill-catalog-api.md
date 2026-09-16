@@ -31,8 +31,9 @@ The catalog answers two questions:
 
 ## Design
 
-A single read-only endpoint, `GET /api/v1/skills`, served by a
-`SkillsHandler` with three sources:
+The L1 read-only endpoint `GET /api/v1/skills` is served by a
+`SkillsHandler` with three sources (the team layer — see the follow-up
+section — adds a fourth via `?team=`):
 
 1. **Builtin skills.** The handler scans the agent-template directories the
    deployer uses when provisioning workers. The template→runtime mapping is
@@ -61,8 +62,9 @@ A single read-only endpoint, `GET /api/v1/skills`, served by a
    `runtimes` / `agents` / `updated_at` — availability follows the plugin's
    deployment (a worker has the skill iff it has the plugin), not
    per-runtime templates or per-worker assignment. They are read-only by
-   construction: the catalog has no write path, and a plugin skill's
-   lifecycle belongs to the plugin package. A missing plugin dir, a
+   construction: the team-skill upload writes the team layer only and
+   never touches plugin entries, and a plugin skill's lifecycle belongs
+   to the plugin package. A missing plugin dir, a
    malformed manifest, or a missing `SKILL.md` degrades that plugin (or
    that one skill) to absence — never an error. Builtin names win on
    collision, as with the shared half.
@@ -114,7 +116,8 @@ registry calls. The response schema is deliberately limited to `name` /
 }
 ```
 
-- `source` is `"builtin"`, `"plugin"`, or `"shared"`.
+- `source` is `"builtin"`, `"plugin"`, or `"shared"` (the L1 view; the
+  `?team=` view adds `"team"` — see team-skills.md).
 - `version` is the SKILL.md frontmatter `version` (top-level, falling back
   to `metadata.version`); for plugin skills it falls back further to the
   plugin package's `metadata.version`. Omitted when nothing declares it.
@@ -179,6 +182,16 @@ separate (write) concern via `PUT /workers`.
   distributed via `spec.skills` (their lifecycle belongs to the plugin
   package), so the per-worker availability view above — when it ships —
   must derive them from the worker's plugin set, not from assignments.
+
+## Follow-up: the team skill layer
+
+The team-scoped read (`?team=`), the upload surface
+(`POST /api/v1/skills`, `scope=team|deployment`), and the assign-time
+materialization with the mandatory content scan (scan ②) are specified in
+the companion design [team-skills.md](team-skills.md). This document stays
+the reference for the L1 read-only catalog half; the team layer reuses its
+response shape (new `source: "team"` entries) and its authorization
+foundation.
 
 ## Tests
 
