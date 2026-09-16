@@ -103,7 +103,7 @@ func TestListMCPServers_AdminSeesMergedCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	h := NewResourceHandler(k8s, "default", nil, "").WithOSS(store)
+	h := NewResourceHandler(k8s, "default", nil, "", nil).WithOSS(store)
 	resp := mcpDecode(t, mcpGet(t, h, mcpCallerCtx(authpkg.RoleAdmin, "", nil)))
 
 	if !resp.RegistryAvailable {
@@ -155,7 +155,7 @@ func TestListMCPServers_L2HumanScopedToOwnTeams(t *testing.T) {
 	store := ossfake.NewMemory()
 	mcpPutRegistry(t, store, "orphan", `{"name":"orphan","url":"https://orphan.example.com/mcp"}`)
 
-	h := NewResourceHandler(k8s, "default", nil, "").WithOSS(store)
+	h := NewResourceHandler(k8s, "default", nil, "", nil).WithOSS(store)
 	// L2 human with accessibleTeams=[t1]: sees only github (referenced by
 	// w1); "other" (t2) and "orphan" (no in-scope reference) are hidden.
 	resp := mcpDecode(t, mcpGet(t, h, mcpCallerCtx(authpkg.RoleHuman, "", []string{"t1"})))
@@ -175,7 +175,7 @@ func TestListMCPServers_TeamLeaderScopedToOwnTeam(t *testing.T) {
 		mcpTestTeam("t2", "w2"),
 		mcpTestWorker("w2", "t2", "other"),
 	).Build()
-	h := NewResourceHandler(k8s, "default", nil, "").WithOSS(ossfake.NewMemory())
+	h := NewResourceHandler(k8s, "default", nil, "", nil).WithOSS(ossfake.NewMemory())
 	resp := mcpDecode(t, mcpGet(t, h, mcpCallerCtx(authpkg.RoleTeamLeader, "t2", nil)))
 	if resp.Total != 1 || resp.Servers[0].Name != "other" {
 		t.Fatalf("leader scope wrong: %+v", resp.Servers)
@@ -185,7 +185,7 @@ func TestListMCPServers_TeamLeaderScopedToOwnTeam(t *testing.T) {
 func TestListMCPServers_ManagerAndWorkerDenied(t *testing.T) {
 	scheme := newServerTestScheme(t)
 	k8s := fake.NewClientBuilder().WithScheme(scheme).Build()
-	h := NewResourceHandler(k8s, "default", nil, "").WithOSS(ossfake.NewMemory())
+	h := NewResourceHandler(k8s, "default", nil, "", nil).WithOSS(ossfake.NewMemory())
 	for _, role := range []string{authpkg.RoleManager, authpkg.RoleWorker} {
 		rec := mcpGet(t, h, mcpCallerCtx(role, "", nil))
 		if rec.Code != http.StatusForbidden {
@@ -199,7 +199,7 @@ func TestListMCPServers_NoOSS_SharedHalfUnavailable(t *testing.T) {
 	k8s := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 		mcpTestWorker("w1", "", "solo"),
 	).Build()
-	h := NewResourceHandler(k8s, "default", nil, "") // no WithOSS
+	h := NewResourceHandler(k8s, "default", nil, "", nil) // no WithOSS
 	resp := mcpDecode(t, mcpGet(t, h, mcpCallerCtx(authpkg.RoleAdmin, "", nil)))
 	if resp.RegistryAvailable {
 		t.Fatal("registry_available = true without OSS")
@@ -221,7 +221,7 @@ func TestListMCPServers_ProductionListingContract(t *testing.T) {
 	store := ossfake.NewMemory()
 	mcpPutRegistry(t, store, "github", `{"name":"github","url":"https://apig.example.com/mcp-servers/github/mcp","transport":"http","timeout":60,"trusted":true}`)
 
-	h := NewResourceHandler(k8s, "default", nil, "").WithOSS(store)
+	h := NewResourceHandler(k8s, "default", nil, "", nil).WithOSS(store)
 	resp := mcpDecode(t, mcpGet(t, h, mcpCallerCtx(authpkg.RoleAdmin, "", nil)))
 
 	if !resp.RegistryAvailable {
@@ -246,7 +246,7 @@ func TestListMCPServers_CorruptRegistryDocSkipped(t *testing.T) {
 	mcpPutRegistry(t, store, "broken", `{not json`)
 	mcpPutRegistry(t, store, "good", `{"name":"good","url":"https://good.example.com/mcp"}`)
 
-	h := NewResourceHandler(k8s, "default", nil, "").WithOSS(store)
+	h := NewResourceHandler(k8s, "default", nil, "", nil).WithOSS(store)
 	resp := mcpDecode(t, mcpGet(t, h, mcpCallerCtx(authpkg.RoleAdmin, "", nil)))
 	if resp.Total != 1 || resp.Servers[0].Name != "good" {
 		t.Fatalf("corrupt doc must be skipped: %+v", resp.Servers)
