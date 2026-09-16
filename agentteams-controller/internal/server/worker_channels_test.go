@@ -400,9 +400,11 @@ func TestChannelsRestart_Forwards(t *testing.T) {
 // expectations below are written from the worker client, not from this
 // handler file — if the worker API ever moves, the worker client and this
 // table change together, and this test catches proxy drift in both
-// directions (missing or extra prefix). The table is the version-agnostic
-// minimum contract: the 9 routes are identical across the official QwenPaw
-// 2.0.1 / 2.2.0 / 2.2.1 releases (verified against the PyPI wheels).
+// directions (missing or extra prefix). The first 9 rows are the
+// version-agnostic core contract, identical across the official QwenPaw
+// 2.0.1 / 2.2.0 / 2.2.1 releases (verified against the PyPI wheels); the
+// conflict-check row is the additive 2.2.x-only route (older builds answer
+// with their own 404, passed through verbatim).
 func TestChannelsUpstreamPathsMatchWorkerContract(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -471,6 +473,18 @@ func TestChannelsUpstreamPathsMatchWorkerContract(t *testing.T) {
 				h.restartChannel(rec, adminCaller(channelsRequest(http.MethodPost, "/api/v1/workers/placeholder/channels/qq/restart", "", "name", "daily-luo", "channel", "qq")))
 			},
 			"/api/config/channels/qq/restart",
+		},
+		{
+			// conflict-check is additive to the 9-route core: it is not in
+			// the worker client (api.py), so its expectation is written from
+			// the official QwenPaw 2.2.x server route (config.py:379) and
+			// the console's checkChannelConflict call — both independent of
+			// this handler file.
+			"conflict-check",
+			func(h *ChannelsHandler, rec *httptest.ResponseRecorder) {
+				h.checkChannelConflict(rec, adminCaller(channelsRequest(http.MethodPost, "/api/v1/workers/placeholder/channels/qq/conflict-check", `{"app_id":"1"}`, "name", "daily-luo", "channel", "qq")))
+			},
+			"/api/config/channels/qq/conflict-check",
 		},
 	}
 	for _, tc := range cases {

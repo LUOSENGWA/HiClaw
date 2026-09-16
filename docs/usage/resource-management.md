@@ -1020,12 +1020,13 @@ curl -s -X PUT http://127.0.0.1:8090/api/v1/workers/{name}/channels/qq \
 
 The `schemas` route returns per-channel form definitions (field names,
 types, labels, options) so frontends render the connect form without
-per-channel code. (`conflict-check` is an additive 2.2.x-only route that
-2.0.x workers do not expose; it will be proxied as a small follow-up once
-a 2.2.x pin lands — see the version-contract section of
-`docs/design/worker-channels-api.md`.)
+per-channel code. The `conflict-check` route (POST) detects other agents
+holding the same channel credentials before you save a config — on a
+2.2.x worker it runs server-side; on an older build the upstream's own
+`404` is returned verbatim, so hide the entry when you see it (see the
+version-contract section of `docs/design/worker-channels-api.md`).
 
-| Role | Read | Write (`PUT` / `restart`) |
+| Role | Read | Write (`PUT` / `restart` / `conflict-check`) |
 |------|------|---------------------------|
 | L1 (admin / cli token) | any worker | any worker |
 | L2 (Matrix token) | own-team workers | own-team workers |

@@ -17,15 +17,17 @@ package server
 //	GET  /api/v1/workers/{name}/channels/{channel}/qrcode
 //	GET  /api/v1/workers/{name}/channels/{channel}/qrcode/status
 //	POST /api/v1/workers/{name}/channels/{channel}/restart
+//	POST /api/v1/workers/{name}/channels/{channel}/conflict-check
 //
 // Upstream contract: requests are forwarded to the worker's qwenpaw config
 // API under /api/config/channels/... — the path the worker's own client
 // (qwenpaw_worker/api.py) and integration coverage use. The proxy is
-// version-agnostic: this 9-route contract is identical across the official
-// QwenPaw 2.0.1 / 2.2.0 / 2.2.1 releases (see the version-contract section
-// of docs/design/worker-channels-api.md). conflict-check is an additive
-// 2.2.x-only route, so this proxy does not offer it yet (small follow-up
-// once a 2.2.x pin lands).
+// version-agnostic: the 9-route core contract is identical across the
+// official QwenPaw 2.0.1 / 2.2.0 / 2.2.1 releases (see the version-contract
+// section of docs/design/worker-channels-api.md). conflict-check is an
+// additive 2.2.x-only route: 2.2.x workers serve it (config.py:379), and a
+// worker on an older build returns its own 404, which the proxy passes
+// through verbatim (version gate).
 //
 // Design notes (full contract in docs/design/worker-channels-api.md):
 //
@@ -403,6 +405,30 @@ func (h *ChannelsHandler) restartChannel(w http.ResponseWriter, r *http.Request)
 		method:   http.MethodPost,
 		upstream: "/api/config/channels/" + ch + "/restart",
 		mutates:  true,
+	})
+}
+
+// checkChannelConflict handles POST .../channels/{channel}/conflict-check
+// (detects other agents holding the same channel credentials — the QQ
+// double-AppID kick-out guard). Non-mutating: a read-only check run before
+// a channel write. The route is additive to the 9-route core contract:
+// QwenPaw 2.2.x exposes it (config.py:379, verified against the official
+// wheels); a worker on a 2.0.x build returns its own 404, which the proxy
+// passes through verbatim (version gate).
+func (h *ChannelsHandler) checkChannelConflict(w http.ResponseWriter, r *http.Request) {
+	if !validateChannelName(w, r.PathValue("channel")) {
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, channelBodyCap))
+	if err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, "read request body: "+err.Error())
+		return
+	}
+	ch := r.PathValue("channel")
+	h.serveChannels(w, r, channelRoute{
+		method:   http.MethodPost,
+		upstream: "/api/config/channels/" + ch + "/conflict-check",
+		body:     body,
 	})
 }
 
