@@ -59,10 +59,11 @@ type Client interface {
 	ResolveModelProvider(ctx context.Context, name string) (*ModelProviderInfo, error)
 
 	// ListAIRoutes returns the configured AI routes with their upstreams and
-	// consumer allowlists. The routes are the authoritative model list for
-	// gateway-backed deployments: a route name is the model alias used by
-	// Worker/Manager CRs. Backends without a route-list API (ai-gateway)
-	// return ErrUnsupportedOp.
+	// consumer allowlists. Routes are the gateway's /v1 entry points with
+	// consumer authorization — NOT a model list: a route name is not a model
+	// ID, and one route can serve several models (model IDs are defined by
+	// the route's upstream provider). Backends without a route-list API
+	// (ai-gateway) return ErrUnsupportedOp.
 	ListAIRoutes(ctx context.Context) ([]AIRouteInfo, error)
 
 	// Healthy returns nil if the gateway console is reachable and authenticated.

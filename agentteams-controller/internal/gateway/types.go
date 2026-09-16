@@ -35,8 +35,13 @@ type AIRouteUpstream struct {
 	Weight   int    `json:"weight,omitempty"`
 }
 
-// AIRouteInfo is a read-only view of a configured AI route. The route name is
-// the model alias that Worker/Manager CRs reference in their model field.
+// AIRouteInfo is a read-only view of a configured AI route. The name is the
+// gateway route name — NOT a model ID: a route is the /v1 entry point with
+// consumer authorization and upstream providers, and one route can serve
+// several models (the default deployment's single default-ai-route serves
+// everything the configured provider loads). Model IDs are the values of
+// the chat-completion model field, which the route's upstream provider
+// defines and serves.
 type AIRouteInfo struct {
 	Name             string            `json:"name"`
 	Upstreams        []AIRouteUpstream `json:"upstreams,omitempty"`

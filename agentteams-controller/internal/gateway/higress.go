@@ -373,7 +373,7 @@ func (c *HigressClient) ListAIRoutes(ctx context.Context) ([]AIRouteInfo, error)
 		info, err := c.getAIRoute(ctx, entry.Name)
 		if err != nil {
 			// Fail the whole call rather than return a silently incomplete
-			// catalog: a partial model list would look authoritative.
+			// catalog: a partial route list would look authoritative.
 			return nil, fmt.Errorf("get AI route %s: %w", entry.Name, err)
 		}
 		routes = append(routes, *info)

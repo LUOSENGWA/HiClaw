@@ -163,7 +163,7 @@ func TestAuthorizer_GatewayResourceL1Only(t *testing.T) {
 		}
 	}
 
-	// Everyone below L1 is denied the gateway resource (incl. /api/v1/models).
+	// Everyone below L1 is denied the gateway resource (incl. /api/v1/gateway/ai-routes).
 	denied := []*CallerIdentity{
 		{Role: RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"},
 		{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}},
