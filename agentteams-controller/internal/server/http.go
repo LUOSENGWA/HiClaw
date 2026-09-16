@@ -147,6 +147,11 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	mux.Handle("PUT /api/v1/workers/{name}/loops/custom/{loop}", mw.RequireAuthz(authpkg.ActionRuntimeConfig, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
 	mux.Handle("DELETE /api/v1/workers/{name}/loops/custom/{loop}", mw.RequireAuthz(authpkg.ActionRuntimeConfig, "worker", nameFn)(http.HandlerFunc(rch.Handle)))
 
+	// --- Worker skill runtime state + preload policy (QwenPaw >= 2.2.1; proxy to the worker's qwenpaw app) ---
+	wskh := NewWorkerSkillsHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix)
+	mux.Handle("GET /api/v1/workers/{name}/skills", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(wskh.getWorkerSkills)))
+	mux.Handle("PUT /api/v1/workers/{name}/skills/{skill_name}/preload", mw.RequireAuthz(authpkg.ActionWorkerSkillPreload, "worker", nameFn)(http.HandlerFunc(wskh.putWorkerSkillPreload)))
+
 	// --- Worker tool approval (team-scoped; proxy to the worker's qwenpaw app) ---
 	ah := NewApprovalHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix)
 	mux.Handle("GET /api/v1/workers/{name}/approval", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(ah.getWorkerApproval)))
