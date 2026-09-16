@@ -486,20 +486,27 @@ func (r *TeamReconciler) reconcileTeam(ctx context.Context, t *v1beta1.Team, pat
 			}
 		}
 	}
+	// Inject the team channel policy for every member, regardless of runtime:
+	// every runtime's worker bridge derives its Matrix allowlists
+	// (groupAllowFrom / dm.allowFrom) from the worker's openclaw.json, and
+	// WorkerReconciler's openclaw.json regeneration preserves the injected
+	// lists (preserveChannelMatrixAllowFrom). Excluding the
+	// member-runtime-config runtimes (qwenpaw, deepseek-harness) left them on
+	// the standalone manager/admin lists, where allowlist mode silently drops
+	// the team leader's, the team admin's, and the coordinator humans'
+	// @mentions and DMs.
 	for _, rm := range members {
 		role := RoleTeamWorker
 		if rm.ref.Name == leaderRef.Name {
 			role = RoleTeamLeader
 		}
-		if !backend.UsesMemberRuntimeConfig(r.teamMemberRuntime(rm)) {
-			policy := r.teamChannelPolicy(derivedTeam, members, leaderRef.Name, rm, role)
-			if err := r.Deployer.InjectChannelPolicy(ctx, service.InjectChannelPolicyRequest{
-				WorkerName:     rm.runtimeName,
-				GroupAllowFrom: policy.GroupAllowFrom,
-				DMAllowFrom:    policy.DMAllowFrom,
-			}); err != nil {
-				logger.Error(err, "channel policy injection failed (non-fatal)", "worker", rm.runtimeName)
-			}
+		policy := r.teamChannelPolicy(derivedTeam, members, leaderRef.Name, rm, role)
+		if err := r.Deployer.InjectChannelPolicy(ctx, service.InjectChannelPolicyRequest{
+			WorkerName:     rm.runtimeName,
+			GroupAllowFrom: policy.GroupAllowFrom,
+			DMAllowFrom:    policy.DMAllowFrom,
+		}); err != nil {
+			logger.Error(err, "channel policy injection failed (non-fatal)", "worker", rm.runtimeName)
 		}
 	}
 
@@ -811,9 +818,11 @@ func (r *TeamReconciler) detachTeamMember(ctx context.Context, t *v1beta1.Team, 
 			return fmt.Errorf("restore Manager to Worker %q personal room: %w", w.Name, err)
 		}
 	}
-	if backend.UsesMemberRuntimeConfig(runtime) {
-		return nil
-	}
+	// The standalone channel-policy reset applies to every runtime: the
+	// active reconcile now injects the team policy for the member-runtime-
+	// config runtimes (qwenpaw, deepseek-harness) too, so a detach must
+	// revert their openclaw.json allowlists or the team's IDs would linger
+	// after the membership ends.
 	if err := r.ManagerConfig.UpdateManagerGroupAllowFrom(r.ManagerConfig.MatrixUserID(runtimeName), false); err != nil {
 		logger.Error(err, "failed to revoke Manager groupAllowFrom for detached member (non-fatal)", "worker", runtimeName)
 	}
