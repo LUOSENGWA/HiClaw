@@ -14,6 +14,7 @@ import (
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/proxy"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/service"
+	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/skillscan"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -30,7 +31,9 @@ type ServerDeps struct {
 	Namespace       string
 	ControllerName  string               // AGENTTEAMS_CONTROLLER_NAME; empty in embedded mode
 	SocketPath      string               // Docker proxy (embedded only)
+	SkillScanner    *skillscan.Client    // shared skill content scan (upload ① + assign ②)
 	ContainerPrefix string               // effective worker container prefix (config.ContainerPrefix); embedded-only address resolution
+	ResourcePrefix  string               // resource name prefix ("" = agentteams-); manager container name derivation for skillscan
 	MatrixConfig    matrix.Config        // for AppService rotation endpoint
 	MatrixClient    matrix.Client        // for project intervention notifications (SendMessageAsAdmin); nil to skip
 	Provisioner     *service.Provisioner // for Matrix token refresh
@@ -173,9 +176,12 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	mux.Handle("GET /api/v1/workers/{name}/tools", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(th.listWorkerTools)))
 	mux.Handle("PATCH /api/v1/workers/{name}/tools/{tool}", mw.RequireAuthz(authpkg.ActionWorkerTools, "worker", nameFn)(http.HandlerFunc(th.patchWorkerTool)))
 
-	// --- Skill catalog (read-only: builtin skills per runtime + shared skills under agents/global/skills/) ---
-	skh := NewSkillsHandler(deps.WorkerAgentDir, deps.OSS)
+	// --- Skill catalog (read: builtin per runtime + shared/team layers; write: team-skill upload) ---
+	// The scanner is shared with the Deployer (one content-hash cache
+	// across upload scan ① and assign-time scan ②).
+	skh := NewSkillsHandler(deps.WorkerAgentDir, deps.OSS, deps.Client, deps.Namespace, deps.SkillScanner)
 	mux.Handle("GET /api/v1/skills", mw.RequireAuthz(authpkg.ActionList, "skills", nil)(http.HandlerFunc(skh.ListSkills)))
+	mux.Handle("POST /api/v1/skills", mw.RequireAuthz(authpkg.ActionSkillPublish, "skills", nil)(http.HandlerFunc(skh.UploadSkill)))
 
 	// --- Worker channels (channel configuration; proxy to the worker's qwenpaw app) ---
 	// Reads use ActionGet; mutations use ActionUpdate so the authorizer's
