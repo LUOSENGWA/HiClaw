@@ -197,6 +197,7 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	mux.Handle("GET /api/v1/workers/{name}/channels/{channel}/qrcode", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(chh.getChannelQrcode)))
 	mux.Handle("GET /api/v1/workers/{name}/channels/{channel}/qrcode/status", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(chh.getQrcodeStatus)))
 	mux.Handle("POST /api/v1/workers/{name}/channels/{channel}/restart", mw.RequireAuthz(authpkg.ActionUpdate, "worker", nameFn)(http.HandlerFunc(chh.restartChannel)))
+	mux.Handle("POST /api/v1/workers/{name}/channels/{channel}/conflict-check", mw.RequireAuthz(authpkg.ActionUpdate, "worker", nameFn)(http.HandlerFunc(chh.checkChannelConflict)))
 
 	// W-PR-2: human intervention + lifecycle (write endpoints). All writes go
 	// through RequireAuthz ActionUpdate + "project" so the authorizer's

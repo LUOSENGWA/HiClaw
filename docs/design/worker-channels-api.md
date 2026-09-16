@@ -28,6 +28,7 @@ probed).
 | `GET /api/v1/workers/{name}/channels/{channel}/qrcode` | `GET /api/config/channels/{channel}/qrcode` | QR-auth channels (wechat / dingtalk scan login) |
 | `GET /api/v1/workers/{name}/channels/{channel}/qrcode/status` | `GET /api/config/channels/{channel}/qrcode/status?token=` | Poll scan status; strict query whitelist (`token` only) |
 | `POST /api/v1/workers/{name}/channels/{channel}/restart` | `POST /api/config/channels/{channel}/restart` | Stop/start the channel without restarting the agent |
+| `POST /api/v1/workers/{name}/channels/{channel}/conflict-check` | `POST /api/config/channels/{channel}/conflict-check` | Detects other agents holding the same channel credentials (QQ double-AppID kick-out guard); non-mutating, run before a channel write. **Additive 2.2.x-only route** — a 2.0.x worker answers with its own `404`, passed through verbatim (version gate) |
 
 `{channel}` must match `^[a-z0-9][a-z0-9_-]*$`; anything else is `400`
 before the upstream dial (injection guard). The single-segment channel
@@ -35,7 +36,7 @@ position also hosts the reserved fixed resources `types` and `schemas`.
 
 ## Authorization
 
-| Role | Read routes | Mutating routes (`PUT` / `restart`) |
+| Role | Read routes | Write-gated routes (`PUT` / `restart` / `conflict-check`) |
 |---|---|---|
 | `admin` / `manager` (L1) | any worker | any worker |
 | `human` (L2, Matrix token) | own accessibleTeams workers | own accessibleTeams workers — **requires the worker-scoped update policy** (authorizer `ActionUpdate` → same-team). Until that policy is merged the middleware denies L2 worker updates and only L1 reaches the handler |
@@ -136,11 +137,12 @@ paths under the `/api` mount:
 
 So the API works unchanged on any QwenPaw across the 2.0.1 → 2.2.1 range:
 
-- **`conflict-check` is an additive 2.2.x-only route.** 2.0.x workers do
-  not expose it. Rather than ship a dead endpoint on a 2.0.x pin, this
-  proxy deliberately does not offer it yet; re-adding the proxy endpoint
-  after a 2.2.x pin is a one-line table entry plus the existing handler
-  shape (tracked as a small follow-up, not a dependency of this PR).
+- **`conflict-check` is an additive 2.2.x-only route.** 2.2.x workers
+  expose it; 2.0.x workers do not. The proxy now forwards it: on a 2.2.x
+  worker the check runs, and on an older build the upstream's own `404`
+  detail is returned verbatim, so clients can distinguish "no conflict
+  check available on this worker build" from a real failure and hide the
+  entry accordingly (the version gate by pass-through below).
 - **Version gate by pass-through.** On a QwenPaw build without the
   channel router at all, the upstream's own `404` detail is returned
   verbatim, so callers see a distinguishable, upstream-sourced failure
