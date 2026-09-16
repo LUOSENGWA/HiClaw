@@ -244,6 +244,10 @@ func (g *workerTestGateway) EnsureStreamIdleTimeout(context.Context, int) error 
 func (g *workerTestGateway) EnsureAIRoute(context.Context, gateway.AIRouteRequest) error {
 	return nil
 }
+func (g *workerTestGateway) ListAIRoutes(context.Context) ([]gateway.AIRouteInfo, error) {
+	return nil, nil
+}
+
 func (g *workerTestGateway) ResolveModelProvider(context.Context, string) (*gateway.ModelProviderInfo, error) {
 	return g.modelInfo, g.modelErr
 }
