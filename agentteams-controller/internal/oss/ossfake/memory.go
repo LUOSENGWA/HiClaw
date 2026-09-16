@@ -207,7 +207,13 @@ func (m *Memory) Mirror(_ context.Context, src, dst string, opts oss.MirrorOptio
 	return nil
 }
 
-// ListObjects returns all keys whose names start with prefix, sorted.
+// ListObjects returns every object under prefix, sorted, as names RELATIVE
+// to the prefix — mirroring the production MinIOClient, whose ListObjects
+// wraps `mc ls <prefix>` and reports the bare child name of each output
+// line ("[date] [size] <name>"). Callers that need a full object key must
+// re-attach the prefix themselves (see project_handler's
+// metaKeyFromListResult); passing a listed name straight to GetObject reads
+// the bucket root instead of the prefixed path.
 func (m *Memory) ListObjects(_ context.Context, prefix string) ([]string, error) {
 	infos, err := m.ListObjectsDetailed(context.Background(), prefix)
 	if err != nil {
@@ -222,7 +228,13 @@ func (m *Memory) ListObjects(_ context.Context, prefix string) ([]string, error)
 
 // ListObjectsDetailed reports the fake's single global write clock as every
 // entry's UpdatedAt (the fake has no per-object mtime; writes advance the
-// clock, so the value reflects the most recent write).
+// clock, so the value reflects the most recent write). Entry names are
+// RELATIVE to prefix, matching the production `mc ls` contract — the
+// previous full-key behavior let callers skip the prefix re-attach that
+// GetObject requires, silently reading the bucket root (see the
+// mcp-servers catalog regression). The fake lists the whole prefix subtree,
+// whereas non-recursive `mc ls` shows only the first level; consumers that
+// filter on flat child names are unaffected by that difference.
 func (m *Memory) ListObjectsDetailed(_ context.Context, prefix string) ([]oss.ObjectInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -236,7 +248,7 @@ func (m *Memory) ListObjectsDetailed(_ context.Context, prefix string) ([]oss.Ob
 	updatedAt := m.modTime.UTC().Format(time.RFC3339)
 	infos := make([]oss.ObjectInfo, 0, len(keys))
 	for _, key := range keys {
-		infos = append(infos, oss.ObjectInfo{Name: key, UpdatedAt: updatedAt})
+		infos = append(infos, oss.ObjectInfo{Name: strings.TrimPrefix(key, prefix), UpdatedAt: updatedAt})
 	}
 	return infos, nil
 }

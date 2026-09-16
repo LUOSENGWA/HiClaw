@@ -1477,19 +1477,25 @@ func TestPrepareWorkerDepsWritesObjectStorageLayout(t *testing.T) {
 		t.Fatalf("PrepareWorkerDeps: %v", err)
 	}
 
-	wantKeys := []string{
-		"instances/alice/data/.agentteams-keep",
-		"instances/alice/env/env",
-		"instances/alice/token/token",
+	// ListObjects reports names relative to the prefix (production mc ls
+	// contract); Stat/GetObject still take full keys.
+	wantListed := []string{
+		"data/.agentteams-keep",
+		"env/env",
+		"token/token",
 	}
 	gotKeys, err := store.ListObjects(ctx, "instances/alice/")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(gotKeys, "\n") != strings.Join(wantKeys, "\n") {
-		t.Fatalf("worker deps keys=%v, want %v", gotKeys, wantKeys)
+	if strings.Join(gotKeys, "\n") != strings.Join(wantListed, "\n") {
+		t.Fatalf("worker deps keys=%v, want %v", gotKeys, wantListed)
 	}
-	for _, key := range wantKeys {
+	for _, key := range []string{
+		"instances/alice/data/.agentteams-keep",
+		"instances/alice/env/env",
+		"instances/alice/token/token",
+	} {
 		if err := store.Stat(ctx, key); err != nil {
 			t.Fatalf("missing %s: %v", key, err)
 		}
