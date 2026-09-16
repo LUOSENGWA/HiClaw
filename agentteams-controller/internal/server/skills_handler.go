@@ -289,7 +289,16 @@ func (h *SkillsHandler) pluginSkills() []*SkillInfo {
 			if ps.Path == "" {
 				continue
 			}
-			name, description, version, _ := parseSkillFrontmatter(filepath.Join(ps.Dir, ps.Path, "SKILL.md"))
+			skillMd := filepath.Join(ps.Dir, ps.Path, "SKILL.md")
+			// A manifest entry whose SKILL.md is missing (or not a regular
+			// file) is an unavailable skill: omit it. The metadata fallbacks
+			// below apply only to a file that exists but lacks fields —
+			// falling back on a missing file would advertise a skill the
+			// runtime cannot load.
+			if st, err := os.Stat(skillMd); err != nil || !st.Mode().IsRegular() {
+				continue
+			}
+			name, description, version, _ := parseSkillFrontmatter(skillMd)
 			if name == "" {
 				name = ps.ID
 			}

@@ -525,6 +525,37 @@ func TestSkillsCatalogPluginSource(t *testing.T) {
 	}
 }
 
+// TestSkillsCatalogPluginSkillMdMissing pins the reviewer repro: a
+// manifest-declared skill whose SKILL.md is missing must be omitted —
+// neither under the frontmatter name nor under the manifest-ID fallback —
+// per the documented "missing SKILL.md → absence" contract.
+func TestSkillsCatalogPluginSkillMdMissing(t *testing.T) {
+	base := t.TempDir()
+	pluginsDir := filepath.Join(base, "plugins")
+	writePluginTree(t, pluginsDir)
+	// Reviewer repro: remove skills/agent/mcporter/SKILL.md.
+	if err := os.Remove(filepath.Join(pluginsDir, "teamharness", "skills", "agent", "mcporter", "SKILL.md")); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewSkillsHandler(filepath.Join(base, "worker-agent"), pluginsDir, &mcLikeOSS{Memory: ossfake.NewMemory()})
+	skills := decodeSkills(t, getSkills(t, h))
+
+	// Only the one plugin skill with a real SKILL.md remains
+	// (mcporter omitted, unlisted organization excluded).
+	if len(skills) != 1 {
+		t.Fatalf("want 1 skill, got %d: %+v", len(skills), skills)
+	}
+	for _, s := range skills {
+		if s.Name == "teamharness-mcporter" || s.Name == "mcporter" {
+			t.Fatalf("skill with missing SKILL.md leaked into the catalog: %+v", s)
+		}
+	}
+	if comm := skillByName(t, skills, "teamharness-communication"); comm.Source != "plugin" {
+		t.Fatalf("communication must survive: %+v", comm)
+	}
+}
+
 func TestSkillsCatalogPluginCollisionBuiltinWins(t *testing.T) {
 	base := t.TempDir()
 	pluginsDir := filepath.Join(base, "plugins")
