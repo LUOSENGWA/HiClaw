@@ -223,6 +223,17 @@ func (a *Authorizer) authorizeHuman(caller *CallerIdentity, req AuthzRequest) er
 		}
 		return deny(caller, req)
 
+	case "audit":
+		// L2 humans may read audit events of their own teams (#1245).
+		// The middleware cannot resolve the requested team scope, so the
+		// handler is the real boundary: ?team= is mandatory for scoped
+		// callers, cross-team reads are hidden as 404 (W8 anti-probing),
+		// and unscoped reads are L1 only.
+		if req.Action == ActionGet {
+			return nil
+		}
+		return deny(caller, req)
+
 	default:
 		return deny(caller, req)
 	}
@@ -283,6 +294,16 @@ func (a *Authorizer) authorizeTeamLeader(caller *CallerIdentity, req AuthzReques
 		default:
 			return deny(caller, req)
 		}
+
+	case "audit":
+		// Team leaders may read audit events of their own team (#1245),
+		// same pattern as the worker/team read paths: the handler enforces
+		// TeamMatches (?team= mandatory, cross-team hidden as 404, W8
+		// anti-probing); unscoped reads are L1 only.
+		if req.Action == ActionGet {
+			return nil
+		}
+		return deny(caller, req)
 
 	default:
 		return deny(caller, req)
