@@ -554,33 +554,8 @@ func TestReconcileTeamTeamReferences_QwenPawProjectsRuntimeRoster(t *testing.T) 
 	if got := len(deployer.Calls.InjectHeartbeatConfig); got != 0 {
 		t.Fatalf("qwenpaw InjectHeartbeatConfig calls=%d, want 0", got)
 	}
-	// QwenPaw workers read their Matrix channel config — allowlists included
-	// — from openclaw.json via the bridge, so the team channel policy must be
-	// injected for them too. Without it, allowlist mode silently drops the
-	// team leader's, the team admin's, and the coordinator humans' @mentions
-	// and DMs (the worker-side counterpart of #1243).
-	if got := len(deployer.Calls.InjectChannelPolicy); got != 2 {
-		t.Fatalf("qwenpaw InjectChannelPolicy calls=%d, want 2 (leader + worker)", got)
-	}
-	var devPolicy *service.InjectChannelPolicyRequest
-	for i := range deployer.Calls.InjectChannelPolicy {
-		if deployer.Calls.InjectChannelPolicy[i].WorkerName == "dev" {
-			req := deployer.Calls.InjectChannelPolicy[i]
-			devPolicy = &req
-		}
-	}
-	if devPolicy == nil {
-		t.Fatalf("missing dev channel policy: %#v", deployer.Calls.InjectChannelPolicy)
-	}
-	for _, want := range []string{"@lead:matrix.local", "@admin:localhost", "@human:matrix.local", "@team-group-bot:matrix.local"} {
-		if !stringSliceContains(devPolicy.GroupAllowFrom, want) {
-			t.Errorf("dev groupAllowFrom=%v, missing %s", devPolicy.GroupAllowFrom, want)
-		}
-	}
-	for _, want := range []string{"@lead:matrix.local", "@admin:localhost", "@human:matrix.local", "@worker-dm-bot:matrix.local"} {
-		if !stringSliceContains(devPolicy.DMAllowFrom, want) {
-			t.Errorf("dev dmAllowFrom=%v, missing %s", devPolicy.DMAllowFrom, want)
-		}
+	if got := len(deployer.Calls.InjectChannelPolicy); got != 0 {
+		t.Fatalf("qwenpaw InjectChannelPolicy calls=%d, want 0", got)
 	}
 }
 
@@ -1439,19 +1414,8 @@ func TestHandleDeleteTeamReferencesSkipsQwenPawLegacyAssets(t *testing.T) {
 	if got := len(deployer.Calls.InjectHeartbeatConfig); got != 0 {
 		t.Fatalf("qwenpaw InjectHeartbeatConfig calls=%d, want 0", got)
 	}
-	// The standalone channel-policy reset is runtime-agnostic: the active
-	// reconcile injects the team policy for qwenpaw members, so the detach
-	// must revert their allowlists (manager + system admin + team admin).
-	if got := len(deployer.Calls.InjectChannelPolicy); got != 2 {
-		t.Fatalf("qwenpaw InjectChannelPolicy calls=%d, want 2 (standalone reset for leader + worker)", got)
-	}
-	for _, call := range deployer.Calls.InjectChannelPolicy {
-		if !stringSliceContains(call.GroupAllowFrom, "@manager:matrix.local") {
-			t.Errorf("%s standalone groupAllowFrom=%v, want manager", call.WorkerName, call.GroupAllowFrom)
-		}
-		if !stringSliceContains(call.DMAllowFrom, "@manager:matrix.local") {
-			t.Errorf("%s standalone dmAllowFrom=%v, want manager", call.WorkerName, call.DMAllowFrom)
-		}
+	if got := len(deployer.Calls.InjectChannelPolicy); got != 0 {
+		t.Fatalf("qwenpaw InjectChannelPolicy calls=%d, want 0", got)
 	}
 	if got := provisioner.Calls.ArchiveTeamRooms; len(got) != 1 {
 		t.Fatalf("ArchiveTeamRooms calls=%v, want one call", got)
@@ -2129,67 +2093,5 @@ func TestHumanToTeamRequests(t *testing.T) {
 	}
 	if got := r.humanToTeamRequests(ctx, unrelated); len(got) != 0 {
 		t.Fatalf("humanToTeamRequests(dave)=%v, want empty", got)
-	}
-}
-
-// TestTeamChannelPolicy_IncludesTeamHumans pins the worker-side counterpart
-// of #1243: team humans must be on each member's group + DM allowlists, or
-// allowlist mode silently drops their @mentions and DMs. A human without a
-// provisioned Matrix ID is skipped (the Human watch re-reconciles once
-// status.matrixUserID is filled), and an explicit groupDenyExtra still wins.
-func TestTeamChannelPolicy_IncludesTeamHumans(t *testing.T) {
-	managerConfig, _ := newTestManagerConfig(t)
-	r := &TeamReconciler{ManagerConfig: managerConfig}
-
-	lead := &v1beta1.Worker{
-		ObjectMeta: metav1.ObjectMeta{Name: "lead", Namespace: "default"},
-		Status:     v1beta1.WorkerStatus{MatrixUserID: "@lead:matrix.local"},
-	}
-	dev := &v1beta1.Worker{
-		ObjectMeta: metav1.ObjectMeta{Name: "dev", Namespace: "default"},
-		Status:     v1beta1.WorkerStatus{MatrixUserID: "@dev:matrix.local"},
-	}
-	members := []teamWorkerMember{
-		{ref: v1beta1.TeamWorkerRef{Name: "lead", Role: "team_leader"}, worker: *lead, runtimeName: "lead"},
-		{ref: v1beta1.TeamWorkerRef{Name: "dev"}, worker: *dev, runtimeName: "dev"},
-	}
-	team := &v1beta1.Team{
-		ObjectMeta: metav1.ObjectMeta{Name: "team-a", Namespace: "default"},
-		Spec: v1beta1.TeamSpec{
-			HumanMembers: []v1beta1.TeamMemberSpec{
-				{Name: "bob", MatrixUserID: "@bob:matrix.local"},
-				{Name: "noprovision"}, // not provisioned yet — must be skipped
-			},
-		},
-	}
-
-	for _, tc := range []struct {
-		current teamWorkerMember
-		role    MemberRole
-	}{
-		{members[0], RoleTeamLeader},
-		{members[1], RoleTeamWorker},
-	} {
-		team.Spec.ChannelPolicy = nil
-		policy := r.teamChannelPolicy(team, members, "lead", tc.current, tc.role)
-		if !stringSliceContains(policy.GroupAllowFrom, "@bob:matrix.local") {
-			t.Errorf("%s role: groupAllowFrom=%v, missing team human @bob:matrix.local", tc.role, policy.GroupAllowFrom)
-		}
-		if !stringSliceContains(policy.DMAllowFrom, "@bob:matrix.local") {
-			t.Errorf("%s role: dmAllowFrom=%v, missing team human @bob:matrix.local", tc.role, policy.DMAllowFrom)
-		}
-		if stringSliceContains(policy.GroupAllowFrom, "@noprovision") {
-			t.Errorf("%s role: groupAllowFrom=%v, must not contain the unprovisioned human name", tc.role, policy.GroupAllowFrom)
-		}
-	}
-
-	// An explicit team-level deny still removes the human from the group list.
-	team.Spec.ChannelPolicy = &v1beta1.ChannelPolicySpec{GroupDenyExtra: []string{"@bob:matrix.local"}}
-	policy := r.teamChannelPolicy(team, members, "lead", members[1], RoleTeamWorker)
-	if stringSliceContains(policy.GroupAllowFrom, "@bob:matrix.local") {
-		t.Errorf("groupAllowFrom=%v, explicit groupDenyExtra must remove the human", policy.GroupAllowFrom)
-	}
-	if !stringSliceContains(policy.DMAllowFrom, "@bob:matrix.local") {
-		t.Errorf("dmAllowFrom=%v, deny is group-scoped only — DM must keep the human", policy.DMAllowFrom)
 	}
 }

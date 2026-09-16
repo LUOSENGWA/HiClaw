@@ -231,68 +231,80 @@ def test_runtime_updater_reconciles_model_mcp_matrix_channel_and_acl_via_api(
     assert not (updater.config.default_workspace_dir / "access_control.json").exists()
 
 
-def test_runtime_updater_runtime_acl_includes_coordinator_humans_and_detaches(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The native qwenpaw worker enforces its Matrix ACL from the team
-    roster in the runtime config (team.members -> _matrix_policy_ids ->
-    reconcile_acl), not from the openclaw.json bridge seed. Pin the
-    resulting runtime ACL: a coordinator human is allowlisted while on
-    the roster and dropped from the ACL once detached (absent from the
-    roster on the next apply)."""
+def _native_acl_raw(team_members=None, with_team: bool = True) -> dict:
+    """runtime.yaml raw used by the native Matrix ACL pin tests below."""
+    raw = {
+        "metadata": {"generation": "1"},
+        "member": {
+            "runtime": "qwenpaw",
+            "matrixUserId": "@worker-a:matrix.local",
+        },
+        "credentials": {
+            "matrixTokenEnv": "AGENTTEAMS_WORKER_MATRIX_TOKEN",
+            "gatewayKeyEnv": "AGENTTEAMS_WORKER_GATEWAY_KEY",
+        },
+        "desired": {
+            "model": {
+                "providerId": "agentteams-gateway",
+                "model": "qwen-plus",
+                "gatewayUrl": "https://gateway.example.com",
+            },
+        },
+    }
+    if with_team:
+        raw["team"] = {
+            "teamRoomId": "!team:matrix.local",
+            "members": team_members,
+        }
+    return raw
+
+
+def _native_acl_updater(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("AGENTTEAMS_MATRIX_URL", "http://matrix.example.com")
     monkeypatch.setenv("AGENTTEAMS_WORKER_MATRIX_TOKEN", "matrix-token")
     monkeypatch.setenv("AGENTTEAMS_WORKER_GATEWAY_KEY", "gateway-secret")
-    updater = _runtime_updater(
+    monkeypatch.setenv("AGENTTEAMS_MATRIX_DOMAIN", "matrix.example.com")
+    return _runtime_updater(
         config=_config(tmp_path),
         package_manager=_NoopPackageManager(),
     )
 
-    def roster_raw(members):
-        return {
-            "metadata": {"generation": "1"},
-            "team": {
-                "teamRoomId": "!team:matrix.local",
-                "members": members,
-            },
-            "member": {
-                "runtime": "qwenpaw",
-                "matrixUserId": "@worker-a:matrix.local",
-            },
-            "credentials": {
-                "matrixTokenEnv": "AGENTTEAMS_WORKER_MATRIX_TOKEN",
-                "gatewayKeyEnv": "AGENTTEAMS_WORKER_GATEWAY_KEY",
-            },
-            "desired": {
-                "model": {
-                    "providerId": "agentteams-gateway",
-                    "model": "qwen-plus",
-                    "gatewayUrl": "https://gateway.example.com",
-                },
-            },
-        }
 
-    on_roster = [
-        {
-            "name": "leader-a",
-            "runtimeName": "leader-a",
-            "role": "team_leader",
-            "matrixUserId": "@leader-a:matrix.local",
-        },
-        {
-            "name": "worker-b",
-            "runtimeName": "worker-b",
-            "role": "worker",
-            "matrixUserId": "@worker-b:matrix.local",
-        },
-        # Coordinator human projected into the roster by team reconcile.
-        {"name": "alice", "role": "coordinator", "matrixUserId": "@alice:matrix.local"},
-    ]
+_TEAM_MEMBERS = [
+    {
+        "name": "leader-a",
+        "runtimeName": "leader-a",
+        "role": "team_leader",
+        "matrixUserId": "@leader-a:matrix.local",
+    },
+    {
+        "name": "worker-b",
+        "runtimeName": "worker-b",
+        "role": "worker",
+        "matrixUserId": "@worker-b:matrix.local",
+    },
+    # Coordinator human projected into the roster by team reconcile.
+    {"name": "alice", "role": "coordinator", "matrixUserId": "@alice:matrix.local"},
+]
+
+
+def test_runtime_updater_acl_drops_coordinator_human_removed_from_roster(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scenario 1: a coordinator human leaves the team roster while the
+    worker stays in the team. The native qwenpaw worker enforces its
+    Matrix ACL from the roster (team.members -> _matrix_policy_ids ->
+    reconcile_acl), not from any openclaw.json allowlists (the qwenpaw
+    worker image does not consume them): the human is
+    allowlisted while on the roster and dropped on the next apply once
+    the roster no longer lists her."""
+    updater = _native_acl_updater(tmp_path, monkeypatch)
+
     updater.apply_once(
         runtime_config=MemberRuntimeConfig(
             path=updater.config.runtime_config_path,
-            raw=roster_raw(on_roster),
+            raw=_native_acl_raw(_TEAM_MEMBERS),
         ),
     )
     whitelist = set(updater.api_client.acls["agentteams_matrix"]["whitelist"])
@@ -301,17 +313,60 @@ def test_runtime_updater_runtime_acl_includes_coordinator_humans_and_detaches(
     assert "@worker-b:matrix.local" in whitelist
     assert "@worker-a:matrix.local" in whitelist  # self-allow
 
-    # Detach: the next apply no longer lists alice.
-    detached = [member for member in on_roster if member["name"] != "alice"]
+    # The human is removed from the roster on the next apply; the worker
+    # itself stays in the team.
+    roster_without_alice = [
+        member for member in _TEAM_MEMBERS if member["name"] != "alice"
+    ]
     updater.apply_once(
         runtime_config=MemberRuntimeConfig(
             path=updater.config.runtime_config_path,
-            raw=roster_raw(detached),
+            raw=_native_acl_raw(roster_without_alice),
         ),
     )
     whitelist = set(updater.api_client.acls["agentteams_matrix"]["whitelist"])
     assert "@alice:matrix.local" not in whitelist
     assert "@leader-a:matrix.local" in whitelist
+    assert "@worker-b:matrix.local" in whitelist
+
+
+def test_runtime_updater_acl_resets_to_standalone_when_worker_detached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scenario 2: the worker is detached from its team, i.e. the next
+    runtime config no longer carries a team section at all. The ACL must
+    reset to the standalone set (manager + system admin + self); no team
+    leader, peer worker, or coordinator human may linger."""
+    updater = _native_acl_updater(tmp_path, monkeypatch)
+
+    updater.apply_once(
+        runtime_config=MemberRuntimeConfig(
+            path=updater.config.runtime_config_path,
+            raw=_native_acl_raw(_TEAM_MEMBERS),
+        ),
+    )
+    whitelist = set(updater.api_client.acls["agentteams_matrix"]["whitelist"])
+    assert "@leader-a:matrix.local" in whitelist
+    assert "@alice:matrix.local" in whitelist
+
+    # Detach: the team section is gone from the worker runtime config.
+    updater.apply_once(
+        runtime_config=MemberRuntimeConfig(
+            path=updater.config.runtime_config_path,
+            raw=_native_acl_raw(with_team=False),
+        ),
+    )
+    whitelist = set(updater.api_client.acls["agentteams_matrix"]["whitelist"])
+    assert "@leader-a:matrix.local" not in whitelist
+    assert "@worker-b:matrix.local" not in whitelist
+    assert "@alice:matrix.local" not in whitelist
+    # Standalone fallback: self + manager + system admin, nothing else.
+    assert whitelist == {
+        "@worker-a:matrix.local",
+        "@manager:matrix.example.com",
+        "@admin:matrix.example.com",
+    }
 
 
 def test_runtime_updater_passes_model_capabilities_to_active_model(
