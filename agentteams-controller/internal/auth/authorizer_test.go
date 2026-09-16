@@ -51,6 +51,11 @@ func TestAuthorizer_HumanScoped(t *testing.T) {
 		// (W8 anti-probing). The handler is the real boundary (404).
 		{Action: ActionWorkspaceFilesWrite, ResourceKind: "worker"},
 		{Action: ActionWorkspaceFilesWrite, ResourceKind: "worker", ResourceTeam: "another-team"},
+		// Skill preload policy (QwenPaw 2.2.1): allowed at the authorizer
+		// level even cross-team — the handler hides cross-team workers as
+		// 404 (W8 anti-probing); a denial here would leak worker existence.
+		{Action: ActionWorkerSkillPreload, ResourceKind: "worker"},
+		{Action: ActionWorkerSkillPreload, ResourceKind: "worker", ResourceTeam: "another-team"},
 	}
 	for _, req := range allowed {
 		if err := az.Authorize(caller, req); err != nil {
@@ -173,6 +178,26 @@ func TestAuthorizer_TeamLeaderOwnTeam(t *testing.T) {
 		if err := az.Authorize(caller, req); err != nil {
 			t.Errorf("team-leader should be allowed %s %s, got: %v", req.Action, req.ResourceKind, err)
 		}
+	}
+}
+
+// TestAuthorizer_TeamLeaderSkillPreloadReadOnly pins the skill-preload
+// boundary: team leaders stay read-only on the preload policy — the write
+// action is denied at the authorizer level (authorizeTeamLeaderWorkerAction
+// default), so the handler never runs and the caller gets an honest 403
+// rather than a handler round trip. The read action keeps the usual
+// same-team rule. The L2 human path (allowed at the authorizer level even
+// cross-team, hidden by the handler as 404) is covered by
+// TestAuthorizer_HumanScoped.
+func TestAuthorizer_TeamLeaderSkillPreloadReadOnly(t *testing.T) {
+	az := NewAuthorizer()
+	caller := &CallerIdentity{Role: RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"}
+
+	if err := az.Authorize(caller, AuthzRequest{Action: ActionWorkerSkillPreload, ResourceKind: "worker", ResourceName: "alpha-dev", ResourceTeam: "alpha-team"}); err == nil {
+		t.Error("team-leader must be denied the skill-preload write on their own team (read-only)")
+	}
+	if err := az.Authorize(caller, AuthzRequest{Action: ActionGet, ResourceKind: "worker", ResourceName: "alpha-dev", ResourceTeam: "alpha-team"}); err != nil {
+		t.Errorf("team-leader should keep read access on their own team, got: %v", err)
 	}
 }
 
