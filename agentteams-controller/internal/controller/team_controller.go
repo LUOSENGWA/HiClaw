@@ -455,6 +455,19 @@ func (r *TeamReconciler) reconcileTeam(ctx context.Context, t *v1beta1.Team, pat
 		if err := r.ManagerConfig.UpdateManagerGroupAllowFrom(leaderMatrixID, true); err != nil {
 			logger.Error(err, "failed to update Manager groupAllowFrom for team leader (non-fatal)")
 		}
+		// Team humans talk to the Manager in team/project rooms. Without
+		// their Matrix IDs in the allowlist, allowlist mode silently drops
+		// their @mentions. Their access derives from the Human CR's
+		// accessibleTeams, so it is intentionally not revoked when this
+		// Team is deleted.
+		for _, hm := range derivedTeam.Spec.HumanMembers {
+			if hm.MatrixUserID == "" {
+				continue
+			}
+			if err := r.ManagerConfig.UpdateManagerGroupAllowFrom(hm.MatrixUserID, true); err != nil {
+				logger.Error(err, "failed to update Manager groupAllowFrom for team human (non-fatal)", "human", hm.Name)
+			}
+		}
 		for _, rm := range members {
 			if rm.ref.Name != leaderRef.Name {
 				if rm.worker.Status.RoomID != "" {
@@ -1305,6 +1318,15 @@ func (r *TeamReconciler) SetupWithManager(mgr ctrl.Manager) (controller.Controll
 		builder.WithPredicates(workerStatusChangePredicate()),
 	)
 
+	// Watch Human CRs: a change to a human's accessibleTeams — or provisioning
+	// that fills status.matrixUserID — must re-reconcile the affected teams so
+	// the Manager's groupAllowFrom (and derived channel policies) converge
+	// without waiting for an unrelated worker status change.
+	bldr = bldr.Watches(
+		&v1beta1.Human{},
+		handler.EnqueueRequestsFromMapFunc(r.humanToTeamRequests),
+	)
+
 	return bldr.Build(r)
 }
 
@@ -1320,6 +1342,39 @@ func (r *TeamReconciler) workerToTeamRequests(ctx context.Context, obj client.Ob
 	}
 	reqs := make([]reconcile.Request, 0, len(teamList.Items))
 	for _, t := range teamList.Items {
+		reqs = append(reqs, reconcile.Request{
+			NamespacedName: client.ObjectKey{Name: t.Name, Namespace: t.Namespace},
+		})
+	}
+	return reqs
+}
+
+// humanToTeamRequests maps a Human event to the Team(s) the human is attached
+// to: spec.accessibleTeams membership or an explicit spec.humanMembers entry.
+func (r *TeamReconciler) humanToTeamRequests(ctx context.Context, obj client.Object) []reconcile.Request {
+	human, ok := obj.(*v1beta1.Human)
+	if !ok {
+		return nil
+	}
+	var teamList v1beta1.TeamList
+	if err := r.List(ctx, &teamList, client.InNamespace(obj.GetNamespace())); err != nil {
+		return nil
+	}
+	reqs := make([]reconcile.Request, 0, len(teamList.Items))
+	for i := range teamList.Items {
+		t := &teamList.Items[i]
+		if !containsString(human.Spec.AccessibleTeams, t.Name) {
+			explicit := false
+			for _, hm := range t.Spec.HumanMembers {
+				if hm.Name == human.Name {
+					explicit = true
+					break
+				}
+			}
+			if !explicit {
+				continue
+			}
+		}
 		reqs = append(reqs, reconcile.Request{
 			NamespacedName: client.ObjectKey{Name: t.Name, Namespace: t.Namespace},
 		})
