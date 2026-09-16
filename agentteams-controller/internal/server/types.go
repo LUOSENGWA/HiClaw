@@ -1,6 +1,9 @@
 package server
 
-import v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
+import (
+	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
+	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/gateway"
+)
 
 // --- Worker API types ---
 
@@ -261,6 +264,16 @@ type ConsumerResponse struct {
 	ConsumerID string `json:"consumer_id"`
 	APIKey     string `json:"api_key,omitempty"`
 	Status     string `json:"status"`
+}
+
+// AIRouteListResponse is the read-only AI route catalog returned by
+// GET /api/v1/gateway/ai-routes. Each entry is a gateway route: name is the
+// route name (NOT a model ID — one route can serve several models),
+// upstreams are the providers serving it, and allowedConsumers are the
+// gateway consumers authorized on the route.
+type AIRouteListResponse struct {
+	Routes []gateway.AIRouteInfo `json:"routes"`
+	Total  int                   `json:"total"`
 }
 
 // --- Lifecycle API types ---
