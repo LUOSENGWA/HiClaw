@@ -595,3 +595,63 @@ func TestRuntimeConfig_LoopNoChangeNoNotify(t *testing.T) {
 		t.Fatalf("notification count=%d, want 0 (no-op)", fn.sentCount)
 	}
 }
+
+// TestRuntimeConfig_LoopsStatusForwardsSessionQuery: the upstream
+// loops/status endpoint answers per session (chat_id / session_id) and
+// reports "idle" without them — the proxy must forward those two selectors
+// (allowlisted, normalized order).
+func TestRuntimeConfig_LoopsStatusForwardsSessionQuery(t *testing.T) {
+	var gotPath, gotQuery string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery = r.URL.Path, r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"state":"awaiting_user"}`))
+	}))
+	defer upstream.Close()
+
+	h := newTestRuntimeConfigHandler(t, "embedded", upstream, nil,
+		rcWorker("daily-luo", "qwenpaw"), rcTeamWithLeader("team-a", "team-a-lead", "daily-luo"))
+	req := rcRequest(http.MethodGet, "daily-luo", "loops/status", nil)
+	req.URL.RawQuery = "session_id=abc123&chat_id=chat-1"
+	rec := httptest.NewRecorder()
+	h.Handle(rec, rcAdminCaller(req))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if gotPath != "/api/loops/status" {
+		t.Fatalf("upstream path=%q, want /api/loops/status", gotPath)
+	}
+	if gotQuery != "chat_id=chat-1&session_id=abc123" {
+		t.Fatalf("upstream query=%q, want chat_id=chat-1&session_id=abc123", gotQuery)
+	}
+}
+
+// TestRuntimeConfig_UnknownQueryRejected: query parameters are rejected
+// everywhere except GET loops/status, and unknown keys are rejected there
+// too (strict whitelist discipline).
+func TestRuntimeConfig_UnknownQueryRejected(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer upstream.Close()
+
+	h := newTestRuntimeConfigHandler(t, "embedded", upstream, nil,
+		rcWorker("daily-luo", "qwenpaw"), rcTeamWithLeader("team-a", "team-a-lead", "daily-luo"))
+
+	req := rcRequest(http.MethodGet, "daily-luo", "loops/status", nil)
+	req.URL.RawQuery = "session_id=abc&evil=1"
+	rec := httptest.NewRecorder()
+	h.Handle(rec, rcAdminCaller(req))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown key: status=%d, want 400", rec.Code)
+	}
+
+	req2 := rcRequest(http.MethodGet, "daily-luo", "loops", nil)
+	req2.URL.RawQuery = "session_id=abc"
+	rec2 := httptest.NewRecorder()
+	h.Handle(rec2, rcAdminCaller(req2))
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("non-status route: status=%d, want 400", rec2.Code)
+	}
+}
