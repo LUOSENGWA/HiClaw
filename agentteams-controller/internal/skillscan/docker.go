@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -58,7 +59,13 @@ func (b *dockerBackend) Run(ctx context.Context, name string, files map[string][
 	}
 	logger := log.FromContext(ctx)
 
-	if err := b.uploadArchive(ctx, target.container, tmpRoot, buildSkillTar(files, target.tmpDir)); err != nil {
+	// A fresh container has no scratch root, and the Docker archive API
+	// refuses to extract into a nonexistent path (404) — every assign-time
+	// scan would fail closed. Create it first (idempotent when present).
+	if err := b.ensureScratchDir(ctx, target.container); err != nil {
+		return "", fmt.Errorf("init scan scratch dir: %w", err)
+	}
+	if err := b.uploadArchive(ctx, target.container, tmpRoot, buildSkillTar(files, tmpRoot, target.tmpDir)); err != nil {
 		return "", fmt.Errorf("upload scan payload: %w", err)
 	}
 	// Best-effort cleanup on every exit path.
@@ -121,23 +128,53 @@ func (b *dockerBackend) selectScanTarget(ctx context.Context) (*scanTarget, erro
 
 // buildSkillTar renders the payload as a tar whose entries live under
 // <tmpDir>/ — one upload materializes the whole skill directory.
-func buildSkillTar(files map[string][]byte, tmpDir string) []byte {
+// buildSkillTar renders the payload as a tar whose entries are extracted
+// RELATIVE to tmpRoot (the archive API path parameter): the per-scan uuid
+// directory first, then every file underneath it. Absolute entry names
+// would land the payload outside the scratch dir, and a file path that is
+// not relative (leading "/", "..") must fail the scan, not silently write
+// elsewhere — validate each entry before it becomes a tar member.
+func buildSkillTar(files map[string][]byte, tmpRoot, tmpDir string) []byte {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
-	for path, data := range files {
-		hdr := &tar.Header{
-			Name: tmpDir + "/" + path,
-			Mode: 0o644,
-			Size: int64(len(data)),
-		}
+	write := func(hdr *tar.Header, data []byte) {
 		if err := tw.WriteHeader(hdr); err != nil {
 			// Cannot happen with a valid Header; the upload will fail.
-			continue
+			return
 		}
 		_, _ = tw.Write(data)
 	}
+	relTmpDir := strings.TrimPrefix(tmpDir, strings.TrimSuffix(tmpRoot, "/")+"/")
+	write(&tar.Header{Name: relTmpDir + "/", Typeflag: tar.TypeDir, Mode: 0o755}, nil)
+	for path, data := range files {
+		if path == "" || strings.HasPrefix(path, "/") || path == "." ||
+			strings.Contains(path, "../") || strings.HasSuffix(path, "/../") {
+			// Invalid entry: drop the member; with an empty payload the
+			// probe finds nothing and fails closed.
+			continue
+		}
+		write(&tar.Header{Name: relTmpDir + "/" + path, Mode: 0o644, Size: int64(len(data))}, data)
+	}
 	_ = tw.Close()
 	return buf.Bytes()
+}
+
+// ensureScratchDir creates the scan scratch root inside the container when
+// missing: PUT an archive holding only the directory entry into its parent
+// (which exists in every container). Idempotent — re-creating an existing
+// directory is a no-op for the container's filesystem.
+func (b *dockerBackend) ensureScratchDir(ctx context.Context, container string) error {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     filepath.Base(tmpRoot),
+		Typeflag: tar.TypeDir,
+		Mode:     0o755,
+	}); err != nil {
+		return err
+	}
+	_ = tw.Close()
+	return b.uploadArchive(ctx, container, filepath.Dir(tmpRoot), buf.Bytes())
 }
 
 // uploadArchive PUTs a tar into the container (Docker archive API). path is

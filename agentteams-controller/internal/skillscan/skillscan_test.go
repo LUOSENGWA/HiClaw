@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -107,6 +108,14 @@ func managerScheme(t *testing.T) *runtime.Scheme {
 
 // --- fake Docker API ---
 
+// fakeDocker emulates the Docker Engine API with the archive-API contract
+// enforced: a PUT archive?path=X returns 404 when X does not exist as a
+// directory inside the container (a fresh container has only / and /tmp),
+// and tar members are extracted RELATIVE to X (an absolute member name is
+// rejected). The probe exec is simulated: when it "finishes" and its
+// payload directory holds files, the verdict file it was told to write
+// appears in the fake filesystem — a scan whose payload never landed gets
+// no verdict and therefore fails closed, like the real probe.
 type fakeDocker struct {
 	mu                    sync.Mutex
 	uploadTars            [][]byte // bodies of the archive PUTs, in order
@@ -114,19 +123,110 @@ type fakeDocker struct {
 	execCount             int
 	probeFirstPollRunning bool // first inspect of the probe exec reports Running
 	execExitCode          int
+
+	// fake container filesystem (lazy-initialized: fresh container).
+	fs   map[string]string // file path -> content
+	dirs map[string]bool
+	// last probe exec: [tmpDir, name, verdictPath] from the exec Cmd.
+	lastProbe struct {
+		tmpDir  string
+		verdict string
+	}
+	probeRan bool
+}
+
+func (f *fakeDocker) ensureFS() {
+	if f.fs == nil {
+		f.fs = map[string]string{}
+		f.dirs = map[string]bool{"/": true, "/tmp": true}
+	}
+}
+
+func (f *fakeDocker) addDir(p string) {
+	// Mark p and every ancestor as an existing directory.
+	cur := ""
+	for _, seg := range strings.Split(strings.Trim(p, "/"), "/") {
+		if seg == "" {
+			continue
+		}
+		if cur == "" {
+			cur = "/" + seg
+		} else {
+			cur = cur + "/" + seg
+		}
+		f.dirs[cur] = true
+	}
+	if p != "/" {
+		f.dirs[p] = true
+	}
+}
+
+func (f *fakeDocker) hasFilesUnder(prefix string) bool {
+	for p := range f.fs {
+		if strings.HasPrefix(p, prefix+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeDocker) handler(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
+	f.ensureFS()
 	defer f.mu.Unlock()
 	path := r.URL.Path
 	switch {
 	case r.Method == http.MethodPut && strings.HasSuffix(path, "/archive"):
+		target := r.URL.Query().Get("path")
+		if !f.dirs[target] {
+			// Docker archive API: the destination directory must exist.
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"path " + target + " does not exist"}`))
+			return
+		}
 		var buf bytes.Buffer
 		_, _ = buf.ReadFrom(r.Body)
-		f.uploadTars = append(f.uploadTars, buf.Bytes())
+		tr := tar.NewReader(&buf)
+		payload := false
+		for {
+			hdr, err := tr.Next()
+			if err != nil {
+				break
+			}
+			if strings.HasPrefix(hdr.Name, "/") {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			full := target + "/" + hdr.Name
+			if hdr.Typeflag == tar.TypeDir {
+				f.addDir(full)
+				continue
+			}
+			payload = true
+			var content bytes.Buffer
+			_, _ = content.ReadFrom(tr)
+			f.addDir(full[:len(full)-len(hdr.Name)-1])
+			f.fs[full] = content.String()
+		}
+		if payload {
+			// Record payload uploads only: the ensureScratchDir tar (dir
+			// entry, no files) is bookkeeping, not a scan upload.
+			f.uploadTars = append(f.uploadTars, buf.Bytes())
+		}
 		w.WriteHeader(http.StatusOK)
 	case r.Method == http.MethodPost && strings.HasSuffix(path, "/exec"):
+		var body struct {
+			Cmd []string `json:"Cmd"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		// Probe cmd: [python, -c, script, tmpDir, name, verdictPath].
+		if len(body.Cmd) >= 6 && body.Cmd[1] == "-c" {
+			f.lastProbe = struct {
+				tmpDir  string
+				verdict string
+			}{tmpDir: body.Cmd[3], verdict: body.Cmd[5]}
+			f.probeRan = false
+		}
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{"Id":"exec-1"}`))
 	case r.Method == http.MethodPost && strings.HasSuffix(path, "/start"):
@@ -137,17 +237,28 @@ func (f *fakeDocker) handler(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`{"Running":true}`))
 			return
 		}
+		// Finished: run the simulated probe (it writes the verdict only
+		// when its payload directory actually contains the skill files).
+		if f.lastProbe.verdict != "" && !f.probeRan && f.verdictBody != "404" {
+			f.probeRan = true
+			if f.hasFilesUnder(f.lastProbe.tmpDir) {
+				f.addDir(f.lastProbe.verdict[:len(f.lastProbe.verdict)-len("verdict")-1])
+				f.fs[f.lastProbe.verdict] = f.verdictBody
+			}
+		}
 		_, _ = w.Write([]byte(`{"Running":false,"ExitCode":` + itoa(f.execExitCode) + `}`))
 	case r.Method == http.MethodGet && strings.HasSuffix(path, "/archive"):
-		if f.verdictBody == "404" {
+		file := r.URL.Query().Get("path")
+		content, ok := f.fs[file]
+		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		// Return the verdict as a one-entry tar.
+		// Return the file as a one-entry tar.
 		var buf bytes.Buffer
 		tw := tar.NewWriter(&buf)
-		_ = tw.WriteHeader(&tar.Header{Name: "verdict", Mode: 0o644, Size: int64(len(f.verdictBody))})
-		_, _ = tw.Write([]byte(f.verdictBody))
+		_ = tw.WriteHeader(&tar.Header{Name: file[strings.LastIndex(file, "/")+1:], Mode: 0o644, Size: int64(len(content))})
+		_, _ = tw.Write([]byte(content))
 		_ = tw.Close()
 		w.Header().Set("Content-Type", "application/x-tar")
 		_, _ = w.Write(buf.Bytes())
@@ -354,28 +465,64 @@ func TestClientK8sModeFailsClosed(t *testing.T) {
 
 // --- payload tar layout (the probe scans exactly what the tar places) ---
 
+// TestBuildSkillTarLayout: the probe scans exactly what the tar places —
+// entries are extracted RELATIVE to the archive-API path (the scratch
+// root): a per-scan directory entry first, then every file beneath it.
+// Absolute or traversal member names are dropped (the probe then finds an
+// empty payload and fails closed) instead of writing outside the scratch
+// dir.
 func TestBuildSkillTarLayout(t *testing.T) {
+	tmpRoot := "/tmp/.skillscan"
+	tmpDir := tmpRoot + "/abc123"
 	files := map[string][]byte{"SKILL.md": []byte("root"), "scripts/run.sh": []byte("x")}
-	tarBytes := buildSkillTar(files, "/tmp/.skillscan/abc123")
+	tarBytes := buildSkillTar(files, tmpRoot, tmpDir)
 	tr := tar.NewReader(bytes.NewReader(tarBytes))
 	seen := map[string]string{}
+	var first *tar.Header
 	for {
 		hdr, err := tr.Next()
 		if err != nil {
 			break
 		}
+		if first == nil {
+			first = hdr
+		}
 		var buf bytes.Buffer
 		_, _ = buf.ReadFrom(tr)
 		seen[hdr.Name] = buf.String()
+		if strings.HasPrefix(hdr.Name, "/") {
+			t.Fatalf("absolute member name %q (would escape the scratch root)", hdr.Name)
+		}
 	}
-	if got := seen["/tmp/.skillscan/abc123/SKILL.md"]; got != "root" {
+	if first == nil || first.Typeflag != tar.TypeDir || first.Name != "abc123/" {
+		t.Fatalf("first entry = %+v, want the relative dir abc123/", first)
+	}
+	if got := seen["abc123/SKILL.md"]; got != "root" {
 		t.Fatalf("SKILL.md entry = %q in %v", got, seen)
 	}
-	if got := seen["/tmp/.skillscan/abc123/scripts/run.sh"]; got != "x" {
+	if got := seen["abc123/scripts/run.sh"]; got != "x" {
 		t.Fatalf("nested entry lost: %v", seen)
 	}
-	if len(seen) != 2 {
+	if len(seen) != 3 {
 		t.Fatalf("unexpected entries: %v", seen)
+	}
+
+	// Absolute and traversal paths are dropped; only the directory entry
+	// remains, so the probe fails closed on the empty payload.
+	dropped := buildSkillTar(map[string][]byte{
+		"/etc/evil": []byte("x"),
+		"a/../b":    []byte("y"),
+	}, tmpRoot, tmpDir)
+	tr = tar.NewReader(bytes.NewReader(dropped))
+	count := 0
+	for {
+		if _, err := tr.Next(); err != nil {
+			break
+		}
+		count++
+	}
+	if count != 1 {
+		t.Fatalf("members = %d, want only the directory entry (invalid files dropped)", count)
 	}
 }
 

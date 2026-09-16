@@ -480,6 +480,69 @@ func TestSkills_UploadStructureValidation(t *testing.T) {
 	}
 }
 
+// TestExtractSkillZip_StandardDirectoryEntriesAccepted is the maintainer's
+// reproduction: standard archive tools (zip -r, Python zipfile) emit
+// directory entries ("my-skill/", "my-skill/scripts/") with a trailing
+// slash. Before the fix the trailing slash produced an empty final path
+// component that was rejected as an unsafe zip entry, so every standard
+// archive was rejected.
+func TestExtractSkillZip_StandardDirectoryEntriesAccepted(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, dir := range []string{"my-skill/", "my-skill/scripts/"} {
+		w, err := zw.CreateHeader(&zip.FileHeader{Name: dir, Method: zip.Store})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte{})
+	}
+	w, _ := zw.Create("my-skill/SKILL.md")
+	_, _ = w.Write([]byte("---\nname: my-skill\n---\n"))
+	w, _ = zw.Create("my-skill/scripts/run.sh")
+	_, _ = w.Write([]byte("echo hi\n"))
+	_ = zw.Close()
+
+	name, files, err := extractSkillZip(buf.Bytes())
+	if err != nil {
+		t.Fatalf("standard archive with directory entries must be accepted, got: %v", err)
+	}
+	if name != "my-skill" {
+		t.Fatalf("name = %q, want my-skill", name)
+	}
+	if len(files) != 2 {
+		t.Fatalf("files = %v, want SKILL.md + scripts/run.sh", files)
+	}
+	if _, ok := files["SKILL.md"]; !ok {
+		t.Errorf("missing SKILL.md in %v", files)
+	}
+	if _, ok := files["scripts/run.sh"]; !ok {
+		t.Errorf("missing scripts/run.sh in %v", files)
+	}
+}
+
+// TestExtractSkillZip_TraversalStillRejectedWithDirEntries: accepting
+// directory entries must not loosen the traversal validation.
+func TestExtractSkillZip_TraversalStillRejectedWithDirEntries(t *testing.T) {
+	cases := map[string][]string{
+		"dotdot dir":  {"my-skill/", "../evil.sh"},
+		"dotdot deep": {"my-skill/", "my-skill/../../evil"},
+		"empty mid":   {"my-skill/", "my-skill//evil"},
+		"second top":  {"my-skill/", "other/SKILL.md"},
+	}
+	for tc, entries := range cases {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		for _, e := range entries {
+			w, _ := zw.Create(e)
+			_, _ = w.Write([]byte("x"))
+		}
+		_ = zw.Close()
+		if _, _, err := extractSkillZip(buf.Bytes()); err == nil {
+			t.Errorf("%s: want error", tc)
+		}
+	}
+}
+
 func TestSkills_UploadZipBombRejected(t *testing.T) {
 	h, _, _ := newSkillsRig(t, passScanner)
 	// A tiny zip that decompresses past the 64 MB limit.
@@ -911,4 +974,85 @@ func sortedCopy(in []string) []string {
 		}
 	}
 	return out
+}
+
+// countingScanner is a fixed-pass scanner with a call counter.
+type countingScanner struct{ calls int }
+
+func (c *countingScanner) ScanSkill(_ context.Context, _ string, _ map[string][]byte) (skillscan.SkillScanVerdict, error) {
+	c.calls++
+	return skillscan.SkillScanVerdict{Status: "pass"}, nil
+}
+
+// TestTeamSkillStandardZipToWorkerE2E is the maintainer's requested
+// end-to-end case: a standard archive (directory entries + nested
+// scripts, the zip -r shape) uploaded through the real handler, then
+// assigned to a worker. Materialization follows the production `mc ls`
+// listing contract (relative names, non-recursive) so every nested file
+// lands under the worker's agent dir, gated by scan ②. The
+// fresh-scanner-container half — the Docker archive API 404s an archive
+// PUT into a nonexistent scratch dir — is enforced by the skillscan
+// embedded tests, whose fake now returns 404 for that case and whose
+// probe only writes a verdict when the payload actually landed;
+// ensureScratchDir is what makes the first scan on a fresh container
+// succeed.
+func TestTeamSkillStandardZipToWorkerE2E(t *testing.T) {
+	ctx := context.Background()
+	// Standard archive shape: directory entries with trailing slashes +
+	// a nested script two levels deep.
+	var zbuf bytes.Buffer
+	zw := zip.NewWriter(&zbuf)
+	for _, dir := range []string{"zip-kb/", "zip-kb/scripts/"} {
+		w, err := zw.CreateHeader(&zip.FileHeader{Name: dir, Method: zip.Store})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte{})
+	}
+	mustZip := func(name, content string) {
+		t.Helper()
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustZip("zip-kb/SKILL.md", "---\nname: zip-kb\n---\n")
+	mustZip("zip-kb/scripts/run.sh", "echo hi\n")
+	mustZip("zip-kb/scripts/lib/helper.py", "x = 1\n")
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Upload through the real handler into the team layer.
+	h, store, _ := newSkillsRig(t, passScanner)
+	rec := postSkill(t, h, skAdmin, "team", "market-team", zbuf.Bytes())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if err := store.Memory.Stat(ctx, "teams/market-team/skills/zip-kb/scripts/lib/helper.py"); err != nil {
+		t.Fatalf("nested file not stored after standard-zip upload: %v", err)
+	}
+
+	// Assign: scan ② gates, materialization lists per the production
+	// contract and copies every nested file into the worker's agent dir.
+	scanner := &countingScanner{}
+	deployer := service.NewDeployer(service.DeployerConfig{OSS: store.Memory, SkillScanner: scanner})
+	if err := deployer.PushOnDemandSkills(ctx, "alice", "market-team", []string{"zip-kb"}, nil); err != nil {
+		t.Fatalf("assign: %v", err)
+	}
+	if scanner.calls != 1 {
+		t.Fatalf("scan ② ran %d times, want 1", scanner.calls)
+	}
+	for _, key := range []string{
+		"agents/alice/skills/zip-kb/SKILL.md",
+		"agents/alice/skills/zip-kb/scripts/run.sh",
+		"agents/alice/skills/zip-kb/scripts/lib/helper.py",
+	} {
+		if err := store.Memory.Stat(ctx, key); err != nil {
+			t.Errorf("missing %s after materialization: %v", key, err)
+		}
+	}
 }

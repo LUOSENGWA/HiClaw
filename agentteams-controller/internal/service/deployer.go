@@ -886,16 +886,71 @@ func (d *Deployer) materializeTeamSkills(ctx context.Context, workerName, teamNa
 	return warning
 }
 
+// listAllObjects enumerates every object under prefix, returning FULL keys.
+// It follows the production listing contract: ListObjects wraps `mc ls
+// <prefix>`, is non-recursive, and reports names RELATIVE to the requested
+// prefix (directory entries carry a trailing slash). First-level directory
+// entries are descended into recursively; the fake-storage listing reports
+// the whole prefix subtree at once, so results are de-duplicated by full
+// key. Callers must never pass a listed name straight to GetObject — that
+// would read the bucket root instead of the prefixed path.
+func listAllObjects(ctx context.Context, client interface {
+	ListObjects(ctx context.Context, prefix string) ([]string, error)
+}, prefix string) ([]string, error) {
+	names, err := client.ListObjects(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(names))
+	var out []string
+	add := func(full string) {
+		if !seen[full] {
+			seen[full] = true
+			out = append(out, full)
+		}
+	}
+	var descend func(p string) error
+	descend = func(p string) error {
+		entries, err := client.ListObjects(ctx, p)
+		if err != nil {
+			return err
+		}
+		for _, name := range entries {
+			if name == "" {
+				continue
+			}
+			full := p + name
+			if strings.HasSuffix(name, "/") {
+				if err := descend(full); err != nil {
+					return err
+				}
+				continue
+			}
+			add(full)
+		}
+		return nil
+	}
+	if err := descend(prefix); err != nil {
+		return nil, err
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // materializeTeamSkill materializes one team skill: download
 // teams/<teamName>/skills/<s>/ → scan ② (MANDATORY — block or unavailable
 // means the skill is NOT copied; the gate does not default open) →
 // exact-copy mirror (Overwrite + Remove) into agents/<worker>/skills/<s>/.
+// Listing follows the production `mc ls` contract (relative names,
+// non-recursive): nested skill files (e.g. scripts/) are enumerated by
+// recursing into first-level directory entries, and every GetObject call
+// gets the full key with the skill prefix re-attached.
 func (d *Deployer) materializeTeamSkill(ctx context.Context, workerName, teamName, skill string) error {
 	logger := log.FromContext(ctx)
 	srcPrefix := "teams/" + teamName + "/skills/" + skill + "/"
 	dstPrefix := fmt.Sprintf("agents/%s/skills/%s/", workerName, skill)
 
-	keys, err := d.oss.ListObjects(ctx, srcPrefix)
+	keys, err := listAllObjects(ctx, d.oss, srcPrefix)
 	if err != nil {
 		return fmt.Errorf("team skill %q (%s): list: %w", skill, teamName, err)
 	}
@@ -915,6 +970,8 @@ func (d *Deployer) materializeTeamSkill(ctx context.Context, workerName, teamNam
 		if rel == "" || rel == "." {
 			continue
 		}
+		// listAllObjects already returns full keys; this stays the single
+		// place that pairs a relative path with its storage key.
 		data, err := d.oss.GetObject(ctx, key)
 		if err != nil {
 			return fmt.Errorf("team skill %q (%s): get %q: %w", skill, teamName, rel, err)

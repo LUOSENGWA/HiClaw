@@ -265,13 +265,32 @@ func extractSkillZip(data []byte) (name string, files map[string][]byte, err err
 			return "", nil, fmt.Errorf("symlink entries are not allowed: %q", zname)
 		}
 		parts := strings.Split(zname, "/")
+		if entry.FileInfo().IsDir() || strings.HasSuffix(zname, "/") {
+			// Directory entry: a trailing slash makes the final component
+			// empty — that is valid (standard writers emit "my-skill/").
+			// Validate the remaining components against traversal and
+			// check the top-level name, then skip: nothing to extract.
+			if len(parts) > 0 && parts[len(parts)-1] == "" {
+				parts = parts[:len(parts)-1]
+			}
+			for _, part := range parts {
+				if part == "" || part == "." || part == ".." {
+					return "", nil, fmt.Errorf("unsafe zip entry %q", zname)
+				}
+			}
+			if len(parts) > 0 {
+				if name == "" {
+					name = parts[0]
+				} else if name != parts[0] {
+					return "", nil, errors.New("the zip must contain exactly one top-level directory")
+				}
+			}
+			continue
+		}
 		for _, part := range parts {
 			if part == "" || part == "." || part == ".." {
 				return "", nil, fmt.Errorf("unsafe zip entry %q", zname)
 			}
-		}
-		if entry.FileInfo().IsDir() {
-			continue
 		}
 		if len(parts) < 2 {
 			return "", nil, errors.New("the zip must contain a single top-level skill directory")
