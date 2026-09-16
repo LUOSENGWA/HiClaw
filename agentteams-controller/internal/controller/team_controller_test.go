@@ -1688,6 +1688,49 @@ func TestWorkerStatusChangePredicateTriggersOnWorkerSpecChange(t *testing.T) {
 	}
 }
 
+// TestWorkerStatusChangePredicateTriggersOnTaskLevelStatusChanges proves the
+// team status view tracks runtime task transitions: a heartbeat-only update
+// flipping AgentStatus idle->running->idle (Phase, MatrixUserID and RoomID all
+// unchanged) must enqueue the owning Team at every transition, otherwise the
+// team's member status stays stale between container-level changes.
+func TestWorkerStatusChangePredicateTriggersOnTaskLevelStatusChanges(t *testing.T) {
+	p := workerStatusChangePredicate()
+	base := &v1beta1.Worker{
+		ObjectMeta: metav1.ObjectMeta{Name: "dev", Generation: 1},
+		Status: v1beta1.WorkerStatus{
+			ObservedGeneration: 1,
+			Phase:              "Running",
+			MatrixUserID:       "@dev:matrix.local",
+			RoomID:             "!room-dev:matrix.local",
+			AgentStatus:        "idle",
+			LastFinishAt:       "2026-09-16T04:00:00Z",
+		},
+	}
+
+	// idle -> running (task start; only task-level fields move)
+	running := base.DeepCopy()
+	running.Status.AgentStatus = "running"
+	if !p.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: running}) {
+		t.Fatal("idle->running task transition must enqueue the owning Team")
+	}
+
+	// running -> idle (task finish; LastFinishAt moves too)
+	idleAgain := running.DeepCopy()
+	idleAgain.Status.AgentStatus = "idle"
+	idleAgain.Status.LastFinishAt = "2026-09-16T05:00:00Z"
+	if !p.Update(event.UpdateEvent{ObjectOld: running, ObjectNew: idleAgain}) {
+		t.Fatal("running->idle task transition must enqueue the owning Team")
+	}
+
+	// heartbeat-only update (LastHeartbeat bump, no task-level change) must
+	// NOT requeue — this predicate gates team reconciles, not per-tick noise
+	same := base.DeepCopy()
+	same.Status.LastHeartbeat = "2026-09-16T05:01:00Z"
+	if p.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: same}) {
+		t.Fatal("heartbeat-only update without task-level change must not enqueue")
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
 		(len(s) > 0 && len(substr) > 0 && searchSubstring(s, substr)))
