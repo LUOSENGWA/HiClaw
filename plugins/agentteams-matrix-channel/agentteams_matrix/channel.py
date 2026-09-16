@@ -19,7 +19,7 @@ import urllib.parse
 from uuid import uuid4
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -429,6 +429,14 @@ class AgentTeamsMatrixChannel(BaseChannel):
         # consumed at the next enqueue).
         self._room_history_gen: Dict[str, int] = {}
         self._room_history_records: Dict[str, int] = {}
+        # Retained per-room event log with stable record indexes: when the
+        # send gate retriggers an in-flight turn, the events that made it
+        # stale are recovered from here (the shared buffer above is already
+        # consumed by the next enqueue and would no longer hold them).
+        # Same cap as the buffer — a turn in flight longer than the cap
+        # loses the head of its window (tail through the newest event is
+        # always retained).
+        self._room_event_log: Dict[str, List[Tuple[int, HistoryEntry]]] = {}
         # Send alignment gate state: room_id -> {event_id, count, deadline}.
         self._send_gate_state: Dict[str, Dict[str, Any]] = {}
         self._dm_room_cache: Dict[str, Dict[str, Any]] = {}
@@ -1967,6 +1975,10 @@ class AgentTeamsMatrixChannel(BaseChannel):
         self._room_history_records[room_id] = (
             self._room_history_records.get(room_id, 0) + 1
         )
+        log = self._room_event_log.setdefault(room_id, [])
+        log.append((self._room_history_records[room_id], entry))
+        while len(log) > limit:
+            log.pop(0)
 
     def _build_history_prefix(self, room_id: str) -> str:
         """Format buffered history entries as a multi-line text block."""
@@ -1980,6 +1992,33 @@ class AgentTeamsMatrixChannel(BaseChannel):
                 line += f" [id:{e.message_id}]"
             lines.append(line)
         return "\n".join(lines)
+
+    def _build_missed_history(
+        self, room_id: str, since_records: int
+    ) -> Tuple[str, list]:
+        """(text, media) of retained events recorded after *since_records*.
+
+        The exact window that made a turn stale: the room events its
+        context snapshot did not cover.  Sourced from the retained
+        per-room event log rather than the shared buffer, which the
+        mention that made the turn stale has already consumed at its own
+        enqueue.  The log is capped like the buffer: a turn in flight
+        for longer than ``history_limit`` room events loses the head of
+        its window (the tail through the newest event is always
+        retained).  Media parts carried by the entries ride along.
+        """
+        lines: list[str] = []
+        media: list[Any] = []
+        for record_idx, e in self._room_event_log.get(room_id, []):
+            if record_idx <= since_records:
+                continue
+            line = f"{e.sender}: {e.body}"
+            if e.message_id:
+                line += f" [id:{e.message_id}]"
+            lines.append(line)
+            if e.media_parts:
+                media.extend(e.media_parts)
+        return "\n".join(lines), media
 
     def _apply_history_to_parts(
         self,
@@ -4319,12 +4358,17 @@ class AgentTeamsMatrixChannel(BaseChannel):
     ) -> None:
         """Drop the stale draft and re-trigger the agent with fresh context.
 
-        The buffered room messages are baked into the re-trigger payload
-        via the normal history prepend, so the agent re-evaluates against
-        the latest conversation state.  The buffer is cleared afterwards
-        so the same messages are not prepended again on a later turn.
-        The in-flight thread-root placeholder is carried over so the
-        retriggered turn reuses that message (no orphaned placeholder).
+        The events that made this turn stale are recovered from the
+        retained per-room event log (its snapshot records .. now, media
+        included), not from the shared buffer: the mention that made this
+        turn stale consumed that buffer at its own enqueue, so reading it
+        here would bake an empty context into the re-trigger.  The
+        re-triggered turn's gate snapshot is captured after the recovery
+        and thus advances only to the context actually supplied.  The
+        shared buffer is left untouched — it keeps serving first-pass
+        turns.  The in-flight thread-root placeholder is carried over so
+        the retriggered turn reuses that message (no orphaned
+        placeholder).
         """
         meta_dict = send_meta if isinstance(send_meta, dict) else {}
         room_id = to_handle
@@ -4339,10 +4383,22 @@ class AgentTeamsMatrixChannel(BaseChannel):
             "snapshot. Review the latest room state (history above) and "
             "reply to the current conversation."
         )
+        # Recover exactly the events this turn missed (its snapshot
+        # records .. now) from the retained log.  The shared buffer no
+        # longer holds them — the mention that made this turn stale
+        # consumed it at that mention's own enqueue.
+        snap_records = int(meta_dict.get("send_gate_snapshot_records") or 0)
+        missed_text, missed_media = self._build_missed_history(
+            room_id, snap_records
+        )
+        if missed_text:
+            nudge = (
+                f"{HISTORY_CONTEXT_MARKER}\n{missed_text}\n\n"
+                f"{CURRENT_MESSAGE_MARKER}\n{nudge}"
+            )
         content_parts: list[Any] = [
             TextContent(type=ContentType.TEXT, text=nudge),
-        ]
-        content_parts = self._apply_history_to_parts(room_id, content_parts)
+        ] + missed_media
         worker_name = (self._user_id or "").split(":")[0].lstrip("@")
         retrigger_meta: Dict[str, Any] = {
             "room_id": room_id,
@@ -4366,10 +4422,13 @@ class AgentTeamsMatrixChannel(BaseChannel):
             carry_meta_root = meta_dict.get(_THREAD_META_ROOT_KEY)
             if carry_meta_root:
                 retrigger_meta[_THREAD_META_ROOT_KEY] = carry_meta_root
-        # The re-triggered turn snapshots the room state at retrigger time
-        # (the buffer above was its context). Without this, the buffer pop
-        # below would leave the re-run turn marker-less and the shared
-        # buffer would again decide its freshness.
+        # The re-triggered turn snapshots the room state it actually
+        # received: the recovered window extends to the newest retained
+        # event, so current gen/records — and the next gate can only
+        # re-trigger on events arriving after this recovery.  (If the
+        # retained log dropped the window head under the cap, the tail
+        # through the newest event is what was supplied, which is exactly
+        # what current gen/records denotes.)
         self._capture_send_gate_snapshot(retrigger_meta, room_id)
         payload = {
             "channel_id": CHANNEL_KEY,
@@ -4378,7 +4437,6 @@ class AgentTeamsMatrixChannel(BaseChannel):
             "acl_sender_id": sender_id,
             "meta": retrigger_meta,
         }
-        self._room_histories.pop(room_id, None)
         logger.info(
             "send gate: retrigger enqueued room=%s new_messages=%s count=%s",
             room_id,
