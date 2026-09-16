@@ -150,6 +150,32 @@ func TestAuthorizer_TeamLeaderOwnTeam(t *testing.T) {
 	}
 }
 
+func TestAuthorizer_GatewayResourceL1Only(t *testing.T) {
+	az := NewAuthorizer()
+
+	// L1 (admin/manager) has full access, including the read-only model list.
+	for _, caller := range []*CallerIdentity{
+		{Role: RoleAdmin, Username: "admin"},
+		{Role: RoleManager, Username: "manager"},
+	} {
+		if err := az.Authorize(caller, AuthzRequest{Action: ActionGet, ResourceKind: "gateway"}); err != nil {
+			t.Errorf("%s GET gateway should be allowed: %v", caller.Role, err)
+		}
+	}
+
+	// Everyone below L1 is denied the gateway resource (incl. /api/v1/gateway/ai-routes).
+	denied := []*CallerIdentity{
+		{Role: RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"},
+		{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}},
+		{Role: RoleWorker, Username: "alice", WorkerName: "alice"},
+	}
+	for _, caller := range denied {
+		if err := az.Authorize(caller, AuthzRequest{Action: ActionGet, ResourceKind: "gateway"}); err == nil {
+			t.Errorf("%s GET gateway should be denied", caller.Role)
+		}
+	}
+}
+
 // TestAuthorizer_TeamLeaderSkillPreloadReadOnly pins the skill-preload
 // boundary: team leaders stay read-only on the preload policy — the write
 // action is denied at the authorizer level (authorizeTeamLeaderWorkerAction
