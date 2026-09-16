@@ -483,6 +483,7 @@ spec:
 | `spec.permissionLevel` | int | Yes | — | Permission level: 1, 2, or 3 |
 | `spec.accessibleTeams` | []string | No | — | Accessible Team list (effective for L2) |
 | `spec.accessibleWorkers` | []string | No | — | Accessible standalone Worker list (effective for L2/L3) |
+| `spec.capabilities` | []string | No | — | Sensitive-surface privileges beyond the L2 baseline: `full_access`, `channel_secrets`, `external_sources`, `approval_policy`, `secret_reveal` (see [capability-foundation](../design/capability-foundation.md)) |
 | `spec.note` | string | No | — | Notes |
 
 ### Three-Level Permission Model
@@ -1032,6 +1033,42 @@ agt apply worker --name alice --model qwen3.5-plus
 | `dmDenyExtra` | Deny list for DMs |
 
 Set `spec.channelPolicy` on a Worker for per-member policy, and `spec.channelPolicy` on a Team for Team-wide policy.
+
+## Worker channel configuration (proxy)
+
+Each worker's qwenpaw app exposes a channel-configuration API (QQ / Matrix /
+DingTalk / ...). The Controller proxies it so admins and L2 humans configure
+channels through the API or a graphical frontend (workbench plugin /
+dashboard) instead of opening a shell on the worker container:
+
+```bash
+# List a worker's channel configs
+curl -s http://127.0.0.1:8090/api/v1/workers/{name}/channels \
+  -H "Authorization: Bearer $AGENTTEAMS_TOKEN"
+
+# Save a channel (body = the full channel config; takes effect immediately, no restart)
+curl -s -X PUT http://127.0.0.1:8090/api/v1/workers/{name}/channels/qq \
+  -H "Authorization: Bearer $AGENTTEAMS_TOKEN" -H "Content-Type: application/json" \
+  -d '{"enabled":true,"app_id":"...","client_secret":"***"}'
+# → 200, body verbatim, X-AgentTeams-MinIO-Persisted: true|false|skipped
+```
+
+The `schemas` route returns per-channel form definitions (field names,
+types, labels, options) so frontends render the connect form without
+per-channel code. (`conflict-check` is an additive 2.2.x-only route that
+2.0.x workers do not expose; it will be proxied as a small follow-up once
+a 2.2.x pin lands — see the version-contract section of
+`docs/design/worker-channels-api.md`.)
+
+| Role | Read | Write (`PUT` / `restart`) |
+|------|------|---------------------------|
+| L1 (admin / cli token) | any worker | any worker |
+| L2 (Matrix token) | own-team workers | own-team workers |
+| Team Leader | own-team workers | read-only (`403`) |
+
+Cross-team access returns `404` uniformly (existence is not probed).
+`embedded` mode only — `503` in kube mode. Full contract:
+[design/worker-channels-api.md](../design/worker-channels-api.md).
 
 ## Communication Permission Matrix
 
