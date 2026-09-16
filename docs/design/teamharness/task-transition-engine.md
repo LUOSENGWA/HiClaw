@@ -85,7 +85,10 @@ note 必填（≤200 字符，超长截断并在响应中标记 `truncated`）�
   history 成升序时间线（`limit` 默认 50 上限 200；`cursor` = 不透明事件身份
   游标（ts, task_id, seq）——seq 为写入端持久化的每任务序号（`history_seq`
   计数，跨 50 条截断稳定），精确匹配定位、无歧义，重复事件（同秒同内容）
-  不跳过不重复；旧格式游标返回 `cursor_expired` 强制客户端重置；
+  不跳过不重复；无 seq 旧格式同秒重复共享同一身份，锚定其内的游标携带
+  组内序号 + 列表长度快照，翻页逐条推进（只读/已完成历史亦可用，无需
+  回填 seq），快照被截断时返回 `cursor_expired`；旧格式游标返回
+  `cursor_expired` 强制客户端重置；
   响应 `{project_id, events, next_cursor, cursor_expired?}`）。零新存储、
   无写侧钩子（seq 由既有的 task meta 写入路径顺带持久化）。
   权限链同 workflow/history（跨 team 访问隐藏为 404；任务 meta 只取项目属主

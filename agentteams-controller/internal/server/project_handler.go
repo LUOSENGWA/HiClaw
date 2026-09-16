@@ -2169,17 +2169,28 @@ type projectEvent struct {
 // content anchor silently skips or repeats duplicates. Cursors in the
 // pre-seq content-tuple format (no version field) are answered with
 // cursor_expired: the client re-fetches from the start.
+//
+// Seq-less legacy entries are the one identity the exact-match contract
+// cannot name uniquely: several duplicates written in the same second
+// share (ts, task_id, seq=0). Cursors anchored inside such a group
+// additionally carry the event's occurrence index and the list length
+// as a snapshot marker, so they advance exactly one event at a time
+// over stable or read-only histories — including completed projects
+// whose history will never be backfilled with seq — and answer
+// cursor_expired if the snapshot truncates before the client catches
+// up. No cursor can ever be issued that fails to advance.
 type projectEventsResponse struct {
 	ProjectID  string         `json:"project_id"`
 	Events     []projectEvent `json:"events"`
 	NextCursor string         `json:"next_cursor,omitempty"`
 	// CursorExpired is true when the presented cursor is well-formed but
 	// its anchor event no longer exists in the retained history (the
-	// writer's 50-entry cap truncated it away), or the cursor predates
-	// the sequence format (its content anchor has no unambiguous
-	// identity). Events is empty on such a response: the client must
-	// discard the cursor and re-fetch from the start. Offsets would
-	// instead silently skip unread events here.
+	// writer's 50-entry cap truncated it away), its seq-less duplicate
+	// snapshot was truncated (its occurrence index may have shifted),
+	// or the cursor predates the sequence format (its content anchor has
+	// no unambiguous identity). Events is empty on such a response: the
+	// client must discard the cursor and re-fetch from the start.
+	// Offsets would instead silently skip unread events here.
 	CursorExpired bool `json:"cursor_expired,omitempty"`
 }
 
@@ -2192,28 +2203,72 @@ type projectEventsResponse struct {
 // progress entries are allowed, so content equality cannot identify an
 // event. V marks the cursor format; anchors without it (pre-seq
 // content-tuple cursors) are answered with cursor_expired.
+//
+// Occ and N only concern seq-less legacy entries, whose identity
+// (ts, task_id, seq=0) is shared by every duplicate written in the same
+// second:
+//   - Occ is the 0-based index of the anchored event within that
+//     same-identity group of the ascending list, so a cursor can always
+//     resume strictly past the event it names.
+//   - N is the length of the aggregated list when the cursor was issued
+//     (a snapshot marker). While the list only grows — new transitions
+//     append at the tail — the occurrences keep their positions. Once
+//     the writer's cap truncates anything (len < N) the occurrence index
+//     may no longer name the anchored event, and the cursor is answered
+//     with cursor_expired instead of resuming at a shifted position.
+//
+// Cursors anchored at a unique identity carry neither field.
 type eventsCursorAnchor struct {
 	V      int    `json:"v"`
 	Ts     string `json:"ts"`
 	TaskID string `json:"task_id"`
 	Seq    int64  `json:"seq"`
+	Occ    int64  `json:"occ,omitempty"`
+	N      int64  `json:"n,omitempty"`
 }
 
 const eventsCursorVersion = 1
 
-func anchorOfEvent(e projectEvent) eventsCursorAnchor {
+func anchorOfEvent(e projectEvent, occ, n int64) eventsCursorAnchor {
 	return eventsCursorAnchor{
 		V:      eventsCursorVersion,
 		Ts:     e.Ts,
 		TaskID: e.TaskID,
 		Seq:    e.Seq,
+		Occ:    occ,
+		N:      n,
 	}
 }
 
-// encodeEventsCursor packs a page's last event as an opaque cursor. Raw
-// URL-safe base64 keeps it free to pass as a query parameter unescaped.
-func encodeEventsCursor(e projectEvent) string {
-	b, err := json.Marshal(anchorOfEvent(e))
+// encodeEventsCursorFor encodes the event at pos as the page's
+// next_cursor. A seq-less legacy event can share its (ts, task_id,
+// seq=0) identity with other events of the same second; the cursor then
+// carries the event's occurrence index within that group plus the list
+// length as a snapshot marker, so the next request resumes exactly past
+// this event — and expires explicitly if the snapshot truncated —
+// instead of issuing a cursor that cannot advance.
+func encodeEventsCursorFor(events []projectEvent, pos int) string {
+	e := events[pos]
+	total, occ := int64(0), int64(0)
+	for i, f := range events {
+		if f.Ts != e.Ts || f.TaskID != e.TaskID || f.Seq != e.Seq {
+			continue
+		}
+		total++
+		if i < pos {
+			occ++
+		}
+	}
+	if total <= 1 {
+		return encodeEventsCursor(e, 0, 0)
+	}
+	return encodeEventsCursor(e, occ, int64(len(events)))
+}
+
+// encodeEventsCursor packs an anchor as an opaque cursor. Raw URL-safe
+// base64 keeps it free to pass as a query parameter unescaped.
+func encodeEventsCursor(e projectEvent, occ, n int64) string {
+	b, err := json.Marshal(anchorOfEvent(e, occ, n))
 	if err != nil {
 		return ""
 	}
@@ -2236,7 +2291,7 @@ func decodeEventsCursor(raw string) (eventsCursorAnchor, bool) {
 	// ts + task_id are the minimum identity of a transition; from/to/action
 	// would be empty only for a malformed event that collectProjectEvents
 	// never produces.
-	if a.Ts == "" || a.TaskID == "" {
+	if a.Ts == "" || a.TaskID == "" || a.Occ < 0 || a.N < 0 {
 		return eventsCursorAnchor{}, false
 	}
 	return a, true
@@ -2325,25 +2380,19 @@ func (h *ProjectHandler) GetProjectEvents(w http.ResponseWriter, r *http.Request
 	}
 	offset := 0
 	if hasCursor {
-		// Exact identity match: (ts, task_id, seq) names at most one
-		// event, so there is no occurrence-direction choice — content
-		// duplicates carry distinct writer-assigned seq values.
-		found := -1
-		for i, e := range events {
-			if e.Ts == anchor.Ts && e.TaskID == anchor.TaskID && e.Seq == anchor.Seq {
-				found = i
-				break
-			}
-		}
-		if found == -1 {
-			// The anchor was truncated out of the retained history (or
-			// never existed): resuming by position would silently skip
-			// unread events, so signal an explicit reset instead.
+		resume, ok := resumeAfterAnchor(events, anchor)
+		if !ok {
+			// The anchor cannot be located unambiguously: it was
+			// truncated out of the retained history, it never existed,
+			// or it points into a seq-less duplicate group whose snapshot
+			// was truncated (its occurrence index may have shifted).
+			// Resuming would silently skip or repeat events, so signal an
+			// explicit reset instead.
 			resp.CursorExpired = true
 			httputil.WriteJSON(w, http.StatusOK, resp)
 			return
 		}
-		offset = found + 1
+		offset = resume
 	}
 	if offset < len(events) {
 		pageEnd := offset + limit
@@ -2352,10 +2401,59 @@ func (h *ProjectHandler) GetProjectEvents(w http.ResponseWriter, r *http.Request
 		}
 		resp.Events = events[offset:pageEnd]
 		if pageEnd < len(events) {
-			resp.NextCursor = encodeEventsCursor(events[pageEnd-1])
+			resp.NextCursor = encodeEventsCursorFor(events, pageEnd-1)
 		}
 	}
 	httputil.WriteJSON(w, http.StatusOK, resp)
+}
+
+// resumeAfterAnchor maps a decoded cursor to the position immediately
+// after its anchored event in the freshly rebuilt list. ok=false means
+// the anchor cannot be resumed unambiguously; the caller answers
+// cursor_expired.
+//
+// An identity with exactly one occurrence resumes by exact match —
+// robust while the per-task cap truncates already-read events and new
+// events append at the tail (the documented cursor-validity contract).
+// A seq-less legacy identity can occur several times (duplicates in one
+// second share seq=0); those cursors carry Occ (which occurrence) and N
+// (list length at issuance) and resume only while the snapshot has not
+// shrunk, so the occurrence index still names the anchored event.
+func resumeAfterAnchor(events []projectEvent, a eventsCursorAnchor) (int, bool) {
+	if a.N > 0 && int64(len(events)) < a.N {
+		// The snapshot truncated: the oldest entries dropped, and a
+		// legacy occurrence index may have shifted. Refuse rather than
+		// guess.
+		return 0, false
+	}
+	occ := int64(0)
+	lastPos := -1
+	for i, e := range events {
+		if e.Ts != a.Ts || e.TaskID != a.TaskID || e.Seq != a.Seq {
+			continue
+		}
+		if a.N > 0 {
+			if occ == a.Occ {
+				return i + 1, true
+			}
+		} else {
+			lastPos = i
+		}
+		occ++
+	}
+	if a.N > 0 {
+		return 0, false // the anchored occurrence is gone (truncated)
+	}
+	if lastPos == -1 {
+		return 0, false // anchor truncated away or never existed
+	}
+	if occ != 1 {
+		// Became ambiguous (a seq-less duplicate group without a
+		// snapshot marker — a cursor issued before the occurrence
+		// format). Refuse rather than guess an occurrence direction.
+		return 0, false
+	}
+	return lastPos + 1, true
 }
 
 // collectProjectEvents reads every task meta of the project graph and

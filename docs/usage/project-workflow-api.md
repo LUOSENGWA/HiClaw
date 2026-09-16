@@ -503,7 +503,7 @@ Query parameters:
 |:--|:--|:--|:--|
 | `team` | string | — | Optional team qualifier, same semantics as the other read endpoints. |
 | `limit` | int | `50` | Page size. Capped at `200`; values `< 1` are rejected `400`. |
-| `cursor` | string | — | Opaque cursor from a previous page's `next_cursor`; pass it back to continue. Encodes the page's last event identity (ts, task_id, seq), so it stays valid while new events are appended — and even while the per-task 50-entry history cap drops already-read events. |
+| `cursor` | string | — | Opaque cursor from a previous page's `next_cursor`; pass it back to continue. Encodes the page's last event identity (ts, task_id, seq), so it stays valid while new events are appended — and even while the per-task 50-entry history cap drops already-read events. For seq-less legacy events that share one second (the same identity), it additionally pins the event's position within that duplicate group, so paging always advances. |
 
 Response:
 
@@ -546,13 +546,19 @@ Response:
 - `next_cursor` is an opaque, URL-safe string. The client never parses it;
   it anchors on the page's last event by exact identity (ts, task_id, seq),
   so appending new events between page requests does not invalidate it and
-  duplicates (same second, same content) are never skipped or repeated.
+  duplicates (same second, same content) are never skipped or repeated. A
+  cursor anchored inside a group of seq-less legacy duplicates (same
+  second, no `seq`) carries the event's occurrence index within the group
+  plus a snapshot of the list length, so paging such groups — including
+  completed read-only histories that will never receive a `seq` backfill —
+  advances exactly one event per page and can never stall.
 - `cursor_expired` is `true` (with `"events": []` and no `next_cursor`)
   when the cursor's anchor event has been truncated out of the retained
-  per-task history (50 entries, oldest dropped), or the cursor predates
-  the sequence format. On that signal the client must discard the cursor
-  and re-fetch from the start; continuing would otherwise skip unread
-  events silently.
+  per-task history (50 entries, oldest dropped), the snapshot behind a
+  legacy duplicate cursor was truncated (its position in the duplicate
+  group may have shifted), or the cursor predates the sequence format. On
+  that signal the client must discard the cursor and re-fetch from the
+  start; continuing would otherwise skip unread events silently.
 - Task metas are read from the project's owning scope only — no
   cross-scope fallback (same rule as `tasks_detail`).
 

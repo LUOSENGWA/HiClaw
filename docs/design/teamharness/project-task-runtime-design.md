@@ -301,7 +301,9 @@ read-modify-write 同批写入 history 条目（actor = authzActor，重试收�
   时间线（零新存储、无写侧钩子），游标 = 不透明事件身份（ts, task_id, seq）：
   时间戳为秒级精度且写入端允许重复 progress，内容相等不是事件身份，故用写入端
   持久化的每任务序号 seq（`history_seq` 计数，跨 50 条截断稳定）做精确匹配；
-  锚点被截断或游标为旧格式时返回 `cursor_expired`。项目级干预事件不在此端点范围
+  无 seq 旧格式同秒重复（同一身份）的游标额外携带组内序号 + 列表长度快照，
+  逐条推进不歧义；锚点被截断、重复组快照被截断或游标为旧格式时返回
+  `cursor_expired`。项目级干预事件不在此端点范围
   （`/history` 快照端点覆盖干预审计，两者互补）。
 
 已知限制：agent 写与 controller 写同一 task meta 的既有竞态（ETag vs pull-before-write）
