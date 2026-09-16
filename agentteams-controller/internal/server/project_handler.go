@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -2139,17 +2140,86 @@ type projectEvent struct {
 
 // projectEventsResponse is the GET /api/v1/projects/{id}/events payload.
 //
-// next_cursor is an opaque offset (decimal string) into the ascending
-// event list: pass it back as cursor to continue. The offset stays valid
-// while the list only grows at the tail, which holds because new
-// transitions carry the newest timestamps. An empty next_cursor means the
-// tail was reached. (A "ts:task_id" cursor cannot be used: timestamps are
-// second-resolution, so several transitions of one task can share both
-// values.)
+// next_cursor is an opaque, URL-safe string encoding the page's last
+// event (its full anchor: ts/task_id/from/to/actor/action/note). Pass it
+// back as cursor to continue. The anchor is located by content in the
+// freshly rebuilt list, so the cursor stays valid while new transitions
+// are appended at the tail and even while the per-task history cap (50
+// entries, oldest dropped) truncates events the client already read.
+// An empty next_cursor means the tail was reached.
+//
+// A bare offset cursor cannot be used: truncation shifts every offset
+// and silently skips unread events. A "ts:task_id" cursor cannot be used
+// either: timestamps are second-resolution, so several transitions of
+// one task can share both values.
 type projectEventsResponse struct {
 	ProjectID  string         `json:"project_id"`
 	Events     []projectEvent `json:"events"`
 	NextCursor string         `json:"next_cursor,omitempty"`
+	// CursorExpired is true when the presented cursor is well-formed but
+	// its anchor event no longer exists in the retained history (the
+	// writer's 50-entry cap truncated it away). Events is empty on such a
+	// response: the client must discard the cursor and re-fetch from the
+	// start. Offsets would instead silently skip unread events here.
+	CursorExpired bool `json:"cursor_expired,omitempty"`
+}
+
+// eventsCursorAnchor identifies the last event of a page — the position a
+// client cursor points at. Full-field equality (including Note) locates it
+// in the rebuilt event list; per-task truncation only drops events older
+// than the anchor, which the client has already received.
+type eventsCursorAnchor struct {
+	Ts     string `json:"ts"`
+	TaskID string `json:"task_id"`
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Actor  string `json:"actor"`
+	Action string `json:"action"`
+	Note   string `json:"note"`
+}
+
+func anchorOfEvent(e projectEvent) eventsCursorAnchor {
+	return eventsCursorAnchor{
+		Ts:     e.Ts,
+		TaskID: e.TaskID,
+		From:   e.From,
+		To:     e.To,
+		Actor:  e.Actor,
+		Action: e.Action,
+		Note:   e.Note,
+	}
+}
+
+// encodeEventsCursor packs a page's last event as an opaque cursor. Raw
+// URL-safe base64 keeps it free to pass as a query parameter unescaped.
+func encodeEventsCursor(e projectEvent) string {
+	b, err := json.Marshal(anchorOfEvent(e))
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// decodeEventsCursor parses a client cursor. ok=false means the value is
+// not a well-formed cursor (400); a well-formed cursor whose anchor has
+// been truncated out of the retained history is reported separately as
+// CursorExpired.
+func decodeEventsCursor(raw string) (eventsCursorAnchor, bool) {
+	b, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return eventsCursorAnchor{}, false
+	}
+	var a eventsCursorAnchor
+	if err := json.Unmarshal(b, &a); err != nil {
+		return eventsCursorAnchor{}, false
+	}
+	// ts + task_id are the minimum identity of a transition; from/to/action
+	// would be empty only for a malformed event that collectProjectEvents
+	// never produces.
+	if a.Ts == "" || a.TaskID == "" {
+		return eventsCursorAnchor{}, false
+	}
+	return a, true
 }
 
 const (
@@ -2211,18 +2281,41 @@ func (h *ProjectHandler) GetProjectEvents(w http.ResponseWriter, r *http.Request
 	if limit > projectEventsMaxLimit {
 		limit = projectEventsMaxLimit
 	}
-	offset := 0
+	anchor := eventsCursorAnchor{}
+	hasCursor := false
 	if raw := strings.TrimSpace(r.URL.Query().Get("cursor")); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < 0 {
+		a, ok := decodeEventsCursor(raw)
+		if !ok {
 			httputil.WriteError(w, http.StatusBadRequest, "invalid cursor")
 			return
 		}
-		offset = n
+		anchor = a
+		hasCursor = true
 	}
 
 	events := h.collectProjectEvents(r.Context(), match.meta, match.team)
 	resp := projectEventsResponse{ProjectID: projectID, Events: []projectEvent{}}
+	offset := 0
+	if hasCursor {
+		// Locate the LAST occurrence of the anchor in the rebuilt list.
+		// Last (not first) so a duplicate of the anchor tuple appended
+		// after the previous page is still delivered.
+		found := -1
+		for i, e := range events {
+			if anchorOfEvent(e) == anchor {
+				found = i
+			}
+		}
+		if found == -1 {
+			// The anchor was truncated out of the retained history (or
+			// never existed): resuming by position would silently skip
+			// unread events, so signal an explicit reset instead.
+			resp.CursorExpired = true
+			httputil.WriteJSON(w, http.StatusOK, resp)
+			return
+		}
+		offset = found + 1
+	}
 	if offset < len(events) {
 		pageEnd := offset + limit
 		if pageEnd > len(events) {
@@ -2230,7 +2323,7 @@ func (h *ProjectHandler) GetProjectEvents(w http.ResponseWriter, r *http.Request
 		}
 		resp.Events = events[offset:pageEnd]
 		if pageEnd < len(events) {
-			resp.NextCursor = strconv.Itoa(pageEnd)
+			resp.NextCursor = encodeEventsCursor(events[pageEnd-1])
 		}
 	}
 	httputil.WriteJSON(w, http.StatusOK, resp)

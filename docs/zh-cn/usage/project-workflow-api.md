@@ -227,7 +227,7 @@ GET /api/v1/projects/{id}/tasks/{taskId}?team=alpha-team
 |:--|:--|:--|:--|
 | `team` | string | — | 可选 team 限定，与其他读端点语义一致。 |
 | `limit` | int | `50` | 分页大小，上限 `200`；小于 `1` 返回 `400`。 |
-| `cursor` | string | — | 上一页 `next_cursor` 返回的不透明 offset，原样传回续读。 |
+| `cursor` | string | — | 上一页 `next_cursor` 返回的不透明游标，原样传回续读。它锚定在该页最后一条事件上，新增事件不会使其失效，每任务 50 条历史上限淘汰已读事件也不会。 |
 
 响应 `200 OK`：
 
@@ -244,12 +244,14 @@ GET /api/v1/projects/{id}/tasks/{taskId}?team=alpha-team
       "actor": "leader:default"
     }
   ],
-  "next_cursor": "2"
+  "next_cursor": "eyJ0cyI6IjIwMjYt..."
 }
 ```
 
 - `events` **最早在前**；秒级时间戳相同时按 `task_id`、再按 `action` 排序，分页确定。
 - `next_cursor` 为空 = 已到尾部；空项目返回 `200` + `"events": []`。
+- `next_cursor` 是不透明的 URL-safe 串，客户端不解析；它按内容锚定该页最后一条事件，翻页间隙追加新事件不会使其失效。
+- `cursor_expired` 为 `true`（`"events": []`、无 `next_cursor`）= 游标锚定的事件已被每任务 50 条历史上限淘汰。收到该信号必须丢弃游标、从头重新拉取；继续续读会静默漏事件。
 - task meta 只取项目属主作用域，不跨作用域回退（与 `tasks_detail` 同规则）。
 
 错误响应：

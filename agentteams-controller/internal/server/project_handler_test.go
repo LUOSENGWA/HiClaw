@@ -5228,8 +5228,8 @@ func TestGetProjectEvents_AggregateSortAndPaginate(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	resp := decodeEvents(t, rec)
-	if len(resp.Events) != 2 || resp.NextCursor != "2" {
-		t.Fatalf("page1=%+v, want 2 events + cursor 2", resp)
+	if len(resp.Events) != 2 || resp.NextCursor == "" {
+		t.Fatalf("page1=%+v, want 2 events + opaque cursor", resp)
 	}
 	if resp.Events[0].TaskID != "t1" || resp.Events[0].To != "prepared" {
 		t.Fatalf("page1[0]=%+v, want t1 planned->prepared", resp.Events[0])
@@ -5237,11 +5237,14 @@ func TestGetProjectEvents_AggregateSortAndPaginate(t *testing.T) {
 	if resp.Events[1].TaskID != "t2" || resp.Events[1].To != "prepared" {
 		t.Fatalf("page1[1]=%+v, want t2 planned->prepared (task_id tie-break)", resp.Events[1])
 	}
+	// The cursor is opaque (anchor of the page's last event): the test
+	// passes it back verbatim and never inspects its format.
+	cursor := resp.NextCursor
 
-	// cursor=2 continues exactly where page 1 stopped.
-	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=2&cursor=2"))
-	if len(resp.Events) != 2 || resp.NextCursor != "4" {
-		t.Fatalf("page2=%+v, want 2 events + cursor 4", resp)
+	// The returned cursor continues exactly where page 1 stopped.
+	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=2&cursor="+cursor))
+	if len(resp.Events) != 2 || resp.NextCursor == "" {
+		t.Fatalf("page2=%+v, want 2 events + cursor", resp)
 	}
 	if resp.Events[0].TaskID != "t1" || resp.Events[0].To != "assigned" {
 		t.Fatalf("page2[0]=%+v, want t1 prepared->assigned", resp.Events[0])
@@ -5249,9 +5252,14 @@ func TestGetProjectEvents_AggregateSortAndPaginate(t *testing.T) {
 	if resp.Events[1].TaskID != "t2" || resp.Events[1].To != "assigned" {
 		t.Fatalf("page2[1]=%+v, want t2 prepared->assigned", resp.Events[1])
 	}
+	// Re-presenting the same cursor is idempotent: same page again.
+	again := decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=2&cursor="+cursor))
+	if len(again.Events) != 2 || again.Events[0] != resp.Events[0] || again.Events[1] != resp.Events[1] {
+		t.Fatalf("page2 retry=%+v, want identical events", again)
+	}
 
 	// tail page: one event, cursor exhausted, note passthrough.
-	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=2&cursor=4"))
+	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=2&cursor="+resp.NextCursor))
 	if len(resp.Events) != 1 || resp.NextCursor != "" {
 		t.Fatalf("page3=%+v, want 1 event + empty cursor", resp)
 	}
@@ -5265,22 +5273,158 @@ func TestGetProjectEvents_AggregateSortAndPaginate(t *testing.T) {
 		t.Fatalf("full=%+v, want all 5 events + empty cursor", resp)
 	}
 
-	// cursor beyond the tail: empty, no error.
-	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?cursor=99"))
-	if len(resp.Events) != 0 || resp.NextCursor != "" {
-		t.Fatalf("beyond=%+v, want empty", resp)
-	}
-
 	// limit is capped at 200, never rejected.
 	rec = doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=999")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("limit=999 status=%d, want capped 200 OK", rec.Code)
 	}
-	for _, bad := range []string{"limit=0", "limit=-1", "limit=abc", "cursor=abc", "cursor=-5"} {
+	for _, bad := range []string{"limit=0", "limit=-1", "limit=abc", "cursor=abc", "cursor=-5", "cursor=99"} {
 		rec = doGetProjectEvents(t, h, "/api/v1/projects/p1/events?"+bad)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("%s status=%d, want 400", bad, rec.Code)
 		}
+	}
+}
+
+// TestGetProjectEvents_PaginationAcrossHistoryTruncation is the maintainer's
+// reproduction: one task with the full 50-entry retained history, page 1 of
+// 10, then a 51st event is appended and the writer's cap drops the oldest
+// (event 1). The next page must start at event 11 (still retained), not at
+// 12 — and when the anchor itself is eventually truncated away the
+// endpoint reports cursor_expired instead of serving a shifted page.
+func TestGetProjectEvents_PaginationAcrossHistoryTruncation(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []string{}},
+		},
+	})
+	// tsForEvent: second-resolution UTC timestamps, ascending.
+	tsForEvent := func(n int) string {
+		return fmt.Sprintf("2026-09-09T10:%02d:%02dZ", (n-1)/60, (n-1)%60)
+	}
+	progressHistory := func(lo, hi int) []map[string]any {
+		hist := make([]map[string]any, 0, hi-lo+1)
+		for n := lo; n <= hi; n++ {
+			hist = append(hist, map[string]any{
+				"ts": tsForEvent(n), "from": "in_progress", "to": "in_progress",
+				"action": "progress", "actor": "worker:a", "note": fmt.Sprintf("step %d", n),
+			})
+		}
+		return hist
+	}
+	putTaskHistory := func(lo, hi int) {
+		putTaskMeta(store, "", "t1", map[string]any{
+			"task_id": "t1", "project_id": "p1", "status": "in_progress",
+			"history": progressHistory(lo, hi),
+		})
+	}
+
+	putTaskHistory(1, 50) // the writer's 50-entry cap, full
+	h := newProjectTestHandler(t, store)
+
+	// Page 1: events 1-10, cursor anchors event 10.
+	resp := decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=10"))
+	if len(resp.Events) != 10 || resp.NextCursor == "" || resp.CursorExpired {
+		t.Fatalf("page1=%+v, want events 1-10 + cursor", resp)
+	}
+	if resp.Events[9].Note != "step 10" {
+		t.Fatalf("page1 last=%+v, want step 10", resp.Events[9])
+	}
+	cursor := resp.NextCursor
+
+	// Ordinary progress: event 51 appended, cap drops event 1. The client
+	// has already read events 1-10, so nothing unread was lost — the
+	// cursor must simply continue at event 11, not at 12.
+	putTaskHistory(2, 51)
+	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=10&cursor="+cursor))
+	if resp.CursorExpired || resp.NextCursor == "" {
+		t.Fatalf("page2=%+v, want continuation after truncation", resp)
+	}
+	if len(resp.Events) != 10 || resp.Events[0].Note != "step 11" {
+		t.Fatalf("page2 first=%+v, want step 11 (no silent skip)", resp.Events)
+	}
+	if resp.Events[9].Note != "step 20" {
+		t.Fatalf("page2 last=%+v, want step 20", resp.Events[9])
+	}
+	cursor = resp.NextCursor
+
+	// Another truncation round: 52-61 appended, 2-11 dropped. Anchor
+	// (step 20) still retained -> continues at step 21.
+	putTaskHistory(12, 61)
+	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=10&cursor="+cursor))
+	if resp.CursorExpired || len(resp.Events) != 10 || resp.Events[0].Note != "step 21" {
+		t.Fatalf("page3=%+v, want step 21..30", resp)
+	}
+	cursor = resp.NextCursor
+
+	// The anchor (step 30) itself is now truncated away: explicit reset
+	// signal, empty page, no shifted events.
+	putTaskHistory(35, 84)
+	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=10&cursor="+cursor))
+	if !resp.CursorExpired || len(resp.Events) != 0 || resp.NextCursor != "" {
+		t.Fatalf("page4=%+v, want cursor_expired + empty", resp)
+	}
+
+	// After the reset the client starts over: fresh page from the
+	// (now retained) head.
+	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=10"))
+	if resp.CursorExpired || len(resp.Events) != 10 || resp.Events[0].Note != "step 35" {
+		t.Fatalf("refetch=%+v, want step 35..44", resp)
+	}
+}
+
+// TestGetProjectEvents_PaginationTailGrowthWithoutTruncation: below the
+// writer's 50-entry cap, new events only extend the tail. The cursor must
+// remain valid (no spurious cursor_expired) and continue after the growth.
+func TestGetProjectEvents_PaginationTailGrowthWithoutTruncation(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []string{}},
+		},
+	})
+	tsForEvent := func(n int) string {
+		return fmt.Sprintf("2026-09-09T10:00:%02dZ", n-1)
+	}
+	progressHistory := func(lo, hi int) []map[string]any {
+		hist := make([]map[string]any, 0, hi-lo+1)
+		for n := lo; n <= hi; n++ {
+			hist = append(hist, map[string]any{
+				"ts": tsForEvent(n), "from": "in_progress", "to": "in_progress",
+				"action": "progress", "actor": "worker:a", "note": fmt.Sprintf("step %d", n),
+			})
+		}
+		return hist
+	}
+	putTaskHistory := func(lo, hi int) {
+		putTaskMeta(store, "", "t1", map[string]any{
+			"task_id": "t1", "project_id": "p1", "status": "in_progress",
+			"history": progressHistory(lo, hi),
+		})
+	}
+
+	putTaskHistory(1, 8)
+	h := newProjectTestHandler(t, store)
+	resp := decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=4"))
+	if len(resp.Events) != 4 || resp.NextCursor == "" {
+		t.Fatalf("page1=%+v, want steps 1-4 + cursor", resp)
+	}
+	cursor := resp.NextCursor
+
+	// Two more events land while the client is between page requests
+	// (no cap pressure yet, so the head is untouched).
+	putTaskHistory(1, 10)
+	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=4&cursor="+cursor))
+	if resp.CursorExpired || len(resp.Events) != 4 || resp.Events[0].Note != "step 5" {
+		t.Fatalf("page2=%+v, want steps 5-8 without expiry", resp)
+	}
+	cursor = resp.NextCursor
+	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=4&cursor="+cursor))
+	if resp.CursorExpired || len(resp.Events) != 2 || resp.Events[0].Note != "step 9" || resp.NextCursor != "" {
+		t.Fatalf("page3=%+v, want steps 9-10, tail reached", resp)
 	}
 }
 
