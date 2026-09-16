@@ -946,6 +946,12 @@ their own teams — no `docker exec` required.
   differs from the current one (the worker-local toggle endpoint flips state
   without a body, so a bare forward would double-flip on a retry). A PATCH
   that changes nothing is a `200` no-op with zero upstream writes.
+- **Concurrent-safe**: because the worker-local enabled mutation is a blind
+  toggle, the read-decide-mutate sequence runs under a per-(worker, tool)
+  lock and the mutation response is verified to carry the requested
+  `enabled` value. Two overlapping `PATCH {"enabled":true}` requests both
+  return `200` and leave the tool enabled (the second observes the first's
+  write and no-ops); a verification mismatch is a `502`, never a false `200`.
 - **State only, never configuration**: the entry exposes
   `requiresConfig` (a flag) but never the tool's configuration values —
   they can hold credentials.

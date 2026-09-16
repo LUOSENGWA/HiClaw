@@ -60,6 +60,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sync"
 	"time"
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
@@ -109,6 +110,14 @@ type ToolsHandler struct {
 	// workerBaseURL resolves a worker name to its qwenpaw app base URL.
 	// Injectable for tests.
 	workerBaseURL func(name string, env map[string]string) string
+	// Per-(worker, tool) write locks: the upstream enabled mutation is a
+	// blind TOGGLE, so the read->decide->mutate sequence of
+	// patchWorkerTool must be atomic per tool. Without it, two overlapping
+	// PATCH {"enabled":true} requests both read false, both toggle, and the
+	// final state is false although both callers asked for true. Keyed by
+	// base URL + tool; bounded by workers x built-in tools.
+	toolWriteMu    sync.Mutex
+	toolWriteLocks map[string]*sync.Mutex
 }
 
 // NewToolsHandler creates the handler with the default embedded-mode worker
@@ -120,6 +129,7 @@ func NewToolsHandler(c client.Client, namespace, kubeMode, containerPrefix strin
 		kubeMode:        kubeMode,
 		containerPrefix: containerPrefix,
 		http:            &http.Client{Timeout: toolsProxyTimeout},
+		toolWriteLocks:  map[string]*sync.Mutex{},
 	}
 	h.workerBaseURL = h.defaultWorkerBaseURL
 	return h
@@ -298,12 +308,42 @@ func (h *ToolsHandler) listWorkerTools(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// toolWriteLock returns the mutex that serializes the read->decide->mutate
+// sequence for one (worker, tool) pair.
+func (h *ToolsHandler) toolWriteLock(baseURL, tool string) *sync.Mutex {
+	key := baseURL + "\x00" + tool
+	h.toolWriteMu.Lock()
+	defer h.toolWriteMu.Unlock()
+	l, ok := h.toolWriteLocks[key]
+	if !ok {
+		l = &sync.Mutex{}
+		h.toolWriteLocks[key] = l
+	}
+	return l
+}
+
+func findToolItem(items []map[string]any, tool string) map[string]any {
+	for _, item := range items {
+		if item["name"] == tool {
+			return item
+		}
+	}
+	return nil
+}
+
 // patchWorkerTool handles PATCH /api/v1/workers/{name}/tools/{tool}.
 //
 // Body: a JSON object with one or both of "enabled" and "asyncExecution"
 // (booleans). Declarative: the local mutation for a field is issued only
 // when the requested value differs from the current one (see the package
 // doc for why the toggle cannot be forwarded blindly).
+//
+// Concurrency: the upstream enabled mutation is a bodyless TOGGLE, so a
+// stale read-then-toggle pair can invert the requested value. The
+// authoritative read, the decision and the mutation therefore run under a
+// per-(worker, tool) lock, and the mutation response is verified to carry
+// the requested enabled value before the success is reported. The initial
+// pre-read stays outside the lock: it only serves the no-op fast path.
 func (h *ToolsHandler) patchWorkerTool(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	tool := r.PathValue("tool")
@@ -354,7 +394,9 @@ func (h *ToolsHandler) patchWorkerTool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read the current table first (fail closed on any upstream error).
+	// Pre-read the current table (fail closed on any upstream error). This
+	// read is outside the write lock and is NOT authoritative: it only
+	// serves the no-op fast path below.
 	body, ok := h.fetchTools(w, r, baseURL)
 	if !ok {
 		return
@@ -363,13 +405,7 @@ func (h *ToolsHandler) patchWorkerTool(w http.ResponseWriter, r *http.Request) {
 	if items == nil {
 		return
 	}
-	var current map[string]any
-	for _, item := range items {
-		if item["name"] == tool {
-			current = item
-			break
-		}
-	}
+	current := findToolItem(items, tool)
 	if current == nil {
 		httputil.WriteError(w, http.StatusNotFound, "tool '"+tool+"' not found")
 		return
@@ -379,6 +415,42 @@ func (h *ToolsHandler) patchWorkerTool(w http.ResponseWriter, r *http.Request) {
 
 	needToggle := payload.Enabled != nil && *payload.Enabled != curEnabled
 	needAsync := payload.AsyncExecution != nil && *payload.AsyncExecution != curAsync
+	if !needToggle && !needAsync {
+		// Idempotent no-op per the pre-read: nothing to write, so nothing
+		// to serialize. Return the current entry without touching the
+		// worker (mirrors the runtime-config no-op).
+		entry, ok := toToolEntry(w, current)
+		if !ok {
+			return
+		}
+		writeToolEntry(w, entry)
+		return
+	}
+
+	// A mutation is planned: take the per-tool lock and re-read
+	// authoritatively — a concurrent writer that passed the same pre-read
+	// may already have flipped the state we are about to toggle.
+	lock := h.toolWriteLock(baseURL, tool)
+	lock.Lock()
+	defer lock.Unlock()
+
+	body, ok = h.fetchTools(w, r, baseURL)
+	if !ok {
+		return
+	}
+	items = parseToolItems(w, body)
+	if items == nil {
+		return
+	}
+	current = findToolItem(items, tool)
+	if current == nil {
+		httputil.WriteError(w, http.StatusNotFound, "tool '"+tool+"' not found")
+		return
+	}
+	curEnabled, _ = current["enabled"].(bool)
+	curAsync, _ = current["async_execution"].(bool)
+	needToggle = payload.Enabled != nil && *payload.Enabled != curEnabled
+	needAsync = payload.AsyncExecution != nil && *payload.AsyncExecution != curAsync
 
 	// Issue only the mutations that change state; the response of the last
 	// mutation is the authoritative updated entry.
@@ -386,6 +458,14 @@ func (h *ToolsHandler) patchWorkerTool(w http.ResponseWriter, r *http.Request) {
 	if needToggle {
 		info, ok := h.patchToolUpstream(w, r, baseURL+"/api/tools/"+tool+"/toggle", nil)
 		if !ok {
+			return
+		}
+		// Verify the resulting state at the mutation boundary: the toggle
+		// response is the upstream's own post-mutation entry; a mismatch
+		// means the requested value did not land — do not report success.
+		if got, _ := info["enabled"].(bool); got != *payload.Enabled {
+			httputil.WriteError(w, http.StatusBadGateway,
+				"enabled state verification failed: upstream did not land the requested value")
 			return
 		}
 		last = info
@@ -401,8 +481,8 @@ func (h *ToolsHandler) patchWorkerTool(w http.ResponseWriter, r *http.Request) {
 
 	final := last
 	if final == nil {
-		// Idempotent no-op: nothing changed. Return the current entry
-		// without touching the worker (mirrors the runtime-config no-op).
+		// Re-decided to a no-op under the lock: a concurrent writer
+		// already applied the requested state. Return the current entry.
 		final = current
 	}
 	entry, ok := toToolEntry(w, final)

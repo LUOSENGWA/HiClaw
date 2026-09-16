@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
@@ -27,6 +28,16 @@ type toolsUpstreamState struct {
 	lastAsync   []byte // raw body of the last async-execution call
 	mutateCode  int    // 0 = 200; otherwise forced for BOTH mutation endpoints
 	mutateGone  bool   // force the per-tool 404 (TOCTOU simulation)
+
+	// One-shot rendezvous barrier on the GET /api/tools read path: when
+	// readBarrierSize > 1, the first readBarrierSize-1 readers block until
+	// the last one arrives, then all proceed and the barrier disarms. Used
+	// to deterministically overlap the initial reads of concurrent PATCH
+	// requests (the maintainer's barrier reproduction).
+	readBarrierSize int
+	readBarrierOpen chan struct{}
+	readArrivals    int
+	readBarrierMu   sync.Mutex
 }
 
 func newTestToolsHandler(t *testing.T, kubeMode string, ts *httptest.Server, objs ...runtime.Object) *ToolsHandler {
@@ -147,6 +158,18 @@ func toolsUpstream(t *testing.T, st *toolsUpstreamState) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/tools":
+			if st.readBarrierSize > 1 {
+				st.readBarrierMu.Lock()
+				st.readArrivals++
+				n := st.readArrivals
+				st.readBarrierMu.Unlock()
+				if n < st.readBarrierSize {
+					<-st.readBarrierOpen
+				} else if n == st.readBarrierSize {
+					close(st.readBarrierOpen)
+				}
+				// n > size: barrier disarmed, later reads pass through.
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(st.tools)
 		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/toggle"):
@@ -603,5 +626,58 @@ func TestToolsPatch_WorkerUnreachable502(t *testing.T) {
 	h.patchWorkerTool(rec, req)
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status=%d body=%s, want 502", rec.Code, rec.Body.String())
+	}
+}
+
+// TestToolsPatch_ConcurrentSameValueBarrierIsAtomic is the maintainer's
+// deterministic reproduction: initial enabled=false, a barrier holds both
+// concurrent PATCH {"enabled":true} requests after their initial reads, so
+// both decisions see the same stale state. With a non-atomic
+// read-then-toggle implementation both requests toggle and the final state
+// is false although both callers asked for true. The required contract:
+// both requests return 200 and the tool ends ENABLED — which also pins the
+// mutation count: exactly one toggle may hit the upstream, because the
+// second request must observe the first's write and become a no-op.
+func TestToolsPatch_ConcurrentSameValueBarrierIsAtomic(t *testing.T) {
+	st := &toolsUpstreamState{
+		tools: []map[string]any{
+			{"name": "execute_shell_command", "enabled": false,
+				"description": "Execute a shell command", "async_execution": false,
+				"icon": "🔧", "requires_config": false},
+		},
+		readBarrierSize: 2,
+		readBarrierOpen: make(chan struct{}),
+	}
+	up := toolsUpstream(t, st)
+	defer up.Close()
+	h := newTestToolsHandler(t, "embedded", up, toolsTeamWithWorkers("market-team", "market-analyst")...)
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req := withCaller(
+				toolsRequest(http.MethodPatch, "market-analyst", "execute_shell_command", `{"enabled":true}`),
+				luoL2Human(),
+			)
+			rec := httptest.NewRecorder()
+			h.patchWorkerTool(rec, req)
+			codes[i] = rec.Code
+		}(i)
+	}
+	wg.Wait()
+
+	for i, code := range codes {
+		if code != http.StatusOK {
+			t.Fatalf("concurrent request %d status=%d, want 200", i, code)
+		}
+	}
+	if st.tools[0]["enabled"] != true {
+		t.Fatalf("final enabled=%v, want true: two concurrent set-true must leave the tool enabled", st.tools[0]["enabled"])
+	}
+	if st.toggleCalls != 1 {
+		t.Fatalf("toggleCalls=%d, want 1: the second request must re-read under the write lock, see the first's write and no-op", st.toggleCalls)
 	}
 }
