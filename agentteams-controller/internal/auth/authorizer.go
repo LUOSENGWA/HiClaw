@@ -111,6 +111,17 @@ func (a *Authorizer) authorizeHuman(caller *CallerIdentity, req AuthzRequest) er
 		}
 		return deny(caller, req)
 
+	case "mcp-server":
+		// Deployment MCP catalog (GET /api/v1/mcp-servers): L2 humans read
+		// the catalog scoped to their accessibleTeams. Like the worker
+		// list, the authorizer does not reject cross-team access — the
+		// handler filters by caller.Teams (accessibleTeams), hiding
+		// out-of-scope entries rather than probing via 403.
+		if req.Action == ActionGet || req.Action == ActionList {
+			return nil
+		}
+		return deny(caller, req)
+
 	case "worker":
 		if req.Action == ActionGet || req.Action == ActionList {
 			return nil // handler filters by accessibleTeams
@@ -195,6 +206,14 @@ func (a *Authorizer) authorizeTeamLeader(caller *CallerIdentity, req AuthzReques
 		return a.authorizeTeamLeaderWorkerAction(caller, req)
 
 	case "team":
+		if req.Action == ActionGet || req.Action == ActionList {
+			return nil
+		}
+		return deny(caller, req)
+
+	case "mcp-server":
+		// Deployment MCP catalog: team leaders read the catalog scoped to
+		// their own team (the handler filters by caller team).
 		if req.Action == ActionGet || req.Action == ActionList {
 			return nil
 		}
