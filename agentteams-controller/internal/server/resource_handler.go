@@ -14,6 +14,7 @@ import (
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/backend"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/httputil"
+	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -31,6 +32,10 @@ type ResourceHandler struct {
 	client    client.Client
 	namespace string
 	backend   *backend.Registry
+	// oss backs object-storage-backed read surfaces (the shared MCP
+	// registry). Nil in embedded mode without MinIO: the affected endpoints
+	// then report the shared half as unavailable instead of failing.
+	oss oss.StorageClient
 
 	defaultWorkerRuntime string
 
@@ -59,6 +64,14 @@ func NewResourceHandler(c client.Client, namespace string, b *backend.Registry, 
 		controllerName: controllerName,
 		audit:          a,
 	}
+}
+
+// WithOSS attaches the object-storage client used by object-storage-backed
+// read surfaces (the shared MCP registry in ListMCPServers). Returns the
+// receiver for chaining; a nil argument leaves the shared half unavailable.
+func (h *ResourceHandler) WithOSS(store oss.StorageClient) *ResourceHandler {
+	h.oss = store
+	return h
 }
 
 // stampControllerLabel force-writes the controller ownership label on meta.
