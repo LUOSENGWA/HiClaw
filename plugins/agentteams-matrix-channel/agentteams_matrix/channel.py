@@ -422,6 +422,13 @@ class AgentTeamsMatrixChannel(BaseChannel):
         self._sync_task: Optional[asyncio.Task] = None
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._room_histories: Dict[str, List[HistoryEntry]] = {}
+        # Per-room history generation + cumulative record counters. The send
+        # alignment gate (#1244) snapshots the generation into each turn's
+        # meta, so a different mention's _clear_history can no longer
+        # consume the turn's staleness marker (the shared buffer is
+        # consumed at the next enqueue).
+        self._room_history_gen: Dict[str, int] = {}
+        self._room_history_records: Dict[str, int] = {}
         # Send alignment gate state: room_id -> {event_id, count, deadline}.
         self._send_gate_state: Dict[str, Dict[str, Any]] = {}
         self._dm_room_cache: Dict[str, Dict[str, Any]] = {}
@@ -1943,7 +1950,12 @@ class AgentTeamsMatrixChannel(BaseChannel):
         return user_id.split(":")[0].lstrip("@") or user_id
 
     def _record_history(self, room_id: str, entry: HistoryEntry) -> None:
-        """Append *entry* to the per-room history buffer (respect limit)."""
+        """Append *entry* to the per-room history buffer (respect limit).
+
+        Also advances the per-room history generation and record counters
+        used by the send alignment gate snapshot (#1244): every new room
+        event is a potential staleness signal for turns still in flight.
+        """
         limit = self.history_limit
         if limit <= 0:
             return
@@ -1951,6 +1963,10 @@ class AgentTeamsMatrixChannel(BaseChannel):
         history.append(entry)
         while len(history) > limit:
             history.pop(0)
+        self._room_history_gen[room_id] = self._room_history_gen.get(room_id, 0) + 1
+        self._room_history_records[room_id] = (
+            self._room_history_records.get(room_id, 0) + 1
+        )
 
     def _build_history_prefix(self, room_id: str) -> str:
         """Format buffered history entries as a multi-line text block."""
@@ -2018,6 +2034,21 @@ class AgentTeamsMatrixChannel(BaseChannel):
     def _clear_history(self, room_id: str) -> None:
         """Drop the buffered history for *room_id*."""
         self._room_histories.pop(room_id, None)
+
+    def _capture_send_gate_snapshot(self, meta: Dict[str, Any], room_id: str) -> None:
+        """Record this turn's room-history generation into its own meta.
+
+        The gate marker travels with the turn's send_meta (captured when
+        the turn's context is snapshotted, before its buffer clear), so a
+        different mention's ``_clear_history`` can no longer consume it:
+        at turn end the gate compares the room's current generation
+        against this per-turn snapshot instead of inspecting the shared
+        buffer, which another turn may have drained.
+        """
+        meta["send_gate_snapshot_gen"] = self._room_history_gen.get(room_id, 0)
+        meta["send_gate_snapshot_records"] = self._room_history_records.get(
+            room_id, 0
+        )
 
     async def _record_media_history(
         self,
@@ -2405,6 +2436,11 @@ class AgentTeamsMatrixChannel(BaseChannel):
             },
         }
 
+        if not is_dm:
+            # Per-turn gate snapshot: captured before the buffer clear,
+            # carried with this turn's meta so no later enqueue can
+            # consume it.
+            self._capture_send_gate_snapshot(payload["meta"], room_id)
         if self._enqueue:
             self._enqueue(payload)
             if not is_dm:
@@ -2817,6 +2853,11 @@ class AgentTeamsMatrixChannel(BaseChannel):
                 },
             )
 
+        if not is_dm and not is_thread_event:
+            # Per-turn gate snapshot: captured before the buffer clear,
+            # carried with this turn's meta so no later enqueue can
+            # consume it.
+            self._capture_send_gate_snapshot(payload["meta"], room_id)
         if self._enqueue:
             self._enqueue(payload)
             if not is_dm and not is_thread_event:
@@ -2982,6 +3023,11 @@ class AgentTeamsMatrixChannel(BaseChannel):
             },
         }
 
+        if not is_dm and not is_thread_event:
+            # Per-turn gate snapshot: captured before the buffer clear,
+            # carried with this turn's meta so no later enqueue can
+            # consume it.
+            self._capture_send_gate_snapshot(payload["meta"], room_id)
         if self._enqueue:
             self._enqueue(payload)
             if not is_dm and not is_thread_event:
@@ -4220,15 +4266,37 @@ class AgentTeamsMatrixChannel(BaseChannel):
             agent with the fresh context.
           - ``"note"``: gate budget exhausted (retrigger count or
             wall-clock deadline) — flush, then append a short note.
+
+        Alignment is decided against the per-turn history-generation
+        snapshot captured at enqueue time (``send_gate_snapshot_gen``),
+        not against the shared room buffer: another mention's enqueue
+        clears that buffer, so with the buffer as the marker a second
+        mention would consume the first turn's staleness signal and let
+        its stale draft through.
         """
         meta_dict = send_meta if isinstance(send_meta, dict) else {}
         room_id = to_handle
         if not meta_dict.get("is_group") or meta_dict.get("is_dm") or meta_dict.get("is_thread_event"):
             return "ok", 0
         turn_event_id = meta_dict.get("event_id") or ""
-        entries = self._room_histories.get(room_id) or []
-        if not entries or not turn_event_id:
-            return "ok", len(entries)
+        snap_gen = meta_dict.get("send_gate_snapshot_gen")
+        if snap_gen is None:
+            # Turn without a snapshot (legacy / non-enqueue paths): fall
+            # back to the shared-buffer heuristic.
+            entries = self._room_histories.get(room_id) or []
+            if not entries or not turn_event_id:
+                return "ok", len(entries)
+            new_count = len(entries)
+        else:
+            if self._room_history_gen.get(room_id, 0) == snap_gen:
+                # No room event since this turn's context snapshot.
+                return "ok", 0
+            if not turn_event_id:
+                return "ok", 0
+            snap_records = int(meta_dict.get("send_gate_snapshot_records") or 0)
+            new_count = max(
+                0, self._room_history_records.get(room_id, 0) - snap_records
+            )
         now = time.time()
         state = self._send_gate_state.get(room_id)
         if state is None or state.get("event_id") != turn_event_id:
@@ -4240,8 +4308,8 @@ class AgentTeamsMatrixChannel(BaseChannel):
             }
             state = self._send_gate_state[room_id]
         if state["count"] >= _MATRIX_SEND_GATE_MAX_RETRIGGERS or now >= state["deadline"]:
-            return "note", len(entries)
-        return "retrigger", len(entries)
+            return "note", new_count
+        return "retrigger", new_count
 
     async def _retrigger_for_new_context(
         self,
@@ -4298,6 +4366,11 @@ class AgentTeamsMatrixChannel(BaseChannel):
             carry_meta_root = meta_dict.get(_THREAD_META_ROOT_KEY)
             if carry_meta_root:
                 retrigger_meta[_THREAD_META_ROOT_KEY] = carry_meta_root
+        # The re-triggered turn snapshots the room state at retrigger time
+        # (the buffer above was its context). Without this, the buffer pop
+        # below would leave the re-run turn marker-less and the shared
+        # buffer would again decide its freshness.
+        self._capture_send_gate_snapshot(retrigger_meta, room_id)
         payload = {
             "channel_id": CHANNEL_KEY,
             "sender_id": sender_id,
