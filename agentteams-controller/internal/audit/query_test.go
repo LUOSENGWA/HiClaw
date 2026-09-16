@@ -284,6 +284,16 @@ func TestQueryRangeTooLarge(t *testing.T) {
 	if !errors.Is(err, ErrRangeTooLarge) {
 		t.Fatalf("want ErrRangeTooLarge for from>to, got: %v", err)
 	}
+	// Same-day reversal: the original instants decide, not the day
+	// truncation (from=11:00Z & to=10:00Z on one day).
+	_, err = q.List(context.Background(), QueryOptions{
+		From:  time.Date(2026, 9, 14, 11, 0, 0, 0, time.UTC),
+		To:    time.Date(2026, 9, 14, 10, 0, 0, 0, time.UTC),
+		Limit: 50,
+	})
+	if !errors.Is(err, ErrRangeTooLarge) {
+		t.Fatalf("want ErrRangeTooLarge for same-day from>to, got: %v", err)
+	}
 }
 
 func TestQuerySameTimestampTiebreakBySeq(t *testing.T) {
@@ -344,9 +354,11 @@ func TestDecodeCursorRoundTrip(t *testing.T) {
 func TestDecodeCursorRejectsGarbage(t *testing.T) {
 	for _, bad := range []string{
 		"!!!not-base64!!!",
-		"YWJj",                                  // valid base64, not JSON
-		`{"date":"2026-09-14"}`,                 // missing seq/ts
-		`{"seq":3,"ts":"2026-09-14T10:00:00Z"}`, // missing date
+		"YWJj",                                               // valid base64, not JSON
+		`{"date":"2026-09-14"}`,                              // missing seq/ts
+		`{"seq":3,"ts":"2026-09-14T10:00:00Z"}`,              // missing date
+		`{"date":"2026-09-14","seq":1,"ts":"bad"}`,           // unparseable ts
+		`{"date":"bad","seq":1,"ts":"2026-09-14T10:00:00Z"}`, // unparseable date
 	} {
 		if _, err := DecodeCursor(bad); err == nil {
 			t.Errorf("DecodeCursor(%q) should fail", bad)

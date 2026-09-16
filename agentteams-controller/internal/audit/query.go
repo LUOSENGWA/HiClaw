@@ -92,6 +92,15 @@ func DecodeCursor(s string) (*Cursor, error) {
 	if c.Date == "" || c.Seq < 1 || c.Ts == "" {
 		return nil, errors.New("invalid cursor payload: date, seq and ts are required")
 	}
+	// Validate the field formats at decode time so the handler can answer
+	// 400 for malformed client input before any storage scan (a bad ts
+	// would otherwise surface as a server error from List).
+	if _, err := time.Parse(time.RFC3339Nano, c.Ts); err != nil {
+		return nil, errors.New("invalid cursor payload: ts must be RFC3339")
+	}
+	if _, err := time.Parse("2006-01-02", c.Date); err != nil {
+		return nil, errors.New("invalid cursor payload: date must be YYYY-MM-DD")
+	}
 	return &c, nil
 }
 
@@ -250,7 +259,11 @@ func (q *Query) dailyKeys(ctx context.Context, from, to time.Time) ([]string, er
 	}
 
 	if fromSet && toSet {
-		if f.After(t) {
+		// Compare the original instants: the day truncation below must not
+		// hide within-day ordering (from=11:00Z & to=10:00Z on the same
+		// day truncates to equal days and would otherwise scan and return
+		// an empty 200).
+		if from.After(to) {
 			return nil, fmt.Errorf("%w: from is after to", ErrRangeTooLarge)
 		}
 		days := int(t.Sub(f).Hours()/24) + 1

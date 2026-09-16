@@ -25,6 +25,16 @@ GET /api/v1/audit
     ?limit=<n>            page size, default 50, max 200
 ```
 
+Input validation (all 400, before any storage scan):
+
+- `from`/`to` must parse as RFC3339; when both are present the **original
+  instants** are compared — `from` strictly after `to` is rejected,
+  including within a single day (the day truncation used to enumerate
+  daily objects must not mask within-day ordering).
+- The cursor must decode as base64url JSON whose `ts` parses as RFC3339
+  and `date` as `YYYY-MM-DD`; a malformed field is rejected at decode
+  time (400), never surfaced later as a server error during the scan.
+
 Response:
 
 ```json
