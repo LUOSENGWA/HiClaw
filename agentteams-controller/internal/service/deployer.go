@@ -494,6 +494,16 @@ func (d *Deployer) deployWorkerMcporterConfig(ctx context.Context, agentPrefix, 
 		return
 	}
 
+	for _, s := range mcpServers {
+		if strings.TrimSpace(s.Name) == "" || strings.TrimSpace(s.URL) == "" {
+			continue
+		}
+		if !d.agentConfig.IsTrustedMCPHost(s.URL) {
+			logger.Info("mcporter entry not on the trusted gateway host; gateway credential not attached",
+				"server", s.Name, "url", s.URL)
+		}
+	}
+
 	mergedJSON, err := d.mergeExistingWorkerMcporterConfig(ctx, agentPrefix, mcporterJSON)
 	if err != nil {
 		logger.Error(err, "mcporter config merge failed, using generated config")
@@ -1534,6 +1544,15 @@ func (d *Deployer) DeployManagerConfig(ctx context.Context, req ManagerDeployReq
 		if err != nil {
 			logger.Error(err, "mcporter config generation failed (non-fatal)")
 		} else if mcporterJSON != nil {
+			for _, s := range req.McpServers {
+				if strings.TrimSpace(s.Name) == "" || strings.TrimSpace(s.URL) == "" {
+					continue
+				}
+				if !d.agentConfig.IsTrustedMCPHost(s.URL) {
+					logger.Info("mcporter entry not on the trusted gateway host; gateway credential not attached",
+						"server", s.Name, "url", s.URL)
+				}
+			}
 			if err := d.oss.PutObject(ctx, agentPrefix+"/mcporter-servers.json", mcporterJSON); err != nil {
 				logger.Error(err, "mcporter config push failed (non-fatal)")
 			}
