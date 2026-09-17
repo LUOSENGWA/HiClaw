@@ -453,9 +453,9 @@ func TestChannelsPut_ExplicitClearRequiresCapability(t *testing.T) {
 // TestChannelsPut_ExtendedCredentialKeysGated: every credential field of
 // the qwenpaw 2.2.x channel models is gated — including the fields beyond
 // the original denylist (app_token, verification_token, twilio_auth_token,
-// livekit_api_secret).
+// livekit_api_secret, http_proxy_auth).
 func TestChannelsPut_ExtendedCredentialKeysGated(t *testing.T) {
-	for _, field := range []string{"app_token", "verification_token", "twilio_auth_token", "livekit_api_secret", "sip_password", "dashscope_api_key", "livekit_api_key"} {
+	for _, field := range []string{"app_token", "verification_token", "twilio_auth_token", "livekit_api_secret", "sip_password", "dashscope_api_key", "livekit_api_key", "http_proxy_auth"} {
 		u := &channelsTestUpstream{status: http.StatusOK, response: `{}`}
 		h := newTestChannelsHandler(t, "embedded", u.server(t), nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
 		rec := httptest.NewRecorder()
@@ -465,6 +465,134 @@ func TestChannelsPut_ExtendedCredentialKeysGated(t *testing.T) {
 		h.putChannel(rec, req)
 		if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), field) {
 			t.Fatalf("%s: status=%d body=%s, want 403 naming the field", field, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// TestChannelsPut_ProxyAuthCredentialLifecycle: http_proxy_auth is the
+// proxy "user:password" pair carried by the qwenpaw 2.2.1 Discord and
+// Telegram channel models (config.py). Before it joined the denylist, a
+// replacement ("old-user:old-password" → "new-user:new-password") was
+// reported as no changed credentials and bypassed the channel_secrets
+// gate. It must now go through the same four lifecycle states as every
+// other credential field: unchanged → ordinary edit, replacement →
+// gated, omitted → back-filled, explicit "" → gated clear.
+func TestChannelsPut_ProxyAuthCredentialLifecycle(t *testing.T) {
+	const oldAuth = "old-user:old-password"
+	const newAuth = "new-user:new-password"
+	const saved = `{"enabled":true,"http_proxy_auth":"` + oldAuth + `"}`
+	l2 := func(caps ...string) *authpkg.CallerIdentity {
+		return &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "bob", Teams: []string{"team-a"}, Capabilities: caps}
+	}
+
+	// Unchanged round-trip: an ordinary edit — no gate, no audit.
+	{
+		store := ossfake.NewMemory()
+		u := &channelsTestUpstream{status: http.StatusOK, response: saved, getResponse: saved}
+		h := newTestChannelsHandler(t, "embedded", u.server(t), store, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+		done := make(chan bool, 1)
+		h.onReadback = func(converged bool) { done <- converged }
+		rec := httptest.NewRecorder()
+		req := channelsRequest(http.MethodPut, "/api/v1/workers/placeholder/channels/discord", saved, "name", "daily-carol", "channel", "discord")
+		h.putChannel(rec, withCaller(req, l2()))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unchanged: status=%d body=%s, want 200 (unchanged credential is an ordinary edit)", rec.Code, rec.Body.String())
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("background readback did not fire within 2s")
+		}
+		for _, line := range readAuditLines(t, store) {
+			if strings.Contains(line, `"channel_credential_write"`) {
+				t.Fatalf("unchanged proxy auth must not be audit-logged: %s", line)
+			}
+		}
+	}
+
+	// Replacement without the capability: 403 naming the field, and the
+	// replacement never reaches upstream.
+	{
+		u := &channelsTestUpstream{status: http.StatusOK, response: `{}`, getResponse: saved}
+		h := newTestChannelsHandler(t, "embedded", u.server(t), nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+		rec := httptest.NewRecorder()
+		body := `{"enabled":true,"http_proxy_auth":"` + newAuth + `"}`
+		req := channelsRequest(http.MethodPut, "/api/v1/workers/placeholder/channels/discord", body, "name", "daily-carol", "channel", "discord")
+		h.putChannel(rec, withCaller(req, l2()))
+		if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "http_proxy_auth") {
+			t.Fatalf("replacement: status=%d body=%s, want 403 naming the field", rec.Code, rec.Body.String())
+		}
+		if len(u.hits) != 1 || u.hits[0] != "GET /api/config/channels/discord" {
+			t.Fatalf("replacement without capability: upstream hits=%v, want only the read-only baseline GET", u.hits)
+		}
+	}
+
+	// Omitted: back-filled from the saved value (upstream replaces the
+	// whole channel, so omission would otherwise erase the pair).
+	{
+		u := &channelsTestUpstream{status: http.StatusOK, response: `{}`, getResponse: saved}
+		h := newTestChannelsHandler(t, "embedded", u.server(t), nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+		rec := httptest.NewRecorder()
+		req := channelsRequest(http.MethodPut, "/api/v1/workers/placeholder/channels/discord", `{"enabled":false}`, "name", "daily-carol", "channel", "discord")
+		h.putChannel(rec, withCaller(req, l2()))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("omitted: status=%d body=%s, want 200 (omitted credential is preserved, not gated)", rec.Code, rec.Body.String())
+		}
+		var forwarded map[string]any
+		if err := json.Unmarshal([]byte(u.body), &forwarded); err != nil {
+			t.Fatalf("forwarded body is not JSON: %s", u.body)
+		}
+		if forwarded["http_proxy_auth"] != oldAuth {
+			t.Fatalf("omitted proxy auth not back-filled; forwarded=%s", u.body)
+		}
+		if forwarded["enabled"] != false {
+			t.Fatalf("edited field lost in back-fill: %s", u.body)
+		}
+	}
+
+	// Explicit "" without the capability: 403 naming the field.
+	{
+		u := &channelsTestUpstream{status: http.StatusOK, response: `{}`, getResponse: saved}
+		h := newTestChannelsHandler(t, "embedded", u.server(t), nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+		rec := httptest.NewRecorder()
+		clearBody := `{"enabled":true,"http_proxy_auth":""}`
+		req := channelsRequest(http.MethodPut, "/api/v1/workers/placeholder/channels/discord", clearBody, "name", "daily-carol", "channel", "discord")
+		h.putChannel(rec, withCaller(req, l2()))
+		if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "http_proxy_auth") {
+			t.Fatalf("clear: status=%d body=%s, want 403 naming the field", rec.Code, rec.Body.String())
+		}
+		if len(u.hits) != 1 || u.hits[0] != "GET /api/config/channels/discord" {
+			t.Fatalf("clear without capability: upstream hits=%v, want only the read-only baseline GET", u.hits)
+		}
+	}
+
+	// Explicit "" with the capability: 200 and the clear is audit-logged.
+	{
+		store := ossfake.NewMemory()
+		u := &channelsTestUpstream{status: http.StatusOK, response: `{}`, getResponse: saved}
+		h := newTestChannelsHandler(t, "embedded", u.server(t), store, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+		done := make(chan bool, 1)
+		h.onReadback = func(bool) { done <- false }
+		rec := httptest.NewRecorder()
+		clearBody := `{"enabled":true,"http_proxy_auth":""}`
+		req := channelsRequest(http.MethodPut, "/api/v1/workers/placeholder/channels/discord", clearBody, "name", "daily-carol", "channel", "discord")
+		h.putChannel(rec, withCaller(req, l2(string(authpkg.CapabilityChannelSecrets))))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("clear with capability: status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("background readback did not fire within 2s")
+		}
+		found := false
+		for _, line := range readAuditLines(t, store) {
+			if strings.Contains(line, `"channel_credential_write"`) && strings.Contains(line, "http_proxy_auth") {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatal("explicit proxy-auth clear must be audit-logged as a credential write")
 		}
 	}
 }

@@ -705,6 +705,7 @@ var channelCredentialKeys = map[string]bool{
 	"verification_token": true,
 	"password":           true,
 	"sip_password":       true,
+	"http_proxy_auth":    true,
 	"api_key":            true,
 	"dashscope_api_key":  true,
 	"livekit_api_key":    true,
