@@ -28,9 +28,10 @@ import (
 )
 
 // Event is one auditable action (#1220 §8 event table, first rows:
-// capability grant/revoke; the Action/Capability/Before/After fields are
-// shaped for the follow-on consumers — approval_level changes, channel
-// credential writes, external source adds/updates).
+// capability grant/revoke, human scope changes; the
+// Action/Capability/Before/After fields are shaped for the follow-on
+// consumers — approval_level changes, channel credential writes,
+// external source adds/updates).
 type Event struct {
 	Who        string    `json:"who"`
 	Role       string    `json:"role"` // admin | manager | team-leader | worker | human

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -558,6 +559,11 @@ func (h *ResourceHandler) CreateHuman(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Audit wiring point (#1220 §8 event table, line 6): the initial
+	// scope granted at creation is a sensitive-surface change and is
+	// recorded on both audit layers.
+	h.auditHumanCreated(r.Context(), human)
+
 	httputil.WriteJSON(w, http.StatusCreated, humanToResponse(human))
 }
 
@@ -599,6 +605,9 @@ func (h *ResourceHandler) UpdateHuman(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		capsBefore := human.Spec.Capabilities
+		plBefore := human.Spec.PermissionLevel
+		teamsBefore := human.Spec.AccessibleTeams
+		workersBefore := human.Spec.AccessibleWorkers
 
 		if req.PermissionLevel != nil && (*req.PermissionLevel < 1 || *req.PermissionLevel > 3) {
 			httputil.WriteError(w, http.StatusBadRequest, "permissionLevel must be 1 (admin), 2 (team), or 3 (worker)")
@@ -661,6 +670,12 @@ func (h *ResourceHandler) UpdateHuman(w http.ResponseWriter, r *http.Request) {
 			h.auditCapabilityChange(ctx, name, caller, capsBefore, human.Spec.Capabilities)
 		}
 
+		// Audit wiring point (#1220 §8 event table, line 6): human scope
+		// changes (permission level / accessible teams / accessible
+		// workers) are sensitive-surface changes and are recorded on both
+		// audit layers.
+		h.auditHumanScopeChange(ctx, name, caller, plBefore, teamsBefore, workersBefore, human.Spec)
+
 		httputil.WriteJSON(w, http.StatusOK, humanToResponse(&human))
 		return
 	}
@@ -690,6 +705,98 @@ func (h *ResourceHandler) auditCapabilityChange(ctx context.Context, name string
 			Before: beforeN, After: afterN,
 		})
 	}
+}
+
+// auditHumanScopeChange emits one event per changed scope field
+// (#1220 §8 event table, line 6: human scope change). Reordering a list
+// without membership changes is not a change and emits no event. Audit
+// failures never break the update: the audit client logs durable-layer
+// errors internally.
+func (h *ResourceHandler) auditHumanScopeChange(ctx context.Context, name string, caller *authpkg.CallerIdentity, plBefore int, teamsBefore, workersBefore []string, after v1beta1.HumanSpec) {
+	if h.audit == nil || caller == nil {
+		return
+	}
+	if after.PermissionLevel != plBefore {
+		h.audit.Record(ctx, audit.Event{
+			Who: caller.Username, Role: caller.Role, Target: name,
+			Action: "permission_level_change",
+			Before: []string{strconv.Itoa(plBefore)},
+			After:  []string{strconv.Itoa(after.PermissionLevel)},
+			Detail: fmt.Sprintf("permission_level %d -> %d", plBefore, after.PermissionLevel),
+		})
+	}
+	auditScopeListChange(h.audit, ctx, name, caller, "accessible_teams_change", teamsBefore, after.AccessibleTeams)
+	auditScopeListChange(h.audit, ctx, name, caller, "accessible_workers_change", workersBefore, after.AccessibleWorkers)
+}
+
+// auditScopeListChange records one scope-list field (accessible teams or
+// workers) when its set membership changed.
+func auditScopeListChange(ac *audit.Client, ctx context.Context, name string, caller *authpkg.CallerIdentity, action string, before, after []string) {
+	if ac == nil || caller == nil {
+		return
+	}
+	added := diffStringSlices(before, after)
+	removed := diffStringSlices(after, before)
+	if len(added) == 0 && len(removed) == 0 {
+		return
+	}
+	ac.Record(ctx, audit.Event{
+		Who: caller.Username, Role: caller.Role, Target: name,
+		Action: action,
+		Before: before, After: after,
+		Detail: "added=[" + strings.Join(added, ", ") + "] removed=[" + strings.Join(removed, ", ") + "]",
+	})
+}
+
+// humanScopeSummary renders the non-empty scope fields of a human spec as
+// a controlled summary (never secret values) for create/delete audit
+// events.
+func humanScopeSummary(spec v1beta1.HumanSpec) []string {
+	var out []string
+	if spec.PermissionLevel >= 1 {
+		out = append(out, "permission_level="+strconv.Itoa(spec.PermissionLevel))
+	}
+	if len(spec.AccessibleTeams) > 0 {
+		out = append(out, "accessible_teams=["+strings.Join(spec.AccessibleTeams, ", ")+"]")
+	}
+	if len(spec.AccessibleWorkers) > 0 {
+		out = append(out, "accessible_workers=["+strings.Join(spec.AccessibleWorkers, ", ")+"]")
+	}
+	return out
+}
+
+// auditHumanCreated records a human creation with its initial scope
+// (#1220 §8 event table, line 6). The After list carries the granted
+// scope summary.
+func (h *ResourceHandler) auditHumanCreated(ctx context.Context, human *v1beta1.Human) {
+	if h.audit == nil {
+		return
+	}
+	caller := authpkg.CallerFromContext(ctx)
+	if caller == nil {
+		return
+	}
+	h.audit.Record(ctx, audit.Event{
+		Who: caller.Username, Role: caller.Role, Target: human.Name,
+		Action: "human_created", After: humanScopeSummary(human.Spec),
+	})
+}
+
+// auditHumanDeleted records a human deletion with the scope that was
+// revoked (#1220 §8 event table, line 6). The Before list carries the
+// removed scope summary.
+func (h *ResourceHandler) auditHumanDeleted(ctx context.Context, human *v1beta1.Human) {
+	if h.audit == nil {
+		return
+	}
+	caller := authpkg.CallerFromContext(ctx)
+	if caller == nil {
+		return
+	}
+	h.audit.Record(ctx, audit.Event{
+		Who: caller.Username, Role: caller.Role, Target: human.Name,
+		Action: "human_deleted", Before: humanScopeSummary(human.Spec),
+	})
 }
 
 // diffStringSlices returns the elements present in b but not in a.
@@ -807,10 +914,21 @@ func (h *ResourceHandler) DeleteHuman(w http.ResponseWriter, r *http.Request) {
 	human := &v1beta1.Human{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: h.namespace},
 	}
+	// Read before delete so the revoked scope can be recorded (#1220 §8
+	// event table, line 6). A missing object is still a plain 404 with
+	// no audit event.
+	if err := h.client.Get(r.Context(), client.ObjectKeyFromObject(human), human); err != nil {
+		writeK8sError(w, "get human for delete", err)
+		return
+	}
 	if err := h.client.Delete(r.Context(), human); err != nil {
 		writeK8sError(w, "delete human", err)
 		return
 	}
+
+	// Audit wiring point (#1220 §8 event table, line 6): deleting a human
+	// revokes all of its access and is recorded on both audit layers.
+	h.auditHumanDeleted(r.Context(), human)
 
 	w.WriteHeader(http.StatusNoContent)
 }
