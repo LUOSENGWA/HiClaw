@@ -46,6 +46,10 @@ package server
 //     unchanged. Decided per #1220 §13 Q5 (2026-09-16) — maintainer
 //     confirmation requested in the PR; a masked read would be a separate
 //     change (mask helper + a reveal capability), not a config flag.
+//     L3 (worker-scoped) readers are the exception — they may read normal
+//     config/status of assigned workers but not plaintext credentials, so
+//     the channel-config reads are sanitized server-side for them
+//     (credential fields omitted, maintainer decision, #1277 review).
 //   - Write contract: the handler is the real boundary (middleware
 //     requires): team leaders are read-only on channels (403 on mutations);
 //     L2 humans are scoped to their accessibleTeams (W8: 404, never 403, so
@@ -217,7 +221,9 @@ func (h *ChannelsHandler) channelsScope(w http.ResponseWriter, r *http.Request, 
 	// findTeamMember's second return value is the member (worker) name, not
 	// the team name — the scope check compares against the Team CR name.
 	// Standalone workers (no team) resolve to "" which TeamMatches rejects,
-	// hiding them from scoped callers as 404.
+	// hiding them from team-scoped callers as 404 (L3 humans with the
+	// worker in their accessibleWorkers are the exception — the read leg
+	// below).
 	teamObj, _, _, err := findTeamMember(r.Context(), h.client, h.namespace, name)
 	if err != nil {
 		writeK8sError(w, "get worker channels", err)
@@ -228,10 +234,19 @@ func (h *ChannelsHandler) channelsScope(w http.ResponseWriter, r *http.Request, 
 		teamName = teamObj.Name
 	}
 	if caller := authpkg.CallerFromContext(r.Context()); caller != nil &&
-		(caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) &&
-		!caller.TeamMatches(teamName) {
-		httputil.WriteError(w, http.StatusNotFound, "worker not found")
-		return "", false
+		(caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) {
+		allowed := caller.TeamMatches(teamName)
+		if !allowed && r.Method == http.MethodGet {
+			// Read leg: L3 (worker-scoped) humans may read exactly their
+			// assigned workers. Mutations keep the strict team-scope
+			// predicate — L3 humans carry no teams, so they fail there
+			// (Q2: L3 is read-only).
+			allowed = caller.WorkerReadable(teamName, name)
+		}
+		if !allowed {
+			httputil.WriteError(w, http.StatusNotFound, "worker not found")
+			return "", false
+		}
 	}
 	return h.workerBaseURL(name, worker.Spec.Env), true
 }
@@ -251,6 +266,15 @@ type channelRoute struct {
 	// records exactly these — not a re-scan of the (possibly back-filled)
 	// body, which would false-positive on round-tripped saved values.
 	changedCreds []string
+	// sanitizeCreds marks channel-CONFIG read routes: for L3
+	// (worker-scoped) readers the credential-bearing fields are stripped
+	// server-side before the response is written (L3 may read normal
+	// config/status of assigned workers, but not plaintext credentials —
+	// maintainer decision, #1277 review). L1/L2 readers are untouched
+	// (the round-trip contract, #1220 §13 Q5). "types"/"schemas" are NOT
+	// marked: the schema documents carry credential field NAMES as keys,
+	// and stripping by key name would break form rendering.
+	sanitizeCreds bool
 }
 
 // serveChannels performs the shared scope check, dials the worker's qwenpaw
@@ -309,6 +333,12 @@ func (h *ChannelsHandler) serveChannels(w http.ResponseWriter, r *http.Request, 
 			w.Header().Set(minioPersistedHeader, persisted)
 			h.auditChannelWrite(r.Context(), name, r.PathValue("channel"), route.changedCreds, caller)
 		}
+		if route.sanitizeCreds && caller != nil && caller.IsWorkerScoped() {
+			// L3 read-only surface: credentials are stripped server-side —
+			// frontend-only masking is not a boundary (the raw response is
+			// the contract).
+			upstreamBody = sanitizeChannelCredentials(upstreamBody)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(upstreamBody)
@@ -354,7 +384,7 @@ func validateChannelName(w http.ResponseWriter, ch string) bool {
 
 // getChannels handles GET /api/v1/workers/{name}/channels.
 func (h *ChannelsHandler) getChannels(w http.ResponseWriter, r *http.Request) {
-	h.serveChannels(w, r, channelRoute{method: http.MethodGet, upstream: "/api/config/channels"})
+	h.serveChannels(w, r, channelRoute{method: http.MethodGet, upstream: "/api/config/channels", sanitizeCreds: true})
 }
 
 // getChannelResource handles GET /api/v1/workers/{name}/channels/{sub} where
@@ -368,7 +398,10 @@ func (h *ChannelsHandler) getChannelResource(w http.ResponseWriter, r *http.Requ
 	if !reservedChannelSubpaths[sub] && !validateChannelName(w, sub) {
 		return
 	}
-	h.serveChannels(w, r, channelRoute{method: http.MethodGet, upstream: "/api/config/channels/" + sub})
+	// Only a real channel name carries credential VALUES; "types" and
+	// "schemas" carry field NAMES as keys and pass through untouched.
+	sanitize := !reservedChannelSubpaths[sub]
+	h.serveChannels(w, r, channelRoute{method: http.MethodGet, upstream: "/api/config/channels/" + sub, sanitizeCreds: sanitize})
 }
 
 // putChannel handles PUT /api/v1/workers/{name}/channels/{channel}. The body
@@ -941,4 +974,48 @@ func extractChannelSection(agentJSON []byte, channel string) ([]byte, bool) {
 		return nil, false
 	}
 	return canonicalJSON(raw)
+}
+
+// sanitizeChannelCredentials strips credential-bearing fields (the
+// channelCredentialKeys denylist, case-insensitive leaf names, any
+// nesting depth) from a channel config document for L3 (worker-scoped)
+// readers: L3 may read normal config/status of assigned workers but not
+// plaintext credentials (maintainer decision, #1277 review). Normal
+// fields are preserved. The fields are OMITTED rather than replaced by a
+// sentinel — presence is visible, the value never is. The stripping is
+// server-side: frontend-only masking is not a boundary, because the raw
+// response is the contract. L1/L2 responses are never passed through
+// here (the round-trip read contract, #1220 §13 Q5).
+//
+// Fail-closed: a 200 body that is not valid JSON is answered with an
+// empty object rather than passed through — an unparseable upstream
+// response cannot be proven credential-free.
+func sanitizeChannelCredentials(raw []byte) []byte {
+	var doc any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return []byte("{}")
+	}
+	var strip func(v any)
+	strip = func(v any) {
+		switch t := v.(type) {
+		case map[string]any:
+			for k, val := range t {
+				if channelCredentialKeys[strings.ToLower(k)] {
+					delete(t, k)
+				} else {
+					strip(val)
+				}
+			}
+		case []any:
+			for _, e := range t {
+				strip(e)
+			}
+		}
+	}
+	strip(doc)
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return []byte("{}")
+	}
+	return out
 }

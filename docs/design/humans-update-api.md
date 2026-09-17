@@ -25,6 +25,17 @@ as teams form and dissolve.
 - **Immutable through this endpoint:** `name` and the Matrix identity
   (username / matrixUserID). Re-provisioning the account is a deliberate
   destroy-and-recreate operation, not an edit.
+- **Level semantics (API authorization):** `1` = admin (the Matrix token
+  path does not resolve level-1 humans; they use the admin SA). `2` = team
+  scope (`accessibleTeams` + `capabilities`; see
+  [l2-worker-scoped-write.md](l2-worker-scoped-write.md) and
+  [capability-foundation.md](capability-foundation.md)). `3` = worker
+  scope — **read-only** access to exactly the `accessibleWorkers` (worker
+  detail, channel config, approval config; no writes);
+  `accessibleTeams` / `capabilities` on a level-3 CR do not grant
+  anything (see [l3-worker-scoped-read.md](l3-worker-scoped-read.md)).
+  The level takes effect on the next authentication (cached identities
+  expire on the authenticator's normal TTL).
 - **Validation, applied before the K8s write:**
   - `permissionLevel` must be 1, 2, or 3 → otherwise `400`.
   - `accessibleTeams` must reference existing Team CRs and

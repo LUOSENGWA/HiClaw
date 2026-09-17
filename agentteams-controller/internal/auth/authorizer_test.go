@@ -1,6 +1,9 @@
 package auth
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestAuthorizer_AdminAllowsEverything(t *testing.T) {
 	az := NewAuthorizer()
@@ -529,5 +532,56 @@ func TestAuthorizer_AuditRead(t *testing.T) {
 	worker := &CallerIdentity{Role: RoleWorker, Username: "market-dev", WorkerName: "market-dev", Team: "market-team"}
 	if err := az.Authorize(worker, AuthzRequest{Action: ActionGet, ResourceKind: "audit"}); err == nil {
 		t.Error("worker audit read should be denied")
+	}
+}
+
+// TestAuthorizer_HumanL3WriteDenied pins the middleware-level probe for L3
+// (worker-scoped) humans: every worker WRITE action is denied at the
+// authorizer — even with an empty ResourceTeam (where an in-team L2 human
+// would pass and be enforced by the handler), because L3 identities carry
+// no teams at all (Q2: L3 is read-only). Reads stay allowed at this layer;
+// the handler applies the accessibleWorkers filter.
+func TestAuthorizer_HumanL3WriteDenied(t *testing.T) {
+	az := NewAuthorizer()
+	l3 := &CallerIdentity{Role: RoleHuman, Username: "viewer", AccessibleWorkers: []string{"market-analyst"}}
+
+	readsAllowed := []AuthzRequest{
+		{Action: ActionList, ResourceKind: "worker"},
+		{Action: ActionGet, ResourceKind: "worker", ResourceTeam: "market-team"},
+	}
+	for _, req := range readsAllowed {
+		if err := az.Authorize(l3, req); err != nil {
+			t.Errorf("L3 human should be allowed %s %s at the authorizer (handler filters), got: %v",
+				req.Action, req.ResourceKind, err)
+		}
+	}
+
+	// ActionUpdate on worker goes through requireSameTeam: the L3 identity
+	// carries no teams at all, so the rejection is the uniform no-team
+	// denial regardless of the target team (no per-target variance to
+	// probe).
+	for _, req := range []AuthzRequest{
+		{Action: ActionUpdate, ResourceKind: "worker"},
+		{Action: ActionUpdate, ResourceKind: "worker", ResourceTeam: "market-team"},
+	} {
+		if err := az.Authorize(l3, req); err == nil {
+			t.Errorf("L3 human must be denied %s %s (read-only), got nil error", req.Action, req.ResourceKind)
+		} else if !strings.Contains(err.Error(), "no team") {
+			t.Errorf("L3 update denial reason = %q, want the no-team rejection (uniform for every target)", err)
+		}
+	}
+
+	// The remaining write actions are denied by the plain default; only the
+	// outcome (denied) is the contract, not the message.
+	for _, req := range []AuthzRequest{
+		{Action: ActionCreate, ResourceKind: "worker"},
+		{Action: ActionDelete, ResourceKind: "worker"},
+		{Action: ActionWake, ResourceKind: "worker"},
+		{Action: ActionSleep, ResourceKind: "worker"},
+		{Action: ActionRefreshMatrixToken, ResourceKind: "credentials"},
+	} {
+		if err := az.Authorize(l3, req); err == nil {
+			t.Errorf("L3 human must be denied %s %s (read-only), got nil error", req.Action, req.ResourceKind)
+		}
 	}
 }

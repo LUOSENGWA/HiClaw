@@ -40,9 +40,10 @@ position also hosts the reserved fixed resources `types` and `schemas`.
 |---|---|---|
 | `admin` / `manager` (L1) | any worker | any worker |
 | `human` (L2, Matrix token) | own accessibleTeams workers | own accessibleTeams workers via the worker-scoped update policy (authorizer `ActionUpdate` → same-team); **replacing a credential value or explicitly clearing it (empty string) additionally requires the `channel_secrets` capability** (403 names the offending fields); unchanged credential values are ordinary fields and omitted ones are preserved (see PUT semantics) |
+| `human` (L3, `permissionLevel: 3`, Matrix token) | **assigned workers only** (`accessibleWorkers`, standalone or team members; see [l3-worker-scoped-read.md](l3-worker-scoped-read.md)) — **channel-config reads sanitized server-side: credential fields omitted, normal fields preserved** | **denied** — `403` (middleware `requireSameTeam`: L3 carries no teams) and `404` at the handler scope check (strict team predicate on mutations); read-only by contract (Q2) |
 | `team-leader` | own team workers | **denied — `403`** (team leaders have read-only access to channels; the middleware's same-team `ActionUpdate` would otherwise allow it, so the handler is the real boundary) |
 | scoped caller, other team | `404` | `404` (W8: never `403`, so cross-team existence cannot be probed) |
-| scoped caller, standalone worker (no team) | `404` | `404` |
+| scoped caller, standalone worker (no team) | `404` | `404` (except an L3 caller with that worker in `accessibleWorkers` — read only) |
 
 Mutating calls are audit-logged (`worker`, `upstream`, `actor`,
 `minio_persisted`).
@@ -141,13 +142,24 @@ curl -s http://127.0.0.1:8090/api/v1/workers/daily-carol/channels/schemas \
 
 ## Notes
 
-- **Unmasked credentials.** Configs round-trip unmasked by design: scoped
-  callers can only reach agents in their own teams, and the form needs the
-  saved values to round-trip unchanged. L1 sees all workers, consistent
-  with its existing worker-management surface. Read-surface contract
-  decided per #1220 §13 Q5 (2026-09-16): round-trip is retained — a masked
-  read would be a separate change (mask helper + reveal capability), not a
-  config flag; maintainer confirmation is requested in the PR.
+- **Unmasked credentials (L1/L2).** Configs round-trip unmasked by design:
+  scoped callers can only reach agents in their own teams, and the form
+  needs the saved values to round-trip unchanged. L1 sees all workers,
+  consistent with its existing worker-management surface. Read-surface
+  contract decided per #1220 §13 Q5 (2026-09-16): round-trip is retained
+  for L1/L2 — a masked read would be a separate change (mask helper +
+  reveal capability), not a config flag. L3 readers are the exception
+  (next bullet).
+- **L3 reads are sanitized.** L3 (worker-scoped) humans may read normal
+  config/status of assigned workers but not plaintext credentials
+  (maintainer decision, #1277 review): the channel-config read routes
+  (`GET /channels`, `GET /channels/{channel}`) strip the
+  credential-bearing fields (the qwenpaw channel-model secret fields,
+  any nesting depth) **server-side** for worker-scoped callers — fields
+  omitted, normal fields preserved, `types`/`schemas` untouched. The
+  stripping is server-side because the raw response is the contract;
+  a non-JSON 200 body fails closed to `{}` for L3 readers. L1/L2
+  responses are never touched.
 - **Single-agent workers.** Without an `X-Agent-Id` header the worker's
   qwenpaw app resolves the active agent from its config; in a
   single-profile worker container that is the worker's own agent. The

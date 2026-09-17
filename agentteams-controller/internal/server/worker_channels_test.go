@@ -1067,3 +1067,244 @@ func TestChannelsQrcodeStatus_QueryWhitelist(t *testing.T) {
 		t.Fatalf("upstream=%s?%s", u.path, u.query)
 	}
 }
+
+// appearingStore wraps ossfake.Memory and materializes one object only after
+// N GetObject misses — simulating push_loop lag between the qwenpaw write
+// and the MinIO baseline.
+type appearingStore struct {
+	*ossfake.Memory
+	after int
+	seen  int
+	key   string
+	value string
+}
+
+func (a *appearingStore) GetObject(ctx context.Context, key string) ([]byte, error) {
+	if key == a.key {
+		a.seen++
+		if a.seen <= a.after {
+			return nil, os.ErrNotExist
+		}
+		return []byte(a.value), nil
+	}
+	return a.Memory.GetObject(ctx, key)
+}
+
+// TestChannelsL3AssignedReadAllowed guards the L3 read leg: an
+// L3 (worker-scoped) human may read the channel configuration of exactly
+// its assigned workers — team members and standalone workers alike.
+func TestChannelsL3AssignedReadAllowed(t *testing.T) {
+	u := &channelsTestUpstream{status: http.StatusOK, response: `{"qq":{"enabled":true}}`}
+	objs := checkpointTeamWithWorkers("team-a", "team-a-dev")
+	objs = append(objs, checkpointWorker("solo"))
+	h := newTestChannelsHandler(t, "embedded", u.server(t), nil, objs...)
+	l3 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "viewer", AccessibleWorkers: []string{"team-a-dev", "solo"}}
+
+	rec := httptest.NewRecorder()
+	req := channelsRequest(http.MethodGet, "/api/v1/workers/placeholder/channels", "", "name", "team-a-dev")
+	req = withCaller(req, l3)
+	h.getChannels(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("assigned team worker status=%d, want 200 for L3 read", rec.Code)
+	}
+	if !u.dialed {
+		t.Fatal("upstream must be dialed for an assigned L3 read")
+	}
+
+	rec2 := httptest.NewRecorder()
+	req2 := channelsRequest(http.MethodGet, "/api/v1/workers/placeholder/channels", "", "name", "solo")
+	req2 = withCaller(req2, l3)
+	h.getChannels(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("assigned standalone worker status=%d, want 200 for L3 read", rec2.Code)
+	}
+}
+
+// TestChannelsL3UnassignedHidden guards the W8 boundary for L3 reads:
+// unassigned workers stay hidden (404, no upstream dial) even when the
+// human is a fully-provisioned L3 identity.
+func TestChannelsL3UnassignedHidden(t *testing.T) {
+	u := &channelsTestUpstream{status: http.StatusOK, response: `{}`}
+	h := newTestChannelsHandler(t, "embedded", u.server(t), nil, checkpointTeamWithWorkers("team-a", "team-a-dev")...)
+	l3 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "viewer", AccessibleWorkers: []string{"someone-else"}}
+
+	rec := httptest.NewRecorder()
+	req := channelsRequest(http.MethodGet, "/api/v1/workers/placeholder/channels", "", "name", "team-a-dev")
+	req = withCaller(req, l3)
+	h.getChannels(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unassigned worker status=%d, want 404 (W8)", rec.Code)
+	}
+	if u.dialed {
+		t.Fatal("upstream must not be dialed for an unassigned L3 caller")
+	}
+}
+
+// TestChannelsL3MutationDenied pins the read-only contract (Q2) at the
+// handler level: a PUT against an ASSIGNED worker still fails the strict
+// team-scope predicate (the middleware's requireSameTeam would have denied
+// it with 403 first; this probe guards the handler so no future middleware
+// change can widen L3 into a channel writer).
+func TestChannelsL3MutationDenied(t *testing.T) {
+	u := &channelsTestUpstream{status: http.StatusOK, response: `{"enabled":true}`}
+	h := newTestChannelsHandler(t, "embedded", u.server(t), nil, checkpointTeamWithWorkers("team-a", "team-a-dev")...)
+	l3 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "viewer", AccessibleWorkers: []string{"team-a-dev"}}
+
+	rec := httptest.NewRecorder()
+	req := channelsRequest(http.MethodPut, "/api/v1/workers/placeholder/channels/qq", `{"enabled":true}`, "name", "team-a-dev", "channel", "qq")
+	req = withCaller(req, l3)
+	h.putChannel(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("L3 PUT of an ASSIGNED worker status=%d, want 404 (read-only)", rec.Code)
+	}
+	if u.dialed {
+		t.Fatal("upstream must not be dialed for an L3 mutation")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// L3 read sanitization: assigned-worker reads never carry plaintext
+// credentials (maintainer decision, #1277 review). The stripping is
+// server-side on the raw response — the raw body is the contract.
+// ---------------------------------------------------------------------------
+
+// l3SanitizeDoc is a multi-channel config carrying a NON-EMPTY sentinel
+// credential on several supported channel types (the regression the
+// reviewer asked for: none of these values may appear in an L3 raw
+// response).
+const l3SanitizeDoc = `{
+  "qq":    {"enabled":true,"app_id":"qq-app-1","client_secret":"SENTINEL-qq-client-secret","markdown_enabled":true},
+  "matrix":{"enabled":true,"homeserver":"https://matrix.example.com","bot_token":"SENTINEL-matrix-bot-token","require_mention":false},
+  "feishu":{"enabled":true,"app_id":"fs-app-1","app_secret":"SENTINEL-feishu-app-secret","encrypt_key":"SENTINEL-feishu-encrypt-key","verification_token":"SENTINEL-feishu-verification-token"},
+  "voice": {"enabled":true,"twilio_auth_token":"SENTINEL-voice-twilio-auth-token","livekit_api_key":"SENTINEL-voice-livekit-api-key","livekit_api_secret":"SENTINEL-voice-livekit-api-secret"},
+  "dingtalk":{"enabled":true,"client_id":"dt-client-1","app_token":"SENTINEL-dingtalk-app-token"}
+}`
+
+func l3Sentinels() []string {
+	return []string{
+		"SENTINEL-qq-client-secret",
+		"SENTINEL-matrix-bot-token",
+		"SENTINEL-feishu-app-secret",
+		"SENTINEL-feishu-encrypt-key",
+		"SENTINEL-feishu-verification-token",
+		"SENTINEL-voice-twilio-auth-token",
+		"SENTINEL-voice-livekit-api-key",
+		"SENTINEL-voice-livekit-api-secret",
+		"SENTINEL-dingtalk-app-token",
+	}
+}
+
+func l3NoSentinels(t *testing.T, label, body string) {
+	t.Helper()
+	for _, s := range l3Sentinels() {
+		if strings.Contains(body, s) {
+			t.Fatalf("%s: raw response leaked sentinel credential %q", label, s)
+		}
+	}
+}
+
+// TestChannelsL3ReadsSanitizeCredentials: both channel-config read routes
+// (aggregate + single channel) strip credential fields for L3 readers
+// while preserving every normal field; L2 and admin readers get the
+// verbatim round-trip, and types/schemas pass through untouched for
+// everyone.
+func TestChannelsL3ReadsSanitizeCredentials(t *testing.T) {
+	u := &channelsTestUpstream{status: http.StatusOK, response: l3SanitizeDoc}
+	objs := checkpointTeamWithWorkers("team-a", "team-a-dev")
+	h := newTestChannelsHandler(t, "embedded", u.server(t), nil, objs...)
+	l3 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "viewer", AccessibleWorkers: []string{"team-a-dev"}}
+	l2 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "bob", Teams: []string{"team-a"}}
+
+	// Aggregate read (L3): normal fields preserved, credentials gone.
+	rec := httptest.NewRecorder()
+	req := channelsRequest(http.MethodGet, "/api/v1/workers/placeholder/channels", "", "name", "team-a-dev")
+	req = withCaller(req, l3)
+	h.getChannels(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("L3 aggregate read status=%d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	l3NoSentinels(t, "L3 aggregate", body)
+	for _, field := range []string{`"qq-app-1"`, `"https://matrix.example.com"`, `"fs-app-1"`, `"dt-client-1"`, `"markdown_enabled":true`} {
+		if !strings.Contains(body, field) {
+			t.Fatalf("L3 aggregate: normal field %s lost: %s", field, body)
+		}
+	}
+	for _, key := range []string{`"client_secret"`, `"bot_token"`, `"app_secret"`, `"encrypt_key"`, `"verification_token"`, `"twilio_auth_token"`, `"livekit_api_key"`, `"livekit_api_secret"`, `"app_token"`} {
+		if strings.Contains(body, key) {
+			t.Fatalf("L3 aggregate: credential key %s not stripped: %s", key, body)
+		}
+	}
+
+	// Single-channel read (L3): same contract for one channel.
+	rec2 := httptest.NewRecorder()
+	req2 := channelsRequest(http.MethodGet, "/api/v1/workers/placeholder/channels/qq", "", "name", "team-a-dev", "sub", "qq")
+	req2 = withCaller(req2, l3)
+	h.getChannelResource(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("L3 single read status=%d, want 200", rec2.Code)
+	}
+	body2 := rec2.Body.String()
+	l3NoSentinels(t, "L3 single", body2)
+	if !strings.Contains(body2, `"qq-app-1"`) {
+		t.Fatalf("L3 single: normal field lost: %s", body2)
+	}
+	if strings.Contains(body2, `"client_secret"`) {
+		t.Fatalf("L3 single: credential key not stripped: %s", body2)
+	}
+
+	// L2 read: the round-trip contract is untouched (sentinels visible).
+	rec3 := httptest.NewRecorder()
+	req3 := channelsRequest(http.MethodGet, "/api/v1/workers/placeholder/channels", "", "name", "team-a-dev")
+	req3 = withCaller(req3, l2)
+	h.getChannels(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("L2 read status=%d, want 200", rec3.Code)
+	}
+	if rec3.Body.String() != l3SanitizeDoc {
+		t.Fatalf("L2 read must be the verbatim upstream round-trip: %s", rec3.Body.String())
+	}
+
+	// Admin read: verbatim.
+	rec4 := httptest.NewRecorder()
+	req4 := channelsRequest(http.MethodGet, "/api/v1/workers/placeholder/channels", "", "name", "team-a-dev")
+	req4 = adminCaller(req4)
+	h.getChannels(rec4, req4)
+	if rec4.Code != http.StatusOK || rec4.Body.String() != l3SanitizeDoc {
+		t.Fatalf("admin read must be verbatim: status=%d body=%s", rec4.Code, rec4.Body.String())
+	}
+
+	// types/schemas pass through untouched for L3 too (schema property
+	// names include credential field names — stripping by key name would
+	// break form rendering).
+	const schemasDoc = `{"qq":{"properties":{"app_id":{"type":"string"},"client_secret":{"type":"string"}}}}`
+	u2 := &channelsTestUpstream{status: http.StatusOK, response: schemasDoc}
+	h2 := newTestChannelsHandler(t, "embedded", u2.server(t), nil, objs...)
+	rec5 := httptest.NewRecorder()
+	req5 := channelsRequest(http.MethodGet, "/api/v1/workers/placeholder/channels/schemas", "", "name", "team-a-dev", "sub", "schemas")
+	req5 = withCaller(req5, l3)
+	h2.getChannelResource(rec5, req5)
+	if rec5.Code != http.StatusOK || rec5.Body.String() != schemasDoc {
+		t.Fatalf("schemas must pass through untouched for L3: status=%d body=%s", rec5.Code, rec5.Body.String())
+	}
+}
+
+// TestChannelsL3UnparseableUpstreamFailsClosed: an L3 read of a 200 body
+// that is not valid JSON is answered with an empty object — an
+// unparseable upstream response cannot be proven credential-free.
+func TestChannelsL3UnparseableUpstreamFailsClosed(t *testing.T) {
+	u := &channelsTestUpstream{status: http.StatusOK, response: `<html>upstream broke</html>`}
+	h := newTestChannelsHandler(t, "embedded", u.server(t), nil, checkpointTeamWithWorkers("team-a", "team-a-dev")...)
+	l3 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "viewer", AccessibleWorkers: []string{"team-a-dev"}}
+
+	rec := httptest.NewRecorder()
+	req := channelsRequest(http.MethodGet, "/api/v1/workers/placeholder/channels", "", "name", "team-a-dev")
+	req = withCaller(req, l3)
+	h.getChannels(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	if strings.TrimSpace(rec.Body.String()) != "{}" {
+		t.Fatalf("unparseable upstream for an L3 reader must fail closed to {}: %s", rec.Body.String())
+	}
+}

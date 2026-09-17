@@ -168,13 +168,15 @@ func (h *ResourceHandler) GetWorker(w http.ResponseWriter, r *http.Request) {
 		} else if ok {
 			applyTeamMember(&resp, team, member)
 		}
-		// Scoped readers (team leaders or L2 humans) may only fetch workers
-		// in the teams they control; standalone workers are hidden. W8: return
-		// 404 (not 403) so scoped callers cannot probe worker existence by
-		// name — consistent with the project enumeration fix (W4).
+		// Scoped readers (team leaders or humans) may only fetch workers in
+		// the teams they control; L3 (worker-scoped) humans may additionally
+		// fetch exactly their assigned workers (standalone or team members).
+		// W8: return 404 (not 403) so scoped callers cannot probe worker
+		// existence by name — consistent with the project enumeration fix
+		// (W4).
 		if caller := authpkg.CallerFromContext(r.Context()); caller != nil &&
 			(caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) &&
-			!caller.TeamMatches(resp.Team) {
+			!caller.WorkerReadable(resp.Team, name) {
 			httputil.WriteError(w, http.StatusNotFound, "get worker: not found")
 			return
 		}
@@ -207,9 +209,10 @@ func (h *ResourceHandler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 		} else if ok {
 			applyTeamMember(&resp, team, member)
 		}
-		// Scoped readers (team leaders or L2 humans) only see the workers in
-		// the teams they control; standalone workers are hidden.
-		if caller != nil && (caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) && !caller.TeamMatches(resp.Team) {
+		// Scoped readers (team leaders or humans) only see the workers in
+		// the teams they control; L3 (worker-scoped) humans only see their
+		// explicitly assigned workers (standalone or team members).
+		if caller != nil && (caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) && !caller.WorkerReadable(resp.Team, list.Items[i].Name) {
 			continue
 		}
 		if teamFilter != "" && resp.Team != teamFilter {

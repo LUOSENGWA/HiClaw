@@ -175,10 +175,19 @@ func (h *ApprovalHandler) approvalScope(w http.ResponseWriter, r *http.Request, 
 		teamName = teamObj.Name
 	}
 	if caller := authpkg.CallerFromContext(r.Context()); caller != nil &&
-		(caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) &&
-		!caller.TeamMatches(teamName) {
-		httputil.WriteError(w, http.StatusNotFound, "worker not found")
-		return "", false
+		(caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) {
+		allowed := caller.TeamMatches(teamName)
+		if !allowed && r.Method == http.MethodGet {
+			// Read leg: L3 (worker-scoped) humans may read exactly their
+			// assigned workers. Mutations keep the strict team-scope
+			// predicate — L3 humans carry no teams, so they fail there
+			// (Q2: L3 is read-only).
+			allowed = caller.WorkerReadable(teamName, name)
+		}
+		if !allowed {
+			httputil.WriteError(w, http.StatusNotFound, "worker not found")
+			return "", false
+		}
 	}
 	return h.workerBaseURL(name, worker.Spec.Env), true
 }

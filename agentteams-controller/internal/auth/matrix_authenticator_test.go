@@ -117,19 +117,100 @@ func TestMatrixAuthenticator_UnknownUserDenied(t *testing.T) {
 
 	if _, err := auth.Authenticate(context.Background(), "matrix-token"); err == nil {
 		t.Fatal("expected error for unknown matrix user")
-	} else if !strings.Contains(err.Error(), "no L2 human matches") {
+	} else if !strings.Contains(err.Error(), "no human with a supported permission level") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
-func TestMatrixAuthenticator_NonL2Denied(t *testing.T) {
+func TestMatrixAuthenticator_UnsupportedLevelDenied(t *testing.T) {
 	auth, fw := newMatrixAuthTest(t, newHuman("carol", "carol", 1))
 	fw.userID = "@carol:matrix.local"
 
 	if _, err := auth.Authenticate(context.Background(), "matrix-token"); err == nil {
-		t.Fatal("expected error for level-1 human")
-	} else if !strings.Contains(err.Error(), "not an L2") {
+		t.Fatal("expected error for level-1 human (admin SA territory)")
+	} else if !strings.Contains(err.Error(), "unsupported permissionLevel") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestMatrixAuthenticator_ResolvesL3Human guards the L3 (worker-scoped)
+// branch: permissionLevel=3 + accessibleWorkers resolves to a read-only
+// human identity carrying exactly the assigned workers (#1220 §2/Q2).
+func TestMatrixAuthenticator_ResolvesL3Human(t *testing.T) {
+	h := newHuman("viewer", "viewer", 3)
+	h.Spec.AccessibleWorkers = []string{"team-a-dev", "solo-helper"}
+	auth, fw := newMatrixAuthTest(t, h)
+	fw.userID = "@viewer:matrix.local"
+
+	id, err := auth.Authenticate(context.Background(), "matrix-token")
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if id.Role != RoleHuman {
+		t.Fatalf("role=%q, want human (read-only L3, not team-leader)", id.Role)
+	}
+	if id.Username != "viewer" {
+		t.Fatalf("username=%q, want viewer", id.Username)
+	}
+	if len(id.AccessibleWorkers) != 2 || id.AccessibleWorkers[0] != "team-a-dev" || id.AccessibleWorkers[1] != "solo-helper" {
+		t.Fatalf("accessibleWorkers=%v, want [team-a-dev solo-helper]", id.AccessibleWorkers)
+	}
+	if len(id.Teams) != 0 {
+		t.Fatalf("teams=%v, want empty (L3 is worker-scoped, not team-scoped)", id.Teams)
+	}
+	if len(id.Capabilities) != 0 {
+		t.Fatalf("capabilities=%v, want empty (capabilities are L2 fields)", id.Capabilities)
+	}
+}
+
+// TestMatrixAuthenticator_L3StrictPerLevel guards the level-isolation
+// contract: an L3 human whose CR also carries accessibleTeams or
+// capabilities gets NEITHER — the permissionLevel is the discriminator,
+// and silently widening the scope by extra fields would blur the L2/L3
+// boundary (#558: the fake CR carries the full combination on purpose).
+func TestMatrixAuthenticator_L3StrictPerLevel(t *testing.T) {
+	h := newHuman("viewer", "viewer", 3, "market-team")
+	h.Spec.AccessibleWorkers = []string{"team-a-dev"}
+	h.Spec.Capabilities = []string{"channel_secrets"}
+	auth, fw := newMatrixAuthTest(t, h)
+	fw.userID = "@viewer:matrix.local"
+
+	id, err := auth.Authenticate(context.Background(), "matrix-token")
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if len(id.AccessibleWorkers) != 1 || id.AccessibleWorkers[0] != "team-a-dev" {
+		t.Fatalf("accessibleWorkers=%v, want [team-a-dev]", id.AccessibleWorkers)
+	}
+	if len(id.Teams) != 0 {
+		t.Fatalf("teams=%v, want empty (L3 ignores accessibleTeams)", id.Teams)
+	}
+	if len(id.Capabilities) != 0 {
+		t.Fatalf("capabilities=%v, want empty (L3 ignores capabilities)", id.Capabilities)
+	}
+}
+
+// TestMatrixAuthenticator_L2IgnoresAccessibleWorkers is the mirror of the
+// L3 strictness: an L2 human whose CR carries accessibleWorkers keeps its
+// team scope only — the worker leg activates solely at permissionLevel=3.
+func TestMatrixAuthenticator_L2IgnoresAccessibleWorkers(t *testing.T) {
+	h := newHuman("scoped-user", "scoped-user", 2, "market-team")
+	h.Spec.AccessibleWorkers = []string{"team-a-dev"}
+	auth, fw := newMatrixAuthTest(t, h)
+	fw.userID = "@scoped-user:matrix.local"
+
+	id, err := auth.Authenticate(context.Background(), "matrix-token")
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if id.Username != "scoped-user" {
+		t.Fatalf("username=%q, want scoped-user", id.Username)
+	}
+	if len(id.Teams) != 1 || id.Teams[0] != "market-team" {
+		t.Fatalf("teams=%v, want [market-team]", id.Teams)
+	}
+	if len(id.AccessibleWorkers) != 0 {
+		t.Fatalf("accessibleWorkers=%v, want empty (L2 ignores accessibleWorkers)", id.AccessibleWorkers)
 	}
 }
 

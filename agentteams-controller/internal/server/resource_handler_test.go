@@ -1106,3 +1106,128 @@ func TestGetWorker_L2Scoped(t *testing.T) {
 		t.Fatalf("standalone worker status=%d, want 404 (W8: hide existence)", rec3.Code)
 	}
 }
+
+// TestGetWorker_L3Scoped guards single-worker fetch for L3 (worker-scoped)
+// humans: exactly the assigned workers are readable (team members and
+// standalone alike); everything else is hidden (404, W8).
+func TestGetWorker_L3Scoped(t *testing.T) {
+	scheme := newServerTestScheme(t)
+	alphaDev := &v1beta1.Worker{}
+	alphaDev.Name = "alpha-dev"
+	alphaDev.Namespace = "default"
+	betaDev := &v1beta1.Worker{}
+	betaDev.Name = "beta-dev"
+	betaDev.Namespace = "default"
+	solo := &v1beta1.Worker{}
+	solo.Name = "solo"
+	solo.Namespace = "default"
+
+	alpha := &v1beta1.Team{}
+	alpha.Name = "alpha-team"
+	alpha.Namespace = "default"
+	alpha.Spec.WorkerMembers = []v1beta1.TeamWorkerRef{{Name: "alpha-dev"}}
+	beta := &v1beta1.Team{}
+	beta.Name = "beta-team"
+	beta.Namespace = "default"
+	beta.Spec.WorkerMembers = []v1beta1.TeamWorkerRef{{Name: "beta-dev"}}
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(alphaDev, betaDev, solo, alpha, beta).Build()
+	handler := NewResourceHandler(k8sClient, "default", nil, "", nil)
+	l3 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "viewer", AccessibleWorkers: []string{"alpha-dev", "solo"}}
+
+	get := func(name string) int {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/workers/"+name, nil)
+		req.SetPathValue("name", name)
+		req = req.WithContext(context.WithValue(req.Context(), authpkg.CallerKeyForTest(), l3))
+		rec := httptest.NewRecorder()
+		handler.GetWorker(rec, req)
+		return rec.Code
+	}
+
+	// Assigned team member (of a team the human does NOT control) -> 200.
+	if code := get("alpha-dev"); code != http.StatusOK {
+		t.Fatalf("assigned team worker status=%d, want 200", code)
+	}
+	// Assigned standalone worker -> 200.
+	if code := get("solo"); code != http.StatusOK {
+		t.Fatalf("assigned standalone worker status=%d, want 200", code)
+	}
+	// Unassigned worker in an uncontrolled team -> 404 (hidden, W8).
+	if code := get("beta-dev"); code != http.StatusNotFound {
+		t.Fatalf("unassigned other-team worker status=%d, want 404 (W8)", code)
+	}
+}
+
+// TestListWorkers_L3Scoped guards list filtering: an L3 human sees exactly
+// its assigned workers (team + standalone), nothing else — no team-scope
+// leakage, no existence probe.
+func TestListWorkers_L3Scoped(t *testing.T) {
+	scheme := newServerTestScheme(t)
+	alphaDev := &v1beta1.Worker{}
+	alphaDev.Name = "alpha-dev"
+	alphaDev.Namespace = "default"
+	betaDev := &v1beta1.Worker{}
+	betaDev.Name = "beta-dev"
+	betaDev.Namespace = "default"
+	solo := &v1beta1.Worker{}
+	solo.Name = "solo"
+	solo.Namespace = "default"
+
+	alpha := &v1beta1.Team{}
+	alpha.Name = "alpha-team"
+	alpha.Namespace = "default"
+	alpha.Spec.WorkerMembers = []v1beta1.TeamWorkerRef{{Name: "alpha-dev"}}
+	beta := &v1beta1.Team{}
+	beta.Name = "beta-team"
+	beta.Namespace = "default"
+	beta.Spec.WorkerMembers = []v1beta1.TeamWorkerRef{{Name: "beta-dev"}}
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(alphaDev, betaDev, solo, alpha, beta).Build()
+	handler := NewResourceHandler(k8sClient, "default", nil, "", nil)
+	l3 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "viewer", AccessibleWorkers: []string{"beta-dev"}}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/workers", nil)
+	req = req.WithContext(context.WithValue(req.Context(), authpkg.CallerKeyForTest(), l3))
+	rec := httptest.NewRecorder()
+	handler.ListWorkers(rec, req)
+
+	var resp WorkerListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Total != 1 || len(resp.Workers) != 1 || resp.Workers[0].Name != "beta-dev" {
+		t.Fatalf("L3 workers=%+v, want exactly [beta-dev]", resp)
+	}
+}
+
+// TestUpdateWorker_L3Denied pins the read-only contract (Q2): even for a
+// worker the L3 human is assigned to, the update path stays denied. The
+// middleware (authorizer requireSameTeam) answers 403 first for team
+// workers; this handler-level probe pins the defense-in-depth fallback —
+// the handler's own team-scope check hides the worker as 404, assigned or
+// not, so no handler path can widen L3 into a writer.
+func TestUpdateWorker_L3Denied(t *testing.T) {
+	scheme := newServerTestScheme(t)
+	alphaDev := &v1beta1.Worker{}
+	alphaDev.Name = "alpha-dev"
+	alphaDev.Namespace = "default"
+	alpha := &v1beta1.Team{}
+	alpha.Name = "alpha-team"
+	alpha.Namespace = "default"
+	alpha.Spec.WorkerMembers = []v1beta1.TeamWorkerRef{{Name: "alpha-dev"}}
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(alphaDev, alpha).Build()
+	handler := NewResourceHandler(k8sClient, "default", nil, "", nil)
+	l3 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "viewer", AccessibleWorkers: []string{"alpha-dev"}}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/workers/alpha-dev", strings.NewReader(`{"skills":[]}`))
+	req.SetPathValue("name", "alpha-dev")
+	req = req.WithContext(context.WithValue(req.Context(), authpkg.CallerKeyForTest(), l3))
+	rec := httptest.NewRecorder()
+	handler.UpdateWorker(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("L3 update of an ASSIGNED worker status=%d, want 404 (read-only, W8)", rec.Code)
+	}
+}

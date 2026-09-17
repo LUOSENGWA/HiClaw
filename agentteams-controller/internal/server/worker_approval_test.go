@@ -704,3 +704,70 @@ func TestApprovalPut_NilConfigRejected(t *testing.T) {
 		t.Fatalf("upstream PUT called %d times, want 0 (no write-back of an empty object)", putCalls)
 	}
 }
+
+// TestApprovalGet_L3AssignedAllowed guards the L3 read leg: an L3
+// (worker-scoped) human may read the approval configuration of exactly its
+// assigned workers (team members and standalone alike).
+func TestApprovalGet_L3AssignedAllowed(t *testing.T) {
+	up := approvalUpstream(t, "SMART", nil)
+	defer up.Close()
+	objs := approvalTeamWithWorkers("market-team", "market-analyst")
+	objs = append(objs, approvalWorker("lone-worker"))
+	h := newTestApprovalHandler(t, "embedded", up, objs...)
+	l3 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "viewer", AccessibleWorkers: []string{"market-analyst", "lone-worker"}}
+
+	rec := httptest.NewRecorder()
+	req := withCaller(approvalRequest(http.MethodGet, "market-analyst", ""), l3)
+	h.getWorkerApproval(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("assigned team worker status=%d body=%s, want 200 for L3 read", rec.Code, rec.Body.String())
+	}
+
+	rec2 := httptest.NewRecorder()
+	req2 := withCaller(approvalRequest(http.MethodGet, "lone-worker", ""), l3)
+	h.getWorkerApproval(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("assigned standalone worker status=%d body=%s, want 200 for L3 read", rec2.Code, rec2.Body.String())
+	}
+}
+
+// TestApprovalGet_L3UnassignedHidden guards the W8 boundary for L3 reads:
+// unassigned workers stay hidden (404) — including workers of teams the
+// human does not control.
+func TestApprovalGet_L3UnassignedHidden(t *testing.T) {
+	up := approvalUpstream(t, "SMART", nil)
+	defer up.Close()
+	h := newTestApprovalHandler(t, "embedded", up,
+		approvalTeamWithWorkers("market-team", "market-analyst")...)
+	l3 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "viewer", AccessibleWorkers: []string{"someone-else"}}
+
+	rec := httptest.NewRecorder()
+	req := withCaller(approvalRequest(http.MethodGet, "market-analyst", ""), l3)
+	h.getWorkerApproval(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unassigned worker status=%d, want 404 (W8)", rec.Code)
+	}
+}
+
+// TestApprovalPut_L3Denied pins the read-only contract (Q2) at the handler
+// level: a PUT against an ASSIGNED worker still fails the strict team-scope
+// predicate (the middleware's ActionWorkerApproval path is handler-enforced;
+// L3 humans carry no teams, so they cannot approve at all).
+func TestApprovalPut_L3Denied(t *testing.T) {
+	var putBody []byte
+	up := approvalUpstream(t, "AUTO", &putBody)
+	defer up.Close()
+	h := newTestApprovalHandler(t, "embedded", up,
+		approvalTeamWithWorkers("market-team", "market-analyst")...)
+	l3 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "viewer", AccessibleWorkers: []string{"market-analyst"}}
+
+	rec := httptest.NewRecorder()
+	req := withCaller(approvalRequest(http.MethodPut, "market-analyst", `{"approval_level":"STRICT"}`), l3)
+	h.updateWorkerApproval(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("L3 PUT of an ASSIGNED worker status=%d, want 404 (read-only)", rec.Code)
+	}
+	if len(putBody) != 0 {
+		t.Fatal("upstream PUT must not be called for an L3 mutation")
+	}
+}
