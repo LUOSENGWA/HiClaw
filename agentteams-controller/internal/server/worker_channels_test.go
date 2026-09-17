@@ -1177,7 +1177,8 @@ const l3SanitizeDoc = `{
   "matrix":{"enabled":true,"homeserver":"https://matrix.example.com","bot_token":"SENTINEL-matrix-bot-token","require_mention":false},
   "feishu":{"enabled":true,"app_id":"fs-app-1","app_secret":"SENTINEL-feishu-app-secret","encrypt_key":"SENTINEL-feishu-encrypt-key","verification_token":"SENTINEL-feishu-verification-token"},
   "voice": {"enabled":true,"twilio_auth_token":"SENTINEL-voice-twilio-auth-token","livekit_api_key":"SENTINEL-voice-livekit-api-key","livekit_api_secret":"SENTINEL-voice-livekit-api-secret"},
-  "dingtalk":{"enabled":true,"client_id":"dt-client-1","app_token":"SENTINEL-dingtalk-app-token"}
+  "dingtalk":{"enabled":true,"client_id":"dt-client-1","app_token":"SENTINEL-dingtalk-app-token"},
+  "discord":{"enabled":true,"http_proxy_auth":"SENTINEL-discord-http-proxy-auth"}
 }`
 
 func l3Sentinels() []string {
@@ -1191,6 +1192,7 @@ func l3Sentinels() []string {
 		"SENTINEL-voice-livekit-api-key",
 		"SENTINEL-voice-livekit-api-secret",
 		"SENTINEL-dingtalk-app-token",
+		"SENTINEL-discord-http-proxy-auth",
 	}
 }
 
@@ -1225,12 +1227,12 @@ func TestChannelsL3ReadsSanitizeCredentials(t *testing.T) {
 	}
 	body := rec.Body.String()
 	l3NoSentinels(t, "L3 aggregate", body)
-	for _, field := range []string{`"qq-app-1"`, `"https://matrix.example.com"`, `"fs-app-1"`, `"dt-client-1"`, `"markdown_enabled":true`} {
+	for _, field := range []string{`"qq-app-1"`, `"https://matrix.example.com"`, `"fs-app-1"`, `"dt-client-1"`, `"markdown_enabled":true`, `"discord"`} {
 		if !strings.Contains(body, field) {
 			t.Fatalf("L3 aggregate: normal field %s lost: %s", field, body)
 		}
 	}
-	for _, key := range []string{`"client_secret"`, `"bot_token"`, `"app_secret"`, `"encrypt_key"`, `"verification_token"`, `"twilio_auth_token"`, `"livekit_api_key"`, `"livekit_api_secret"`, `"app_token"`} {
+	for _, key := range []string{`"client_secret"`, `"bot_token"`, `"app_secret"`, `"encrypt_key"`, `"verification_token"`, `"twilio_auth_token"`, `"livekit_api_key"`, `"livekit_api_secret"`, `"app_token"`, `"http_proxy_auth"`} {
 		if strings.Contains(body, key) {
 			t.Fatalf("L3 aggregate: credential key %s not stripped: %s", key, body)
 		}
@@ -1251,6 +1253,26 @@ func TestChannelsL3ReadsSanitizeCredentials(t *testing.T) {
 	}
 	if strings.Contains(body2, `"client_secret"`) {
 		t.Fatalf("L3 single: credential key not stripped: %s", body2)
+	}
+
+	// Single-channel read of the proxy-credential channel (L3): the
+	// qwenpaw 2.2.1 Discord/Telegram channel models carry the proxy
+	// "user:password" pair in http_proxy_auth — it must be stripped like
+	// every other credential.
+	rec2b := httptest.NewRecorder()
+	req2b := channelsRequest(http.MethodGet, "/api/v1/workers/placeholder/channels/discord", "", "name", "team-a-dev", "sub", "discord")
+	req2b = withCaller(req2b, l3)
+	h.getChannelResource(rec2b, req2b)
+	if rec2b.Code != http.StatusOK {
+		t.Fatalf("L3 single discord read status=%d, want 200", rec2b.Code)
+	}
+	body2b := rec2b.Body.String()
+	l3NoSentinels(t, "L3 single-discord", body2b)
+	if strings.Contains(body2b, `"http_proxy_auth"`) {
+		t.Fatalf("L3 single: http_proxy_auth not stripped: %s", body2b)
+	}
+	if !strings.Contains(body2b, `"enabled":true`) {
+		t.Fatalf("L3 single discord: normal field lost: %s", body2b)
 	}
 
 	// L2 read: the round-trip contract is untouched (sentinels visible).
