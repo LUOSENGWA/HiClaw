@@ -72,7 +72,10 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	mux.Handle("GET /api/v1/version", mw.Authenticate(http.HandlerFunc(sh.Version)))
 
 	// --- Declarative resource CRUD ---
-	rh := NewResourceHandler(deps.Client, deps.Namespace, deps.Backend, deps.ControllerName, audit.NewClient(deps.OSS)).WithOSS(deps.OSS)
+	// One shared audit client: resource mutations (human updates, capability
+	// changes) and approval OFF transitions append to the same durable trail.
+	auditClient := audit.NewClient(deps.OSS)
+	rh := NewResourceHandler(deps.Client, deps.Namespace, deps.Backend, deps.ControllerName, auditClient).WithOSS(deps.OSS)
 	rh.defaultWorkerRuntime = deps.DefaultWorkerRuntime
 	nameFn := authpkg.NameFromPath
 
@@ -166,7 +169,7 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	mux.Handle("PUT /api/v1/workers/{name}/skills/{skill_name}/preload", mw.RequireAuthz(authpkg.ActionWorkerSkillPreload, "worker", nameFn)(http.HandlerFunc(wskh.putWorkerSkillPreload)))
 
 	// --- Worker tool approval (team-scoped; proxy to the worker's qwenpaw app) ---
-	ah := NewApprovalHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix)
+	ah := NewApprovalHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix, auditClient)
 	mux.Handle("GET /api/v1/workers/{name}/approval", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(ah.getWorkerApproval)))
 	mux.Handle("PUT /api/v1/workers/{name}/approval", mw.RequireAuthz(authpkg.ActionWorkerApproval, "worker", nameFn)(http.HandlerFunc(ah.updateWorkerApproval)))
 
