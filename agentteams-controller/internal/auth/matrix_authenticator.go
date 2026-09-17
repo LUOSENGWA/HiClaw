@@ -14,7 +14,7 @@ import (
 )
 
 // MatrixWhoami validates a Matrix access token and returns the owning user id
-// (e.g. "@maizong:matrix.local"). Implemented by the tuwunel client.
+// (e.g. "@alice:matrix.local"). Implemented by the tuwunel client.
 type MatrixWhoami interface {
 	Whoami(ctx context.Context, accessToken string) (userID string, err error)
 }
@@ -163,7 +163,7 @@ func (a *MatrixTokenAuthenticator) putToCache(key [32]byte, identity *CallerIden
 }
 
 // localpartFromUserID extracts the localpart from a Matrix user id
-// ("@maizong:matrix.local" → "maizong").
+// ("@alice:matrix.local" → "alice").
 func localpartFromUserID(userID string) string {
 	if !strings.HasPrefix(userID, "@") {
 		return ""

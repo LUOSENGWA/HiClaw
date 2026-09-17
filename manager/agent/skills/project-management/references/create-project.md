@@ -42,7 +42,7 @@ bash /opt/agentteams/agent/skills/project-management/scripts/create-project.sh \
   --id "${PROJECT_ID}" \
   --title "<title>" \
   --workers "worker1,worker2,worker3" \
-  --grant-admin "sunzong"
+  --grant-admin "bob"
 ```
 
 Each user listed in `--grant-admin` co-owns the project room (power level 100) from creation. Only pass humans who genuinely need room administration; workers are always created at level 0. The granted humans are **also added to the Manager's project-room allowlists** (`groupAllowFrom` / `group_allow_from`) alongside the workers — without this, their `@manager` messages in the project room are silently dropped in allowlist mode.

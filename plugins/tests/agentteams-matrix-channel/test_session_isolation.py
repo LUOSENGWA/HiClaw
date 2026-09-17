@@ -45,7 +45,7 @@ AgentTeamsMatrixChannel = channel_module.AgentTeamsMatrixChannel
 
 ROOM = "!roomid:matrix.local"
 LEADER = "@sysdev-lead:matrix.local"
-HUMAN = "@luo:matrix.local"
+HUMAN = "@carol:matrix.local"
 
 
 def _make_channel(**overrides):

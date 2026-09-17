@@ -118,7 +118,7 @@ func TestApprovalGet_InScopeL2Human(t *testing.T) {
 	h := newTestApprovalHandler(t, "embedded", up,
 		approvalTeamWithWorkers("market-team", "market-analyst")...)
 	req := withCaller(approvalRequest(http.MethodGet, "market-analyst", ""),
-		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "scoped-user", Teams: []string{"market-team"}})
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
 	rec := httptest.NewRecorder()
 	h.getWorkerApproval(rec, req)
 
@@ -136,7 +136,7 @@ func TestApprovalGet_CrossTeamHidden(t *testing.T) {
 	h := newTestApprovalHandler(t, "embedded", up,
 		approvalTeamWithWorkers("market-team", "market-analyst")...)
 	req := withCaller(approvalRequest(http.MethodGet, "market-analyst", ""),
-		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "sunzong", Teams: []string{"biz-team"}})
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "bob", Teams: []string{"biz-team"}})
 	rec := httptest.NewRecorder()
 	h.getWorkerApproval(rec, req)
 	if rec.Code != http.StatusNotFound {
@@ -163,7 +163,7 @@ func TestApprovalGet_StandaloneHiddenFromScoped(t *testing.T) {
 	defer up.Close()
 	h := newTestApprovalHandler(t, "embedded", up, approvalWorker("lone-worker"))
 	req := withCaller(approvalRequest(http.MethodGet, "lone-worker", ""),
-		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "scoped-user", Teams: []string{"market-team"}})
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
 	rec := httptest.NewRecorder()
 	h.getWorkerApproval(rec, req)
 	if rec.Code != http.StatusNotFound {
@@ -239,7 +239,7 @@ func TestApprovalPut_InScopeL2Human(t *testing.T) {
 	h := newTestApprovalHandler(t, "embedded", up,
 		approvalTeamWithWorkers("market-team", "market-analyst")...)
 	req := withCaller(approvalRequest(http.MethodPut, "market-analyst", `{"approval_level":"STRICT"}`),
-		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "scoped-user", Teams: []string{"market-team"}})
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
 	rec := httptest.NewRecorder()
 	h.updateWorkerApproval(rec, req)
 
@@ -286,7 +286,7 @@ func TestApprovalPut_CrossTeamHidden(t *testing.T) {
 	h := newTestApprovalHandler(t, "embedded", up,
 		approvalTeamWithWorkers("market-team", "market-analyst")...)
 	req := withCaller(approvalRequest(http.MethodPut, "market-analyst", `{"approval_level":"OFF"}`),
-		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "sunzong", Teams: []string{"biz-team"}})
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "bob", Teams: []string{"biz-team"}})
 	rec := httptest.NewRecorder()
 	h.updateWorkerApproval(rec, req)
 	if rec.Code != http.StatusNotFound {
@@ -337,7 +337,7 @@ func TestApprovalPut_InvalidLevelRejected(t *testing.T) {
 		approvalTeamWithWorkers("market-team", "market-analyst")...)
 	for _, level := range []string{"strict", "YOLO", "", "Auto"} {
 		req := withCaller(approvalRequest(http.MethodPut, "market-analyst", `{"approval_level":`+jsonQuote(level)+`}`),
-			&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "scoped-user", Teams: []string{"market-team"}})
+			&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
 		rec := httptest.NewRecorder()
 		h.updateWorkerApproval(rec, req)
 		if rec.Code != http.StatusBadRequest {
@@ -420,7 +420,7 @@ func TestApprovalPut_OffDeniedForL2Human(t *testing.T) {
 		approvalTeamWithWorkers("market-team", "market-analyst")...)
 
 	req := withCaller(approvalRequest(http.MethodPut, "market-analyst", `{"approval_level":"OFF"}`),
-		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "scoped-user", Teams: []string{"market-team"}})
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
 	rec := httptest.NewRecorder()
 	h.updateWorkerApproval(rec, req)
 	if rec.Code != http.StatusForbidden {
@@ -446,7 +446,7 @@ func TestApprovalPut_OffDeniedForL2Human(t *testing.T) {
 	rec3 := httptest.NewRecorder()
 	h2.updateWorkerApproval(rec3, withCaller(
 		approvalRequest(http.MethodPut, "market-analyst", `{"approval_level":"STRICT"}`),
-		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "scoped-user", Teams: []string{"market-team"}}))
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}}))
 	if rec3.Code != http.StatusOK {
 		t.Fatalf("L2 guarded-level status=%d, want 200", rec3.Code)
 	}
@@ -662,7 +662,7 @@ func TestApprovalPut_RoundTripLargeConfig(t *testing.T) {
 	h := newTestApprovalHandler(t, "embedded", up,
 		approvalTeamWithWorkers("market-team", "market-analyst")...)
 	req := withCaller(approvalRequest(http.MethodPut, "market-analyst", `{"approval_level":"STRICT"}`),
-		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "scoped-user", Teams: []string{"market-team"}})
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
 	rec := httptest.NewRecorder()
 	h.updateWorkerApproval(rec, req)
 	if rec.Code != http.StatusOK {

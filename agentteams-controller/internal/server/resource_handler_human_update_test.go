@@ -27,10 +27,10 @@ func newHumanUpdateRig(t *testing.T) *ResourceHandler {
 	team := &v1beta1.Team{ObjectMeta: metav1.ObjectMeta{Name: "market-team", Namespace: "default"}}
 	worker := &v1beta1.Worker{ObjectMeta: metav1.ObjectMeta{Name: "market-dev", Namespace: "default"}}
 	human := &v1beta1.Human{
-		ObjectMeta: metav1.ObjectMeta{Name: "maizong", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "alice", Namespace: "default"},
 		Spec: v1beta1.HumanSpec{
-			DisplayName:     "Mai",
-			Email:           "maizong@example.com",
+			DisplayName:     "Alice",
+			Email:           "alice@example.com",
 			PermissionLevel: 2,
 			AccessibleTeams: []string{"market-team"},
 		},
@@ -50,7 +50,7 @@ func putHuman(t *testing.T, handler *ResourceHandler, name, body string) *httpte
 
 func TestUpdateHuman_LevelAndTeamsApplied(t *testing.T) {
 	handler := newHumanUpdateRig(t)
-	rec := putHuman(t, handler, "maizong", `{"permissionLevel":1,"accessibleTeams":["market-team"],"displayName":"Mai Zong"}`)
+	rec := putHuman(t, handler, "alice", `{"permissionLevel":1,"accessibleTeams":["market-team"],"displayName":"Alice"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -61,18 +61,18 @@ func TestUpdateHuman_LevelAndTeamsApplied(t *testing.T) {
 	if resp.PermissionLevel != 1 {
 		t.Errorf("level = %d, want 1", resp.PermissionLevel)
 	}
-	if resp.DisplayName != "Mai Zong" {
+	if resp.DisplayName != "Alice" {
 		t.Errorf("displayName = %q", resp.DisplayName)
 	}
 	// Untouched field preserved.
-	if resp.Email != "maizong@example.com" {
+	if resp.Email != "alice@example.com" {
 		t.Errorf("email changed: %q", resp.Email)
 	}
 }
 
 func TestUpdateHuman_PartialMergePreservesOthers(t *testing.T) {
 	handler := newHumanUpdateRig(t)
-	rec := putHuman(t, handler, "maizong", `{"note":"onboarding done"}`)
+	rec := putHuman(t, handler, "alice", `{"note":"onboarding done"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -90,7 +90,7 @@ func TestUpdateHuman_PartialMergePreservesOthers(t *testing.T) {
 
 func TestUpdateHuman_ClearsListWithEmptyArray(t *testing.T) {
 	handler := newHumanUpdateRig(t)
-	rec := putHuman(t, handler, "maizong", `{"accessibleTeams":[]}`)
+	rec := putHuman(t, handler, "alice", `{"accessibleTeams":[]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -107,7 +107,7 @@ func TestUpdateHuman_CapabilitiesApplied(t *testing.T) {
 	handler := newHumanUpdateRig(t)
 	// Unordered + duplicated input must land deduped and sorted; other
 	// fields untouched.
-	rec := putHuman(t, handler, "maizong", `{"capabilities":["channel_secrets","approval_policy","channel_secrets"]}`)
+	rec := putHuman(t, handler, "alice", `{"capabilities":["channel_secrets","approval_policy","channel_secrets"]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -122,18 +122,18 @@ func TestUpdateHuman_CapabilitiesApplied(t *testing.T) {
 	if len(resp.AccessibleTeams) != 1 || resp.AccessibleTeams[0] != "market-team" {
 		t.Errorf("capabilities grant clobbered accessibleTeams: %v", resp.AccessibleTeams)
 	}
-	if resp.Email != "maizong@example.com" {
+	if resp.Email != "alice@example.com" {
 		t.Errorf("capabilities grant clobbered email: %q", resp.Email)
 	}
 }
 
 func TestUpdateHuman_CapabilitiesOmittedPreserved(t *testing.T) {
 	handler := newHumanUpdateRig(t)
-	if rec := putHuman(t, handler, "maizong", `{"capabilities":["secret_reveal"]}`); rec.Code != http.StatusOK {
+	if rec := putHuman(t, handler, "alice", `{"capabilities":["secret_reveal"]}`); rec.Code != http.StatusOK {
 		t.Fatalf("prime: expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	// A later update that omits capabilities must not clear them.
-	rec := putHuman(t, handler, "maizong", `{"note":"no capability change"}`)
+	rec := putHuman(t, handler, "alice", `{"note":"no capability change"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -148,10 +148,10 @@ func TestUpdateHuman_CapabilitiesOmittedPreserved(t *testing.T) {
 
 func TestUpdateHuman_CapabilitiesClearedWithEmptyArray(t *testing.T) {
 	handler := newHumanUpdateRig(t)
-	if rec := putHuman(t, handler, "maizong", `{"capabilities":["full_access"]}`); rec.Code != http.StatusOK {
+	if rec := putHuman(t, handler, "alice", `{"capabilities":["full_access"]}`); rec.Code != http.StatusOK {
 		t.Fatalf("prime: expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	rec := putHuman(t, handler, "maizong", `{"capabilities":[]}`)
+	rec := putHuman(t, handler, "alice", `{"capabilities":[]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -166,7 +166,7 @@ func TestUpdateHuman_CapabilitiesClearedWithEmptyArray(t *testing.T) {
 
 func TestUpdateHuman_UnknownCapabilityRejected(t *testing.T) {
 	handler := newHumanUpdateRig(t)
-	rec := putHuman(t, handler, "maizong", `{"capabilities":["skill_publish"]}`)
+	rec := putHuman(t, handler, "alice", `{"capabilities":["skill_publish"]}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -175,7 +175,7 @@ func TestUpdateHuman_UnknownCapabilityRejected(t *testing.T) {
 		t.Errorf("error should name the unknown value and list the valid set: %s", body)
 	}
 	// The rejected update must not persist.
-	rec = putHuman(t, handler, "maizong", `{"note":"noop"}`)
+	rec = putHuman(t, handler, "alice", `{"note":"noop"}`)
 	var resp HumanResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -192,9 +192,9 @@ func TestUpdateHuman_CapabilityChangeIsAudited(t *testing.T) {
 	scheme := newServerTestScheme(t)
 	team := &v1beta1.Team{ObjectMeta: metav1.ObjectMeta{Name: "market-team", Namespace: "default"}}
 	human := &v1beta1.Human{
-		ObjectMeta: metav1.ObjectMeta{Name: "maizong", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "alice", Namespace: "default"},
 		Spec: v1beta1.HumanSpec{
-			DisplayName:     "Mai",
+			DisplayName:     "Alice",
 			PermissionLevel: 2,
 			AccessibleTeams: []string{"market-team"},
 		},
@@ -207,9 +207,9 @@ func TestUpdateHuman_CapabilityChangeIsAudited(t *testing.T) {
 		&authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
 
 	put := func(body string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPut, "/api/v1/humans/maizong", bytes.NewReader([]byte(body)))
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/humans/alice", bytes.NewReader([]byte(body)))
 		req = req.WithContext(adminCtx)
-		req.SetPathValue("name", "maizong")
+		req.SetPathValue("name", "alice")
 		rec := httptest.NewRecorder()
 		handler.UpdateHuman(rec, req)
 		return rec
@@ -241,7 +241,7 @@ func TestUpdateHuman_CapabilityChangeIsAudited(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &ev); err != nil {
 		t.Fatalf("line 1 parse: %v", err)
 	}
-	if ev.Who != "admin" || ev.Role != "admin" || ev.Target != "maizong" || ev.Action != "capability_grant" || ev.Capability != "approval_policy" {
+	if ev.Who != "admin" || ev.Role != "admin" || ev.Target != "alice" || ev.Action != "capability_grant" || ev.Capability != "approval_policy" {
 		t.Fatalf("line 1 = %+v", ev)
 	}
 	if err := json.Unmarshal([]byte(lines[1]), &ev); err != nil {
@@ -261,7 +261,7 @@ func TestUpdateHuman_CapabilityChangeIsAudited(t *testing.T) {
 func TestUpdateHuman_InvalidLevelRejected(t *testing.T) {
 	handler := newHumanUpdateRig(t)
 	for _, level := range []string{"0", "4", "-1"} {
-		rec := putHuman(t, handler, "maizong", `{"permissionLevel":`+level+`}`)
+		rec := putHuman(t, handler, "alice", `{"permissionLevel":`+level+`}`)
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("level %s: expected 400, got %d: %s", level, rec.Code, rec.Body.String())
 		}
@@ -270,7 +270,7 @@ func TestUpdateHuman_InvalidLevelRejected(t *testing.T) {
 
 func TestUpdateHuman_MissingTeamRejected(t *testing.T) {
 	handler := newHumanUpdateRig(t)
-	rec := putHuman(t, handler, "maizong", `{"accessibleTeams":["ghost-team"]}`)
+	rec := putHuman(t, handler, "alice", `{"accessibleTeams":["ghost-team"]}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -281,7 +281,7 @@ func TestUpdateHuman_MissingTeamRejected(t *testing.T) {
 
 func TestUpdateHuman_MissingWorkerRejected(t *testing.T) {
 	handler := newHumanUpdateRig(t)
-	rec := putHuman(t, handler, "maizong", `{"accessibleWorkers":["ghost-dev"]}`)
+	rec := putHuman(t, handler, "alice", `{"accessibleWorkers":["ghost-dev"]}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -292,7 +292,7 @@ func TestUpdateHuman_MissingWorkerRejected(t *testing.T) {
 
 func TestUpdateHuman_ExistingWorkerAllowed(t *testing.T) {
 	handler := newHumanUpdateRig(t)
-	rec := putHuman(t, handler, "maizong", `{"accessibleWorkers":["market-dev"]}`)
+	rec := putHuman(t, handler, "alice", `{"accessibleWorkers":["market-dev"]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -310,7 +310,7 @@ func TestUpdateHuman_NotFound(t *testing.T) {
 // request — the request itself may be perfectly valid.
 func TestUpdateHuman_TeamListFailureIsServerError(t *testing.T) {
 	scheme := newServerTestScheme(t)
-	human := &v1beta1.Human{ObjectMeta: metav1.ObjectMeta{Name: "maizong", Namespace: "default"}}
+	human := &v1beta1.Human{ObjectMeta: metav1.ObjectMeta{Name: "alice", Namespace: "default"}}
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(human).
@@ -321,7 +321,7 @@ func TestUpdateHuman_TeamListFailureIsServerError(t *testing.T) {
 		}).
 		Build()
 	handler := NewResourceHandler(k8sClient, "default", nil, "", nil)
-	rec := putHuman(t, handler, "maizong", `{"accessibleTeams":["market-team"]}`)
+	rec := putHuman(t, handler, "alice", `{"accessibleTeams":["market-team"]}`)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 for backend list failure, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -333,7 +333,7 @@ func TestUpdateHuman_TeamListFailureIsServerError(t *testing.T) {
 // Same for a Worker Get that fails with a non-NotFound backend error.
 func TestUpdateHuman_WorkerGetFailureIsServerError(t *testing.T) {
 	scheme := newServerTestScheme(t)
-	human := &v1beta1.Human{ObjectMeta: metav1.ObjectMeta{Name: "maizong", Namespace: "default"}}
+	human := &v1beta1.Human{ObjectMeta: metav1.ObjectMeta{Name: "alice", Namespace: "default"}}
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(human).
@@ -347,7 +347,7 @@ func TestUpdateHuman_WorkerGetFailureIsServerError(t *testing.T) {
 		}).
 		Build()
 	handler := NewResourceHandler(k8sClient, "default", nil, "", nil)
-	rec := putHuman(t, handler, "maizong", `{"accessibleWorkers":["market-dev"]}`)
+	rec := putHuman(t, handler, "alice", `{"accessibleWorkers":["market-dev"]}`)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 for backend get failure, got %d: %s", rec.Code, rec.Body.String())
 	}

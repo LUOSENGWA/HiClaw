@@ -208,7 +208,7 @@ func simpleUpstream(t *testing.T, code int, body string) *httptest.Server {
 }
 
 func luoL2Human() *authpkg.CallerIdentity {
-	return &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"market-team"}}
+	return &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}}
 }
 
 func luoAdmin() *authpkg.CallerIdentity {

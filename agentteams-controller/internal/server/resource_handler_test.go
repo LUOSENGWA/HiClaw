@@ -937,7 +937,7 @@ func TestListTeams_L2Scoped(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/teams", nil)
 	req = req.WithContext(context.WithValue(req.Context(), authpkg.CallerKeyForTest(), &authpkg.CallerIdentity{
-		Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"},
+		Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team"},
 	}))
 	rec := httptest.NewRecorder()
 	handler.ListTeams(rec, req)
@@ -992,7 +992,7 @@ func TestListWorkers_L2Scoped(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/workers", nil)
 	req = req.WithContext(context.WithValue(req.Context(), authpkg.CallerKeyForTest(), &authpkg.CallerIdentity{
-		Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"},
+		Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team"},
 	}))
 	rec := httptest.NewRecorder()
 	handler.ListWorkers(rec, req)
@@ -1026,7 +1026,7 @@ func TestGetTeam_L2Scoped(t *testing.T) {
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(alpha, beta).Build()
 	handler := NewResourceHandler(k8sClient, "default", nil, "", nil)
-	l2 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"}}
+	l2 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team"}}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/teams/alpha-team", nil)
 	req.SetPathValue("name", "alpha-team")
@@ -1074,7 +1074,7 @@ func TestGetWorker_L2Scoped(t *testing.T) {
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithObjects(alphaLead, betaDev, solo, alpha, beta).Build()
 	handler := NewResourceHandler(k8sClient, "default", nil, "", nil)
-	l2 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"}}
+	l2 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team"}}
 
 	// Own team worker -> 200.
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/workers/alpha-lead", nil)

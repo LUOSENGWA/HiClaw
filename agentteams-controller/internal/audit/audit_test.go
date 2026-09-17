@@ -26,7 +26,7 @@ func sampleEvent() Event {
 		Who:        "admin",
 		Role:       "admin",
 		When:       time.Date(2026, 9, 12, 8, 0, 0, 0, time.UTC),
-		Target:     "maizong",
+		Target:     "alice",
 		Action:     "capability_grant",
 		Capability: "approval_policy",
 		After:      []string{"approval_policy"},
@@ -51,7 +51,7 @@ func TestRecordCreatesObjectAndWritesParseableLine(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &got); err != nil {
 		t.Fatalf("line not parseable: %v", err)
 	}
-	if got.Who != "admin" || got.Role != "admin" || got.Target != "maizong" ||
+	if got.Who != "admin" || got.Role != "admin" || got.Target != "alice" ||
 		got.Action != "capability_grant" || got.Capability != "approval_policy" ||
 		len(got.After) != 1 || got.After[0] != "approval_policy" {
 		t.Fatalf("fields incomplete or wrong: %+v", got)
@@ -251,7 +251,7 @@ func TestEventJSONHasClosedSchema(t *testing.T) {
 	ev := Event{
 		Who: "admin", Role: "admin",
 		When:       time.Date(2026, 9, 12, 8, 0, 0, 0, time.UTC),
-		Target:     "maizong",
+		Target:     "alice",
 		TargetTeam: "market-team",
 		Action:     "capability_grant",
 		Capability: "approval_policy",

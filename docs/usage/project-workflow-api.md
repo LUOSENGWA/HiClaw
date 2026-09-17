@@ -668,7 +668,7 @@ Request body:
 {
   "title": "New project",
   "source": "matrix",
-  "requester": "@luo:server",
+  "requester": "@carol:server",
   "team_id": "biz-team",
   "project_id": "optional-custom-id",
   "source_room_id": "!room:server"

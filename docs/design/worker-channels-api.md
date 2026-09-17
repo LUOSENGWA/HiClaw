@@ -128,14 +128,14 @@ Mutating calls are audit-logged (`worker`, `upstream`, `actor`,
 ## Example
 
 ```bash
-# Connect a QQ channel to daily-luo (L1 admin, cli token)
-curl -s -X PUT http://127.0.0.1:8090/api/v1/workers/daily-luo/channels/qq \
+# Connect a QQ channel to daily-carol (L1 admin, cli token)
+curl -s -X PUT http://127.0.0.1:8090/api/v1/workers/daily-carol/channels/qq \
   -H "Authorization: Bearer $AGENTTEAMS_TOKEN" -H "Content-Type: application/json" \
   -d '{"enabled":true,"app_id":"1904153419","client_secret":"***","markdown_enabled":true}'
 # → 200 {"enabled":true,...}  X-AgentTeams-MinIO-Persisted: pending
 
 # L2 user's form: fetch schemas, render, save
-curl -s http://127.0.0.1:8090/api/v1/workers/daily-luo/channels/schemas \
+curl -s http://127.0.0.1:8090/api/v1/workers/daily-carol/channels/schemas \
   -H "Authorization: Bearer $MATRIX_TOKEN"
 ```
 

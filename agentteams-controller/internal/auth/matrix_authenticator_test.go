@@ -52,10 +52,10 @@ func newMatrixAuthTest(t *testing.T, humans ...*v1beta1.Human) (*MatrixTokenAuth
 
 func TestMatrixAuthenticator_ResolvesL2Human(t *testing.T) {
 	auth, fw := newMatrixAuthTest(t,
-		newHuman("maizong", "maizong", 2, "market-team"),
-		newHuman("sunzong", "sunzong", 2, "biz-team", "sysdev-team"),
+		newHuman("alice", "alice", 2, "market-team"),
+		newHuman("bob", "bob", 2, "biz-team", "sysdev-team"),
 	)
-	fw.userID = "@sunzong:matrix.local"
+	fw.userID = "@bob:matrix.local"
 
 	id, err := auth.Authenticate(context.Background(), "matrix-token")
 	if err != nil {
@@ -64,8 +64,8 @@ func TestMatrixAuthenticator_ResolvesL2Human(t *testing.T) {
 	if id.Role != RoleHuman {
 		t.Fatalf("role=%q, want human (read-only L2, not team-leader)", id.Role)
 	}
-	if id.Username != "sunzong" {
-		t.Fatalf("username=%q, want sunzong", id.Username)
+	if id.Username != "bob" {
+		t.Fatalf("username=%q, want bob", id.Username)
 	}
 	if len(id.Teams) != 2 || id.Teams[0] != "biz-team" || id.Teams[1] != "sysdev-team" {
 		t.Fatalf("teams=%v, want [biz-team sysdev-team]", id.Teams)
@@ -73,10 +73,10 @@ func TestMatrixAuthenticator_ResolvesL2Human(t *testing.T) {
 }
 
 func TestMatrixAuthenticator_L2HumanCarriesCapabilities(t *testing.T) {
-	h := newHuman("maizong", "maizong", 2, "market-team")
+	h := newHuman("alice", "alice", 2, "market-team")
 	h.Spec.Capabilities = []string{"approval_policy", "channel_secrets"}
 	auth, fw := newMatrixAuthTest(t, h)
-	fw.userID = "@maizong:matrix.local"
+	fw.userID = "@alice:matrix.local"
 
 	id, err := auth.Authenticate(context.Background(), "matrix-token")
 	if err != nil {
@@ -94,8 +94,8 @@ func TestMatrixAuthenticator_L2HumanCarriesCapabilities(t *testing.T) {
 }
 
 func TestMatrixAuthenticator_HumanWithoutCapabilitiesHasEmptySet(t *testing.T) {
-	auth, fw := newMatrixAuthTest(t, newHuman("maizong", "maizong", 2, "market-team"))
-	fw.userID = "@maizong:matrix.local"
+	auth, fw := newMatrixAuthTest(t, newHuman("alice", "alice", 2, "market-team"))
+	fw.userID = "@alice:matrix.local"
 
 	id, err := auth.Authenticate(context.Background(), "matrix-token")
 	if err != nil {
@@ -112,7 +112,7 @@ func TestMatrixAuthenticator_HumanWithoutCapabilitiesHasEmptySet(t *testing.T) {
 }
 
 func TestMatrixAuthenticator_UnknownUserDenied(t *testing.T) {
-	auth, fw := newMatrixAuthTest(t, newHuman("maizong", "maizong", 2, "market-team"))
+	auth, fw := newMatrixAuthTest(t, newHuman("alice", "alice", 2, "market-team"))
 	fw.userID = "@stranger:matrix.local"
 
 	if _, err := auth.Authenticate(context.Background(), "matrix-token"); err == nil {
@@ -123,8 +123,8 @@ func TestMatrixAuthenticator_UnknownUserDenied(t *testing.T) {
 }
 
 func TestMatrixAuthenticator_NonL2Denied(t *testing.T) {
-	auth, fw := newMatrixAuthTest(t, newHuman("luo", "luo", 1))
-	fw.userID = "@luo:matrix.local"
+	auth, fw := newMatrixAuthTest(t, newHuman("carol", "carol", 1))
+	fw.userID = "@carol:matrix.local"
 
 	if _, err := auth.Authenticate(context.Background(), "matrix-token"); err == nil {
 		t.Fatal("expected error for level-1 human")
@@ -134,7 +134,7 @@ func TestMatrixAuthenticator_NonL2Denied(t *testing.T) {
 }
 
 func TestMatrixAuthenticator_WhoamiFailure(t *testing.T) {
-	auth, fw := newMatrixAuthTest(t, newHuman("maizong", "maizong", 2, "market-team"))
+	auth, fw := newMatrixAuthTest(t, newHuman("alice", "alice", 2, "market-team"))
 	fw.err = errors.New("matrix down")
 
 	if _, err := auth.Authenticate(context.Background(), "matrix-token"); err == nil {
@@ -143,8 +143,8 @@ func TestMatrixAuthenticator_WhoamiFailure(t *testing.T) {
 }
 
 func TestCompositeAuthenticator_FallsBackToMatrix(t *testing.T) {
-	matrixAuth, fw := newMatrixAuthTest(t, newHuman("maizong", "maizong", 2, "market-team"))
-	fw.userID = "@maizong:matrix.local"
+	matrixAuth, fw := newMatrixAuthTest(t, newHuman("alice", "alice", 2, "market-team"))
+	fw.userID = "@alice:matrix.local"
 
 	// First authenticator always fails (e.g. SA TokenReview rejecting a
 	// Matrix token); the composite must fall through to the Matrix path.
@@ -155,8 +155,8 @@ func TestCompositeAuthenticator_FallsBackToMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("composite authenticate: %v", err)
 	}
-	if id.Username != "maizong" || len(id.Teams) != 1 || id.Teams[0] != "market-team" {
-		t.Fatalf("identity=%+v, want maizong/market-team", id)
+	if id.Username != "alice" || len(id.Teams) != 1 || id.Teams[0] != "market-team" {
+		t.Fatalf("identity=%+v, want alice/market-team", id)
 	}
 }
 
@@ -178,7 +178,7 @@ func TestCompositeAuthenticator_AllFail(t *testing.T) {
 // differ from spec.username (deterministic hash of issuer+subject), so
 // matching must use the authoritative Matrix user id.
 func TestMatrixAuthenticator_SSOHumanMatchesMatrixUserID(t *testing.T) {
-	sso := newHuman("maizong", "maizong", 2, "market-team")
+	sso := newHuman("alice", "alice", 2, "market-team")
 	sso.Status.MatrixUserID = "@3f9a2b:matrix.local" // derived from issuer+subject hash
 	auth, fw := newMatrixAuthTest(t, sso)
 
@@ -188,14 +188,14 @@ func TestMatrixAuthenticator_SSOHumanMatchesMatrixUserID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	if id.Username != "maizong" || len(id.Teams) != 1 || id.Teams[0] != "market-team" {
-		t.Fatalf("identity=%+v, want maizong/market-team", id)
+	if id.Username != "alice" || len(id.Teams) != 1 || id.Teams[0] != "market-team" {
+		t.Fatalf("identity=%+v, want alice/market-team", id)
 	}
 
 	// A token for a localpart-only match must NOT match the reconciled SSO
 	// human (its authoritative id is the hash, not the username).
 	auth2, fw2 := newMatrixAuthTest(t, sso)
-	fw2.userID = "@maizong:matrix.local"
+	fw2.userID = "@alice:matrix.local"
 	if _, err := auth2.Authenticate(context.Background(), "matrix-token"); err == nil {
 		t.Fatal("expected error: reconciled SSO human must not match by localpart")
 	}

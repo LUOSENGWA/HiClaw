@@ -32,7 +32,7 @@ func TestAuthorizer_ManagerAllowsEverything(t *testing.T) {
 // credentials, or mutate teams.
 func TestAuthorizer_HumanScoped(t *testing.T) {
 	az := NewAuthorizer()
-	caller := &CallerIdentity{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}}
+	caller := &CallerIdentity{Role: RoleHuman, Username: "alice", Teams: []string{"market-team"}}
 
 	allowed := []AuthzRequest{
 		{Action: ActionList, ResourceKind: "project"},
@@ -87,7 +87,7 @@ func TestAuthorizer_SkillPublishRoles(t *testing.T) {
 	admin := &CallerIdentity{Role: RoleAdmin, Username: "admin"}
 	manager := &CallerIdentity{Role: RoleManager, Username: "manager"}
 	leader := &CallerIdentity{Role: RoleTeamLeader, Username: "market-lead", Team: "market-team"}
-	human := &CallerIdentity{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}}
+	human := &CallerIdentity{Role: RoleHuman, Username: "alice", Teams: []string{"market-team"}}
 	worker := &CallerIdentity{Role: RoleWorker, Username: "market-dev", Team: "market-team"}
 	req := AuthzRequest{Action: ActionSkillPublish, ResourceKind: "skills"}
 
@@ -122,17 +122,17 @@ func TestAuthorizer_HumanUpdateAdminOnly(t *testing.T) {
 		{Role: RoleManager, Username: "manager"},
 	}
 	for i := range allowed {
-		if err := az.Authorize(&allowed[i], AuthzRequest{Action: ActionUpdate, ResourceKind: "human", ResourceName: "maizong"}); err != nil {
+		if err := az.Authorize(&allowed[i], AuthzRequest{Action: ActionUpdate, ResourceKind: "human", ResourceName: "alice"}); err != nil {
 			t.Errorf("%s should be allowed to update humans, got: %v", allowed[i].Role, err)
 		}
 	}
 	denied := []CallerIdentity{
 		{Role: RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"},
-		{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}},
+		{Role: RoleHuman, Username: "alice", Teams: []string{"market-team"}},
 		{Role: RoleWorker, Username: "alpha-dev", Team: "alpha-team"},
 	}
 	for i := range denied {
-		if err := az.Authorize(&denied[i], AuthzRequest{Action: ActionUpdate, ResourceKind: "human", ResourceName: "maizong"}); err == nil {
+		if err := az.Authorize(&denied[i], AuthzRequest{Action: ActionUpdate, ResourceKind: "human", ResourceName: "alice"}); err == nil {
 			t.Errorf("%s must be denied updating humans", denied[i].Role)
 		}
 	}
@@ -144,7 +144,7 @@ func TestAuthorizer_HumanUpdateAdminOnly(t *testing.T) {
 func TestAuthorizer_SkillsListOnly(t *testing.T) {
 	az := NewAuthorizer()
 	roles := []*CallerIdentity{
-		{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}},
+		{Role: RoleHuman, Username: "alice", Teams: []string{"market-team"}},
 		{Role: RoleTeamLeader, Username: "market-lead", Team: "market-team"},
 	}
 	for _, caller := range roles {
@@ -197,7 +197,7 @@ func TestAuthorizer_GatewayResourceL1Only(t *testing.T) {
 	// Everyone below L1 is denied the gateway resource (incl. /api/v1/gateway/ai-routes).
 	denied := []*CallerIdentity{
 		{Role: RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"},
-		{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}},
+		{Role: RoleHuman, Username: "alice", Teams: []string{"market-team"}},
 		{Role: RoleWorker, Username: "alice", WorkerName: "alice"},
 	}
 	for _, caller := range denied {
@@ -405,7 +405,7 @@ func TestAuthorizer_WorkerProjectDenied(t *testing.T) {
 
 func TestAuthorizer_WorkerApproval_W8Boundary(t *testing.T) {
 	az := NewAuthorizer()
-	human := &CallerIdentity{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}}
+	human := &CallerIdentity{Role: RoleHuman, Username: "alice", Teams: []string{"market-team"}}
 
 	// W8: like ActionGet, the approval write is allowed at the authorizer
 	// even cross-team, so the handler can hide it as 404 — a 403 from the
@@ -442,7 +442,7 @@ func TestAuthorizer_WorkerApproval_W8Boundary(t *testing.T) {
 // workers are denied outright.
 func TestAuthorize_RuntimeConfig(t *testing.T) {
 	az := NewAuthorizer()
-	human := &CallerIdentity{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}}
+	human := &CallerIdentity{Role: RoleHuman, Username: "alice", Teams: []string{"market-team"}}
 
 	for _, req := range []AuthzRequest{
 		{Action: ActionRuntimeConfig, ResourceKind: "worker", ResourceName: "market-analyst", ResourceTeam: "market-team"},
@@ -472,7 +472,7 @@ func TestAuthorize_RuntimeConfig(t *testing.T) {
 
 func TestAuthorizer_WorkerTools_W8Boundary(t *testing.T) {
 	az := NewAuthorizer()
-	human := &CallerIdentity{Role: RoleHuman, Username: "maizong", Teams: []string{"alpha-team"}}
+	human := &CallerIdentity{Role: RoleHuman, Username: "alice", Teams: []string{"alpha-team"}}
 	leader := &CallerIdentity{Role: RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"}
 	worker := &CallerIdentity{Role: RoleWorker, Username: "alpha-dev", WorkerName: "alpha-dev"}
 
@@ -510,7 +510,7 @@ func TestAuthorizer_WorkerTools_W8Boundary(t *testing.T) {
 func TestAuthorizer_AuditRead(t *testing.T) {
 	az := NewAuthorizer()
 
-	human := &CallerIdentity{Role: RoleHuman, Username: "maizong", Teams: []string{"market-team"}}
+	human := &CallerIdentity{Role: RoleHuman, Username: "alice", Teams: []string{"market-team"}}
 	if err := az.Authorize(human, AuthzRequest{Action: ActionGet, ResourceKind: "audit"}); err != nil {
 		t.Errorf("L2 human audit read should be allowed at the authorizer (handler enforces team scope), got: %v", err)
 	}

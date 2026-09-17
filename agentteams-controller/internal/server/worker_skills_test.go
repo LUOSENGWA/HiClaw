@@ -66,8 +66,8 @@ func skillsRequest(method, url, body string, kv ...string) *http.Request {
 
 const (
 	skillsTeam    = "team-a"
-	skillsWorker  = "daily-luo"
-	skillsHuman   = "luo"
+	skillsWorker  = "daily-carol"
+	skillsHuman   = "carol"
 	skillsOtherHR = "other-team-human"
 )
 

@@ -1447,10 +1447,10 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     runtime_cfg = pathlib.Path("#{root}") / "runtime.yaml"
     runtime_cfg.write_text(
         runtime_cfg.read_text(encoding="utf-8").rstrip()
-        + "\\n    - name: 'Luo'\\n"
-        "      runtimeName: 'luo'\\n"
+        + "\\n    - name: 'Carol'\\n"
+        "      runtimeName: 'carol'\\n"
         "      role: 'human'\\n"
-        "      matrixUserId: '@luo:example.test'\\n",
+        "      matrixUserId: '@carol:example.test'\\n",
         encoding="utf-8",
     )
 
@@ -1593,7 +1593,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         if f"- Status: {status}" not in body:
             raise AssertionError(f"{status} event must carry the Status line: {body!r}")
         mentions = (evs[0]["content"].get("m.mentions") or {}).get("user_ids", [])
-        if "@admin:example.test" not in mentions or "@luo:example.test" not in mentions:
+        if "@admin:example.test" not in mentions or "@carol:example.test" not in mentions:
             raise AssertionError(f"{status} event must mention leader and human initiator: {mentions!r}")
     ok_tid = "tok-success"
     _lifecycle_setup(ok_tid)
@@ -1665,7 +1665,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     if f"ATTENTION_APPROVAL: {att_tid} - Ship to production?" not in att_body:
         raise AssertionError(f"attention event must carry the contract line: {att_body!r}")
     mentions = (att_ev[0]["content"].get("m.mentions") or {}).get("user_ids", [])
-    if "@admin:example.test" not in mentions or "@luo:example.test" not in mentions:
+    if "@admin:example.test" not in mentions or "@carol:example.test" not in mentions:
         raise AssertionError(f"attention event must mention leader and human: {mentions!r}")
     att2 = payload("taskflow", {
         "role": "worker",
@@ -1888,7 +1888,7 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     if f"PROJECT_COMPLETED: {comp_pid} - Project completed:" not in comp_body:
         raise AssertionError(f"project event must carry the contract line: {comp_body!r}")
     mentions = (comp_ev[0]["content"].get("m.mentions") or {}).get("user_ids", [])
-    if "@admin:example.test" not in mentions or "@luo:example.test" not in mentions:
+    if "@admin:example.test" not in mentions or "@carol:example.test" not in mentions:
         raise AssertionError(f"project event must mention leader and human: {mentions!r}")
     comp2 = payload("projectflow", {
         "action": "complete_project",

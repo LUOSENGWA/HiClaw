@@ -104,7 +104,7 @@ func TestAuditAdminTeamFilter(t *testing.T) {
 
 func TestAuditScopedReaderRequiresTeam(t *testing.T) {
 	r := newAuditRig(t)
-	human := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"}}
+	human := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team"}}
 	rec := r.do(t, "", human)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("human unscoped: want 400, got %d: %s", rec.Code, rec.Body.String())
@@ -116,7 +116,7 @@ func TestAuditScopedReaderRequiresTeam(t *testing.T) {
 
 func TestAuditScopedReaderOwnTeam(t *testing.T) {
 	r := newAuditRig(t)
-	human := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"}}
+	human := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team"}}
 	rec := r.do(t, "?team=alpha-team", human)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("human own team: want 200, got %d: %s", rec.Code, rec.Body.String())
@@ -132,7 +132,7 @@ func TestAuditScopedReaderOwnTeam(t *testing.T) {
 
 func TestAuditScopedReaderCrossTeamIs404(t *testing.T) {
 	r := newAuditRig(t)
-	human := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"}}
+	human := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team"}}
 	rec := r.do(t, "?team=beta-team", human)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("cross-team: want 404 (W8), got %d: %s", rec.Code, rec.Body.String())

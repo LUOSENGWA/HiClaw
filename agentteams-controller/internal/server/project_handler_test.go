@@ -975,7 +975,7 @@ func TestListProjects_L2HumanAggregatesTeams(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
 	// L2 human with two accessible teams (Human CR accessibleTeams = CR names).
 	req = withCaller(req, &authpkg.CallerIdentity{
-		Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team", "beta-team"},
+		Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team", "beta-team"},
 	})
 	rec := httptest.NewRecorder()
 	h.ListProjects(rec, req)
@@ -1014,7 +1014,7 @@ func TestGetProjectWorkflow_L2HumanAnyAccessibleTeam(t *testing.T) {
 	})
 	h := newProjectTestHandler(t, store, team("alpha-team"), team("gamma-team"))
 	l2 := &authpkg.CallerIdentity{
-		Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"},
+		Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team"},
 	}
 
 	// Accessible team -> OK.
@@ -1152,7 +1152,7 @@ func TestListProjects_L2HumanTeamFilter(t *testing.T) {
 	})
 	h := newProjectTestHandler(t, store, team("alpha-team"), team("beta-team"))
 	l2 := &authpkg.CallerIdentity{
-		Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team", "beta-team"},
+		Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team", "beta-team"},
 	}
 
 	// Narrow to one accessible team.
@@ -1219,13 +1219,13 @@ func TestProjectHTTP_L2AuthChain(t *testing.T) {
 	})
 	scheme := newProjectTestScheme(t)
 	human := &v1beta1.Human{
-		ObjectMeta: metav1.ObjectMeta{Name: "maizong", Namespace: "default"},
-		Spec:       v1beta1.HumanSpec{Username: "maizong", PermissionLevel: 2, AccessibleTeams: []string{"alpha-team"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "alice", Namespace: "default"},
+		Spec:       v1beta1.HumanSpec{Username: "alice", PermissionLevel: 2, AccessibleTeams: []string{"alpha-team"}},
 	}
 	k8s := fake.NewClientBuilder().WithScheme(scheme).
 		WithRuntimeObjects(human, team("alpha-team")).Build()
 
-	matrixAuth := authpkg.NewMatrixTokenAuthenticator(k8s, "default", &staticWhoami{validToken: "matrix-token", userID: "@maizong:matrix.local"})
+	matrixAuth := authpkg.NewMatrixTokenAuthenticator(k8s, "default", &staticWhoami{validToken: "matrix-token", userID: "@alice:matrix.local"})
 	composite := authpkg.NewCompositeAuthenticator(&alwaysFailAuth{}, matrixAuth)
 	enricher := authpkg.NewCREnricher(k8s, "default")
 	mw := authpkg.NewMiddleware(composite, enricher, authpkg.NewAuthorizer(), k8s, "default")
@@ -1307,13 +1307,13 @@ func TestProjectHTTP_L2WriteChain(t *testing.T) {
 	})
 	scheme := newProjectTestScheme(t)
 	human := &v1beta1.Human{
-		ObjectMeta: metav1.ObjectMeta{Name: "maizong", Namespace: "default"},
-		Spec:       v1beta1.HumanSpec{Username: "maizong", PermissionLevel: 2, AccessibleTeams: []string{"alpha-team"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "alice", Namespace: "default"},
+		Spec:       v1beta1.HumanSpec{Username: "alice", PermissionLevel: 2, AccessibleTeams: []string{"alpha-team"}},
 	}
 	k8s := fake.NewClientBuilder().WithScheme(scheme).
 		WithRuntimeObjects(human, team("alpha-team"), team("beta-team")).Build()
 
-	matrixAuth := authpkg.NewMatrixTokenAuthenticator(k8s, "default", &staticWhoami{validToken: "matrix-token", userID: "@maizong:matrix.local"})
+	matrixAuth := authpkg.NewMatrixTokenAuthenticator(k8s, "default", &staticWhoami{validToken: "matrix-token", userID: "@alice:matrix.local"})
 	composite := authpkg.NewCompositeAuthenticator(&alwaysFailAuth{}, matrixAuth)
 	enricher := authpkg.NewCREnricher(k8s, "default")
 	mw := authpkg.NewMiddleware(composite, enricher, authpkg.NewAuthorizer(), k8s, "default")
@@ -1337,8 +1337,8 @@ func TestProjectHTTP_L2WriteChain(t *testing.T) {
 	data, _ := store.GetObject(context.Background(), "teams/alpha-team/shared/projects/pa/meta.json")
 	var meta map[string]any
 	_ = json.Unmarshal(data, &meta)
-	if meta["status"] != "paused" || meta["pause_reason"] != "review" || meta["updated_by"] != "maizong (human)" {
-		t.Fatalf("meta after pause=%v, want paused/review/maizong (human)", meta)
+	if meta["status"] != "paused" || meta["pause_reason"] != "review" || meta["updated_by"] != "alice (human)" {
+		t.Fatalf("meta after pause=%v, want paused/review/alice (human)", meta)
 	}
 
 	// Cross-team pause -> 404 (existence hidden through the write path too).
@@ -1418,7 +1418,7 @@ func TestGetProjectWorkflow_PassThroughAuditFields(t *testing.T) {
 	store := ossfake.NewMemory()
 	putProject(store, "shared/projects/audit1/meta.json", map[string]any{
 		"project_id": "audit1", "title": "Audit", "status": "paused", "plan_type": "dag",
-		"updated_by": "luo", "updated_at": "2026-08-12T10:00:00Z", "pause_reason": "hold for review",
+		"updated_by": "carol", "updated_at": "2026-08-12T10:00:00Z", "pause_reason": "hold for review",
 		"tasks": []map[string]any{},
 	})
 	h := newProjectTestHandler(t, store)
@@ -1433,7 +1433,7 @@ func TestGetProjectWorkflow_PassThroughAuditFields(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &wf); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if wf.UpdatedBy != "luo" || wf.UpdatedAt != "2026-08-12T10:00:00Z" || wf.PauseReason != "hold for review" {
+	if wf.UpdatedBy != "carol" || wf.UpdatedAt != "2026-08-12T10:00:00Z" || wf.PauseReason != "hold for review" {
 		t.Fatalf("audit fields not passed through: %+v", wf)
 	}
 }
@@ -1930,7 +1930,7 @@ func TestGetTaskArtifact_L2Scoped(t *testing.T) {
 	})
 	putProject(store, "teams/alpha-team/shared/tasks/t1/result.md", map[string]any{"ok": true})
 	// L2 human with alpha-team accessible.
-	l2 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "sun", Teams: []string{"alpha-team"}}
+	l2 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "dave", Teams: []string{"alpha-team"}}
 	h := newProjectTestHandler(t, store, team("alpha-team"))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact", nil)
@@ -1960,7 +1960,7 @@ func TestGetTaskArtifact_L2CrossTeam404(t *testing.T) {
 	})
 	putProject(store, "teams/alpha-team/shared/tasks/t1/result.md", map[string]any{"ok": true})
 	// L2 human controlling only beta-team cannot read alpha-team artifact.
-	l2 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "ma", Teams: []string{"beta-team"}}
+	l2 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "eve", Teams: []string{"beta-team"}}
 	h := newProjectTestHandler(t, store, team("alpha-team"))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/tasks/t1/artifact", nil)
@@ -2271,7 +2271,7 @@ func TestGetProjectSpawns_AggregatesWorkerSpawns(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/spawns", nil)
 	req.SetPathValue("id", "p1")
-	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "luo", Teams: []string{"alpha-team"}})
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "carol", Teams: []string{"alpha-team"}})
 	rec := httptest.NewRecorder()
 	h.GetProjectSpawns(rec, req)
 
@@ -2467,7 +2467,7 @@ func TestGetProjectSpawns_TwoProjectsSameTeamIsolated(t *testing.T) {
 	// p1 sees only its own room's spawn.
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/spawns", nil)
 	req.SetPathValue("id", "p1")
-	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "luo", Teams: []string{"alpha-team"}})
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "carol", Teams: []string{"alpha-team"}})
 	rec := httptest.NewRecorder()
 	h.GetProjectSpawns(rec, req)
 	if rec.Code != http.StatusOK {
@@ -2487,7 +2487,7 @@ func TestGetProjectSpawns_TwoProjectsSameTeamIsolated(t *testing.T) {
 	// p2 sees only its own room's spawn.
 	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p2/spawns", nil)
 	req2.SetPathValue("id", "p2")
-	req2 = withCaller(req2, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "luo", Teams: []string{"alpha-team"}})
+	req2 = withCaller(req2, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "carol", Teams: []string{"alpha-team"}})
 	rec2 := httptest.NewRecorder()
 	h.GetProjectSpawns(rec2, req2)
 	if rec2.Code != http.StatusOK {
@@ -2569,7 +2569,7 @@ func TestGetProjectWorkflow_AmbiguousProjectID(t *testing.T) {
 	// A scoped caller sees only their own team's p1 — no ambiguity.
 	req3 := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow", nil)
 	req3.SetPathValue("id", "p1")
-	req3 = withCaller(req3, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "luo", Teams: []string{"alpha-team"}})
+	req3 = withCaller(req3, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "carol", Teams: []string{"alpha-team"}})
 	rec3 := httptest.NewRecorder()
 	h.GetProjectWorkflow(rec3, req3)
 	if rec3.Code != http.StatusOK {
@@ -2807,7 +2807,7 @@ func spawnMsgEnv(t *testing.T, history []byte) (*ProjectHandler, *ossfake.Memory
 }
 
 func humanCaller() *authpkg.CallerIdentity {
-	return &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "luo", Teams: []string{"alpha-team"}}
+	return &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "carol", Teams: []string{"alpha-team"}}
 }
 
 func TestGetProjectSpawnMessages_ReturnsStreamAndTask(t *testing.T) {
@@ -3147,7 +3147,7 @@ func TestPauseProject_L2CrossTeamDenied(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
 	req.SetPathValue("id", "p1")
-	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"beta-team"}})
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"beta-team"}})
 	rec := httptest.NewRecorder()
 	h.PauseProject(rec, req)
 
@@ -3167,7 +3167,7 @@ func TestPauseProject_L2SameTeamAllowed(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
 	req.SetPathValue("id", "p1")
-	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "sunzong", Teams: []string{"alpha-team", "beta-team"}})
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "bob", Teams: []string{"alpha-team", "beta-team"}})
 	rec := httptest.NewRecorder()
 	h.PauseProject(rec, req)
 
@@ -3498,7 +3498,7 @@ func TestCreateProject_Admin(t *testing.T) {
 	store := ossfake.NewMemory()
 	h := newProjectTestHandler(t, store, team("alpha-team"))
 
-	body := `{"title":"New Project","source":"matrix","requester":"@luo:server","team_id":"alpha-team"}`
+	body := `{"title":"New Project","source":"matrix","requester":"@carol:server","team_id":"alpha-team"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(body))
 	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
 	rec := httptest.NewRecorder()
@@ -3536,7 +3536,7 @@ func TestCreateProject_L2CrossTeamDenied(t *testing.T) {
 	// L2 with only beta-team accessible tries to create in alpha-team.
 	body := `{"title":"X","team_id":"alpha-team"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(body))
-	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"beta-team"}})
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"beta-team"}})
 	rec := httptest.NewRecorder()
 	h.CreateProject(rec, req)
 

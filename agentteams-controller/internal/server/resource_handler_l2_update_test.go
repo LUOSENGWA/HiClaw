@@ -60,7 +60,7 @@ func l2UpdateRequest(t *testing.T, handler *ResourceHandler, name string, body s
 // worker in one of their accessibleTeams.
 func TestUpdateWorker_L2HumanInScopeSkillFieldsAllowed(t *testing.T) {
 	handler, _ := newL2UpdateRig(t)
-	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"}}
+	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team"}}
 
 	body := `{"skills":["file-sync","mcporter"]}`
 	rec := l2UpdateRequest(t, handler, "alpha-dev", body, caller)
@@ -110,7 +110,7 @@ func TestUpdateWorker_L2HumanRemoteSkillsRequiresCapability(t *testing.T) {
 // so an external URL no longer receives the key.
 func TestUpdateWorker_L2HumanMcpServersAllowed(t *testing.T) {
 	handler, _ := newL2UpdateRig(t)
-	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"}}
+	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team"}}
 
 	rec := l2UpdateRequest(t, handler, "alpha-dev",
 		`{"mcpServers":[{"name":"fetch","url":"https://gw.example.com/mcp-servers/fetch/mcp"}]}`, caller)
@@ -143,7 +143,7 @@ func TestUpdateWorker_L2HumanMcpServersAllowed(t *testing.T) {
 // checkScopedWorkerUpdate, the probe gets 200 (fail-open) and this test fails.
 func TestL2WorkerUpdateFieldPolicyCoversAllRequestFields(t *testing.T) {
 	handler, _ := newL2UpdateRig(t)
-	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"}}
+	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team"}}
 	allowed := map[string]bool{"skills": true, "mcpServers": true}
 
 	typ := reflect.TypeOf(UpdateWorkerRequest{})
@@ -195,7 +195,7 @@ func TestL2WorkerUpdateFieldPolicyCoversAllRequestFields(t *testing.T) {
 // the read path and learn their owning team (W8 probe resistance).
 func TestUpdateWorker_L2HumanCrossTeamHidden(t *testing.T) {
 	handler, _ := newL2UpdateRig(t)
-	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "sunzong", Teams: []string{"beta-team"}}
+	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "bob", Teams: []string{"beta-team"}}
 
 	rec := l2UpdateRequest(t, handler, "alpha-dev", `{"skills":["file-sync"]}`, caller)
 	if rec.Code != http.StatusNotFound {
@@ -207,7 +207,7 @@ func TestUpdateWorker_L2HumanCrossTeamHidden(t *testing.T) {
 // them too (404, probe-resistant).
 func TestUpdateWorker_L2HumanStandaloneWorkerHidden(t *testing.T) {
 	handler, _ := newL2UpdateRig(t)
-	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"}}
+	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team"}}
 
 	rec := l2UpdateRequest(t, handler, "solo-dev", `{"skills":["file-sync"]}`, caller)
 	if rec.Code != http.StatusNotFound {
@@ -219,7 +219,7 @@ func TestUpdateWorker_L2HumanStandaloneWorkerHidden(t *testing.T) {
 // offending fields.
 func TestUpdateWorker_L2HumanForbiddenFieldsRejected(t *testing.T) {
 	handler, _ := newL2UpdateRig(t)
-	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"}}
+	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team"}}
 
 	rec := l2UpdateRequest(t, handler, "alpha-dev", `{"model":"qwen3.8","soul":"override"}`, caller)
 	if rec.Code != http.StatusBadRequest {
@@ -233,7 +233,7 @@ func TestUpdateWorker_L2HumanForbiddenFieldsRejected(t *testing.T) {
 // An empty L2 update body is a harmless no-op.
 func TestUpdateWorker_L2HumanEmptyBodyNoOp(t *testing.T) {
 	handler, _ := newL2UpdateRig(t)
-	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"alpha-team"}}
+	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team"}}
 
 	rec := l2UpdateRequest(t, handler, "alpha-dev", `{}`, caller)
 	if rec.Code != http.StatusOK {
@@ -331,7 +331,7 @@ func TestUpdateWorker_TeamLeaderStandaloneWorkerHidden(t *testing.T) {
 // the out-of-scope worker with 404, same as any other out-of-scope case.
 func TestUpdateWorker_L2HumanNoTeamsHidden(t *testing.T) {
 	handler, _ := newL2UpdateRig(t)
-	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "luo", Teams: nil}
+	caller := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "carol", Teams: nil}
 
 	rec := l2UpdateRequest(t, handler, "alpha-dev", `{"skills":["file-sync"]}`, caller)
 	if rec.Code != http.StatusNotFound {

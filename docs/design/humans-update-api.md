@@ -70,8 +70,8 @@ Request body (all fields optional):
 
 ```json
 {
-  "displayName": "Mai Zong",
-  "email": "maizong@example.com",
+  "displayName": "Alice",
+  "email": "alice@example.com",
   "permissionLevel": 2,
   "accessibleTeams": ["market-team"],
   "accessibleWorkers": [],

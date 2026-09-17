@@ -287,7 +287,7 @@ GET /api/v1/projects/{id}/tasks/{taskId}?team=alpha-team
 {
   "title": "新项目",
   "source": "matrix",
-  "requester": "@luo:server",
+  "requester": "@carol:server",
   "team_id": "biz-team",
   "project_id": "可选自定义 id",
   "source_room_id": "!room:server"

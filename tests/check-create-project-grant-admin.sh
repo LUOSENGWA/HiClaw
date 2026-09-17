@@ -34,7 +34,7 @@ grep -F -- '${WORKER_POWER_LEVELS}' "${SCRIPT}" | grep -Fq -- '${GRANT_ADMIN_LEV
 #    the Manager is never told about it.
 grep -Fq -- "--grant-admin" "${REFERENCE}" ||
     fail "create-project.md must document --grant-admin for the Manager"
-grep -Fq -- "--grant-admin \"sunzong\"" "${REFERENCE}" ||
+grep -Fq -- "--grant-admin \"bob\"" "${REFERENCE}" ||
     fail "create-project.md must show a concrete --grant-admin usage example"
 grep -qi -- "co-owns the project room" "${REFERENCE}" ||
     fail "create-project.md must explain what --grant-admin grants (level 100 co-ownership)"

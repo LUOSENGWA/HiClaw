@@ -36,7 +36,7 @@ def _make_channel(user_id: str = "@worker-a:hs.local") -> AgentTeamsMatrixChanne
     return ch
 
 
-def _entry(sender: str = "@luo:hs.local", body: str = "new message") -> HistoryEntry:
+def _entry(sender: str = "@carol:hs.local", body: str = "new message") -> HistoryEntry:
     return HistoryEntry(
         sender=sender,
         body=body,
@@ -52,7 +52,7 @@ def _turn_meta(event_id: str = "$turn1", **overrides) -> dict:
         "is_group": True,
         "event_id": event_id,
         "thread_root_event_id": event_id,
-        "sender_id": "@luo:hs.local",
+        "sender_id": "@carol:hs.local",
     }
     meta.update(overrides)
     return meta
@@ -134,7 +134,7 @@ def test_retrigger_enqueues_fresh_context_and_preserves_buffer():
     ch = _make_channel()
     room = "!room:hs.local"
     ch._record_history(
-        room, _entry(sender="@luo:hs.local", body="correction: do it differently"),
+        room, _entry(sender="@carol:hs.local", body="correction: do it differently"),
     )
     ch._send_gate_state[room] = {
         "event_id": "$turn1",
@@ -148,7 +148,7 @@ def test_retrigger_enqueues_fresh_context_and_preserves_buffer():
     payload = ch.enqueued[0]
     assert payload["meta"]["send_gate_retrigger"] is True
     assert payload["meta"]["event_id"] == "$turn1"
-    assert payload["meta"]["sender_id"] == "@luo:hs.local"
+    assert payload["meta"]["sender_id"] == "@carol:hs.local"
     # Missed context baked in: nudge + recovered history prepend.
     text = payload["content_parts"][0].text
     assert "draft reply was NOT sent" in text
@@ -290,7 +290,7 @@ def test_retrigger_recovers_media_from_missed_window():
     ch._record_history(
         room,
         HistoryEntry(
-            sender="@luo:hs.local",
+            sender="@carol:hs.local",
             body="with image",
             timestamp=1,
             message_id="$m2",

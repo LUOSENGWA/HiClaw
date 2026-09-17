@@ -138,7 +138,7 @@ func getSkillsAs(t *testing.T, h *SkillsHandler, caller *authpkg.CallerIdentity,
 
 var (
 	skAdmin   = &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"}
-	skL2      = &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"market-team"}}
+	skL2      = &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}}
 	skL2Empty = &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "nobody"}
 	skLeader  = &authpkg.CallerIdentity{Role: authpkg.RoleTeamLeader, Username: "market-lead", Team: "market-team"}
 	skManager = &authpkg.CallerIdentity{Role: authpkg.RoleManager, Username: "manager"}
@@ -808,7 +808,7 @@ func TestSkills_NonAdminNoTeam_400(t *testing.T) {
 		name   string
 		caller *authpkg.CallerIdentity
 	}{
-		{"l2-human", &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"market-team"}}},
+		{"l2-human", &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}}},
 		{"team-leader", &authpkg.CallerIdentity{Role: authpkg.RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"}},
 		{"worker", &authpkg.CallerIdentity{Role: authpkg.RoleWorker, Username: "alpha-worker-1"}},
 		{"manager", &authpkg.CallerIdentity{Role: authpkg.RoleManager, Username: "manager"}},
