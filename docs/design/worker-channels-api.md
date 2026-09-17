@@ -39,7 +39,7 @@ position also hosts the reserved fixed resources `types` and `schemas`.
 | Role | Read routes | Write-gated routes (`PUT` / `restart` / `conflict-check`) |
 |---|---|---|
 | `admin` / `manager` (L1) | any worker | any worker |
-| `human` (L2, Matrix token) | own accessibleTeams workers | own accessibleTeams workers — **requires the worker-scoped update policy** (authorizer `ActionUpdate` → same-team). Until that policy is merged the middleware denies L2 worker updates and only L1 reaches the handler |
+| `human` (L2, Matrix token) | own accessibleTeams workers | own accessibleTeams workers via the worker-scoped update policy (authorizer `ActionUpdate` → same-team); **replacing a credential value or explicitly clearing it (empty string) additionally requires the `channel_secrets` capability** (403 names the offending fields); unchanged credential values are ordinary fields and omitted ones are preserved (see PUT semantics) |
 | `team-leader` | own team workers | **denied — `403`** (team leaders have read-only access to channels; the middleware's same-team `ActionUpdate` would otherwise allow it, so the handler is the real boundary) |
 | scoped caller, other team | `404` | `404` (W8: never `403`, so cross-team existence cannot be probed) |
 | scoped caller, standalone worker (no team) | `404` | `404` |
@@ -49,33 +49,73 @@ Mutating calls are audit-logged (`worker`, `upstream`, `actor`,
 
 ## PUT semantics
 
-1. **Validation boundary = upstream.** The body is forwarded verbatim;
-   qwenpaw validates it with the channel's pydantic model. Upstream
-   `400`/`422` (validation detail), `404` (unknown channel) and `409`
-   responses are passed through verbatim. An **empty body is rejected by
-   the Controller with `400`** — upstream would treat it as an empty
-   config and wipe the saved channel.
+1. **Validation boundary = upstream.** The body is forwarded (after the
+   credential back-fill below, item 5); qwenpaw validates it with the
+   channel's pydantic model. Upstream `400`/`422` (validation detail),
+   `404` (unknown channel) and `409` responses are passed through
+   verbatim. An **empty body is rejected by the Controller with `400`** —
+   upstream would treat it as an empty config and wipe the saved channel.
+   Unparseable JSON passes through untouched (no diff, no back-fill) —
+   upstream's validation rejects it.
 2. **The write is the qwenpaw-authoritative path.** Upstream persists the
    config into the worker's `agent.json` and hot-reloads the channel —
    no worker restart. The response body is the persisted channel config,
    returned verbatim.
-3. **Read-back validation.** After a `200`, the Controller reads the
-   MinIO baseline (`agents/{name}/.qwenpaw/workspaces/default/agent.json`)
-   up to three times (2s apart) to verify the worker's `push_loop`
-   converged the new config to the storage source that `mirror_all` pulls
-   on rebuild. The outcome is reported in the
-   `X-AgentTeams-MinIO-Persisted` response header — the body stays
-   verbatim:
+3. **Read-back validation (async).** After a `200`, the Controller answers
+   immediately with `X-AgentTeams-MinIO-Persisted: pending` and schedules
+   a **single background re-check at a conservative bound (120s) far
+   beyond the worker push_loop sync interval** (`check_interval=5s` in
+   the current qwenpaw worker). The re-check reads the MinIO baseline
+   (`agents/{name}/.qwenpaw/workspaces/default/agent.json`) and records
+   the outcome in the durable audit log (action `channel_readback`,
+   `converged=true|false`, attributed to the PUT's actor) — the
+   convergence result is an audit signal, not an in-request one. The old
+   bounded in-request polling (3x2s) was systematically false-negative
+   against the push_loop sync interval in production, so every healthy
+   PUT looked unpersisted. **Superseded writes:** each PUT claims the
+   next readback generation for its (worker, channel); if a newer PUT
+   lands before an older re-check runs, the older re-check is skipped —
+   a newer successful write is never reported as a persistence failure
+   of the older (superseded) one.
 
    | Header value | Meaning |
    |---|---|
-   | `true` | baseline verified (canonical-JSON comparison of `channels.{channel}` vs the persisted config) |
-   | `false` | baseline not converged within the read-back budget (or missing) — frontend should warn and re-check; the config IS live on the worker |
+   | `pending` | background re-check scheduled; the convergence result lands in the audit log (`channel_readback`) |
    | `skipped` | no storage client configured |
 
    The Controller never writes to the baseline — `push_loop` remains the
    single writer (manual-edit persistence gaps, where the MinIO copy lagged
-   the live container, are what this header surfaces).
+   the live container, are what `converged=false` surfaces). The `200`
+   body is authoritative either way: the config IS live on the worker.
+4. **Credential gate (diff against the saved config).** Before the write,
+   the Controller fetches the saved channel config from the worker (a
+   read-only dial on the same upstream; a `PUT` whose baseline cannot be
+   read fails with `502` rather than proceeding) and diffs the request
+   against it, credential field by credential field (any nesting depth).
+   A credential field is one whose leaf name is in the
+   `channelCredentialKeys` denylist: `access_token`, `bot_token`,
+   `token`, `app_secret`, `app_token`, `client_secret`, `secret`,
+   `encrypt_key`, `verification_token`, `password`, `sip_password`,
+   `api_key`, `dashscope_api_key`, `livekit_api_key`,
+   `livekit_api_secret`, `twilio_auth_token`. The semantics per field:
+
+   | Field in the body | Meaning | Gate (L2) | Audit |
+   |---|---|---|---|
+   | absent | **preserved** — the saved value is back-filled into the forwarded body, because upstream replaces the whole channel (`config_class(**body)`) and an omitted secret would be erased by the model default | — | — |
+   | present, non-empty, equal to the saved value | unchanged round-trip → an ordinary edit | — | — |
+   | present, non-empty, different from the saved value | a credential replacement | `channel_secrets` required (403 names the fields) | `channel_credential_write` |
+   | present as `""` | an explicit clear (an empty string is a clear, not a placeholder) | `channel_secrets` required | `channel_credential_write` |
+
+   L1 (admin/manager) writes are exempt from the gate but audit-logged
+   (action `channel_credential_write`, `who`/`role`/target
+   `worker/channel`, capability, field list). A `PUT` whose baseline
+   fetch returns the worker's own `404` (unknown channel) still proceeds
+   — the write then passes through upstream's own `404` verbatim — but
+   with no back-fill and every present credential field gated as a
+   write.
+5. **Baseline fetch cost.** The diff costs one extra read-only upstream
+   call per `PUT` (5s dial bound, same as the write). It runs after the
+   empty-body and team-leader rejections (those answer without a dial).
 
 ## Status mapping
 
@@ -92,7 +132,7 @@ Mutating calls are audit-logged (`worker`, `upstream`, `actor`,
 curl -s -X PUT http://127.0.0.1:8090/api/v1/workers/daily-luo/channels/qq \
   -H "Authorization: Bearer $AGENTTEAMS_TOKEN" -H "Content-Type: application/json" \
   -d '{"enabled":true,"app_id":"1904153419","client_secret":"***","markdown_enabled":true}'
-# → 200 {"enabled":true,...}  X-AgentTeams-MinIO-Persisted: true
+# → 200 {"enabled":true,...}  X-AgentTeams-MinIO-Persisted: pending
 
 # L2 user's form: fetch schemas, render, save
 curl -s http://127.0.0.1:8090/api/v1/workers/daily-luo/channels/schemas \
@@ -104,7 +144,10 @@ curl -s http://127.0.0.1:8090/api/v1/workers/daily-luo/channels/schemas \
 - **Unmasked credentials.** Configs round-trip unmasked by design: scoped
   callers can only reach agents in their own teams, and the form needs the
   saved values to round-trip unchanged. L1 sees all workers, consistent
-  with its existing worker-management surface.
+  with its existing worker-management surface. Read-surface contract
+  decided per #1220 §13 Q5 (2026-09-16): round-trip is retained — a masked
+  read would be a separate change (mask helper + reveal capability), not a
+  config flag; maintainer confirmation is requested in the PR.
 - **Single-agent workers.** Without an `X-Agent-Id` header the worker's
   qwenpaw app resolves the active agent from its config; in a
   single-profile worker container that is the worker's own agent. The
@@ -147,8 +190,10 @@ So the API works unchanged on any QwenPaw across the 2.0.1 → 2.2.1 range:
   channel router at all, the upstream's own `404` detail is returned
   verbatim, so callers see a distinguishable, upstream-sourced failure
   instead of a silent proxy error.
-- **MinIO read-back timing.** `X-AgentTeams-MinIO-Persisted` reports
-  convergence of the worker's push-loop against the MinIO baseline within
-  a bounded window; `false` means "not yet converged", not "write failed"
-  (the 200 body is authoritative). The push-loop interval can exceed the
-  read-back window, so clients should treat `false` as advisory.
+- **MinIO read-back timing.** `X-AgentTeams-MinIO-Persisted: pending`
+  means the baseline convergence check runs in the background (2x the
+  push_loop interval) and its result is an audit-log entry
+  (`channel_readback`, `converged=true|false`), not a header value.
+  `converged=false` means "not converged at check time", not "write
+  failed" (the 200 body is authoritative). Clients that need a
+  persistence signal query the audit object instead of the header.
