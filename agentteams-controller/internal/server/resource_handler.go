@@ -1163,10 +1163,11 @@ func workerToResponse(w *v1beta1.Worker) WorkerResponse {
 // sanitizeWorkerResponseForL3 scrubs credential material from a worker
 // response before it is served to an L3 (worker-scoped) reader. The MCP
 // server URLs are the credential-bearing field: an endpoint URL may embed
-// the API key in the query (?api_key=...) or in the userinfo component
-// (https://user:pass@host). The URL itself is kept — host, path and any
-// non-credential query values are useful, non-secret metadata — only the
-// credential material is removed. No other WorkerResponse field carries
+// the API key in the query (?api_key=..., ?apiKey=..., ?key=...) or in the
+// userinfo component (https://user:pass@host). Each URL is reduced to
+// scheme://host[:port]/path — the query and fragment are unclassified
+// input and dropped wholesale, not filtered key by key. No other
+// WorkerResponse field carries
 // secret material on the L3 read surfaces (audited: channel configs are
 // sanitized separately on the channel routes; the approval endpoint returns
 // a single level; checkpoints/workspace-files hide as 404 for L3; the
@@ -1177,45 +1178,36 @@ func sanitizeWorkerResponseForL3(resp *WorkerResponse) {
 	}
 }
 
-// sanitizeMCPURLForL3 removes credential material from an MCP endpoint URL:
-// the userinfo component (always secret in this context) and every query
-// parameter whose key names a credential field (the same denylist as the L3
-// channel-config sanitization — one shared contract). A URL with no
-// credential material is returned byte-identical. It fails closed: a URL
-// that cannot be parsed, or that is not absolute, is a URL we cannot prove
-// clean, so it is omitted entirely.
+// sanitizeMCPURLForL3 reduces an MCP endpoint URL to the metadata an L3
+// (worker-scoped) reader may safely see: scheme, host, port and path.
+//
+// MCP endpoints are arbitrary external URLs, so their query strings are
+// unclassified input. A denylist of known credential field names (such as
+// the L3 channel-config denylist) cannot be a complete credential contract
+// for that namespace — apiKey, key, token, or any vendor-specific name may
+// carry a secret. The query and fragment are therefore dropped wholesale,
+// along with the userinfo component (always secret in this context); no
+// query value, classified or not, is exposed to L3. scheme://host[:port]/
+// path still identifies the endpoint without exposing values.
+//
+// A URL without userinfo, query, or fragment is returned byte-identical.
+// It fails closed: a URL that cannot be parsed, is not absolute, or has no
+// host is a URL we cannot prove clean, so it is omitted entirely.
 func sanitizeMCPURLForL3(raw string) string {
 	if raw == "" {
 		return raw
 	}
 	u, err := url.Parse(raw)
-	if err != nil || !u.IsAbs() {
+	if err != nil || !u.IsAbs() || u.Host == "" {
 		return ""
 	}
-	changed := u.User != nil
-	if !changed {
-		for key := range u.Query() {
-			if isCredentialField(key) {
-				changed = true
-				break
-			}
-		}
-	}
-	if !changed {
+	if u.User == nil && u.RawQuery == "" && u.Fragment == "" {
 		return raw
 	}
 	u.User = nil
-	q := u.Query()
-	changedQuery := false
-	for key := range q {
-		if isCredentialField(key) {
-			q.Del(key)
-			changedQuery = true
-		}
-	}
-	if changedQuery {
-		u.RawQuery = q.Encode()
-	}
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
 	return u.String()
 }
 

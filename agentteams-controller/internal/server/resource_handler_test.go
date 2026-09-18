@@ -1245,6 +1245,8 @@ func TestGetWorker_L3MCPCredentialsSanitized(t *testing.T) {
 	alphaDev.Namespace = "default"
 	alphaDev.Spec.McpServers = []v1beta1.MCPServer{
 		{Name: "ext", URL: "https://mcp.example.test/mcp?api_key=REVIEW_SENTINEL_SECRET"},
+		{Name: "apiKey", URL: "https://mcp.example.test/mcp?apiKey=REVIEW_SENTINEL_SECRET"},
+		{Name: "key", URL: "https://mcp.example.test/key?key=REVIEW_SENTINEL_SECRET"},
 		{Name: "auth", URL: "https://review-user:REVIEW_SENTINEL_PASS@mcp.example.test/auth"},
 		{Name: "clean", URL: "https://plain.example.test/mcp?limit=5"},
 	}
@@ -1272,11 +1274,21 @@ func TestGetWorker_L3MCPCredentialsSanitized(t *testing.T) {
 			t.Fatalf("L3 raw response leaks credential material %q: %s", sentinel, body)
 		}
 	}
-	// Non-secret metadata must survive the scrub.
-	for _, want := range []string{"https://mcp.example.test/mcp", "https://mcp.example.test/auth", "limit=5"} {
+	// Non-secret metadata (scheme://host[:port]/path) must survive the scrub.
+	for _, want := range []string{
+		"https://mcp.example.test/mcp",
+		"https://mcp.example.test/auth",
+		"https://plain.example.test/mcp",
+	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("L3 response lost non-secret metadata %q: %s", want, body)
 		}
+	}
+	// Query values are unclassified input for arbitrary external MCP
+	// endpoints: even a name that does not look like a credential must not
+	// be exposed to L3 (fail-closed, not denylisted).
+	if strings.Contains(body, "limit=5") {
+		t.Fatalf("L3 response exposed an unclassified query value: %s", body)
 	}
 }
 
@@ -1290,6 +1302,8 @@ func TestListWorkers_L3MCPCredentialsSanitized(t *testing.T) {
 	betaDev.Namespace = "default"
 	betaDev.Spec.McpServers = []v1beta1.MCPServer{
 		{Name: "ext", URL: "https://mcp.example.test/mcp?api_key=REVIEW_SENTINEL_SECRET"},
+		{Name: "apiKey", URL: "https://mcp.example.test/mcp?apiKey=REVIEW_SENTINEL_SECRET"},
+		{Name: "key", URL: "https://mcp.example.test/key?key=REVIEW_SENTINEL_SECRET"},
 	}
 	beta := &v1beta1.Team{}
 	beta.Name = "beta-team"
@@ -1327,6 +1341,7 @@ func TestGetWorker_L2MCPCredentialsVerbatim(t *testing.T) {
 	alphaDev.Namespace = "default"
 	alphaDev.Spec.McpServers = []v1beta1.MCPServer{
 		{Name: "ext", URL: "https://mcp.example.test/mcp?api_key=REVIEW_SENTINEL_SECRET"},
+		{Name: "apiKey", URL: "https://mcp.example.test/mcp?apiKey=REVIEW_SENTINEL_SECRET"},
 	}
 	alpha := &v1beta1.Team{}
 	alpha.Name = "alpha-team"
@@ -1346,7 +1361,11 @@ func TestGetWorker_L2MCPCredentialsVerbatim(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("L2 own-team worker detail status=%d, want 200", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "api_key=REVIEW_SENTINEL_SECRET") {
-		t.Fatalf("L2 response must carry the MCP URL verbatim: %s", rec.Body.String())
+	// Both the denylisted (api_key) and the non-denylisted (apiKey) forms
+	// must reach L2 verbatim — the scrub applies to L3 only.
+	for _, want := range []string{"api_key=REVIEW_SENTINEL_SECRET", "apiKey=REVIEW_SENTINEL_SECRET"} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("L2 response must carry the MCP URL verbatim (%s): %s", want, rec.Body.String())
+		}
 	}
 }
