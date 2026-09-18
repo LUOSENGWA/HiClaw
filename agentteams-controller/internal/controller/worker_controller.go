@@ -221,6 +221,12 @@ func (r *WorkerReconciler) reconcileNormal(ctx context.Context, w *v1beta1.Worke
 	if inTeam && teamRole == RoleTeamLeader {
 		configContext.Role = RoleTeamLeader
 	}
+	// Team-wide subagent model default (read-time merge). Only workers
+	// without an explicit value consult the team, and only when they are
+	// actually team members (annotation check keeps the List call rare).
+	if w.Spec.SubagentModel == "" && w.Annotations[v1beta1.AnnotationWorkerTeamName] != "" {
+		configContext.TeamSubagentModel = r.owningTeamSubagentModel(ctx, w)
+	}
 
 	if mctx.DeployMode == v1beta1.DeployModeEdge {
 		// Edge UUID rotation: when the UUID label changes, delete the SA so any
@@ -345,6 +351,30 @@ func (r *WorkerReconciler) reconcileNormal(ctx context.Context, w *v1beta1.Worke
 
 	requeueAfter := minPositiveDuration(reconcileInterval, state.RequeueAfter)
 	return reconcile.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// owningTeamSubagentModel returns the subagent model declared on the team
+// that owns this worker (the fallback for workers without an explicit
+// subagentModel). It mirrors the ownership lookup in workerTeamName — by
+// scanning Team.spec.workerMembers rather than trusting the annotation, it
+// is correct whether or not the team has a display alias. A lookup failure
+// degrades to "" (no default), never to a reconcile error.
+func (r *WorkerReconciler) owningTeamSubagentModel(ctx context.Context, w *v1beta1.Worker) string {
+	var teams v1beta1.TeamList
+	if err := r.List(ctx, &teams, client.InNamespace(w.Namespace)); err != nil {
+		logger := log.FromContext(ctx)
+		logger.Error(err, "list teams for subagent model default (non-fatal)", "worker", w.Name)
+		return ""
+	}
+	for i := range teams.Items {
+		team := &teams.Items[i]
+		for _, member := range team.Spec.WorkerMembers {
+			if member.Name == w.Name {
+				return team.Spec.SubagentModel
+			}
+		}
+	}
+	return ""
 }
 
 func (r *WorkerReconciler) workerTeamName(ctx context.Context, w *v1beta1.Worker) (string, error) {

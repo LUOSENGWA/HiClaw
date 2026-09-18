@@ -47,6 +47,13 @@ const AnnotationEdgeAppliedUUID = "agentteams.io/edge-applied-uuid"
 // Worker so independent Worker reconciles preserve its scoped team storage access.
 const AnnotationWorkerTeamName = "agentteams.io/team-name"
 
+// AnnotationSubagentModelApplied records the Team.spec.subagentModel value that
+// was last propagated to member workers. The TeamReconciler compares it against
+// the live spec value; on a change it bumps each member Worker's
+// resourceVersion so their config reconciles re-resolve the team default
+// (read-time merge — the Team never writes Worker specs).
+const AnnotationSubagentModelApplied = "agentteams.io/subagent-model-applied"
+
 // AccessEntry declares one cloud-permission grant under a logical
 // service. v1 supported services: "object-storage", "ai-gateway", "ai-registry", "schedulerx3".
 //
@@ -464,6 +471,13 @@ type TeamSpec struct {
 	// Worker's openclaw.json and coordination context AGENTS.md.
 	// Example: "30m". Empty means leader heartbeat is disabled.
 	HeartbeatEvery string `json:"heartbeatEvery,omitempty"`
+
+	// SubagentModel is the team-wide default for the model used by spawned
+	// subagents (see WorkerSpec.SubagentModel). A worker's own
+	// subagentModel always takes precedence; members without an explicit
+	// value inherit this default via read-time merge during their config
+	// reconcile. Changing it re-triggers member config reconciles.
+	SubagentModel string `json:"subagentModel,omitempty"`
 }
 
 // TeamWorkerRef references an existing Worker CR as a team member.

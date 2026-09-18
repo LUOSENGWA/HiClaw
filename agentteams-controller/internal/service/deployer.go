@@ -25,8 +25,12 @@ import (
 
 // WorkerDeployRequest describes a worker config deployment (create or update).
 type WorkerDeployRequest struct {
-	Name           string
-	Spec           v1beta1.WorkerSpec
+	Name string
+	Spec v1beta1.WorkerSpec
+	// SubagentModel is the resolved subagent model for this worker
+	// (explicit spec value or the team default, resolved by the caller).
+	// Non-empty values take precedence over Spec.SubagentModel.
+	SubagentModel  string
 	Role           string // "standalone" | "team_leader" | "worker"
 	TeamName       string
 	TeamLeaderName string
@@ -285,6 +289,17 @@ func (d *Deployer) WriteInlineConfigs(name string, spec v1beta1.WorkerSpec) erro
 	return nil
 }
 
+// resolvedSubagentModel returns the subagent model to write into
+// openclaw.json: an explicitly resolved value (team default merged in by the
+// caller) wins, falling back to the raw spec field for callers that do not
+// pre-resolve.
+func resolvedSubagentModel(req WorkerDeployRequest) string {
+	if req.SubagentModel != "" {
+		return req.SubagentModel
+	}
+	return req.Spec.SubagentModel
+}
+
 // DeployWorkerConfig generates and pushes all configuration files to OSS:
 // openclaw.json, SOUL.md, mcporter config, Matrix password, agent file sync,
 // AGENTS.md merge with builtin section + coordination context, builtin skills.
@@ -337,7 +352,7 @@ func (d *Deployer) DeployWorkerConfig(ctx context.Context, req WorkerDeployReque
 		MatrixToken:       req.MatrixToken,
 		GatewayKey:        req.GatewayKey,
 		ModelName:         req.Spec.Model,
-		SubagentModelName: req.Spec.SubagentModel,
+		SubagentModelName: resolvedSubagentModel(req),
 		AIGatewayURL:      req.AIGatewayURL,
 		TeamLeaderName:    req.TeamLeaderName,
 		ChannelPolicy:     channelPolicy,
