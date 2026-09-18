@@ -234,8 +234,9 @@ func (h *ResourceHandler) UpdateWorker(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	if caller := authpkg.CallerFromContext(ctx); caller != nil && caller.Role == authpkg.RoleHuman {
-		if status, msg := h.checkHumanWorkerUpdate(ctx, caller, name, &req); status != 0 {
+	if caller := authpkg.CallerFromContext(ctx); caller != nil &&
+		(caller.Role == authpkg.RoleHuman || caller.Role == authpkg.RoleTeamLeader) {
+		if status, msg := h.checkScopedWorkerUpdate(ctx, caller, name, &req); status != 0 {
 			httputil.WriteError(w, status, msg)
 			return
 		}
@@ -1117,20 +1118,27 @@ func (h *ResourceHandler) findTeamForMember(ctx context.Context, name string) (s
 	return team.Name, true, nil
 }
 
-// checkHumanWorkerUpdate enforces the L2 human boundary on worker updates.
+// checkScopedWorkerUpdate enforces the scoped write boundary on worker
+// updates for L2 humans and team leaders (#1220 §5/§9, B2). Both roles may
+// touch only the non-sensitive surfaces: skills (public-catalog assignment)
+// and mcpServers — the gateway credential is attached at generation time
+// only to entries on the trusted AI gateway host (GenerateMcporterConfig,
+// #1220 §7), so an external URL no longer receives the key and writing
+// mcpServers is no longer a credential-exfiltration path. remoteSkills
+// (arbitrary external registries whose source URIs may embed tokens) is
+// gated on the external_sources capability; team leaders are
+// service-account scoped and never carry it. Everything else (model, image,
+// identity, resources, ...) is the team owner's / admin's domain.
 // The worker must be a member of one of the caller's accessibleTeams —
-// standalone workers are hidden from L2 readers (ListWorkers), so they are
-// hidden here as well (404 keeps the endpoint probe-resistant). The request
-// may only touch the public-catalog skill assignment (skills). remoteSkills
-// (arbitrary external registries with credential-bearing source URIs) and
-// mcpServers (the gateway consumer key is injected into every entry, so an
-// L2-controlled URL is a credential-exfiltration path) require an elevated
-// capability pending the L2 permission design; everything else (model,
-// image, identity, resources, ...) is the team owner's domain.
+// standalone workers are hidden from scoped readers (ListWorkers), so they
+// are hidden here as well (404 keeps the endpoint probe-resistant, W8).
+// The middleware still carries the ActionUpdate+requireSameTeam scope; this
+// handler is the field-level boundary (same pattern as the #1216 approval
+// proxy — the middleware cannot parse the request body).
 // TestL2WorkerUpdateFieldPolicyCoversAllRequestFields pins the policy so no
-// field of UpdateWorkerRequest becomes L2-writable by omission.
+// field of UpdateWorkerRequest becomes scoped-writable by omission.
 // Returns (0, "") when the update is allowed.
-func (h *ResourceHandler) checkHumanWorkerUpdate(ctx context.Context, caller *authpkg.CallerIdentity, name string, req *UpdateWorkerRequest) (int, string) {
+func (h *ResourceHandler) checkScopedWorkerUpdate(ctx context.Context, caller *authpkg.CallerIdentity, name string, req *UpdateWorkerRequest) (int, string) {
 	team, _, ok, err := findTeamMember(ctx, h.client, h.namespace, name)
 	if err != nil {
 		return http.StatusInternalServerError, "lookup worker team: " + err.Error()
@@ -1170,18 +1178,19 @@ func (h *ResourceHandler) checkHumanWorkerUpdate(ctx context.Context, caller *au
 	if req.Agents != "" {
 		forbidden = append(forbidden, "agents")
 	}
-	// Credential-bearing surfaces: remoteSkills (registry source URIs may
-	// embed tokens) and mcpServers (URLs are used verbatim in the generated
-	// mcporter config; the gateway bearer key is now attached only to trusted
-	// gateway hosts (#1220 §7), but external endpoints remain a data-exfil
-	// vector for any per-entry secret). Elevated capability pending the L2
-	// permission design.
-	if req.RemoteSkills != nil {
+	// remoteSkills: arbitrary external registries whose source URIs may
+	// embed tokens — gated on the external_sources capability. L2 humans
+	// with the grant (or full_access) may write it; team leaders are
+	// service-account scoped and never carry the capability, so for them
+	// remoteSkills is always forbidden.
+	if req.RemoteSkills != nil && !authpkg.HasCapability(caller, authpkg.CapabilityExternalSources) {
 		forbidden = append(forbidden, "remoteSkills")
 	}
-	if req.McpServers != nil {
-		forbidden = append(forbidden, "mcpServers")
-	}
+	// mcpServers: writable for both scoped roles (#1220 §7, part 2). The
+	// gateway credential is attached at generation time only to entries on
+	// the trusted AI gateway host, so a scoped caller can no longer exfil
+	// the key through an external URL; pointing a worker at an external
+	// endpoint is an operator decision, not a credential leak.
 	if req.Package != "" {
 		forbidden = append(forbidden, "package")
 	}
@@ -1202,7 +1211,7 @@ func (h *ResourceHandler) checkHumanWorkerUpdate(ctx context.Context, caller *au
 	}
 	if len(forbidden) > 0 {
 		return http.StatusBadRequest,
-			"L2 humans may only update the skills field (public-catalog assignment); remoteSkills and mcpServers require an elevated capability; not allowed: " + strings.Join(forbidden, ", ")
+			"L2 humans and team leaders may only update the skills and mcpServers fields; remoteSkills requires the external_sources capability; not allowed: " + strings.Join(forbidden, ", ")
 	}
 	return 0, ""
 }
