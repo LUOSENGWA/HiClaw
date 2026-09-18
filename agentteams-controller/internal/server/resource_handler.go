@@ -1130,6 +1130,7 @@ func workerToResponse(w *v1beta1.Worker) WorkerResponse {
 		Phase:            w.Status.Phase,
 		State:            w.Spec.DesiredState(),
 		Model:            w.Spec.Model,
+		SubagentModel:    w.Spec.SubagentModel,
 		Runtime:          w.Spec.Runtime,
 		Image:            w.Spec.Image,
 		Identity:         w.Spec.Identity,

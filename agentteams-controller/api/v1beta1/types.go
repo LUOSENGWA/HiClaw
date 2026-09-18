@@ -176,11 +176,19 @@ type Worker struct {
 }
 
 type WorkerSpec struct {
-	Model         string                     `json:"model"`
-	ModelProvider string                     `json:"modelProvider,omitempty"` // APIG Model API name for per-worker LLM provider
-	Runtime       string                     `json:"runtime,omitempty"`       // openclaw | copaw | hermes | qwenpaw | deepseek-harness (default: openclaw)
-	Image         string                     `json:"image,omitempty"`         // custom Docker image
-	WorkerName    string                     `json:"workerName,omitempty"`    // business/runtime identity (Matrix localpart, OSS path key)
+	Model         string `json:"model"`
+	ModelProvider string `json:"modelProvider,omitempty"` // APIG Model API name for per-worker LLM provider
+	// SubagentModel optionally names a (cheaper/faster) model used by
+	// spawned subagents instead of the worker's primary model. It must be
+	// a model id served by the team's AI gateway (free string; the
+	// controller does not validate against any catalog — an unknown model
+	// surfaces as a visible upstream error at spawn time). Consumed by
+	// QwenPaw >= 2.1.1 via the native AgentProfileConfig.subagent_model
+	// field; on older runtimes the field is silently ignored.
+	SubagentModel string                     `json:"subagentModel,omitempty"`
+	Runtime       string                     `json:"runtime,omitempty"`    // openclaw | copaw | hermes | qwenpaw | deepseek-harness (default: openclaw)
+	Image         string                     `json:"image,omitempty"`      // custom Docker image
+	WorkerName    string                     `json:"workerName,omitempty"` // business/runtime identity (Matrix localpart, OSS path key)
 	Identity      string                     `json:"identity,omitempty"`
 	Soul          string                     `json:"soul,omitempty"`
 	Agents        string                     `json:"agents,omitempty"`

@@ -333,15 +333,16 @@ func (d *Deployer) DeployWorkerConfig(ctx context.Context, req WorkerDeployReque
 	}
 
 	configJSON, err := d.agentConfig.GenerateOpenClawConfig(agentconfig.WorkerConfigRequest{
-		WorkerName:     req.Name,
-		MatrixToken:    req.MatrixToken,
-		GatewayKey:     req.GatewayKey,
-		ModelName:      req.Spec.Model,
-		AIGatewayURL:   req.AIGatewayURL,
-		TeamLeaderName: req.TeamLeaderName,
-		ChannelPolicy:  channelPolicy,
-		Heartbeat:      req.Heartbeat,
-		Runtime:        req.Spec.Runtime,
+		WorkerName:        req.Name,
+		MatrixToken:       req.MatrixToken,
+		GatewayKey:        req.GatewayKey,
+		ModelName:         req.Spec.Model,
+		SubagentModelName: req.Spec.SubagentModel,
+		AIGatewayURL:      req.AIGatewayURL,
+		TeamLeaderName:    req.TeamLeaderName,
+		ChannelPolicy:     channelPolicy,
+		Heartbeat:         req.Heartbeat,
+		Runtime:           req.Spec.Runtime,
 	})
 	if err != nil {
 		return fmt.Errorf("config generation failed: %w", err)
