@@ -617,6 +617,16 @@ msg() {
         "data.volume_prompt.en") text="Docker volume name for persistent data [agentteams-data]" ;;
         "data.volume_using.zh") text="  使用 Docker 卷: %s" ;;
         "data.volume_using.en") text="  Using Docker volume: %s" ;;
+        "data.volume_existing.zh") text="  检测到现有安装使用数据卷: %s（留空将沿用该卷）" ;;
+        "data.volume_existing.en") text="  Existing installation detected using data volume: %s (leave empty to keep it)" ;;
+        "data.volume_detected.zh") text="  从现有 agentteams-controller 容器的 /data 挂载检测数据卷: %s" ;;
+        "data.volume_detected.en") text="  Data volume detected from the existing agentteams-controller /data mount: %s" ;;
+        "data.volume_mismatch_warning.zh") text="⚠ 警告: 现有安装使用的数据卷是 %s，与最终使用的卷不一致——升级可能孤儿化全部数据（CRD 状态/消息历史/工作区）！" ;;
+        "data.volume_mismatch_warning.en") text="⚠ WARNING: the existing installation uses data volume %s, but the final value differs — upgrading may orphan all data (CRD state, message history, workspaces)!" ;;
+        "data.volume_mismatch_confirm.zh") text="仍要继续？(y/N)" ;;
+        "data.volume_mismatch_confirm.en") text="Continue anyway? (y/N)" ;;
+        "data.volume_mismatch_abort.zh") text="已取消。数据卷不一致可能导致数据丢失——请核对后重试。" ;;
+        "data.volume_mismatch_abort.en") text="Aborted. A mismatched data volume may lose data — verify and re-run." ;;
         # --- Manager Workspace ---
         "workspace.title.zh") text="--- Manager 工作空间 ---" ;;
         "workspace.title.en") text="--- Manager Workspace ---" ;;
@@ -1430,6 +1440,8 @@ load_current_params_from_env() {
         [ -z "${AGENTTEAMS_PORT_DASHBOARD:+x}" ] && AGENTTEAMS_PORT_DASHBOARD="$(grep '^AGENTTEAMS_PORT_DASHBOARD=' "${env_file}" 2>/dev/null | cut -d= -f2- | tr -d '\r')"
         [ -z "${AGENTTEAMS_DASHBOARD_IMAGE:+x}" ] && AGENTTEAMS_DASHBOARD_IMAGE="$(grep '^AGENTTEAMS_DASHBOARD_IMAGE=' "${env_file}" 2>/dev/null | cut -d= -f2- | tr -d '\r')"
         [ -z "${AGENTTEAMS_AI_GATEWAY_ADMIN_URL:+x}" ] && AGENTTEAMS_AI_GATEWAY_ADMIN_URL="$(grep '^AGENTTEAMS_AI_GATEWAY_ADMIN_URL=' "${env_file}" 2>/dev/null | cut -d= -f2- | tr -d '\r')"
+        [ -z "${AGENTTEAMS_DATA_DIR:+x}" ] && AGENTTEAMS_DATA_DIR="$(grep '^AGENTTEAMS_DATA_DIR=' "${env_file}" 2>/dev/null | cut -d= -f2- | tr -d '\r')"
+        return 0
     fi
 }
 
@@ -2511,10 +2523,45 @@ step_skills() {
     log ""
 }
 
+# Derive the data volume from the existing agentteams-controller /data mount
+# (works for running or stopped containers). Prints the volume name or bind
+# path; empty when no controller container exists or the mount is absent.
+detect_installed_data_volume() {
+    local _id
+    # Named volumes: the reusable identifier is .Name (the docker volume
+    # name). .Source is Docker's internal path
+    # (/var/lib/docker/volumes/<name>/_data) — never store it in the env
+    # file or pass it to `docker volume create`.
+    # Bind mounts: the reusable identifier is the host path .Source,
+    # preserved verbatim (bind paths may contain spaces).
+    _id=$(${DOCKER_CMD} inspect agentteams-controller --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{if eq .Type "volume"}}{{.Name}}{{else}}{{.Source}}{{end}}{{end}}{{end}}' 2>/dev/null || true)
+    if [ -n "${_id}" ]; then
+        printf '%s\n' "${_id}"
+    fi
+    return 0
+}
+
+# Ensure the data storage target exists and build the docker mount args.
+# Named volumes (no '/' — docker volume names cannot contain it) are created
+# when missing; host paths are created as directories. A bind path is never
+# passed to `docker volume create`.
+prepare_data_volume() {
+    local _vol="${AGENTTEAMS_DATA_DIR}"
+    if [ "${_vol#/}" = "${_vol}" ]; then
+        if ! ${DOCKER_CMD} volume ls -q | grep -q "^${_vol}$"; then
+            ${DOCKER_CMD} volume create "${_vol}" > /dev/null
+        fi
+    else
+        mkdir -p "${_vol}"
+    fi
+    DATA_MOUNT_ARGS=("-v" "${_vol}:/data")
+}
+
 step_volume() {
     log "$(msg data.title)"
     # ── Non-interactive guard (deep defense) ──────────────────────────
     if [ "${AGENTTEAMS_NON_INTERACTIVE}" = "1" ]; then
+        AGENTTEAMS_DATA_DIR="${AGENTTEAMS_DATA_DIR:-$(detect_installed_data_volume)}"
         AGENTTEAMS_DATA_DIR="${AGENTTEAMS_DATA_DIR:-agentteams-data}"
         log "  $(msg data.volume_using "${AGENTTEAMS_DATA_DIR}") (non-interactive, skipped)"
         export AGENTTEAMS_DATA_DIR
@@ -2522,10 +2569,16 @@ step_volume() {
     fi
     # ─────────────────────────────────────────────────────────────────
     if [ -z "${AGENTTEAMS_DATA_DIR+x}" ]; then
-        local _input
+        local _input _vol_default="agentteams-data"
+        _vol_default="$(detect_installed_data_volume)"
+        if [ -n "${_vol_default}" ]; then
+            log "$(msg data.volume_existing "${_vol_default}")"
+        else
+            _vol_default="agentteams-data"
+        fi
         read -e -p "$(msg data.volume_prompt): " _input
         if [ "${_input}" = "b" ]; then STEP_RESULT="back"; return 0; fi
-        AGENTTEAMS_DATA_DIR="${_input:-agentteams-data}"
+        AGENTTEAMS_DATA_DIR="${_input:-${_vol_default}}"
         export AGENTTEAMS_DATA_DIR
     fi
     AGENTTEAMS_DATA_DIR="${AGENTTEAMS_DATA_DIR:-agentteams-data}"
@@ -3458,7 +3511,29 @@ install_manager() {
     # ── End state machine ──────────────────────────────────────────────────────
 
     # Post-machine defaults for any steps that were skipped
+    local _detected_data_vol
+    _detected_data_vol="$(detect_installed_data_volume)"
+    if [ -z "${AGENTTEAMS_DATA_DIR:-}" ]; then
+        # An installed controller exists but no volume was read back — use its
+        # real /data mount before defaulting, so upgrades cannot silently
+        # orphan all data.
+        if [ -n "${_detected_data_vol}" ]; then
+            AGENTTEAMS_DATA_DIR="${_detected_data_vol}"
+            log "$(msg data.volume_detected "${AGENTTEAMS_DATA_DIR}")"
+        fi
+    fi
     AGENTTEAMS_DATA_DIR="${AGENTTEAMS_DATA_DIR:-agentteams-data}"
+    if [ -n "${_detected_data_vol}" ] && [ "${AGENTTEAMS_DATA_DIR}" != "${_detected_data_vol}" ]; then
+        echo -e "\033[31m$(msg data.volume_mismatch_warning "${_detected_data_vol}")\033[0m"
+        if [ "${AGENTTEAMS_NON_INTERACTIVE}" != "1" ]; then
+            local _vol_confirm
+            read -r -p "$(msg data.volume_mismatch_confirm): " _vol_confirm
+            if [ "${_vol_confirm}" != "y" ] && [ "${_vol_confirm}" != "Y" ]; then
+                log "$(msg data.volume_mismatch_abort)"
+                exit 1
+            fi
+        fi
+    fi
     if [ -z "${AGENTTEAMS_WORKSPACE_DIR+x}" ] || [ -z "${AGENTTEAMS_WORKSPACE_DIR}" ]; then
         AGENTTEAMS_WORKSPACE_DIR="${HOME}/agentteams-manager"
         export AGENTTEAMS_WORKSPACE_DIR
@@ -3667,13 +3742,9 @@ EOF
         fi
     fi
 
-    # Create the data volume if it doesn't already exist (reuse on reinstall)
-    if ! ${DOCKER_CMD} volume ls -q | grep -q "^${AGENTTEAMS_DATA_DIR}$"; then
-        ${DOCKER_CMD} volume create "${AGENTTEAMS_DATA_DIR}" > /dev/null
-    fi
-
-    # Data mount: Docker volume
-    DATA_MOUNT_ARGS="-v ${AGENTTEAMS_DATA_DIR}:/data"
+    # Create the data volume (or host bind directory) if missing, and build
+    # the mount args (named volume vs bind path are handled distinctly).
+    prepare_data_volume
 
     # Manager workspace mount (always a host directory, defaulting to ~/agentteams-manager)
     WORKSPACE_MOUNT_ARGS="-v ${AGENTTEAMS_WORKSPACE_DIR}:/root/manager-workspace"
@@ -4303,7 +4374,7 @@ CREDEOF
             -p "${_port_prefix}${AGENTTEAMS_PORT_CONSOLE}:8001" \
             -p "${_port_prefix}${AGENTTEAMS_PORT_ELEMENT_WEB:-18088}:8088" \
             -p "127.0.0.1:${AGENTTEAMS_PORT_MANAGER_CONSOLE:-18888}:18888" \
-            ${DATA_MOUNT_ARGS} \
+            "${DATA_MOUNT_ARGS[@]}" \
             ${WORKSPACE_MOUNT_ARGS} \
             ${HOST_SHARE_MOUNT_ARGS} \
             --restart unless-stopped \
