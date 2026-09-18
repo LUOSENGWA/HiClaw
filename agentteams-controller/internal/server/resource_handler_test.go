@@ -1231,3 +1231,122 @@ func TestUpdateWorker_L3Denied(t *testing.T) {
 		t.Fatalf("L3 update of an ASSIGNED worker status=%d, want 404 (read-only, W8)", rec.Code)
 	}
 }
+
+// TestGetWorker_L3MCPCredentialsSanitized pins the L3 no-plaintext-
+// credentials requirement on the worker detail surface: MCP endpoint URLs
+// may embed credentials in the query (?api_key=...) or the userinfo
+// component (user:pass@host); both must be absent from the raw L3 response,
+// while non-secret URL metadata (host, path, non-credential query values)
+// is retained.
+func TestGetWorker_L3MCPCredentialsSanitized(t *testing.T) {
+	scheme := newServerTestScheme(t)
+	alphaDev := &v1beta1.Worker{}
+	alphaDev.Name = "alpha-dev"
+	alphaDev.Namespace = "default"
+	alphaDev.Spec.McpServers = []v1beta1.MCPServer{
+		{Name: "ext", URL: "https://mcp.example.test/mcp?api_key=REVIEW_SENTINEL_SECRET"},
+		{Name: "auth", URL: "https://review-user:REVIEW_SENTINEL_PASS@mcp.example.test/auth"},
+		{Name: "clean", URL: "https://plain.example.test/mcp?limit=5"},
+	}
+	alpha := &v1beta1.Team{}
+	alpha.Name = "alpha-team"
+	alpha.Namespace = "default"
+	alpha.Spec.WorkerMembers = []v1beta1.TeamWorkerRef{{Name: "alpha-dev"}}
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(alphaDev, alpha).Build()
+	handler := NewResourceHandler(k8sClient, "default", nil, "", nil)
+	l3 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "viewer", AccessibleWorkers: []string{"alpha-dev"}}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/workers/alpha-dev", nil)
+	req.SetPathValue("name", "alpha-dev")
+	req = req.WithContext(context.WithValue(req.Context(), authpkg.CallerKeyForTest(), l3))
+	rec := httptest.NewRecorder()
+	handler.GetWorker(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("assigned worker detail status=%d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, sentinel := range []string{"REVIEW_SENTINEL_SECRET", "REVIEW_SENTINEL_PASS", "review-user"} {
+		if strings.Contains(body, sentinel) {
+			t.Fatalf("L3 raw response leaks credential material %q: %s", sentinel, body)
+		}
+	}
+	// Non-secret metadata must survive the scrub.
+	for _, want := range []string{"https://mcp.example.test/mcp", "https://mcp.example.test/auth", "limit=5"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("L3 response lost non-secret metadata %q: %s", want, body)
+		}
+	}
+}
+
+// TestListWorkers_L3MCPCredentialsSanitized pins the same contract on the
+// list surface: the sentinel must be absent from the raw list JSON for an
+// L3 viewer, with the non-credential metadata retained.
+func TestListWorkers_L3MCPCredentialsSanitized(t *testing.T) {
+	scheme := newServerTestScheme(t)
+	betaDev := &v1beta1.Worker{}
+	betaDev.Name = "beta-dev"
+	betaDev.Namespace = "default"
+	betaDev.Spec.McpServers = []v1beta1.MCPServer{
+		{Name: "ext", URL: "https://mcp.example.test/mcp?api_key=REVIEW_SENTINEL_SECRET"},
+	}
+	beta := &v1beta1.Team{}
+	beta.Name = "beta-team"
+	beta.Namespace = "default"
+	beta.Spec.WorkerMembers = []v1beta1.TeamWorkerRef{{Name: "beta-dev"}}
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(betaDev, beta).Build()
+	handler := NewResourceHandler(k8sClient, "default", nil, "", nil)
+	l3 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "viewer", AccessibleWorkers: []string{"beta-dev"}}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/workers", nil)
+	req = req.WithContext(context.WithValue(req.Context(), authpkg.CallerKeyForTest(), l3))
+	rec := httptest.NewRecorder()
+	handler.ListWorkers(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status=%d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "REVIEW_SENTINEL_SECRET") {
+		t.Fatalf("L3 raw list response leaks the MCP api_key: %s", body)
+	}
+	if !strings.Contains(body, "https://mcp.example.test/mcp") {
+		t.Fatalf("L3 list response lost the MCP endpoint metadata: %s", body)
+	}
+}
+
+// TestGetWorker_L2MCPCredentialsVerbatim pins that the L3 scrub does not
+// over-apply: an L2 human (team scope) reads the assigned-in-team worker's
+// MCP URLs verbatim — credential URLs are legitimate for team controllers.
+func TestGetWorker_L2MCPCredentialsVerbatim(t *testing.T) {
+	scheme := newServerTestScheme(t)
+	alphaDev := &v1beta1.Worker{}
+	alphaDev.Name = "alpha-dev"
+	alphaDev.Namespace = "default"
+	alphaDev.Spec.McpServers = []v1beta1.MCPServer{
+		{Name: "ext", URL: "https://mcp.example.test/mcp?api_key=REVIEW_SENTINEL_SECRET"},
+	}
+	alpha := &v1beta1.Team{}
+	alpha.Name = "alpha-team"
+	alpha.Namespace = "default"
+	alpha.Spec.WorkerMembers = []v1beta1.TeamWorkerRef{{Name: "alpha-dev"}}
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(alphaDev, alpha).Build()
+	handler := NewResourceHandler(k8sClient, "default", nil, "", nil)
+	l2 := &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"alpha-team"}}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/workers/alpha-dev", nil)
+	req.SetPathValue("name", "alpha-dev")
+	req = req.WithContext(context.WithValue(req.Context(), authpkg.CallerKeyForTest(), l2))
+	rec := httptest.NewRecorder()
+	handler.GetWorker(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("L2 own-team worker detail status=%d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "api_key=REVIEW_SENTINEL_SECRET") {
+		t.Fatalf("L2 response must carry the MCP URL verbatim: %s", rec.Body.String())
+	}
+}

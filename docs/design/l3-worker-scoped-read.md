@@ -79,7 +79,7 @@ No write route is touched. L3 is read-only by two independent layers:
 |---|---|---|---|
 | admin / manager (L1) | any worker | any worker | any worker (unchanged) |
 | L2 human (`permissionLevel: 2`) | own accessibleTeams (unchanged) | own accessibleTeams (unchanged) | existing scoped-write policy (unchanged) |
-| **L3 human (`permissionLevel: 3`)** | **assigned workers (team + standalone); others 404** | **assigned workers; others 404 — channel-config reads sanitized (credentials stripped)** | **denied — 403 (worker/channels, middleware) or 404 (approval, handler); no upstream mutation** |
+| **L3 human (`permissionLevel: 3`)** | **assigned workers (team + standalone); others 404 — MCP endpoint URLs scrubbed (userinfo + credential query values)** | **assigned workers; others 404 — channel-config reads sanitized (credentials stripped)** | **denied — 403 (worker/channels, middleware) or 404 (approval, handler); no upstream mutation** |
 | team leader / worker SA | unchanged | unchanged | unchanged |
 
 `accessibleWorkers` on an L2 (level 2) CR is inert — the worker leg
@@ -89,12 +89,31 @@ activates solely at level 3.
 
 Maintainer decision (#1277 review): an L3 reader may read **normal
 config/status** of its assigned workers, but **no plaintext credentials**.
-The only L3-readable response surface carrying credential VALUES is the
-channel-config read pair (`GET .../channels`, `GET .../channels/{name}`
-— audited surface by surface: `WorkerResponse` has no credential or env
-fields — `mcpServers` is name/url/transport only; the approval GET
-returns a single `approval_level` string; channel health is
-`channel/status/detail`). Both channel-config read routes therefore strip
+The L3-readable response surfaces carrying credential VALUES are two (both
+audited surface by surface: the approval GET returns a single
+`approval_level` string; checkpoints/workspace-files hide as 404 for L3;
+the runtime-status endpoint is authorizer-denied for humans; channel
+health is `channel/status/detail`):
+
+1. The channel-config read pair (`GET .../channels`,
+   `GET .../channels/{name}`) — stripped by the `channelCredentialKeys`
+   denylist (below).
+2. The `mcpServers` URLs of `WorkerResponse` (worker detail
+   `GET /workers/{name}` + worker list `GET /workers`) — the struct is
+   name/url/transport, but the URL VALUE may embed credentials: an API
+   key in the query (`?api_key=...`) or a user:password pair in the
+   userinfo component (`https://user:pass@host`). `sanitizeMCPURLForL3`
+   removes the userinfo (always secret in this context) and every query
+   parameter whose key names a credential field — the same shared
+   `channelCredentialKeys` denylist, one contract — and keeps the rest of
+   the URL (host, path, non-credential query values) as useful,
+   non-secret metadata. A URL with no credential material is returned
+   byte-identical; a URL that cannot be parsed, or that is not absolute,
+   fails closed to empty (an unprovable URL is not served). The scrub
+   applies to `IsWorkerScoped()` callers only; L1/L2/SA responses carry
+   the URLs verbatim (team controllers legitimately manage these).
+
+Both channel-config read routes therefore strip
 credential-bearing fields **server-side** for worker-scoped callers:
 the `channelCredentialKeys` denylist (the qwenpaw 2.2.x channel model
 secret fields, case-insensitive leaf names, any nesting depth) is removed
@@ -133,7 +152,12 @@ the strip (the round-trip read contract, #1220 §13 Q5).
   (update via the uniform no-team rejection).
 - `internal/server/resource_handler_test.go` — `GetWorker_L3Scoped`,
   `ListWorkers_L3Scoped`, `UpdateWorker_L3Denied` (handler-level probe:
-  updating an *assigned* worker still 404s).
+  updating an *assigned* worker still 404s),
+  `GetWorker_L3MCPCredentialsSanitized` (query api_key + userinfo
+  sentinels absent from the raw L3 detail response; host/path/non-
+  credential query values retained), `ListWorkers_L3MCPCredentialsSanitized`
+  (same contract on the list surface), `GetWorker_L2MCPCredentialsVerbatim`
+  (the scrub does not over-apply: L2 reads the URLs verbatim).
 - `internal/server/worker_channels_test.go` — `ChannelsL3AssignedReadAllowed`
   (team + standalone), `ChannelsL3UnassignedHidden` (404, no dial),
   `ChannelsL3MutationDenied` (handler-level probe: PUT of an *assigned*

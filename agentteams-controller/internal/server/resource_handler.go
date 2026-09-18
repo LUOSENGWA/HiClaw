@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -174,11 +175,18 @@ func (h *ResourceHandler) GetWorker(w http.ResponseWriter, r *http.Request) {
 		// W8: return 404 (not 403) so scoped callers cannot probe worker
 		// existence by name — consistent with the project enumeration fix
 		// (W4).
-		if caller := authpkg.CallerFromContext(r.Context()); caller != nil &&
+		caller := authpkg.CallerFromContext(r.Context())
+		if caller != nil &&
 			(caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) &&
 			!caller.WorkerReadable(resp.Team, name) {
 			httputil.WriteError(w, http.StatusNotFound, "get worker: not found")
 			return
+		}
+		// L3 (worker-scoped) readers never receive plaintext credentials:
+		// scrub the MCP endpoint URLs before the response leaves the server.
+		// Other callers get the verbatim spec.
+		if caller != nil && caller.IsWorkerScoped() {
+			sanitizeWorkerResponseForL3(&resp)
 		}
 		httputil.WriteJSON(w, http.StatusOK, resp)
 		return
@@ -217,6 +225,12 @@ func (h *ResourceHandler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 		}
 		if teamFilter != "" && resp.Team != teamFilter {
 			continue
+		}
+		// L3 (worker-scoped) readers never receive plaintext credentials:
+		// scrub the MCP endpoint URLs before the response leaves the server.
+		// Other callers get the verbatim spec.
+		if caller != nil && caller.IsWorkerScoped() {
+			sanitizeWorkerResponseForL3(&resp)
 		}
 		workers = append(workers, resp)
 	}
@@ -1144,6 +1158,65 @@ func workerToResponse(w *v1beta1.Worker) WorkerResponse {
 		resp.ExposedPorts = append(resp.ExposedPorts, ExposedPortInfo{Port: ep.Port, Domain: ep.Domain})
 	}
 	return resp
+}
+
+// sanitizeWorkerResponseForL3 scrubs credential material from a worker
+// response before it is served to an L3 (worker-scoped) reader. The MCP
+// server URLs are the credential-bearing field: an endpoint URL may embed
+// the API key in the query (?api_key=...) or in the userinfo component
+// (https://user:pass@host). The URL itself is kept — host, path and any
+// non-credential query values are useful, non-secret metadata — only the
+// credential material is removed. No other WorkerResponse field carries
+// secret material on the L3 read surfaces (audited: channel configs are
+// sanitized separately on the channel routes; the approval endpoint returns
+// a single level; checkpoints/workspace-files hide as 404 for L3; the
+// runtime-status endpoint is authorizer-denied for humans).
+func sanitizeWorkerResponseForL3(resp *WorkerResponse) {
+	for i := range resp.McpServers {
+		resp.McpServers[i].URL = sanitizeMCPURLForL3(resp.McpServers[i].URL)
+	}
+}
+
+// sanitizeMCPURLForL3 removes credential material from an MCP endpoint URL:
+// the userinfo component (always secret in this context) and every query
+// parameter whose key names a credential field (the same denylist as the L3
+// channel-config sanitization — one shared contract). A URL with no
+// credential material is returned byte-identical. It fails closed: a URL
+// that cannot be parsed, or that is not absolute, is a URL we cannot prove
+// clean, so it is omitted entirely.
+func sanitizeMCPURLForL3(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || !u.IsAbs() {
+		return ""
+	}
+	changed := u.User != nil
+	if !changed {
+		for key := range u.Query() {
+			if isCredentialField(key) {
+				changed = true
+				break
+			}
+		}
+	}
+	if !changed {
+		return raw
+	}
+	u.User = nil
+	q := u.Query()
+	changedQuery := false
+	for key := range q {
+		if isCredentialField(key) {
+			q.Del(key)
+			changedQuery = true
+		}
+	}
+	if changedQuery {
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
 }
 
 func teamToResponse(t *v1beta1.Team) TeamResponse {
