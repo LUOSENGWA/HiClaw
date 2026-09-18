@@ -364,7 +364,7 @@ func TestDeployWorkerConfigMergesMcporterConfigPreservingExternalMCP(t *testing.
 	}
 
 	deployer := NewDeployer(DeployerConfig{
-		AgentConfig: agentconfig.NewGenerator(agentconfig.Config{}),
+		AgentConfig: agentconfig.NewGenerator(agentconfig.Config{AIGatewayURL: "https://gw.example.com"}),
 		OSS:         store,
 		AgentFSDir:  filepath.Join(tmp, "agents"),
 	})
