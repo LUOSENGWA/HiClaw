@@ -2527,12 +2527,34 @@ step_skills() {
 # (works for running or stopped containers). Prints the volume name or bind
 # path; empty when no controller container exists or the mount is absent.
 detect_installed_data_volume() {
-    local _src
-    _src=$(${DOCKER_CMD} inspect agentteams-controller --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' 2>/dev/null | tr -d '[:space:]' || true)
-    if [ -n "${_src}" ]; then
-        printf '%s\n' "${_src}"
+    local _id
+    # Named volumes: the reusable identifier is .Name (the docker volume
+    # name). .Source is Docker's internal path
+    # (/var/lib/docker/volumes/<name>/_data) — never store it in the env
+    # file or pass it to `docker volume create`.
+    # Bind mounts: the reusable identifier is the host path .Source,
+    # preserved verbatim (bind paths may contain spaces).
+    _id=$(${DOCKER_CMD} inspect agentteams-controller --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{if eq .Type "volume"}}{{.Name}}{{else}}{{.Source}}{{end}}{{end}}{{end}}' 2>/dev/null || true)
+    if [ -n "${_id}" ]; then
+        printf '%s\n' "${_id}"
     fi
     return 0
+}
+
+# Ensure the data storage target exists and build the docker mount args.
+# Named volumes (no '/' — docker volume names cannot contain it) are created
+# when missing; host paths are created as directories. A bind path is never
+# passed to `docker volume create`.
+prepare_data_volume() {
+    local _vol="${AGENTTEAMS_DATA_DIR}"
+    if [ "${_vol#/}" = "${_vol}" ]; then
+        if ! ${DOCKER_CMD} volume ls -q | grep -q "^${_vol}$"; then
+            ${DOCKER_CMD} volume create "${_vol}" > /dev/null
+        fi
+    else
+        mkdir -p "${_vol}"
+    fi
+    DATA_MOUNT_ARGS=("-v" "${_vol}:/data")
 }
 
 step_volume() {
@@ -3720,13 +3742,9 @@ EOF
         fi
     fi
 
-    # Create the data volume if it doesn't already exist (reuse on reinstall)
-    if ! ${DOCKER_CMD} volume ls -q | grep -q "^${AGENTTEAMS_DATA_DIR}$"; then
-        ${DOCKER_CMD} volume create "${AGENTTEAMS_DATA_DIR}" > /dev/null
-    fi
-
-    # Data mount: Docker volume
-    DATA_MOUNT_ARGS="-v ${AGENTTEAMS_DATA_DIR}:/data"
+    # Create the data volume (or host bind directory) if missing, and build
+    # the mount args (named volume vs bind path are handled distinctly).
+    prepare_data_volume
 
     # Manager workspace mount (always a host directory, defaulting to ~/agentteams-manager)
     WORKSPACE_MOUNT_ARGS="-v ${AGENTTEAMS_WORKSPACE_DIR}:/root/manager-workspace"
@@ -4356,7 +4374,7 @@ CREDEOF
             -p "${_port_prefix}${AGENTTEAMS_PORT_CONSOLE}:8001" \
             -p "${_port_prefix}${AGENTTEAMS_PORT_ELEMENT_WEB:-18088}:8088" \
             -p "127.0.0.1:${AGENTTEAMS_PORT_MANAGER_CONSOLE:-18888}:18888" \
-            ${DATA_MOUNT_ARGS} \
+            "${DATA_MOUNT_ARGS[@]}" \
             ${WORKSPACE_MOUNT_ARGS} \
             ${HOST_SHARE_MOUNT_ARGS} \
             --restart unless-stopped \
