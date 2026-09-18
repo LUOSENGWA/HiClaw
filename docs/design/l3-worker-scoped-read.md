@@ -101,17 +101,26 @@ health is `channel/status/detail`):
 2. The `mcpServers` URLs of `WorkerResponse` (worker detail
    `GET /workers/{name}` + worker list `GET /workers`) — the struct is
    name/url/transport, but the URL VALUE may embed credentials: an API
-   key in the query (`?api_key=...`) or a user:password pair in the
-   userinfo component (`https://user:pass@host`). `sanitizeMCPURLForL3`
-   removes the userinfo (always secret in this context) and every query
-   parameter whose key names a credential field — the same shared
-   `channelCredentialKeys` denylist, one contract — and keeps the rest of
-   the URL (host, path, non-credential query values) as useful,
-   non-secret metadata. A URL with no credential material is returned
-   byte-identical; a URL that cannot be parsed, or that is not absolute,
-   fails closed to empty (an unprovable URL is not served). The scrub
-   applies to `IsWorkerScoped()` callers only; L1/L2/SA responses carry
-   the URLs verbatim (team controllers legitimately manage these).
+   key in the query (`?api_key=...`, `?apiKey=...`, `?key=...` — arbitrary
+   vendor naming) or a user:password pair in the userinfo component
+   (`https://user:pass@host`). `sanitizeMCPURLForL3` **reduces** each URL
+   to `scheme://host[:port]/path`: the userinfo component, the **entire
+   query string**, and any fragment are dropped wholesale. MCP endpoints
+   are arbitrary external URLs, so their query namespaces are
+   unclassified input — a denylist of known credential field names (e.g.
+   the channel-config denylist) cannot be a complete credential contract
+   for that namespace (review, 0918 round 4: `apiKey`/`key` survived the
+   key-by-key filter), so no query value, classified or not, is exposed
+   to L3. This is the same secret contract as the MCP catalog surface
+   (`redactMCPURL`: host/path only); the worker response additionally
+   keeps the scheme as a transport-security signal. A URL with none of
+   those components is returned byte-identical; a URL that cannot be
+   parsed, or that is not absolute, or has no host, fails closed to empty
+   (an unprovable URL is not served). Known residual: a credential
+   encoded *in the path* (rare by convention) would survive — reducing
+   to `scheme://host[:port]` is a one-line tightening. The scrub applies
+   to `IsWorkerScoped()` callers only; L1/L2/SA responses carry the
+   URLs verbatim (team controllers legitimately manage these).
 
 Both channel-config read routes therefore strip
 credential-bearing fields **server-side** for worker-scoped callers:
