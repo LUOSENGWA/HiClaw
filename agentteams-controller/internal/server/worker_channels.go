@@ -40,30 +40,50 @@ package server
 //     channel (no worker restart). The worker's push_loop then propagates
 //     the file to the MinIO baseline that mirror_all pulls on rebuild; the
 //     read-back below covers the persistence gap that burned manual edits.
-//   - Credentials round-trip unmasked by design: scoped callers can only
-//     reach agents in their own teams, and the config form needs the saved
-//     values to round-trip unchanged.
-//   - The handler is the real boundary (middleware requires): team leaders
-//     are read-only on channels (403 on mutations), L2 humans are scoped to
-//     their accessibleTeams (W8: 404, never 403, so cross-team existence
-//     cannot be probed). L2 write authorization at the middleware rides on
-//     the worker-scoped update policy — until it lands, L2 PUTs are denied
-//     by the middleware and this PR's L2 path is inert-but-correct.
+//   - Read contract (round-trip, by design): credential values round-trip
+//     unmasked. Rationale: scoped callers can only reach agents in their own
+//     teams (W8), and the config form needs the saved values to round-trip
+//     unchanged. Decided per #1220 §13 Q5 (2026-09-16) — maintainer
+//     confirmation requested in the PR; a masked read would be a separate
+//     change (mask helper + a reveal capability), not a config flag.
+//   - Write contract: the handler is the real boundary (middleware
+//     requires): team leaders are read-only on channels (403 on mutations);
+//     L2 humans are scoped to their accessibleTeams (W8: 404, never 403, so
+//     cross-team existence cannot be probed) and may write non-credential
+//     fields by default. A PUT is diffed against the saved channel config
+//     before the write: credential fields (channelCredentialKeys) whose
+//     value is unchanged are ordinary fields; replacing a value or
+//     explicitly clearing it (empty string) additionally requires the
+//     channel_secrets capability for L2 callers and is audit-logged for
+//     every role. Credential fields omitted from the body are back-filled
+//     from the saved values, because upstream replaces the whole channel
+//     (config_class(**body)) — an omitted secret would otherwise be erased
+//     by the model default. admin/manager are exempt from the gate (their
+//     changed credential writes are audit-logged, not gated).
+//   - Read-back contract (async): a successful PUT answers immediately with
+//     X-AgentTeams-MinIO-Persisted: "pending"; a background re-check at a
+//     conservative bound beyond the worker push_loop sync interval records
+//     the convergence result in the audit log. The old bounded in-request
+//     polling budget (3x2s) was systematically false-negative against the
+//     push_loop (#1220 §11).
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
+	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/audit"
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/httputil"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss"
@@ -78,14 +98,22 @@ const (
 	// app (same bound as the checkpoint proxy).
 	channelProxyTimeout = 5 * time.Second
 
-	// minioPersistedHeader reports the read-back validation outcome of a
+	// minioPersistedHeader reports the read-back validation state of a
 	// successful PUT without touching the verbatim upstream response body.
-	// Values: "true" (baseline verified), "false" (baseline not converged
-	// within the read-back budget), "skipped" (no storage client configured).
+	// Values: "pending" (background re-check scheduled; the convergence
+	// result lands in the audit log as action "channel_readback"),
+	// "skipped" (no storage client configured). The former synchronous
+	// "true"/"false" values are retired with the async read-back.
 	minioPersistedHeader = "X-AgentTeams-MinIO-Persisted"
 
-	channelReadbackAttempts = 3
-	channelReadbackInterval = 2 * time.Second
+	// channelReadbackDelay is when the background baseline re-check runs
+	// after a successful PUT. The worker push_loop sync interval is short
+	// (check_interval=5s in the current qwenpaw worker), so this is a
+	// conservative bound far beyond any normal push_loop lag: a healthy
+	// push_loop has converged long before the check, and
+	// "converged=false" is a signal of a sustained persistence problem,
+	// not a race.
+	channelReadbackDelay = 2 * time.Minute
 
 	// channelBodyCap bounds the proxied request/response bodies — channel
 	// configs and schemas are small documents; the cap guards against a
@@ -113,25 +141,41 @@ type ChannelsHandler struct {
 	// oss is the storage client for the MinIO baseline read-back (nil =
 	// read-back skipped; the header reports "skipped").
 	oss oss.StorageClient
+	// audit records channel credential writes and read-back outcomes.
+	// nil = audit disabled (tests without an audit store).
+	audit *audit.Client
 	// workerBaseURL resolves a worker name to its qwenpaw app base URL from
 	// the effective prefix and the worker's env. Injectable for tests.
 	workerBaseURL func(name string, env map[string]string) string
-	// readbackInterval spaces the MinIO read-back attempts (injectable so
-	// tests do not sleep the production 2s cadence).
-	readbackInterval time.Duration
+	// readbackDelay is when the background baseline re-check runs after a
+	// successful PUT (injectable so tests do not wait the production 2min).
+	readbackDelay time.Duration
+	// onReadback, when set, is called from the background re-check goroutine
+	// with the convergence result (test hook for deterministic assertions).
+	onReadback func(converged bool)
+	// readbackGen serializes superseded-write detection: each PUT that
+	// schedules a baseline re-check claims the next generation for its
+	// (worker, channel); a re-check whose generation is no longer the
+	// newest (a newer PUT superseded the write) is skipped, so a newer
+	// successful write is never reported as a persistence failure of an
+	// older one.
+	readbackMu  sync.Mutex
+	readbackGen map[string]int64
 }
 
 // NewChannelsHandler creates the handler with the default embedded-mode
 // worker address resolution (same chain as the checkpoint proxy).
-func NewChannelsHandler(c client.Client, namespace, kubeMode, containerPrefix string, o oss.StorageClient) *ChannelsHandler {
+func NewChannelsHandler(c client.Client, namespace, kubeMode, containerPrefix string, o oss.StorageClient, ac *audit.Client) *ChannelsHandler {
 	h := &ChannelsHandler{
-		client:           c,
-		namespace:        namespace,
-		kubeMode:         kubeMode,
-		http:             &http.Client{Timeout: channelProxyTimeout},
-		containerPrefix:  containerPrefix,
-		oss:              o,
-		readbackInterval: channelReadbackInterval,
+		client:          c,
+		namespace:       namespace,
+		kubeMode:        kubeMode,
+		http:            &http.Client{Timeout: channelProxyTimeout},
+		containerPrefix: containerPrefix,
+		oss:             o,
+		audit:           ac,
+		readbackDelay:   channelReadbackDelay,
+		readbackGen:     map[string]int64{},
 	}
 	h.workerBaseURL = h.defaultWorkerBaseURL
 	return h
@@ -202,6 +246,11 @@ type channelRoute struct {
 	body     []byte // JSON request body (PUT channel config)
 	readback bool   // verify the MinIO baseline after a successful 200
 	mutates  bool   // true for state-changing calls (audit-logged)
+	// changedCreds lists the credential fields this write changed or
+	// cleared, pre-diffed against the saved config (PUT only). The audit
+	// records exactly these — not a re-scan of the (possibly back-filled)
+	// body, which would false-positive on round-tripped saved values.
+	changedCreds []string
 }
 
 // serveChannels performs the shared scope check, dials the worker's qwenpaw
@@ -256,8 +305,9 @@ func (h *ChannelsHandler) serveChannels(w http.ResponseWriter, r *http.Request, 
 	case http.StatusOK:
 		persisted := ""
 		if route.readback {
-			persisted = h.verifyMinioPersistence(r.Context(), name, r.PathValue("channel"), upstreamBody)
+			persisted = h.scheduleMinioReadback(r.Context(), name, r.PathValue("channel"), upstreamBody)
 			w.Header().Set(minioPersistedHeader, persisted)
+			h.auditChannelWrite(r.Context(), name, r.PathValue("channel"), route.changedCreds, caller)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -324,8 +374,25 @@ func (h *ChannelsHandler) getChannelResource(w http.ResponseWriter, r *http.Requ
 // putChannel handles PUT /api/v1/workers/{name}/channels/{channel}. The body
 // must be the full channel config object; upstream validates it (pydantic)
 // and the validation errors pass through verbatim.
+//
+// Credential semantics (the write contract, see the package doc): the
+// request is diffed against the saved channel config before the write.
+// Unchanged credential values are ordinary fields (a full-config edit
+// carrying the round-tripped saved values is a normal edit); replacing a
+// value or explicitly clearing it (empty string) requires the
+// channel_secrets capability for L2 humans; omitted credential fields are
+// back-filled from the saved values, because upstream replaces the whole
+// channel (config_class(**body)) and an omitted secret would otherwise be
+// erased by the model default.
 func (h *ChannelsHandler) putChannel(w http.ResponseWriter, r *http.Request) {
 	if !validateChannelName(w, r.PathValue("channel")) {
+		return
+	}
+	// Team leaders manage nothing — before any upstream dial, so a leader
+	// mutation never reaches the worker (serveChannels re-checks for its
+	// other mutating routes).
+	if caller := authpkg.CallerFromContext(r.Context()); caller != nil && caller.Role == authpkg.RoleTeamLeader {
+		httputil.WriteError(w, http.StatusForbidden, "team leaders have read-only access to worker channels")
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, channelBodyCap))
@@ -339,13 +406,87 @@ func (h *ChannelsHandler) putChannel(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusBadRequest, "request body must be the full channel config object (JSON)")
 		return
 	}
+
+	ch := r.PathValue("channel")
+	base, ok := h.channelsScope(w, r, r.PathValue("name"))
+	if !ok {
+		return
+	}
+
+	// Fetch the saved channel config so the write can be diffed against it
+	// (credential gate + back-fill). A read that fails the same way the
+	// write would: the PUT is not attempted when the baseline is unknown.
+	existing, exists, err := h.fetchChannelConfig(r.Context(), base, ch)
+	if err != nil {
+		httputil.WriteError(w, http.StatusBadGateway, "worker channel API unreachable")
+		return
+	}
+
+	// Unparseable bodies pass through untouched: the credential diff and
+	// the back-fill both need a document, and upstream's pydantic
+	// validation rejects the body anyway (no persistence without a 200).
+	var incoming any
+	changed, backfilled := []string{}, false
+	if err := json.Unmarshal(body, &incoming); err == nil {
+		changed, backfilled = reconcileCredentialFields(&incoming, existing, exists)
+	}
+
+	// Credential gate (L2 humans only; admin/manager writes are exempt but
+	// audit-logged in the 200 branch). Unchanged values do not count —
+	// only replacements and explicit clears do. The 403 names the
+	// offending fields so the client knows exactly what to drop or keep
+	// unchanged.
+	if caller := authpkg.CallerFromContext(r.Context()); caller != nil &&
+		caller.Role == authpkg.RoleHuman &&
+		len(changed) > 0 && !authpkg.HasCapability(caller, authpkg.CapabilityChannelSecrets) {
+		httputil.WriteError(w, http.StatusForbidden,
+			"writing or clearing channel credentials requires the channel_secrets capability; credential fields changed: "+strings.Join(changed, ", "))
+		return
+	}
+
+	out := body
+	if backfilled {
+		if encoded, err := json.Marshal(incoming); err == nil {
+			out = encoded
+		}
+	}
 	h.serveChannels(w, r, channelRoute{
-		method:   http.MethodPut,
-		upstream: "/api/config/channels/" + r.PathValue("channel"),
-		body:     body,
-		readback: true,
-		mutates:  true,
+		method:       http.MethodPut,
+		upstream:     "/api/config/channels/" + ch,
+		body:         out,
+		readback:     true,
+		mutates:      true,
+		changedCreds: changed,
 	})
+}
+
+// fetchChannelConfig reads the saved channel config from the worker's
+// qwenpaw app. exists=false means upstream reported the channel unknown
+// (404) — the write can still proceed (the PUT passes through upstream's
+// own 404), but nothing can be back-filled or diffed. Any other transport
+// or status error is returned: a PUT whose baseline cannot be read must not
+// proceed, because an omitted secret would be erased on a 200.
+func (h *ChannelsHandler) fetchChannelConfig(ctx context.Context, base, channel string) (raw []byte, exists bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/config/channels/"+channel, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	resp, err := h.http.Do(req)
+	if err != nil {
+		return nil, false, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, channelBodyCap))
+	if err != nil {
+		return nil, false, err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, false, fmt.Errorf("upstream status %d", resp.StatusCode)
+	}
+	return data, true, nil
 }
 
 // getChannelHealth handles GET .../channels/{channel}/health.
@@ -438,43 +579,337 @@ func agentJSONMinIOKey(worker string) string {
 	return "agents/" + worker + "/.qwenpaw/workspaces/default/agent.json"
 }
 
-// verifyMinioPersistence reads back the MinIO baseline after a successful
-// PUT and reports whether the worker's push_loop has converged it. It is
-// bounded (a few seconds), never blocks on convergence, and never writes to
-// the baseline — single-writer discipline: push_loop owns the MinIO copy.
-func (h *ChannelsHandler) verifyMinioPersistence(ctx context.Context, worker, channel string, saved []byte) string {
+// scheduleMinioReadback answers "pending" immediately and defers the
+// baseline convergence check to a background goroutine that runs once, at
+// readbackDelay after the PUT, and records the outcome in the audit log
+// (action "channel_readback"). The in-request polling budget it replaced
+// (3x2s) was systematically false-negative against the worker push_loop
+// sync interval in production (#1220 §11): a healthy push_loop could
+// never converge inside the request, so every PUT looked unpersisted.
+// Each PUT claims the next readback generation for its (worker, channel);
+// a re-check whose write was superseded by a newer PUT is skipped, so a
+// newer successful write is never reported as a persistence failure of an
+// older one. Single-writer discipline is unchanged: the re-check only
+// reads; the worker's push_loop owns the MinIO copy.
+func (h *ChannelsHandler) scheduleMinioReadback(ctx context.Context, worker, channel string, saved []byte) string {
 	if h.oss == nil {
 		return "skipped"
 	}
+	// Claim this write's generation: if a newer PUT lands before the
+	// re-check runs, the older re-check must not report its (superseded)
+	// expected config against the newer baseline.
+	key := worker + "/" + channel
+	h.readbackMu.Lock()
+	h.readbackGen[key]++
+	generation := h.readbackGen[key]
+	h.readbackMu.Unlock()
+	// Detached from the request: the response is written before the check
+	// runs, and the check outlives the HTTP exchange by design.
+	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+	go func() {
+		defer cancel()
+		select {
+		case <-bg.Done():
+			return
+		case <-time.After(h.readbackDelay):
+		}
+		h.readbackMu.Lock()
+		superseded := h.readbackGen[key] != generation
+		h.readbackMu.Unlock()
+		if superseded {
+			// A newer successful write owns the baseline now; this write's
+			// convergence is neither true nor false — it is superseded,
+			// and reporting it would false-alarm the older actor.
+			log.FromContext(bg).Info("worker channel readback skipped: write superseded by a newer PUT",
+				"worker", worker, "channel", channel)
+			return
+		}
+		converged := h.checkMinioConvergence(bg, worker, channel, saved)
+		if h.audit != nil {
+			// The event is attributed to the actor who performed the PUT
+			// (the caller identity survives context.WithoutCancel because
+			// values are copied, not just the cancel signal).
+			caller := authpkg.CallerFromContext(bg)
+			who, role := "unknown", "unknown"
+			if caller != nil {
+				who, role = caller.Username, caller.Role
+			}
+			h.audit.Record(bg, audit.Event{
+				Who:    who,
+				Role:   role,
+				Target: worker + "/" + channel,
+				Action: "channel_readback",
+				Detail: "converged=" + strconv.FormatBool(converged),
+			})
+		}
+		if h.onReadback != nil {
+			h.onReadback(converged)
+		}
+	}()
+	return "pending"
+}
+
+// checkMinioConvergence is the single background baseline read: does
+// channels.<channel> in the MinIO agent.json equal the config the worker's
+// qwenpaw app acknowledged? One attempt by design — the generous delay
+// (not retries) is what absorbs normal push_loop lag, so "false" at check
+// time is a real signal worth auditing, not a race.
+func (h *ChannelsHandler) checkMinioConvergence(ctx context.Context, worker, channel string, saved []byte) bool {
 	savedJSON, ok := canonicalJSON(saved)
 	if !ok {
-		// Upstream returned non-JSON on 200: unverifiable, report false
-		// (the response body itself still reaches the client verbatim).
-		return "false"
+		return false // non-JSON upstream 200: unverifiable
 	}
-	key := agentJSONMinIOKey(worker)
-	for attempt := 0; attempt < channelReadbackAttempts; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return "false"
-			case <-time.After(h.readbackInterval):
-			}
+	data, err := h.oss.GetObject(ctx, agentJSONMinIOKey(worker))
+	if err != nil {
+		return false // baseline missing or transient storage error
+	}
+	persisted, ok := extractChannelSection(data, channel)
+	return ok && bytes.Equal(persisted, savedJSON)
+}
+
+// auditChannelWrite records a successful channel PUT that changed or
+// cleared credential fields (who, which fields). The list is pre-diffed
+// against the saved config in putChannel, so round-tripped unchanged
+// values are not audit-logged. Non-credential writes are not audit-logged
+// either — they are covered by the existing "worker channel updated"
+// access log in serveChannels.
+func (h *ChannelsHandler) auditChannelWrite(ctx context.Context, worker, channel string, changedCreds []string, caller *authpkg.CallerIdentity) {
+	if h.audit == nil || caller == nil || len(changedCreds) == 0 {
+		return
+	}
+	h.audit.Record(ctx, audit.Event{
+		Who:        caller.Username,
+		Role:       caller.Role,
+		Target:     worker + "/" + channel,
+		Action:     "channel_credential_write",
+		Capability: string(authpkg.CapabilityChannelSecrets),
+		Detail:     "credential_fields=" + strings.Join(changedCreds, ","),
+	})
+}
+
+// channelCredentialKeys names the fields of qwenpaw 2.2.x channel config
+// models (config.py) that carry secret material. The list is the contract
+// for the channel_secrets gate: adding a new qwenpaw secret field here is
+// what keeps the gate current. Generic "token"/"secret" are included so an
+// unknown-but-secret-shaped key over-blocks (403 naming the field) rather
+// than under-blocks.
+var channelCredentialKeys = map[string]bool{
+	"access_token":       true,
+	"bot_token":          true,
+	"token":              true,
+	"app_secret":         true,
+	"app_token":          true,
+	"client_secret":      true,
+	"secret":             true,
+	"encrypt_key":        true,
+	"verification_token": true,
+	"password":           true,
+	"sip_password":       true,
+	"http_proxy_auth":    true,
+	"api_key":            true,
+	"dashscope_api_key":  true,
+	"livekit_api_key":    true,
+	"livekit_api_secret": true,
+	"twilio_auth_token":  true,
+}
+
+// reconcileCredentialFields diffs the incoming channel config against the
+// saved one, credential field by credential field (any nesting depth), and
+// back-fills omitted credential fields from the saved values:
+//
+//   - present, non-empty, equal to the saved value → unchanged: neither
+//     gated nor audit-logged (a full-config edit carrying the
+//     round-tripped saved values is an ordinary edit);
+//   - present, different from the saved value → a credential write
+//     (gated for L2 humans + audit-logged);
+//   - present as an explicit "" → an explicit clear (gated + audit-logged;
+//     clearing through an empty string is a credential operation, not a
+//     placeholder);
+//   - absent from the incoming config but non-empty in the saved config →
+//     back-filled into the incoming document (upstream replaces the whole
+//     channel — an omitted secret would otherwise be erased by the model
+//     default).
+//
+// It returns the sorted list of changed/cleared credential fields (for the
+// gate and the audit) and whether the incoming document was modified. A
+// missing or unreadable saved config means every present credential field
+// is a write and nothing can be back-filled (fail gated).
+func reconcileCredentialFields(incoming *any, existing []byte, exists bool) ([]string, bool) {
+	var existingDoc any
+	if exists {
+		if err := json.Unmarshal(existing, &existingDoc); err != nil {
+			exists = false
 		}
-		data, err := h.oss.GetObject(ctx, key)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue // push_loop has not written the baseline yet
-			}
-			// Transient storage error: one retry round is worth it, but do
-			// not mask a hard failure as "converged".
+	}
+	inFlat := flattenJSONDoc(*incoming)
+	var exFlat map[string]any
+	if exists {
+		exFlat = flattenJSONDoc(existingDoc)
+	}
+
+	changed := map[string]bool{}
+	for path, val := range inFlat {
+		if !isCredentialField(fieldBaseName(path)) {
 			continue
 		}
-		if persisted, ok := extractChannelSection(data, channel); ok && bytes.Equal(persisted, savedJSON) {
-			return "true"
+		s, isString := val.(string)
+		switch {
+		case isString && s != "":
+			exVal, present := exFlat[path]
+			if present && exVal == s {
+				continue // unchanged round-trip value
+			}
+			changed[path] = true
+		case isString:
+			changed[path] = true // explicit "" = explicit clear
+		default:
+			changed[path] = true // non-string value: gate it (upstream validates the type)
 		}
 	}
-	return "false"
+
+	backfilled := false
+	for path, val := range exFlat {
+		if !isCredentialField(fieldBaseName(path)) {
+			continue
+		}
+		if _, present := inFlat[path]; present {
+			continue
+		}
+		if s, ok := val.(string); ok && s != "" {
+			setJSONPath(incoming, path, s)
+			backfilled = true
+		}
+	}
+
+	paths := make([]string, 0, len(changed))
+	for path := range changed {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths, backfilled
+}
+
+func isCredentialField(name string) bool {
+	return channelCredentialKeys[strings.ToLower(name)]
+}
+
+// fieldBaseName extracts the leaf field name from a flat path
+// ("a.b[0].c" → "c", "a.bot_token" → "bot_token").
+func fieldBaseName(path string) string {
+	seg := path
+	if i := strings.LastIndex(seg, "."); i >= 0 {
+		seg = seg[i+1:]
+	}
+	if j := strings.LastIndex(seg, "["); j >= 0 {
+		seg = seg[:j]
+	}
+	return seg
+}
+
+// flattenJSONDoc maps a JSON document to "dot.path" → leaf value
+// (list indices rendered as "[i]"). Empty maps/objects contribute no
+// leaves — credential fields are scalar leaves in the channel models.
+func flattenJSONDoc(v any) map[string]any {
+	out := map[string]any{}
+	var walk func(prefix string, val any)
+	walk = func(prefix string, val any) {
+		switch t := val.(type) {
+		case map[string]any:
+			for k, e := range t {
+				p := k
+				if prefix != "" {
+					p = prefix + "." + k
+				}
+				walk(p, e)
+			}
+		case []any:
+			for i, e := range t {
+				walk(fmt.Sprintf("%s[%d]", prefix, i), e)
+			}
+		default:
+			out[prefix] = val
+		}
+	}
+	walk("", v)
+	return out
+}
+
+// setJSONPath assigns value at the dot.path location inside the document,
+// creating intermediate objects as needed (back-fill only targets paths
+// that exist in the saved config, whose shape the incoming document may
+// have partially omitted). Paths that traverse list positions the incoming
+// document lacks are left untouched rather than invented.
+func setJSONPath(doc *any, path string, value any) {
+	type step struct {
+		key   string
+		index int
+		isIdx bool
+	}
+	var steps []step
+	cur, curIsIdx := "", false
+	flush := func() {
+		if cur == "" {
+			return
+		}
+		if curIsIdx {
+			steps = append(steps, step{index: atoiOrNeg(cur), isIdx: true})
+		} else {
+			steps = append(steps, step{key: cur})
+		}
+		cur, curIsIdx = "", false
+	}
+	for _, r := range path {
+		switch {
+		case r == '.':
+			flush()
+		case r == '[':
+			flush()
+			curIsIdx = true
+		case r == ']':
+			flush()
+		default:
+			cur += string(r)
+		}
+	}
+	flush()
+
+	node := doc
+	for i, st := range steps {
+		if st.isIdx {
+			list, ok := (*node).([]any)
+			if !ok || st.index < 0 || st.index >= len(list) {
+				return // cannot back-fill into a list the caller omitted
+			}
+			node = &list[st.index]
+			continue
+		}
+		m, ok := (*node).(map[string]any)
+		if !ok {
+			m = map[string]any{}
+			*node = m
+		}
+		if i == len(steps)-1 {
+			m[st.key] = value
+			return
+		}
+		next, ok := m[st.key].(map[string]any)
+		if !ok {
+			// The incoming document omitted (or flattened) an intermediate
+			// object the saved config has: recreate it.
+			next = map[string]any{}
+			m[st.key] = next
+		}
+		nextAny := any(next)
+		node = &nextAny
+	}
+}
+
+func atoiOrNeg(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return -1
+	}
+	return n
 }
 
 // canonicalJSON re-encodes a JSON document with sorted keys so semantic
