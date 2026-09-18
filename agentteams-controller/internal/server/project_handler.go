@@ -571,6 +571,12 @@ func (h *ProjectHandler) ListProjects(w http.ResponseWriter, r *http.Request) {
 		PlanType  string `json:"plan_type"`
 		TeamID    string `json:"team_id"`
 		Mode      string `json:"mode"`
+		// UpdatedAt surfaces projectMeta.UpdatedAt (written by the lifecycle
+		// write API) so list consumers can sort by real activity time. Empty
+		// for projects never touched by a lifecycle write — consumers fall
+		// back to their own heuristics (omitempty keeps the payload unchanged
+		// for such projects).
+		UpdatedAt string `json:"updated_at,omitempty"`
 	}
 	projects := make([]projectSummary, 0)
 	seen := map[string]bool{}
@@ -677,6 +683,7 @@ func (h *ProjectHandler) ListProjects(w http.ResponseWriter, r *http.Request) {
 			PlanType:  meta.PlanType,
 			TeamID:    meta.TeamID,
 			Mode:      meta.Mode,
+			UpdatedAt: meta.UpdatedAt,
 		})
 	}
 

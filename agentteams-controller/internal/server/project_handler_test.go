@@ -560,6 +560,40 @@ func TestListProjects_SortedAndTeamFiltered(t *testing.T) {
 	}
 }
 
+func TestListProjects_UpdatedAtPassthrough(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"updated_at": "2026-09-18T08:30:00Z",
+	})
+	putProject(store, "shared/projects/p2/meta.json", map[string]any{
+		"project_id": "p2", "title": "P2", "status": "active", "plan_type": "dag",
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ListProjects(rec, req)
+	var resp struct {
+		Projects []map[string]any `json:"projects"`
+		Total    int              `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Total != 2 {
+		t.Fatalf("total=%d, want 2", resp.Total)
+	}
+	p1, p2 := resp.Projects[0], resp.Projects[1]
+	if got := p1["updated_at"]; got != "2026-09-18T08:30:00Z" {
+		t.Fatalf("p1 updated_at=%v, want passthrough", got)
+	}
+	if _, ok := p2["updated_at"]; ok {
+		t.Fatalf("p2 should omit updated_at when meta has none: %v", p2)
+	}
+}
+
 func TestGetProjectWorkflow_LoopWaitingUserHasNoNext(t *testing.T) {
 	store := ossfake.NewMemory()
 	putProject(store, "shared/projects/p1/meta.json", map[string]any{
