@@ -1171,10 +1171,11 @@ func (h *ResourceHandler) checkHumanWorkerUpdate(ctx context.Context, caller *au
 		forbidden = append(forbidden, "agents")
 	}
 	// Credential-bearing surfaces: remoteSkills (registry source URIs may
-	// embed tokens) and mcpServers (GenerateMcporterConfig injects the
-	// gateway bearer key into every entry, URL used verbatim — an
-	// attacker-controlled URL exfiltrates it). Elevated capability pending
-	// the L2 permission design.
+	// embed tokens) and mcpServers (URLs are used verbatim in the generated
+	// mcporter config; the gateway bearer key is now attached only to trusted
+	// gateway hosts (#1220 §7), but external endpoints remain a data-exfil
+	// vector for any per-entry secret). Elevated capability pending the L2
+	// permission design.
 	if req.RemoteSkills != nil {
 		forbidden = append(forbidden, "remoteSkills")
 	}
