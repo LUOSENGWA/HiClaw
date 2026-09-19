@@ -35,9 +35,12 @@ type CreateWorkerRequest struct {
 }
 
 type UpdateWorkerRequest struct {
-	WorkerName    string                             `json:"workerName,omitempty"`
-	Model         string                             `json:"model,omitempty"`
-	SubagentModel string                             `json:"subagentModel,omitempty"`
+	WorkerName string `json:"workerName,omitempty"`
+	Model      string `json:"model,omitempty"`
+	// SubagentModel is a pointer so callers can distinguish omission (nil:
+	// keep the current value) from an explicit clear ("" — the worker
+	// returns to inheriting the team default / the runtime default).
+	SubagentModel *string                            `json:"subagentModel,omitempty"`
 	ModelProvider string                             `json:"modelProvider,omitempty"`
 	Runtime       string                             `json:"runtime,omitempty"`
 	Image         string                             `json:"image,omitempty"`

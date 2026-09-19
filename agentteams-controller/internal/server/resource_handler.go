@@ -270,8 +270,10 @@ func (h *ResourceHandler) UpdateWorker(w http.ResponseWriter, r *http.Request) {
 		if req.Model != "" {
 			worker.Spec.Model = req.Model
 		}
-		if req.SubagentModel != "" {
-			worker.Spec.SubagentModel = req.SubagentModel
+		// Pointer semantics: nil = omitted (keep), "" = explicit clear
+		// (return to team default / runtime default).
+		if req.SubagentModel != nil {
+			worker.Spec.SubagentModel = *req.SubagentModel
 		}
 		if req.ModelProvider != "" {
 			worker.Spec.ModelProvider = req.ModelProvider
@@ -1353,7 +1355,8 @@ func (h *ResourceHandler) checkScopedWorkerUpdate(ctx context.Context, caller *a
 	}
 	// subagentModel sits with model: the model slot is a decision-layer
 	// field owned by the team owner / admin (L1), not by scoped L2 writers.
-	if req.SubagentModel != "" {
+	// The pointer check also covers an explicit clear ("" present).
+	if req.SubagentModel != nil {
 		forbidden = append(forbidden, "subagentModel")
 	}
 	if req.ModelProvider != "" {
