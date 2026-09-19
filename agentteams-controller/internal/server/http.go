@@ -149,6 +149,14 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	// qwenpaw app). The dashboard renders a worker's conversation history
 	// for the caller's scoped workers; embedded mode only. ---
 	chatsh := NewChatsHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix)
+	// L2 participation anchor (room level): the caller's own Matrix token
+	// → homeserver GET /joined_rooms (ListJoinedRooms takes the caller's
+	// token — membership is a property of the token's user, no admin
+	// substitute view). When there is no Matrix client the field stays
+	// nil and every L2 request fails closed (uniform 404).
+	if deps.MatrixClient != nil {
+		chatsh.joinedRooms = deps.MatrixClient.ListJoinedRooms
+	}
 	mux.Handle("GET /api/v1/workers/{name}/chats", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(chatsh.listChats)))
 	mux.Handle("GET /api/v1/workers/{name}/chats/{chat_id}", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(chatsh.getChat)))
 	mux.Handle("GET /api/v1/workers/{name}/chats/{chat_id}/status", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(chatsh.getChatStatus)))

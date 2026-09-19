@@ -2,7 +2,9 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,7 +15,6 @@ import (
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/config"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/service"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -330,107 +331,146 @@ func TestChat_TeamLeaderCrossTeamDenied(t *testing.T) {
 	}
 }
 
-// testHuman builds a Human CR with a reconciled Matrix MXID — the
-// participation anchor the chats proxy resolves server-side.
-func testHuman(name, mxid string) *v1beta1.Human {
-	return &v1beta1.Human{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
-		Status:     v1beta1.HumanStatus{MatrixUserID: mxid},
+// l2Caller builds an L2 human request (in scope for market-team) carrying
+// the given Matrix bearer token; token "" exercises the no-token case.
+func l2Caller(req *http.Request, token string) *http.Request {
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	return req
 }
 
-// TestChat_L2HumanInScopeAllowed locks the scoped-caller fix: an L2 human
-// whose team contains the worker must resolve 200 (findTeamMember's second
-// return value is the member name, not the team name — the check must
-// compare against the Team CR name). With the participation boundary, the
-// list must additionally be server-forced to the caller's own MXID.
-func TestChat_L2HumanInScopeAllowed(t *testing.T) {
+// roomsStub wires a room-membership source into the handler and returns a
+// pointer that records the token the source was called with (the L2 anchor
+// must be the caller's OWN token — never a substitute identity).
+func roomsStub(rooms []string, err error) (func(context.Context, string) ([]string, error), *string) {
+	tokenSeen := new(string)
+	return func(_ context.Context, token string) ([]string, error) {
+		*tokenSeen = token
+		return rooms, err
+	}, tokenSeen
+}
+
+// roomListPayload is one worker's full chat list, covering every
+// participation class: a matrix chat in !team:ex — the caller's room, an
+// AGENT-DRIVEN session (chat user_id is the manager's MXID, not the
+// caller's; this is the isolated share_session_in_group mode, the
+// AgentTeams default, #7001) — a matrix chat in a room the caller is not
+// in, and non-matrix channels (console/qq, other session namespaces).
+const roomListPayload = `[` +
+	`{"id":"aaaa0000-0000-4000-8000-000000000001","name":"matrix:!team:ex","session_id":"matrix:!team:ex","user_id":"@manager:ex","channel":"matrix"},` +
+	`{"id":"aaaa0000-0000-4000-8000-000000000002","name":"matrix:!other:ex","session_id":"matrix:!other:ex","user_id":"@manager:ex","channel":"matrix"},` +
+	`{"id":"aaaa0000-0000-4000-8000-000000000003","name":"console","session_id":"default","user_id":"default","channel":"console"},` +
+	`{"id":"aaaa0000-0000-4000-8000-000000000004","name":"qq","session_id":"qq:9527","user_id":"9527","channel":"qq"}` +
+	`]`
+
+// TestChat_L2RoomParticipation_ListFiltersToCallerRooms is the core room
+// level boundary: an L2 human gets the worker's matrix chats for the rooms
+// she is a current member of — INCLUDING the agent-driven (manager/leader)
+// sessions that carry the diagnostic evidence, and EXCLUDING other rooms
+// and non-matrix channels. Client-supplied filters are dropped; the
+// upstream fetch is forced to channel=matrix; the membership source is
+// called with the caller's own token.
+func TestChat_L2RoomParticipation_ListFiltersToCallerRooms(t *testing.T) {
 	var gotQuery string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotQuery = r.URL.RawQuery
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"id":"c1","name":"ch1"}]`))
+		_, _ = w.Write([]byte(roomListPayload))
 	}))
 	defer upstream.Close()
 
-	objs := checkpointTeamWithWorkers("market-team", "market-writer")
-	objs = append(objs, testHuman("alice", "@alice:example.com"))
-	h := newTestChatsHandler(t, "embedded", upstream, objs...)
-	req := chatsListRequest("market-writer", "")
-	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
-	rec := httptest.NewRecorder()
-	h.listChats(rec, req)
+	h := newTestChatsHandler(t, "embedded", upstream, checkpointTeamWithWorkers("market-team", "market-writer")...)
+	fn, tokenSeen := roomsStub([]string{"!team:ex"}, nil)
+	h.joinedRooms = fn
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s, want 200 for in-scope L2 human", rec.Code, rec.Body.String())
-	}
-	want := "user_id=" + url.QueryEscape("@alice:example.com")
-	if gotQuery != want {
-		t.Fatalf("upstream query=%q, want %q (server-forced own-MXID filter)", gotQuery, want)
-	}
-}
-
-// TestChat_L2Participation_ListOverridesClientFilters locks the maintainer
-// boundary: client-supplied user_id is a filter, never authorization —
-// for an L2 human the user_id filter is overridden to the caller's own
-// MXID, include_app_owned is dropped, and the remaining whitelisted
-// filters (channel/archived) narrow the caller's own chats.
-func TestChat_L2Participation_ListOverridesClientFilters(t *testing.T) {
-	var gotQuery string
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotQuery = r.URL.RawQuery
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[]`))
-	}))
-	defer upstream.Close()
-
-	objs := checkpointTeamWithWorkers("market-team", "market-writer")
-	objs = append(objs, testHuman("alice", "@alice:example.com"))
-	h := newTestChatsHandler(t, "embedded", upstream, objs...)
-	req := chatsListRequest("market-writer", "?user_id=bob&include_app_owned=true&channel=matrix&archived=false")
-	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
+	req := chatsListRequest("market-writer", "?user_id=bob&include_app_owned=true&archived=false")
+	req = l2Caller(req, "alice-token")
 	rec := httptest.NewRecorder()
 	h.listChats(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
 	}
-	want := "archived=false&channel=matrix&user_id=" + url.QueryEscape("@alice:example.com")
-	if gotQuery != want {
-		t.Fatalf("upstream query=%q, want %q (bob overridden, app_owned dropped, own filters kept)", gotQuery, want)
+	if gotQuery != "channel=matrix" {
+		t.Fatalf("upstream query=%q, want channel=matrix (client filters dropped for L2)", gotQuery)
+	}
+	if *tokenSeen != "alice-token" {
+		t.Fatalf("joined_rooms called with token %q, want the caller's own token", *tokenSeen)
+	}
+	want := `[{"id":"aaaa0000-0000-4000-8000-000000000001","name":"matrix:!team:ex","session_id":"matrix:!team:ex","user_id":"@manager:ex","channel":"matrix"}]`
+	if body := strings.TrimSpace(rec.Body.String()); body != want {
+		t.Fatalf("list=%s, want exactly the caller-room matrix chat (agent-driven session included, other rooms/channels excluded)", body)
 	}
 }
 
-// TestChat_L2Participation_OtherUsersChatDetail404 locks the detail
-// boundary: a chat belonging to another user (bob's conversation with the
-// worker) is hidden from alice as a uniform 404 — and the upstream detail
-// endpoint is never dialed (no content, no existence probe).
-func TestChat_L2Participation_OtherUsersChatDetail404(t *testing.T) {
+// TestChat_L2RoomParticipation_InRoomAgentDrivenDetail200 locks the
+// behavior that changed from the sender-level v1: a chat in the caller's
+// room whose user_id is the MANAGER's MXID (agent-driven session, isolated
+// mode) is readable — v1's strict "own MXID only" precheck 404'd it.
+func TestChat_L2RoomParticipation_InRoomAgentDrivenDetail200(t *testing.T) {
+	const payload = `{"messages":[{"id":"m1","type":"message","role":"user","content":[{"type":"text","text":"delegation log"}],"status":"completed"}],"status":"idle"}`
 	var detailDials int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if strings.HasPrefix(r.URL.Path, "/api/chats/0d9f3d6e") {
+		if strings.HasPrefix(r.URL.Path, "/api/chats/aaaa0000-0000-4000-8000-000000000001") {
 			detailDials++
-			_, _ = w.Write([]byte(`{"messages":[{"id":"m1","type":"message","role":"user","content":[{"type":"text","text":"bob secret"}],"status":"completed"}],"status":"idle"}`))
+			_, _ = w.Write([]byte(payload))
 			return
 		}
-		// the precheck list, scoped to alice's MXID: bob's chat is absent
-		_, _ = w.Write([]byte(`[{"id":"11111111-2222-4333-8444-555555555555","name":"alice-chat"}]`))
+		_, _ = w.Write([]byte(roomListPayload))
 	}))
 	defer upstream.Close()
 
-	objs := checkpointTeamWithWorkers("market-team", "market-writer")
-	objs = append(objs, testHuman("alice", "@alice:example.com"))
-	h := newTestChatsHandler(t, "embedded", upstream, objs...)
-	req := chatsDetailRequest("market-writer", "0d9f3d6e-1a2b-4c3d-8e5f-6a7b8c9d0e1f", "")
-	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
+	h := newTestChatsHandler(t, "embedded", upstream, checkpointTeamWithWorkers("market-team", "market-writer")...)
+	h.joinedRooms, _ = roomsStub([]string{"!team:ex"}, nil)
+
+	req := chatsDetailRequest("market-writer", "aaaa0000-0000-4000-8000-000000000001", "")
+	req = l2Caller(req, "alice-token")
+	rec := httptest.NewRecorder()
+	h.getChat(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 for an in-room chat", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != payload {
+		t.Fatalf("body not verbatim:\n got %s\nwant %s", rec.Body.String(), payload)
+	}
+	if detailDials != 1 {
+		t.Fatalf("upstream detail dialed %d times, want 1", detailDials)
+	}
+}
+
+// TestChat_L2RoomParticipation_OtherRoomDetail404: a chat in a room the
+// caller is not in is hidden as a uniform 404 (upstream's own not-found
+// shape) and the detail endpoint is never dialed — no existence probe, no
+// content.
+func TestChat_L2RoomParticipation_OtherRoomDetail404(t *testing.T) {
+	var detailDials int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/api/chats/aaaa0000-0000-4000-8000-000000000002") {
+			detailDials++
+			_, _ = w.Write([]byte(`{"messages":[{"id":"m1","type":"message","role":"user","content":[{"type":"text","text":"other room secret"}],"status":"completed"}],"status":"idle"}`))
+			return
+		}
+		_, _ = w.Write([]byte(roomListPayload))
+	}))
+	defer upstream.Close()
+
+	h := newTestChatsHandler(t, "embedded", upstream, checkpointTeamWithWorkers("market-team", "market-writer")...)
+	h.joinedRooms, _ = roomsStub([]string{"!team:ex"}, nil)
+
+	req := chatsDetailRequest("market-writer", "aaaa0000-0000-4000-8000-000000000002", "")
+	req = l2Caller(req, "alice-token")
 	rec := httptest.NewRecorder()
 	h.getChat(rec, req)
 
 	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status=%d body=%s, want 404 for another user's chat", rec.Code, rec.Body.String())
+		t.Fatalf("status=%d body=%s, want 404 for a chat in a room the caller is not in", rec.Code, rec.Body.String())
 	}
-	want := `{"detail":"Chat not found: 0d9f3d6e-1a2b-4c3d-8e5f-6a7b8c9d0e1f"}`
+	want := `{"detail":"Chat not found: aaaa0000-0000-4000-8000-000000000002"}`
 	if rec.Body.String() != want {
 		t.Fatalf("body=%s, want %s (uniform, indistinguishable from upstream 404)", rec.Body.String(), want)
 	}
@@ -439,121 +479,185 @@ func TestChat_L2Participation_OtherUsersChatDetail404(t *testing.T) {
 	}
 }
 
-// TestChat_L2Participation_OwnChatDetail200: alice's own chat passes the
-// precheck and is proxied verbatim.
-func TestChat_L2Participation_OwnChatDetail200(t *testing.T) {
-	const payload = `{"messages":[{"id":"m1","type":"message","role":"user","content":[{"type":"text","text":"hi"}],"status":"completed"}],"status":"idle"}`
+// TestChat_L2RoomParticipation_NonMatrixChatDetail404: console/qq/app-owned
+// chats have no "!"-prefixed room namespace, so matrixRoomID yields "" and
+// they are never visible to an L2 human — fail closed, no per-channel
+// allowlist.
+func TestChat_L2RoomParticipation_NonMatrixChatDetail404(t *testing.T) {
+	var detailDials int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if strings.HasPrefix(r.URL.Path, "/api/chats/0d9f3d6e") {
-			_, _ = w.Write([]byte(payload))
+		if strings.HasPrefix(r.URL.Path, "/api/chats/aaaa0000-0000-4000-8000-000000000003") {
+			detailDials++
+			_, _ = w.Write([]byte(`{"messages":[],"status":"idle"}`))
 			return
 		}
-		_, _ = w.Write([]byte(`[{"id":"0d9f3d6e-1a2b-4c3d-8e5f-6a7b8c9d0e1f","name":"alice-chat"}]`))
+		_, _ = w.Write([]byte(roomListPayload))
 	}))
 	defer upstream.Close()
 
-	objs := checkpointTeamWithWorkers("market-team", "market-writer")
-	objs = append(objs, testHuman("alice", "@alice:example.com"))
-	h := newTestChatsHandler(t, "embedded", upstream, objs...)
-	req := chatsDetailRequest("market-writer", "0d9f3d6e-1a2b-4c3d-8e5f-6a7b8c9d0e1f", "")
-	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
+	h := newTestChatsHandler(t, "embedded", upstream, checkpointTeamWithWorkers("market-team", "market-writer")...)
+	h.joinedRooms, _ = roomsStub([]string{"!team:ex"}, nil)
+
+	req := chatsDetailRequest("market-writer", "aaaa0000-0000-4000-8000-000000000003", "")
+	req = l2Caller(req, "alice-token")
 	rec := httptest.NewRecorder()
 	h.getChat(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s, want 200 for own chat", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s, want 404 for a non-matrix chat", rec.Code, rec.Body.String())
 	}
-	if rec.Body.String() != payload {
-		t.Fatalf("body not verbatim:\n got %s\nwant %s", rec.Body.String(), payload)
+	if detailDials != 0 {
+		t.Fatalf("upstream detail dialed %d times, want 0 (no content leak)", detailDials)
 	}
 }
 
-// TestChat_L2Participation_StatusSameBoundary: the status route runs the
-// same precheck (own chat 200, other user's chat 404).
-func TestChat_L2Participation_StatusSameBoundary(t *testing.T) {
+// TestChat_L2RoomParticipation_SharedSessionModeVisible locks the second
+// share_session_in_group mode (room-wide sharing, legacy/optional): the
+// single room session stores the ROOM ID as user_id — sender-level
+// anchoring could never match it; room-level anchoring admits it for
+// every current room member.
+func TestChat_L2RoomParticipation_SharedSessionModeVisible(t *testing.T) {
+	const shared = `[{"id":"bbbb0000-0000-4000-8000-000000000001","name":"shared-room-session","session_id":"matrix:!team:ex","user_id":"!team:ex","channel":"matrix"}]`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(shared))
+	}))
+	defer upstream.Close()
+
+	h := newTestChatsHandler(t, "embedded", upstream, checkpointTeamWithWorkers("market-team", "market-writer")...)
+	h.joinedRooms, _ = roomsStub([]string{"!team:ex"}, nil)
+
+	req := chatsListRequest("market-writer", "")
+	req = l2Caller(req, "alice-token")
+	rec := httptest.NewRecorder()
+	h.listChats(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != shared {
+		t.Fatalf("list=%s, want the shared room session (user_id = room id)", body)
+	}
+}
+
+// TestChat_L2RoomParticipation_StatusSameBoundary: the status route runs
+// the same room precheck (in-room chat 200, other-room chat 404).
+func TestChat_L2RoomParticipation_StatusSameBoundary(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasPrefix(r.URL.Path, "/api/chats/") && strings.HasSuffix(r.URL.Path, "/status") {
 			_, _ = w.Write([]byte(`{"status":"running"}`))
 			return
 		}
-		_, _ = w.Write([]byte(`[{"id":"11111111-2222-4333-8444-555555555555","name":"alice-chat"}]`))
+		_, _ = w.Write([]byte(roomListPayload))
 	}))
 	defer upstream.Close()
 
-	objs := checkpointTeamWithWorkers("market-team", "market-writer")
-	objs = append(objs, testHuman("alice", "@alice:example.com"))
-	h := newTestChatsHandler(t, "embedded", upstream, objs...)
-	caller := func() *http.Request {
-		req := chatsStatusRequest("market-writer", "0d9f3d6e-1a2b-4c3d-8e5f-6a7b8c9d0e1f", "")
-		return withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
+	h := newTestChatsHandler(t, "embedded", upstream, checkpointTeamWithWorkers("market-team", "market-writer")...)
+	h.joinedRooms, _ = roomsStub([]string{"!team:ex"}, nil)
+	caller := func(chatID string) *http.Request {
+		return l2Caller(chatsStatusRequest("market-writer", chatID, ""), "alice-token")
 	}
+
+	// other room's chat → 404
 	rec := httptest.NewRecorder()
-	h.getChatStatus(rec, caller())
+	h.getChatStatus(rec, caller("aaaa0000-0000-4000-8000-000000000002"))
 	if rec.Code != http.StatusNotFound {
-		t.Fatalf("other user's chat: status=%d, want 404", rec.Code)
+		t.Fatalf("other-room chat: status=%d, want 404", rec.Code)
 	}
-	// own chat present in the precheck list
+	// in-room chat → 200
 	rec2 := httptest.NewRecorder()
-	upstream2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if strings.HasPrefix(r.URL.Path, "/api/chats/") && strings.HasSuffix(r.URL.Path, "/status") {
-			_, _ = w.Write([]byte(`{"status":"idle"}`))
-			return
-		}
-		_, _ = w.Write([]byte(`[{"id":"0d9f3d6e-1a2b-4c3d-8e5f-6a7b8c9d0e1f","name":"alice-chat"}]`))
-	}))
-	defer upstream2.Close()
-	h.workerBaseURL = func(string, map[string]string) string { return upstream2.URL }
-	h.getChatStatus(rec2, caller())
+	h.getChatStatus(rec2, caller("aaaa0000-0000-4000-8000-000000000001"))
 	if rec2.Code != http.StatusOK {
-		t.Fatalf("own chat: status=%d body=%s, want 200", rec2.Code, rec2.Body.String())
+		t.Fatalf("in-room chat: status=%d body=%s, want 200", rec2.Code, rec2.Body.String())
 	}
 }
 
-// TestChat_L2Participation_HumanCRUnresolved404: without a reconciled
-// Human CR (or with an empty matrixUserID) the participation anchor cannot
-// be established — fail closed with the uniform 404, no upstream dial.
-func TestChat_L2Participation_HumanCRUnresolved404(t *testing.T) {
+// TestChat_L2RoomParticipation_JoinedRoomsFailure404: when the membership
+// source fails, participation cannot be proven — fail closed with the
+// uniform 404, no upstream dial (an unprovable anchor must not leak a
+// conversation view).
+func TestChat_L2RoomParticipation_JoinedRoomsFailure404(t *testing.T) {
 	var dials int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		dials++
 		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(roomListPayload))
+	}))
+	defer upstream.Close()
+
+	h := newTestChatsHandler(t, "embedded", upstream, checkpointTeamWithWorkers("market-team", "market-writer")...)
+	h.joinedRooms, _ = roomsStub(nil, fmt.Errorf("homeserver down"))
+
+	req := chatsListRequest("market-writer", "")
+	req = l2Caller(req, "alice-token")
+	rec := httptest.NewRecorder()
+	h.listChats(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s, want uniform 404 (fail closed)", rec.Code, rec.Body.String())
+	}
+	if dials != 0 {
+		t.Fatalf("upstream dialed %d times, want 0", dials)
+	}
+}
+
+// TestChat_L2RoomParticipation_NoToken404: an L2 caller whose request
+// carries no bearer token cannot anchor participation — uniform 404.
+func TestChat_L2RoomParticipation_NoToken404(t *testing.T) {
+	var dials int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dials++
 		_, _ = w.Write([]byte(`[]`))
 	}))
 	defer upstream.Close()
 
-	for _, tc := range []struct {
-		name string
-		hrs  []runtime.Object
-	}{
-		{"no human cr", nil},
-		{"empty matrix user id", []runtime.Object{testHuman("alice", "")}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dials = 0
-			objs := checkpointTeamWithWorkers("market-team", "market-writer")
-			objs = append(objs, tc.hrs...)
-			h := newTestChatsHandler(t, "embedded", upstream, objs...)
-			req := chatsListRequest("market-writer", "")
-			req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
-			rec := httptest.NewRecorder()
-			h.listChats(rec, req)
-			if rec.Code != http.StatusNotFound {
-				t.Fatalf("status=%d body=%s, want uniform 404 (fail closed)", rec.Code, rec.Body.String())
-			}
-			if dials != 0 {
-				t.Fatalf("upstream dialed %d times, want 0", dials)
-			}
-		})
+	h := newTestChatsHandler(t, "embedded", upstream, checkpointTeamWithWorkers("market-team", "market-writer")...)
+	h.joinedRooms, _ = roomsStub([]string{"!team:ex"}, nil)
+
+	req := l2Caller(chatsListRequest("market-writer", ""), "")
+	rec := httptest.NewRecorder()
+	h.listChats(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s, want uniform 404 without a token", rec.Code, rec.Body.String())
+	}
+	if dials != 0 {
+		t.Fatalf("upstream dialed %d times, want 0", dials)
 	}
 }
 
-// TestChat_L2Participation_PreachUpstreamFailure502: when the precheck
-// list call itself fails, participation cannot be proven — 502, not a
-// false 404 (a healthy worker must not be silently hidden).
-func TestChat_L2Participation_PreachUpstreamFailure502(t *testing.T) {
+// TestChat_L2RoomParticipation_NoMatrixSource404: a deploy without a
+// Matrix client (joinedRooms nil) fails closed for L2 humans.
+func TestChat_L2RoomParticipation_NoMatrixSource404(t *testing.T) {
+	var dials int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dials++
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer upstream.Close()
+
+	h := newTestChatsHandler(t, "embedded", upstream, checkpointTeamWithWorkers("market-team", "market-writer")...)
+	// joinedRooms left nil — no Matrix source wired.
+
+	req := l2Caller(chatsListRequest("market-writer", ""), "alice-token")
+	rec := httptest.NewRecorder()
+	h.listChats(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s, want uniform 404 with no matrix source", rec.Code, rec.Body.String())
+	}
+	if dials != 0 {
+		t.Fatalf("upstream dialed %d times, want 0", dials)
+	}
+}
+
+// TestChat_L2RoomParticipation_PrecheckUpstreamFailure502: when the
+// precheck list call itself fails (worker 5xx), participation cannot be
+// proven — 502, not a false 404 (a healthy worker must not be silently
+// hidden).
+func TestChat_L2RoomParticipation_PrecheckUpstreamFailure502(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/chats/") {
 			w.WriteHeader(http.StatusOK)
@@ -565,16 +669,43 @@ func TestChat_L2Participation_PreachUpstreamFailure502(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	objs := checkpointTeamWithWorkers("market-team", "market-writer")
-	objs = append(objs, testHuman("alice", "@alice:example.com"))
-	h := newTestChatsHandler(t, "embedded", upstream, objs...)
-	req := chatsStatusRequest("market-writer", "0d9f3d6e-1a2b-4c3d-8e5f-6a7b8c9d0e1f", "")
-	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
+	h := newTestChatsHandler(t, "embedded", upstream, checkpointTeamWithWorkers("market-team", "market-writer")...)
+	h.joinedRooms, _ = roomsStub([]string{"!team:ex"}, nil)
+
+	req := chatsStatusRequest("market-writer", "aaaa0000-0000-4000-8000-000000000001", "")
+	req = l2Caller(req, "alice-token")
 	rec := httptest.NewRecorder()
 	h.getChatStatus(rec, req)
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status=%d body=%s, want 502 (unprovable participation is not a 404)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestChat_L2RoomParticipation_ScopeCheckStillApplies locks the scoped
+// caller fix end-to-end for the room-level boundary: an L2 human whose
+// team contains the worker resolves 200 (findTeamMember's second return
+// value is the member name, not the team name — the check must compare
+// against the Team CR name).
+func TestChat_L2RoomParticipation_ScopeCheckStillApplies(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer upstream.Close()
+
+	h := newTestChatsHandler(t, "embedded", upstream, checkpointTeamWithWorkers("market-team", "market-writer")...)
+	h.joinedRooms, _ = roomsStub([]string{}, nil)
+
+	req := l2Caller(chatsListRequest("market-writer", ""), "alice-token")
+	rec := httptest.NewRecorder()
+	h.listChats(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 for in-scope L2 human (empty room set is still a valid anchor)", rec.Code, rec.Body.String())
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != "[]" {
+		t.Fatalf("list=%s, want [] (no rooms joined)", body)
 	}
 }
 

@@ -3,9 +3,10 @@
 // same thin, byte-transparent pattern as the worker checkpoint proxy: the
 // controller resolves the worker, enforces the worker-scoped read boundary
 // (W8: 404, not 403, so worker existence cannot be probed) plus the
-// participation boundary (L2 humans see only their own conversations —
-// server-side, anchored on the Human CR's reconciled Matrix MXID), and
-// forwards to the worker's own qwenpaw app over loopback.
+// participation boundary (L2 humans see the worker's conversations in the
+// Matrix rooms they are current members of — server-side, resolved with the
+// caller's own Matrix token via GET /joined_rooms; no privilege escalation),
+// and forwards to the worker's own qwenpaw app over loopback.
 //
 // The detail endpoint returns the worker's saved agent context converted
 // to messages — presented as "agent context", not a guaranteed complete
@@ -19,11 +20,11 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -72,6 +73,12 @@ type ChatsHandler struct {
 	http            *http.Client
 	containerPrefix string
 	workerBaseURL   func(name string, env map[string]string) string
+	// joinedRooms resolves the rooms the calling Matrix user is in, using
+	// the caller's OWN access token (the L2 participation anchor, room
+	// level). Wired from matrix.Client.ListJoinedRooms; nil (e.g.
+	// deploys without a Matrix client) makes every L2 request fail
+	// closed.
+	joinedRooms func(ctx context.Context, userToken string) ([]string, error)
 }
 
 // NewChatsHandler builds a chats proxy over the given K8s client.
@@ -112,24 +119,46 @@ type chatRoute struct {
 	detail bool
 }
 
-// callerChatAnchor resolves the Matrix MXID that identifies the caller's
-// own conversations with a worker: the Human CR's reconciler-verified
-// status.matrixUserID — the same id the Matrix authenticator cross-checks
-// against the token's whoami (internal/auth/matrix_authenticator.go). L2
-// humans authenticate AS their Matrix user, so a matrix chat whose
-// user_id equals this MXID is a conversation they participated in.
-// Non-matrix channels (qq/console/cron) store other id namespaces, so no
-// L2 human can claim those chats — the server-side user_id filter excludes
-// them without a per-channel allowlist.
+// callerRoomSet resolves the set of Matrix room IDs the calling user is a
+// current member of — the L2 participation anchor, at ROOM level (the
+// decision the AgentTeams workflow implies: a human's work with a team
+// happens in the team's Matrix rooms, where the real conversations —
+// manager/leader agents delegating, workers reporting — take place;
+// sender-level "my own @-chats only" was too narrow for that, because in
+// the AgentTeams work pattern a human's own @-messages are rare and the
+// diagnostic evidence is the agent-driven sessions in the same rooms).
 //
-// Returns ("", nil) for full-view callers (admin/manager SAs, team
-// leaders), (mxid, nil) for an L2 human, or an error when the Human CR
-// cannot be resolved — the caller fails closed (uniform 404), because an
-// unprovable participation anchor must not leak a conversation view.
-func (h *ChatsHandler) callerChatAnchor(r *http.Request) (string, error) {
+// Resolution uses the caller's OWN access token (already validated by the
+// authenticator's whoami) against the homeserver's GET
+// /_matrix/client/v3/joined_rooms: membership is a property of the token's
+// user, so no privilege escalation, no stored membership table that could
+// drift, and no Human CR dependency (the reconciled status.matrixUserID
+// is no longer consulted on this path).
+//
+// Why room level covers both matrix group-session modes
+// (share_session_in_group, AgentTeams decision #7001, 2026-09-05): the
+// matrix channel keys every chat by room — session_id is "matrix:{room_id}"
+// in both modes; only the per-chat user_id differs (the sender's MXID when
+// sessions are isolated per sender, the room ID itself in shared mode).
+// So "rooms you are in" admits exactly the conversations a participant may
+// see: isolated mode exposes each (room, sender) session of the caller's
+// rooms (including the agent-driven ones), shared mode exposes the single
+// room session to every current member. DMs (two-member rooms) stay
+// private to their participants — room level is the literal "who is in the
+// room" check, no broader. Non-matrix channels (qq/console/cron, app-owned
+// chats, subagent sessions) have no "!"-prefixed room namespace, so matrixRoomID
+// yields "" and an L2 human never sees them (fail closed, no per-channel
+// allowlist).
+//
+// Returns (nil, nil) for full-view callers (admin/manager SAs, team
+// leaders), (set, nil) for an L2 human, or an error when the anchor cannot
+// be established (no token, homeserver failure, no Matrix source) — the
+// caller fails closed (uniform 404), because an unprovable participation
+// anchor must not leak a conversation view.
+func (h *ChatsHandler) callerRoomSet(r *http.Request) (map[string]bool, error) {
 	caller := authpkg.CallerFromContext(r.Context())
 	if caller == nil || caller.Role != authpkg.RoleHuman {
-		return "", nil
+		return nil, nil
 	}
 	// Defense in depth: L3 (worker-scoped) humans carry no teams, so they
 	// already 404 at the team-scope check. If the scope check ever gains a
@@ -137,16 +166,61 @@ func (h *ChatsHandler) callerChatAnchor(r *http.Request) (string, error) {
 	// stays L1/L2 for now (#1277 deliberately keeps the other read
 	// surfaces team-scoped; L3 chats access is a follow-up decision).
 	if caller.IsWorkerScoped() {
-		return "", fmt.Errorf("worker-scoped callers have no chats access")
+		return nil, fmt.Errorf("worker-scoped callers have no chats access")
 	}
-	var human v1beta1.Human
-	if err := h.client.Get(r.Context(), client.ObjectKey{Name: caller.Username, Namespace: h.namespace}, &human); err != nil {
-		return "", err
+	if h.joinedRooms == nil {
+		return nil, fmt.Errorf("no matrix source for room membership")
 	}
-	if human.Status.MatrixUserID == "" {
-		return "", fmt.Errorf("human %q has no reconciled matrix user id", human.Name)
+	// Same header the authenticator extracted and validated (the context
+	// carries the identity, not the token — the raw token is re-read from
+	// the request, mirroring internal/auth's extractBearerToken).
+	token := requestBearerToken(r)
+	if token == "" {
+		return nil, fmt.Errorf("l2 caller request carries no matrix bearer token")
 	}
-	return human.Status.MatrixUserID, nil
+	rooms, err := h.joinedRooms(r.Context(), token)
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[string]bool, len(rooms))
+	for _, roomID := range rooms {
+		set[roomID] = true
+	}
+	return set, nil
+}
+
+// requestBearerToken mirrors internal/auth's extractBearerToken (which is
+// unexported): the middleware already validated this exact token, so
+// re-reading the header is not a second authentication.
+func requestBearerToken(r *http.Request) string {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		return ""
+	}
+	token := strings.TrimPrefix(authHeader, "Bearer ")
+	if token == authHeader {
+		return ""
+	}
+	return token
+}
+
+// matrixRoomID extracts the Matrix room ID from a qwenpaw chat session_id.
+// The matrix channel keys every chat as "matrix:{room_id}" — identically in
+// both share_session_in_group modes (channel.resolve_session_id derives the
+// session id from the room before the per-sender split); Matrix room ids
+// are opaque ids starting with "!". Anything else — console/qq/cron
+// session ids, app-owned chats, subagent session ids — yields "" and is
+// never visible to an L2 human (fail closed).
+func matrixRoomID(sessionID string) string {
+	const prefix = "matrix:"
+	if !strings.HasPrefix(sessionID, prefix) {
+		return ""
+	}
+	roomID := strings.TrimPrefix(sessionID, prefix)
+	if !strings.HasPrefix(roomID, "!") {
+		return ""
+	}
+	return roomID
 }
 
 // proxy performs the shared request pipeline for all three routes:
@@ -200,11 +274,12 @@ func (h *ChatsHandler) proxy(w http.ResponseWriter, r *http.Request, name string
 	}
 
 	// Participation boundary (L2 humans only): a team-scoped human sees
-	// their own conversations with the worker — not the worker's other
-	// conversations (with an admin, another user, an app). The client
-	// never supplies the filter: it is resolved server-side from the
-	// Human CR.
-	anchor, perr := h.callerChatAnchor(r)
+	// the worker's conversations in the rooms the human is a current
+	// member of — not the worker's conversations in other rooms or DMs,
+	// and never non-matrix-channel chats. The filter is resolved
+	// server-side (the caller's own Matrix token → joined rooms); the
+	// client never supplies it.
+	roomSet, perr := h.callerRoomSet(r)
 	if perr != nil {
 		httputil.WriteError(w, http.StatusNotFound, "worker not found")
 		return
@@ -212,23 +287,31 @@ func (h *ChatsHandler) proxy(w http.ResponseWriter, r *http.Request, name string
 
 	base := h.workerBaseURL(worker.Name, worker.Spec.Env)
 	upstreamPath := route.upstream
-	if anchor != "" {
+	if roomSet != nil {
 		if route.detail {
-			if !h.participatesInChat(w, r, base, anchor, r.PathValue("chat_id")) {
+			if !h.participatesInRoomChat(w, r, base, roomSet, r.PathValue("chat_id")) {
 				return
 			}
 		} else {
-			// list: force the user_id filter to the caller's own MXID —
-			// the client-supplied value is overridden (a filter, never
-			// authorization), and include_app_owned is a content filter
-			// for PawApp-owned chats, which are never a human's
-			// conversations.
-			q := r.URL.Query()
-			q.Set("user_id", anchor)
-			q.Del("include_app_owned")
-			if encoded := q.Encode(); encoded != "" {
-				upstreamPath += "?" + encoded
+			// list: room-scoped, server-filtered — fetch the worker's
+			// matrix chat list and return only the items whose session
+			// resolves to one of the caller's rooms (byte-transparent
+			// per item). Client-supplied filters are dropped: channel is
+			// forced to matrix (L2 visibility is matrix-room-scoped),
+			// user_id has no room-level meaning, and include_app_owned
+			// would widen into app-owned namespaces.
+			items, _, uerr := h.anchoredChats(r, base, roomSet)
+			if uerr != nil {
+				httputil.WriteError(w, http.StatusBadGateway, uerr.Error())
+				return
 			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if err := json.NewEncoder(w).Encode(items); err != nil {
+				// headers already sent — nothing left to do.
+				return
+			}
+			return
 		}
 	} else if r.URL.RawQuery != "" {
 		// Full-view callers: forward the (whitelist-validated) query,
@@ -281,48 +364,79 @@ func (h *ChatsHandler) proxy(w http.ResponseWriter, r *http.Request, name string
 	httputil.WriteError(w, http.StatusBadGateway, "worker upstream error: "+strings.TrimSpace(string(body)))
 }
 
-// participatesInChat is the L2 participation precheck for the detail and
-// status routes: the upstream list scoped to the caller's own MXID must
-// contain the chat id. Three outcomes:
+// anchoredChats fetches the worker's matrix chat list (GET
+// /api/chats?channel=matrix) and keeps only the items whose session_id
+// resolves to a room the caller is a current member of. Returns the
+// surviving items byte-transparent (raw upstream JSON) plus a set of
+// their ids for the detail/status precheck. A non-nil *upstreamListErr
+// maps to the same 502 shapes as the transparent dial (worker down vs
+// upstream 5xx vs malformed list): participation that cannot be proven is
+// never a 404.
+func (h *ChatsHandler) anchoredChats(r *http.Request, base string, roomSet map[string]bool) ([]json.RawMessage, map[string]bool, *upstreamListErr) {
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, base+"/api/chats?channel=matrix", nil)
+	if err != nil {
+		return nil, nil, &upstreamListErr{msg: "failed to build upstream request"}
+	}
+	resp, err := h.http.Do(req)
+	if err != nil {
+		return nil, nil, &upstreamListErr{msg: "worker unreachable"}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, chatErrorBodyCap))
+		return nil, nil, &upstreamListErr{msg: "worker upstream error: " + strings.TrimSpace(string(body))}
+	}
+	var items []json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+		return nil, nil, &upstreamListErr{msg: "worker upstream error: malformed chat list"}
+	}
+	// Non-nil: an empty room set must encode as [] (the dashboard's
+	// array contract), never null.
+	kept := []json.RawMessage{}
+	ids := make(map[string]bool, len(items))
+	for _, item := range items {
+		var probe struct {
+			ID        string `json:"id"`
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal(item, &probe); err != nil {
+			continue
+		}
+		if roomSet[matrixRoomID(probe.SessionID)] {
+			kept = append(kept, item)
+			ids[probe.ID] = true
+		}
+	}
+	return kept, ids, nil
+}
+
+// upstreamListErr is a fetch failure of the room-scoped list, carrying the
+// 502 body verbatim (distinguishable dial failure vs upstream 5xx).
+type upstreamListErr struct{ msg string }
+
+func (e *upstreamListErr) Error() string { return e.msg }
+
+// participatesInRoomChat is the L2 participation precheck for the detail
+// and status routes: the worker's matrix chat list filtered to the
+// caller's rooms must contain the chat id. Three outcomes:
 //   - present in the list: true, the dial proceeds.
 //   - absent: a uniform 404 in the upstream's own not-found shape
 //     ("Chat not found: {id}", the 2.2.1 FastAPI detail) so a denied
 //     request is indistinguishable from a genuinely missing chat —
-//     neither other users' chat existence nor content can be probed.
+//     neither other rooms' chat existence nor content can be probed.
 //   - upstream failure / malformed list: 502. Participation cannot be
 //     proven, and a false 404 would silently hide a healthy worker.
 //
 // One extra loopback hop per L2 detail/status request; full-view callers
 // never pay it.
-func (h *ChatsHandler) participatesInChat(w http.ResponseWriter, r *http.Request, base, anchor, chatID string) bool {
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
-		base+"/api/chats?user_id="+url.QueryEscape(anchor), nil)
-	if err != nil {
-		httputil.WriteError(w, http.StatusInternalServerError, "failed to build upstream request")
+func (h *ChatsHandler) participatesInRoomChat(w http.ResponseWriter, r *http.Request, base string, roomSet map[string]bool, chatID string) bool {
+	_, ids, uerr := h.anchoredChats(r, base, roomSet)
+	if uerr != nil {
+		httputil.WriteError(w, http.StatusBadGateway, uerr.Error())
 		return false
 	}
-	resp, err := h.http.Do(req)
-	if err != nil {
-		httputil.WriteError(w, http.StatusBadGateway, "worker unreachable")
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, chatErrorBodyCap))
-		httputil.WriteError(w, http.StatusBadGateway, "worker upstream error: "+strings.TrimSpace(string(body)))
-		return false
-	}
-	var chats []struct {
-		ID string `json:"id"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&chats); err != nil {
-		httputil.WriteError(w, http.StatusBadGateway, "worker upstream error: malformed chat list")
-		return false
-	}
-	for _, c := range chats {
-		if c.ID == chatID {
-			return true
-		}
+	if ids[chatID] {
+		return true
 	}
 	// chatID is pattern-validated ([a-z0-9-]) before this point, so it
 	// cannot inject into the JSON body.
@@ -334,8 +448,9 @@ func (h *ChatsHandler) participatesInChat(w http.ResponseWriter, r *http.Request
 
 // listChats handles GET /api/v1/workers/{name}/chats.
 // Forwards the whitelisted read-only filters to GET /api/chats. L2
-// humans: the user_id filter is server-forced to their own MXID and
-// include_app_owned is dropped (participation boundary).
+// humans: the response is room-scoped server-side — only chats whose
+// session resolves to a room the caller is a current member of are
+// returned (participation boundary; client-supplied filters are dropped).
 func (h *ChatsHandler) listChats(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	for key := range q {
