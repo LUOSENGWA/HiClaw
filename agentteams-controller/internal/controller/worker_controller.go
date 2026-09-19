@@ -77,6 +77,21 @@ type WorkerReconciler struct {
 	// namespace do not cross-watch each other's resources.
 	ControllerName string
 
+	// KubeMode is "embedded" or "incluster" (Config.KubeMode). Hot-apply
+	// dials the worker container's console directly, which is only
+	// addressable in embedded (docker) mode.
+	KubeMode string
+
+	// ContainerPrefix is the effective worker container name prefix
+	// (Config.ContainerPrefix) used to build the worker console URL for
+	// hot-apply — the same derivation the server-side proxies use.
+	ContainerPrefix string
+
+	// subagentModelURLFor overrides the worker console base URL for
+	// subagent model hot-apply (tests). nil → derived from
+	// ContainerPrefix + EffectiveWorkerConsolePort.
+	subagentModelURLFor func(w *v1beta1.Worker, spec v1beta1.WorkerSpec) string
+
 	// AuthCache is cleared after deleting a rotated Edge Worker's
 	// ServiceAccount so old SA tokens cannot pass via cached TokenReview.
 	AuthCache interface{ InvalidateCache() }
@@ -340,6 +355,13 @@ func (r *WorkerReconciler) reconcileNormal(ctx context.Context, w *v1beta1.Worke
 	applyMemberStateToWorker(w, state)
 	w.Status.SpecHash = mctx.AppliedSpecHash
 	applyDeploymentTargetStatus(w, mctx)
+
+	// Hot-apply a changed subagent model to the running worker process
+	// (#1292 Part 3): the declarative chain (openclaw.json → bridge →
+	// agent.json) updates the file, but a running process keeps its
+	// in-memory config until it is dialed. Best-effort — a failed dial
+	// leaves the annotation unset and the periodic reconcile retries.
+	r.applySubagentModelHot(ctx, w, effectiveSpec, configContext, state)
 
 	r.reconcileManagerAccess(ctx, w, mctx, state)
 
@@ -871,6 +893,7 @@ func hashAppliedWorkerSpecForRuntimeAndResources(spec v1beta1.WorkerSpec, runtim
 		return hashAppliedWorkerSpec(spec)
 	}
 	spec.Model = ""           // config-only: written to openclaw.json/runtime.yaml
+	spec.SubagentModel = ""   // config-only: hot-applied via model-settings (#1292), no restart
 	spec.McpServers = nil     // config-only: written to mcporter/runtime config
 	spec.AccessEntries = nil  // permission-only: resolved when credentials are issued
 	spec.State = nil          // exclude lifecycle state from hash
