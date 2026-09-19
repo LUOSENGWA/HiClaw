@@ -116,6 +116,7 @@ func (h *ResourceHandler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 		},
 		Spec: v1beta1.WorkerSpec{
 			Model:            req.Model,
+			SubagentModel:    req.SubagentModel,
 			ModelProvider:    req.ModelProvider,
 			WorkerName:       req.WorkerName,
 			Runtime:          runtime,
@@ -268,6 +269,9 @@ func (h *ResourceHandler) UpdateWorker(w http.ResponseWriter, r *http.Request) {
 
 		if req.Model != "" {
 			worker.Spec.Model = req.Model
+		}
+		if req.SubagentModel != "" {
+			worker.Spec.SubagentModel = req.SubagentModel
 		}
 		if req.ModelProvider != "" {
 			worker.Spec.ModelProvider = req.ModelProvider
@@ -1346,6 +1350,11 @@ func (h *ResourceHandler) checkScopedWorkerUpdate(ctx context.Context, caller *a
 	}
 	if req.Model != "" {
 		forbidden = append(forbidden, "model")
+	}
+	// subagentModel sits with model: the model slot is a decision-layer
+	// field owned by the team owner / admin (L1), not by scoped L2 writers.
+	if req.SubagentModel != "" {
+		forbidden = append(forbidden, "subagentModel")
 	}
 	if req.ModelProvider != "" {
 		forbidden = append(forbidden, "modelProvider")

@@ -11,6 +11,7 @@ type CreateWorkerRequest struct {
 	Name          string                             `json:"name"`
 	WorkerName    string                             `json:"workerName,omitempty"`
 	Model         string                             `json:"model,omitempty"`
+	SubagentModel string                             `json:"subagentModel,omitempty"`
 	ModelProvider string                             `json:"modelProvider,omitempty"`
 	Runtime       string                             `json:"runtime,omitempty"`
 	Image         string                             `json:"image,omitempty"`
@@ -36,6 +37,7 @@ type CreateWorkerRequest struct {
 type UpdateWorkerRequest struct {
 	WorkerName    string                             `json:"workerName,omitempty"`
 	Model         string                             `json:"model,omitempty"`
+	SubagentModel string                             `json:"subagentModel,omitempty"`
 	ModelProvider string                             `json:"modelProvider,omitempty"`
 	Runtime       string                             `json:"runtime,omitempty"`
 	Image         string                             `json:"image,omitempty"`
