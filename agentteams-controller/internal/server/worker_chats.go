@@ -285,7 +285,11 @@ func (h *ChatsHandler) proxy(w http.ResponseWriter, r *http.Request, name string
 		return
 	}
 
-	base := h.workerBaseURL(worker.Name, worker.Spec.Env)
+	// The container identity is the effective runtime name (spec.workerName
+	// when set, the CR name otherwise) — dialing by the CR name would miss
+	// the container for imported/renamed workers. The authorization checks
+	// above deliberately stay on the original resource/team identity.
+	base := h.workerBaseURL(worker.Spec.EffectiveWorkerName(worker.Name), worker.Spec.Env)
 	upstreamPath := route.upstream
 	if roomSet != nil {
 		if route.detail {

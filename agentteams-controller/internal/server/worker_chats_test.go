@@ -854,3 +854,65 @@ func TestChats_UpstreamBodyStreamsVerbatim(t *testing.T) {
 		t.Fatalf("large transcript not streamed verbatim: got %d bytes, want %d", rec.Body.Len(), len(payload))
 	}
 }
+
+// Regression (review): the dial target must be the effective runtime name
+// (spec.workerName when set) — the CR name only addresses the Kubernetes
+// resource. A worker imported/renamed as `worker-cr` + `spec.workerName:
+// runtime-alice` previously dialed the wrong container host for all three
+// chat routes. The scoped-caller authorization above stays keyed on the
+// original resource/team identity (covered by the participation tests).
+func TestChatsProxy_DialsEffectiveRuntimeName(t *testing.T) {
+	var dials []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case strings.Contains(r.URL.Path, "/chats/"):
+			_, _ = w.Write([]byte(`{"id":"chat-1"}`))
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer upstream.Close()
+
+	renamed := checkpointWorker("worker-cr")
+	renamed.Spec.WorkerName = "runtime-alice"
+	plain := checkpointWorker("plain-cr")
+	plain.Spec.WorkerName = "" // no override → effective name is the CR name
+	team := checkpointTeam("team-a", "worker-cr", "plain-cr")
+	h := newTestChatsHandler(t, "embedded", upstream, team, renamed, plain)
+	h.workerBaseURL = func(name string, env map[string]string) string {
+		dials = append(dials, name)
+		return upstream.URL
+	}
+
+	call := func(run func(http.ResponseWriter, *http.Request), req *http.Request) int {
+		rec := httptest.NewRecorder()
+		run(rec, adminCaller(req))
+		return rec.Code
+	}
+
+	if code := call(h.listChats, chatsListRequest("worker-cr", "")); code != http.StatusOK {
+		t.Fatalf("list: status %d", code)
+	}
+	if code := call(h.getChat, chatsDetailRequest("worker-cr", "chat-1", "")); code != http.StatusOK {
+		t.Fatalf("detail: status %d", code)
+	}
+	if code := call(h.getChatStatus, chatsStatusRequest("worker-cr", "chat-1", "")); code != http.StatusOK {
+		t.Fatalf("status: status %d", code)
+	}
+	if code := call(h.listChats, chatsListRequest("plain-cr", "")); code != http.StatusOK {
+		t.Fatalf("plain list: status %d", code)
+	}
+
+	want := []string{"runtime-alice", "runtime-alice", "runtime-alice", "plain-cr"}
+	if len(dials) != len(want) {
+		t.Fatalf("dials = %v, want %v", dials, want)
+	}
+	for i := range want {
+		if dials[i] != want[i] {
+			t.Fatalf("dial[%d] = %q, want %q (full: %v)", i, dials[i], want[i], dials)
+		}
+	}
+}

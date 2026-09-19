@@ -69,6 +69,13 @@ returns `404`, uniformly with "no such worker" — worker existence cannot
 be probed (404-not-403, same as the other worker-scoped reads).
 Embedded mode only: kube mode returns `503` uniformly.
 
+Resource addressing versus runtime addressing: the `{name}` path segment
+addresses the Worker CR and authorization keys off it (team scope,
+404-not-403). The upstream dial uses the container identity instead —
+`WorkerSpec.EffectiveWorkerName(worker.Name)` (`spec.workerName` when
+set, the CR name otherwise) — so imported/renamed workers reach the
+right container.
+
 ### Participation boundary (layer 2 — L2 humans, room level)
 
 Passing the worker scope is necessary but not sufficient for an L2
