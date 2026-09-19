@@ -13,6 +13,7 @@ import (
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/config"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/service"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -329,18 +330,32 @@ func TestChat_TeamLeaderCrossTeamDenied(t *testing.T) {
 	}
 }
 
+// testHuman builds a Human CR with a reconciled Matrix MXID — the
+// participation anchor the chats proxy resolves server-side.
+func testHuman(name, mxid string) *v1beta1.Human {
+	return &v1beta1.Human{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Status:     v1beta1.HumanStatus{MatrixUserID: mxid},
+	}
+}
+
 // TestChat_L2HumanInScopeAllowed locks the scoped-caller fix: an L2 human
 // whose team contains the worker must resolve 200 (findTeamMember's second
 // return value is the member name, not the team name — the check must
-// compare against the Team CR name).
+// compare against the Team CR name). With the participation boundary, the
+// list must additionally be server-forced to the caller's own MXID.
 func TestChat_L2HumanInScopeAllowed(t *testing.T) {
+	var gotQuery string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[{"id":"c1","name":"ch1"}]`))
 	}))
 	defer upstream.Close()
 
-	h := newTestChatsHandler(t, "embedded", upstream, checkpointTeamWithWorkers("market-team", "market-writer")...)
+	objs := checkpointTeamWithWorkers("market-team", "market-writer")
+	objs = append(objs, testHuman("alice", "@alice:example.com"))
+	h := newTestChatsHandler(t, "embedded", upstream, objs...)
 	req := chatsListRequest("market-writer", "")
 	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
 	rec := httptest.NewRecorder()
@@ -348,6 +363,238 @@ func TestChat_L2HumanInScopeAllowed(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200 for in-scope L2 human", rec.Code, rec.Body.String())
+	}
+	want := "user_id=" + url.QueryEscape("@alice:example.com")
+	if gotQuery != want {
+		t.Fatalf("upstream query=%q, want %q (server-forced own-MXID filter)", gotQuery, want)
+	}
+}
+
+// TestChat_L2Participation_ListOverridesClientFilters locks the maintainer
+// boundary: client-supplied user_id is a filter, never authorization —
+// for an L2 human the user_id filter is overridden to the caller's own
+// MXID, include_app_owned is dropped, and the remaining whitelisted
+// filters (channel/archived) narrow the caller's own chats.
+func TestChat_L2Participation_ListOverridesClientFilters(t *testing.T) {
+	var gotQuery string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer upstream.Close()
+
+	objs := checkpointTeamWithWorkers("market-team", "market-writer")
+	objs = append(objs, testHuman("alice", "@alice:example.com"))
+	h := newTestChatsHandler(t, "embedded", upstream, objs...)
+	req := chatsListRequest("market-writer", "?user_id=bob&include_app_owned=true&channel=matrix&archived=false")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
+	rec := httptest.NewRecorder()
+	h.listChats(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	want := "archived=false&channel=matrix&user_id=" + url.QueryEscape("@alice:example.com")
+	if gotQuery != want {
+		t.Fatalf("upstream query=%q, want %q (bob overridden, app_owned dropped, own filters kept)", gotQuery, want)
+	}
+}
+
+// TestChat_L2Participation_OtherUsersChatDetail404 locks the detail
+// boundary: a chat belonging to another user (bob's conversation with the
+// worker) is hidden from alice as a uniform 404 — and the upstream detail
+// endpoint is never dialed (no content, no existence probe).
+func TestChat_L2Participation_OtherUsersChatDetail404(t *testing.T) {
+	var detailDials int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/api/chats/0d9f3d6e") {
+			detailDials++
+			_, _ = w.Write([]byte(`{"messages":[{"id":"m1","type":"message","role":"user","content":[{"type":"text","text":"bob secret"}],"status":"completed"}],"status":"idle"}`))
+			return
+		}
+		// the precheck list, scoped to alice's MXID: bob's chat is absent
+		_, _ = w.Write([]byte(`[{"id":"11111111-2222-4333-8444-555555555555","name":"alice-chat"}]`))
+	}))
+	defer upstream.Close()
+
+	objs := checkpointTeamWithWorkers("market-team", "market-writer")
+	objs = append(objs, testHuman("alice", "@alice:example.com"))
+	h := newTestChatsHandler(t, "embedded", upstream, objs...)
+	req := chatsDetailRequest("market-writer", "0d9f3d6e-1a2b-4c3d-8e5f-6a7b8c9d0e1f", "")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
+	rec := httptest.NewRecorder()
+	h.getChat(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s, want 404 for another user's chat", rec.Code, rec.Body.String())
+	}
+	want := `{"detail":"Chat not found: 0d9f3d6e-1a2b-4c3d-8e5f-6a7b8c9d0e1f"}`
+	if rec.Body.String() != want {
+		t.Fatalf("body=%s, want %s (uniform, indistinguishable from upstream 404)", rec.Body.String(), want)
+	}
+	if detailDials != 0 {
+		t.Fatalf("upstream detail dialed %d times, want 0 (no content leak)", detailDials)
+	}
+}
+
+// TestChat_L2Participation_OwnChatDetail200: alice's own chat passes the
+// precheck and is proxied verbatim.
+func TestChat_L2Participation_OwnChatDetail200(t *testing.T) {
+	const payload = `{"messages":[{"id":"m1","type":"message","role":"user","content":[{"type":"text","text":"hi"}],"status":"completed"}],"status":"idle"}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/api/chats/0d9f3d6e") {
+			_, _ = w.Write([]byte(payload))
+			return
+		}
+		_, _ = w.Write([]byte(`[{"id":"0d9f3d6e-1a2b-4c3d-8e5f-6a7b8c9d0e1f","name":"alice-chat"}]`))
+	}))
+	defer upstream.Close()
+
+	objs := checkpointTeamWithWorkers("market-team", "market-writer")
+	objs = append(objs, testHuman("alice", "@alice:example.com"))
+	h := newTestChatsHandler(t, "embedded", upstream, objs...)
+	req := chatsDetailRequest("market-writer", "0d9f3d6e-1a2b-4c3d-8e5f-6a7b8c9d0e1f", "")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
+	rec := httptest.NewRecorder()
+	h.getChat(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 for own chat", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != payload {
+		t.Fatalf("body not verbatim:\n got %s\nwant %s", rec.Body.String(), payload)
+	}
+}
+
+// TestChat_L2Participation_StatusSameBoundary: the status route runs the
+// same precheck (own chat 200, other user's chat 404).
+func TestChat_L2Participation_StatusSameBoundary(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/api/chats/") && strings.HasSuffix(r.URL.Path, "/status") {
+			_, _ = w.Write([]byte(`{"status":"running"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`[{"id":"11111111-2222-4333-8444-555555555555","name":"alice-chat"}]`))
+	}))
+	defer upstream.Close()
+
+	objs := checkpointTeamWithWorkers("market-team", "market-writer")
+	objs = append(objs, testHuman("alice", "@alice:example.com"))
+	h := newTestChatsHandler(t, "embedded", upstream, objs...)
+	caller := func() *http.Request {
+		req := chatsStatusRequest("market-writer", "0d9f3d6e-1a2b-4c3d-8e5f-6a7b8c9d0e1f", "")
+		return withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
+	}
+	rec := httptest.NewRecorder()
+	h.getChatStatus(rec, caller())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("other user's chat: status=%d, want 404", rec.Code)
+	}
+	// own chat present in the precheck list
+	rec2 := httptest.NewRecorder()
+	upstream2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/api/chats/") && strings.HasSuffix(r.URL.Path, "/status") {
+			_, _ = w.Write([]byte(`{"status":"idle"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`[{"id":"0d9f3d6e-1a2b-4c3d-8e5f-6a7b8c9d0e1f","name":"alice-chat"}]`))
+	}))
+	defer upstream2.Close()
+	h.workerBaseURL = func(string, map[string]string) string { return upstream2.URL }
+	h.getChatStatus(rec2, caller())
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("own chat: status=%d body=%s, want 200", rec2.Code, rec2.Body.String())
+	}
+}
+
+// TestChat_L2Participation_HumanCRUnresolved404: without a reconciled
+// Human CR (or with an empty matrixUserID) the participation anchor cannot
+// be established — fail closed with the uniform 404, no upstream dial.
+func TestChat_L2Participation_HumanCRUnresolved404(t *testing.T) {
+	var dials int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dials++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer upstream.Close()
+
+	for _, tc := range []struct {
+		name string
+		hrs  []runtime.Object
+	}{
+		{"no human cr", nil},
+		{"empty matrix user id", []runtime.Object{testHuman("alice", "")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dials = 0
+			objs := checkpointTeamWithWorkers("market-team", "market-writer")
+			objs = append(objs, tc.hrs...)
+			h := newTestChatsHandler(t, "embedded", upstream, objs...)
+			req := chatsListRequest("market-writer", "")
+			req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
+			rec := httptest.NewRecorder()
+			h.listChats(rec, req)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status=%d body=%s, want uniform 404 (fail closed)", rec.Code, rec.Body.String())
+			}
+			if dials != 0 {
+				t.Fatalf("upstream dialed %d times, want 0", dials)
+			}
+		})
+	}
+}
+
+// TestChat_L2Participation_PreachUpstreamFailure502: when the precheck
+// list call itself fails, participation cannot be proven — 502, not a
+// false 404 (a healthy worker must not be silently hidden).
+func TestChat_L2Participation_PreachUpstreamFailure502(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/chats/") {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"running"}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`boom`))
+	}))
+	defer upstream.Close()
+
+	objs := checkpointTeamWithWorkers("market-team", "market-writer")
+	objs = append(objs, testHuman("alice", "@alice:example.com"))
+	h := newTestChatsHandler(t, "embedded", upstream, objs...)
+	req := chatsStatusRequest("market-writer", "0d9f3d6e-1a2b-4c3d-8e5f-6a7b8c9d0e1f", "")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "alice", Teams: []string{"market-team"}})
+	rec := httptest.NewRecorder()
+	h.getChatStatus(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s, want 502 (unprovable participation is not a 404)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestChat_L3HumanDenied: L3 (worker-scoped) humans have no chats access
+// in v1 — consistent with #1277, which keeps the other read surfaces
+// (checkpoints/skills/...) team-scoped and lists extensions as follow-ups.
+func TestChat_L3HumanDenied(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("upstream must not be dialed for L3")
+	}))
+	defer upstream.Close()
+
+	h := newTestChatsHandler(t, "embedded", upstream, checkpointTeamWithWorkers("market-team", "market-writer")...)
+	req := chatsListRequest("market-writer", "")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "dave", AccessibleWorkers: []string{"market-writer"}})
+	rec := httptest.NewRecorder()
+	h.listChats(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 for L3 human (no chats access in v1)", rec.Code)
 	}
 }
 
