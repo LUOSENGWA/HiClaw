@@ -91,6 +91,12 @@ type MemberRuntimeConfigDeployRequest struct {
 	Generation  int64
 	Spec        v1beta1.WorkerSpec
 
+	// SubagentModel is the resolved subagent model for this member (an
+	// explicit Worker value wins over the team-wide default; callers pass
+	// the merged result). Empty means no subagent override is declared and
+	// the runtime keeps its current/unset setting.
+	SubagentModel string
+
 	MatrixUserID   string
 	PersonalRoomID string
 	// MatrixAccessToken is projected only for remote-managed local runtimes.

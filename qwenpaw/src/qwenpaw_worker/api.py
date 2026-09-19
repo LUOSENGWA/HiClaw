@@ -433,6 +433,27 @@ class QwenPawApiClient:
                 )
         return actual
 
+    def update_agent_model_settings(self, subagent_model: dict[str, Any]) -> None:
+        """Set the worker's subagent model override (QwenPaw >= 2.1.1).
+
+        ``PATCH /api/agents/default/model-settings`` applies only the fields
+        present in the body and schedules an in-process agent reload, so a
+        running process picks the value up without a restart. The profile
+        readback verifies the value persisted.
+        """
+        self._request(
+            "PATCH",
+            "/api/agents/default/model-settings",
+            {"subagent_model": subagent_model},
+        )
+        actual = self._request("GET", "/api/agents/default")
+        slot = (actual or {}).get("subagent_model") or {}
+        if (
+            slot.get("provider_id") != subagent_model.get("provider_id")
+            or slot.get("model") != subagent_model.get("model")
+        ):
+            raise QwenPawApiError("QwenPaw subagent model readback mismatch")
+
     @staticmethod
     def _find_model_entry(
         provider: dict[str, Any],

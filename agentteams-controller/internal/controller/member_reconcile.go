@@ -388,8 +388,6 @@ func EnsureMemberServiceAccount(ctx context.Context, d MemberDeps, m MemberConte
 	return nil
 }
 
-// ReconcileMemberConfig pushes all OSS config (package, inline configs,
-// openclaw.json, mcporter, AGENTS.md, builtin skills) for the member.
 // resolveSubagentModel applies the precedence rule for the subagent model:
 // an explicit worker value wins over the team-wide default.
 func resolveSubagentModel(specValue, teamDefault string) string {
@@ -399,6 +397,8 @@ func resolveSubagentModel(specValue, teamDefault string) string {
 	return teamDefault
 }
 
+// ReconcileMemberConfig pushes all OSS config (package, inline configs,
+// openclaw.json, mcporter, AGENTS.md, builtin skills) for the member.
 func ReconcileMemberConfig(ctx context.Context, d MemberDeps, m MemberContext, state *MemberState) error {
 	if state.ProvResult == nil {
 		return nil
@@ -425,6 +425,7 @@ func ReconcileMemberConfig(ctx context.Context, d MemberDeps, m MemberContext, s
 			Role:                  m.Role.String(),
 			Generation:            m.Generation,
 			Spec:                  m.Spec,
+			SubagentModel:         resolveSubagentModel(m.Spec.SubagentModel, m.TeamSubagentModel),
 			MatrixUserID:          state.MatrixUserID,
 			PersonalRoomID:        state.RoomID,
 			MatrixAccessToken:     matrixAccessToken,
