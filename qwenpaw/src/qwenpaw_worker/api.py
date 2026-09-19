@@ -433,23 +433,40 @@ class QwenPawApiClient:
                 )
         return actual
 
-    def update_agent_model_settings(self, subagent_model: dict[str, Any]) -> None:
-        """Set the worker's subagent model override (QwenPaw >= 2.1.1).
+    def get_agent_subagent_model(self) -> Optional[dict[str, Any]]:
+        """Return the worker's current subagent model override, if any."""
+        actual = self._request("GET", "/api/agents/default")
+        slot = (actual or {}).get("subagent_model")
+        return slot if isinstance(slot, dict) else None
+
+    def update_agent_model_settings(
+        self,
+        subagent_model: Optional[dict[str, Any]],
+    ) -> None:
+        """Set — or clear (``None``) — the worker's subagent model override.
 
         ``PATCH /api/agents/default/model-settings`` applies only the fields
-        present in the body and schedules an in-process agent reload, so a
-        running process picks the value up without a restart. The profile
-        readback verifies the value persisted.
+        present in the body: an explicit ``null`` removes the override, a
+        value sets it. Either way the endpoint schedules an in-process
+        agent reload, so a running process picks the change up without a
+        restart. The profile readback verifies the write persisted (or the
+        override was removed).
         """
         self._request(
             "PATCH",
             "/api/agents/default/model-settings",
             {"subagent_model": subagent_model},
         )
-        actual = self._request("GET", "/api/agents/default")
-        slot = (actual or {}).get("subagent_model") or {}
+        slot = self.get_agent_subagent_model()
+        if subagent_model is None:
+            if slot is not None:
+                raise QwenPawApiError(
+                    "QwenPaw subagent model readback mismatch: clear not persisted",
+                )
+            return
         if (
-            slot.get("provider_id") != subagent_model.get("provider_id")
+            slot is None
+            or slot.get("provider_id") != subagent_model.get("provider_id")
             or slot.get("model") != subagent_model.get("model")
         ):
             raise QwenPawApiError("QwenPaw subagent model readback mismatch")

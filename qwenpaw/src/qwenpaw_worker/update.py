@@ -1722,27 +1722,54 @@ class RuntimeUpdater:
         }
 
     def _apply_subagent_model(self, config: MemberRuntimeConfig) -> None:
-        """Apply the declared subagent model through QwenPaw's agent settings.
+        """Apply — or reconcile the removal of — the declared subagent model.
 
         This is the startup/recreation path for the override: a recreated
-        container must pick up the desired value from runtime.yaml even
-        though the controller hot apply (annotation-gated) would skip it.
-        Clears are intentionally not issued here (an absent declaration
-        leaves the runtime untouched); an explicit removal propagates via
-        the controller hot apply.
+        container must pick the desired value up from runtime.yaml even
+        though the controller hot apply (annotation-gated, embedded-only)
+        would skip it. Removal is reconciled here as well, so clearing
+        does not depend on the embedded-only controller dial: when the
+        declaration is absent but the runtime still holds an override
+        (removed in the CR, possibly across a restart), an explicit null
+        clear is issued with readback. An initially absent declaration
+        stays read-only — one profile check, no write — preserving
+        compatibility for workers/runtimes that never used the surface.
         """
         desired = self._subagent_model_desired_state(config)
-        if desired is None:
+        if desired is not None:
+            if self.api_client is None:
+                raise RuntimeError(
+                    "QwenPaw API client is required for subagent model configuration",
+                )
+            try:
+                self.api_client.update_agent_model_settings(desired)
+            except QwenPawApiError as exc:
+                # QwenPaw < 2.1.1 has no model-settings endpoint; the declared
+                # value stays in runtime.yaml and takes effect after an upgrade.
+                if "HTTP 404" in str(exc):
+                    logger.warning("subagent model endpoint unavailable, skipping: %s", exc)
+                    return
+                raise
             return
+        # Absent declaration: clear only when an override is actually present.
+        # Without an API client there is nothing to inspect or clear —
+        # stay a no-op (compat).
         if self.api_client is None:
-            raise RuntimeError("QwenPaw API client is required for subagent model configuration")
+            return
         try:
-            self.api_client.update_agent_model_settings(desired)
+            current = self.api_client.get_agent_subagent_model()
         except QwenPawApiError as exc:
-            # QwenPaw < 2.1.1 has no model-settings endpoint; the declared
-            # value stays in runtime.yaml and takes effect after an upgrade.
             if "HTTP 404" in str(exc):
-                logger.warning("subagent model endpoint unavailable, skipping: %s", exc)
+                logger.warning("subagent model settings unavailable, skipping clear: %s", exc)
+                return
+            raise
+        if current is None:
+            return
+        try:
+            self.api_client.update_agent_model_settings(None)
+        except QwenPawApiError as exc:
+            if "HTTP 404" in str(exc):
+                logger.warning("subagent model endpoint unavailable, skipping clear: %s", exc)
                 return
             raise
 
