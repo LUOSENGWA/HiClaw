@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
+	"net/url"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -1234,6 +1236,97 @@ func TestTeamSkillStandardZipToWorkerE2E(t *testing.T) {
 	} {
 		if err := store.Memory.Stat(ctx, key); err != nil {
 			t.Errorf("missing %s after materialization: %v", key, err)
+		}
+	}
+}
+
+
+// --- GET /api/v1/skills/{name}/download（v1.2.5 新增：技能包下载） ---
+
+func downloadSkill(t *testing.T, h *SkillsHandler, caller *authpkg.CallerIdentity, name, team string) *httptest.ResponseRecorder {
+	t.Helper()
+	path := "/api/v1/skills/" + name + "/download"
+	if team != "" {
+		path += "?team=" + url.QueryEscape(team)
+	}
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.SetPathValue("name", name)
+	req = withCaller(req, caller)
+	rec := httptest.NewRecorder()
+	h.DownloadSkill(rec, req)
+	return rec
+}
+
+func TestSkills_DownloadTeamZipRoundTrip(t *testing.T) {
+	h, store, _ := newSkillsRig(t, passScanner)
+	// 上传后下载：文件与嵌套子目录都要在包里（嵌套 = 走查关键断言）。
+	rec := postSkill(t, h, skAdmin, "team", "market-team",
+		skillZip("dl-tool", map[string]string{"scripts/run.sh": "#!/bin/sh\necho hi\n"}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d: %s", rec.Code, rec.Body.String())
+	}
+	got := downloadSkill(t, h, skAdmin, "dl-tool", "market-team")
+	if got.Code != http.StatusOK {
+		t.Fatalf("download status = %d: %s", got.Code, got.Body.String())
+	}
+	if ct := got.Header().Get("Content-Type"); ct != "application/zip" {
+		t.Errorf("content-type = %q, want application/zip", ct)
+	}
+	if cd := got.Header().Get("Content-Disposition"); !strings.Contains(cd, "dl-tool.zip") {
+		t.Errorf("content-disposition = %q", cd)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(got.Body.Bytes()), int64(got.Body.Len()))
+	if err != nil {
+		t.Fatalf("zip read: %v", err)
+	}
+	files := map[string]string{}
+	for _, f := range zr.File {
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatalf("open %s: %v", f.Name, err)
+		}
+		b, _ := io.ReadAll(rc)
+		_ = rc.Close()
+		files[f.Name] = string(b)
+	}
+	if !strings.Contains(files["SKILL.md"], "name: dl-tool") {
+		t.Errorf("SKILL.md = %q", files["SKILL.md"])
+	}
+	if files["scripts/run.sh"] == "" {
+		t.Errorf("scripts/run.sh missing from zip (files=%v)", files)
+	}
+	_ = store
+}
+
+func TestSkills_DownloadMissing404(t *testing.T) {
+	h, _, _ := newSkillsRig(t, passScanner)
+	rec := downloadSkill(t, h, skAdmin, "no-such-skill", "market-team")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSkills_DownloadScopeRules(t *testing.T) {
+	h, _, _ := newSkillsRig(t, passScanner)
+	cases := []struct {
+		name   string
+		caller *authpkg.CallerIdentity
+		skill  string
+		team   string
+		want   int
+	}{
+		{"admin own team", skAdmin, "team-kb", "market-team", http.StatusOK},
+		{"admin global no team", skAdmin, "shared-kb", "", http.StatusOK},
+		{"leader own team", skLeader, "team-kb", "market-team", http.StatusOK},
+		{"leader cross team", skLeader, "biz-only", "biz-team", http.StatusNotFound},
+		{"leader no team", skLeader, "shared-kb", "", http.StatusBadRequest},
+		{"manager denied", skManager, "team-kb", "market-team", http.StatusForbidden},
+		{"bad name", skAdmin, "Bad_Name", "market-team", http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		rec := downloadSkill(t, h, tc.caller, tc.skill, tc.team)
+		if rec.Code != tc.want {
+			t.Errorf("%s: status = %d, want %d (%s)", tc.name, rec.Code, tc.want, rec.Body.String())
 		}
 	}
 }

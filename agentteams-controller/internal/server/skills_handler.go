@@ -506,6 +506,124 @@ func (h *SkillsHandler) UploadSkill(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// DownloadSkill handles GET /api/v1/skills/{name}/download.
+//
+// Streams the skill's files as a zip (Content-Disposition attachment).
+// Scope rules mirror the catalog exactly:
+//
+//	?team=T   → teams/T/skills/<name>/   (admin any team; L2 human own
+//	                                       teams; leader own team; others
+//	                                       denied by checkTeamScope)
+//	no team   → agents/global/skills/<name>/  (admin only, same as the
+//	                                       no-param catalog)
+//
+// The controller-side storage client only exposes one-level listings on the
+// real backend (mc ls) and flattened relative names on the in-memory fake —
+// the walk below handles both: entries ending in "/" recurse, everything
+// else is fetched as a file at the walked prefix.
+func (h *SkillsHandler) DownloadSkill(w http.ResponseWriter, r *http.Request) {
+	caller := auth.CallerFromContext(r.Context())
+	name := strings.TrimSpace(r.PathValue("name"))
+	if !skillNameRe.MatchString(name) {
+		httputil.WriteError(w, http.StatusBadRequest, "invalid skill name")
+		return
+	}
+	team := strings.TrimSpace(r.URL.Query().Get("team"))
+	if team == "" {
+		if caller == nil || caller.Role != auth.RoleAdmin {
+			httputil.WriteError(w, http.StatusBadRequest, "team scope required")
+			return
+		}
+	} else {
+		if err := h.checkTeamScope(r.Context(), caller, team); err != nil {
+			writeTeamScopeError(w, err)
+			return
+		}
+	}
+	if h.oss == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "storage client unavailable")
+		return
+	}
+	prefix := globalSkillsPrefix + name + "/"
+	if team != "" {
+		prefix = "teams/" + team + "/skills/" + name + "/"
+	}
+
+	files := map[string][]byte{}
+	if err := h.collectSkillFiles(r.Context(), prefix, "", files, 0); err != nil {
+		// 目录不存在（真实后端 mc ls 报错）或存储不可读：统一 404 + 原因，
+		// 下载动作两者都无法继续，调用侧拿到可读信息即可。
+		httputil.WriteError(w, http.StatusNotFound,
+			fmt.Sprintf("skill %q not found under %s (%v)", name, prefix, err))
+		return
+	}
+	if len(files) == 0 {
+		httputil.WriteError(w, http.StatusNotFound,
+			fmt.Sprintf("skill %q not found under %s", name, prefix))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition",
+		fmt.Sprintf("attachment; filename=\"%s.zip\"", name))
+	zw := zip.NewWriter(w)
+	paths := make([]string, 0, len(files))
+	for rel := range files {
+		paths = append(paths, rel)
+	}
+	sort.Strings(paths)
+	for _, rel := range paths {
+		fw, err := zw.Create(rel)
+		if err != nil {
+			// 已开始写响应体——只能中断 zip（客户端解压报错比静默缺文件好）。
+			_ = zw.Close()
+			return
+		}
+		if _, err := fw.Write(files[rel]); err != nil {
+			_ = zw.Close()
+			return
+		}
+	}
+	_ = zw.Close()
+}
+
+// collectSkillFiles walks a skill prefix and reads every file into out
+// (relpath -> bytes; rel accumulates the walked subdirectories so nested
+// resources keep their path inside the zip). Depth is bounded (skill
+// packages are shallow); a single unreadable file is skipped rather than
+// failing the whole archive.
+func (h *SkillsHandler) collectSkillFiles(ctx context.Context, prefix, rel string, out map[string][]byte, depth int) error {
+	if depth > 6 {
+		return nil
+	}
+	entries, err := h.oss.ListObjectsDetailed(ctx, prefix)
+	if err != nil {
+		if depth == 0 {
+			return err
+		}
+		return nil // 子目录列不出：跳过该子树
+	}
+	for _, entry := range entries {
+		raw := strings.TrimSpace(entry.Name)
+		if raw == "" || strings.HasPrefix(raw, ".") {
+			continue
+		}
+		if strings.HasSuffix(raw, "/") {
+			sub := strings.TrimSuffix(raw, "/")
+			if err := h.collectSkillFiles(ctx, prefix+raw, rel+sub+"/", out, depth+1); err != nil {
+				return err
+			}
+			continue
+		}
+		data, err := h.oss.GetObject(ctx, prefix+raw)
+		if err != nil {
+			continue
+		}
+		out[rel+raw] = data
+	}
+	return nil
+}
+
 // writeCatalog builds the catalog: the builtin half always, plus the shared
 // half (agents/global/skills/) for the no-param view or the team half
 // (teams/<t>/skills/) for the ?team= view.
