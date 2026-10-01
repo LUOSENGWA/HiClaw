@@ -11,11 +11,13 @@ Tests below pin the behavior the Manager actually runs in production):
    manages the ``security`` block (QwenPaw applies runtime defaults).
 
 2. **restart-overlay phase** — the overlay refreshes only the fields the
-   Controller owns: Matrix scalars (token, user, allowlists — Controller
-   value WINS, local edits do not survive), ``groups`` (raw Controller
-   value replaces the local block), stream filters (pinned True/True),
-   ``running.max_input_length``, ``subagent_model``. Console is forced off.
-   ``env`` and user-owned fields are never bridged.
+   Controller owns: Matrix scalars (token, user), ``running.max_input_length``,
+   ``subagent_model``; stream filters are pinned True/True. Console is
+   forced off.  ``channels.matrix.allow_from`` / ``group_allow_from``
+   union-merge with local entries (a re-bridge never drops operator
+   additions — see the union test), and ``channels.matrix.groups``
+   deep-merges with local values winning at leaves.  ``env`` and other
+   user-owned fields are never bridged.
 """
 
 import json
@@ -310,15 +312,12 @@ def test_embedding_config_never_written_by_bridge():
 # Controller-field overlay: union
 # ---------------------------------------------------------------------------
 
-def test_allow_from_controller_value_wins_over_user_additions():
-    """allow_from: the Controller value overwrites on every re-bridge;
-    local user additions do NOT survive (no union merge in the 2.2 line).
+def test_union_allow_from_merges_cr_and_user():
+    """channels.matrix.allow_from: CR entries + user additions co-exist.
 
-    Known gap — this is exactly the #169 incident class: operator-added
-    allowlist entries (e.g. human @luo) are silently dropped on the next
-    bridge run, and allowlist mode then drops their messages with no error.
-    Tracked for a follow-up fix (union merge); the test pins the CURRENT
-    behavior on purpose so a future change is deliberate, not accidental.
+    Regression guard for the pre-2.2 union contract: a re-bridge must
+    not silently drop locally added allowlist entries (a dropped human
+    entry is then silently blocked in allowlist mode with no error).
     """
     cfg = _make_openclaw_cfg()
     cfg["channels"]["matrix"]["dm"] = {
@@ -342,20 +341,17 @@ def test_allow_from_controller_value_wins_over_user_additions():
         agent = _read_agent(working_dir)
 
     allow_from = agent["channels"]["matrix"]["allow_from"]
-    assert allow_from == ["@alice:example.org", "@carol:example.org"]
+    assert set(allow_from) == {"@alice:example.org", "@bob:example.org", "@carol:example.org"}
+    assert allow_from.count("@alice:example.org") == 1  # dedup
 
 
 # ---------------------------------------------------------------------------
 # Controller-field overlay: deep-merge (channels.matrix.groups)
 # ---------------------------------------------------------------------------
 
-def test_groups_controller_value_replaces_user_overrides():
-    """channels.matrix.groups: the raw Controller value replaces the local
-    block on every re-bridge (no per-leaf deep merge in the 2.2 line).
-
-    Same known-gap class as allow_from (see that test) — per-room user
-    overrides are dropped on the next bridge run.
-    """
+def test_deep_merge_groups_preserves_user_override():
+    """channels.matrix.groups: user leaf edits survive; controller may only
+    add new leaves the agent doesn't have yet (local-wins deep merge)."""
     cfg = _make_openclaw_cfg()
     cfg["channels"]["matrix"]["groups"] = {
         "*": {"requireMention": True, "historyLimit": 50},
@@ -376,12 +372,15 @@ def test_groups_controller_value_replaces_user_overrides():
         agent_path.write_text(json.dumps(agent))
 
         cfg["channels"]["matrix"]["groups"]["*"]["historyLimit"] = 200
+        cfg["channels"]["matrix"]["groups"]["*"]["newFlag"] = True
         _run_bridge(cfg, working_dir)
         agent = _read_agent(working_dir)
 
     groups = agent["channels"]["matrix"]["groups"]
-    assert groups["*"] == {"requireMention": True, "historyLimit": 200}
-    assert "!room:example.org" not in groups
+    assert groups["*"]["requireMention"] is False  # user override kept
+    assert groups["*"]["historyLimit"] == 50  # existing leaf NOT overwritten
+    assert groups["*"]["newFlag"] is True  # new leaf added
+    assert groups["!room:example.org"] == {"requireMention": False}
 
 
 # ---------------------------------------------------------------------------
