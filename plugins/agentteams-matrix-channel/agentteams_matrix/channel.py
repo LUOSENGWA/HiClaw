@@ -1802,6 +1802,20 @@ class AgentTeamsMatrixChannel(BaseChannel):
             re.IGNORECASE,
         ):
             return True
+        # 4. matrix.to localpart-only link (domain omitted by some clients)
+        localpart = self._user_id.lstrip("@").split(":", 1)[0]
+        if localpart and formatted_body and re.search(
+            rf'href=["\']https://matrix\.to/#/{re.escape("@" + localpart)}["\']',
+            formatted_body,
+            re.IGNORECASE,
+        ):
+            return True
+        # 5. bare @localpart in plain text (word-bounded, own localpart only)
+        if localpart and re.search(
+            rf"(?<![\w@])@{re.escape(localpart)}(?!\w)",
+            text,
+        ):
+            return True
         return False
 
     def _teamharness_self_trigger(self, room_id: str, event: Any) -> dict[str, Any] | None:
