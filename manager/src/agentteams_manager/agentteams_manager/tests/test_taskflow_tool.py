@@ -8,11 +8,11 @@ from uuid import UUID
 
 import pytest
 
-import copaw_worker.hooks.tools.projectflow as projectflow_tool
-import copaw_worker.hooks.tools.taskflow as taskflow_tool
-from copaw_worker.hooks.tools.projectflow import projectflow
-from copaw_worker.hooks.tools.taskflow import taskflow
-from copaw_worker.task import (
+import agentteams_manager.tools.projectflow as projectflow_tool
+import agentteams_manager.tools.taskflow as taskflow_tool
+from agentteams_manager.tools.projectflow import projectflow
+from agentteams_manager.tools.taskflow import taskflow
+from agentteams_manager.task import (
     FileSystemTaskStore,
     TaskMeta,
     TaskResult,
@@ -59,7 +59,7 @@ def _write_submitted_task(
 ) -> dict:
     store = FileSystemTaskStore(workspace)
     create_project(store, project_id=project_id, title="Decision project")
-    from copaw_worker.task import plan_dag
+    from agentteams_manager.task import plan_dag
     plan_dag(
         store,
         project_id=project_id,
@@ -99,9 +99,9 @@ async def test_projectflow_decision_requires_submission_id_before_side_effects(
     dry_run,
 ):
     leader_dir = tmp_path / "leader"
-    working_dir = leader_dir / ".copaw"
+    working_dir = leader_dir / ".qwenpaw"
     workspace = working_dir / "workspaces/default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _write_team_leader_runtime_config(leader_dir)
     _set_actor(monkeypatch, "@leader:domain")
     sync = _mock_project_sync(monkeypatch)
@@ -180,9 +180,9 @@ async def test_leader_accepts_submitted_result_and_resolves_continuation(
     monkeypatch,
 ):
     leader_dir = tmp_path / "leader"
-    working_dir = leader_dir / ".copaw"
+    working_dir = leader_dir / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _write_team_leader_runtime_config(leader_dir)
     _set_actor(monkeypatch, "@leader:domain")
     sync = _mock_project_sync(monkeypatch)
@@ -237,9 +237,9 @@ async def test_leader_decision_maps_result_status_to_terminal_state(
     expected_status,
 ):
     leader_dir = tmp_path / "leader"
-    working_dir = leader_dir / ".copaw"
+    working_dir = leader_dir / ".qwenpaw"
     workspace = working_dir / "workspaces/default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _write_team_leader_runtime_config(leader_dir)
     _set_actor(monkeypatch, "@leader:domain")
     _mock_project_sync(monkeypatch)
@@ -263,9 +263,9 @@ async def test_leader_decision_maps_result_status_to_terminal_state(
 @pytest.mark.asyncio
 async def test_leader_cancels_submitted_task_and_retry_is_idempotent(tmp_path, monkeypatch):
     leader_dir = tmp_path / "leader"
-    working_dir = leader_dir / ".copaw"
+    working_dir = leader_dir / ".qwenpaw"
     workspace = working_dir / "workspaces/default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _write_team_leader_runtime_config(leader_dir)
     _set_actor(monkeypatch, "@leader:domain")
     _mock_project_sync(monkeypatch)
@@ -311,9 +311,9 @@ async def test_cancel_task_does_not_depend_on_result_artifact_integrity(
     result_artifact,
 ):
     leader_dir = tmp_path / "leader"
-    working_dir = leader_dir / ".copaw"
+    working_dir = leader_dir / ".qwenpaw"
     workspace = working_dir / "workspaces/default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _write_team_leader_runtime_config(leader_dir)
     _set_actor(monkeypatch, "@leader:domain")
     _mock_project_sync(monkeypatch)
@@ -350,9 +350,9 @@ async def test_cancel_task_still_rejects_stale_submission_when_result_is_missing
     monkeypatch,
 ):
     leader_dir = tmp_path / "leader"
-    working_dir = leader_dir / ".copaw"
+    working_dir = leader_dir / ".qwenpaw"
     workspace = working_dir / "workspaces/default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _write_team_leader_runtime_config(leader_dir)
     _set_actor(monkeypatch, "@leader:domain")
     sync = _mock_project_sync(monkeypatch)
@@ -383,9 +383,9 @@ async def test_cancel_task_still_rejects_stale_submission_when_result_is_missing
 @pytest.mark.asyncio
 async def test_cancel_task_tool_requires_reason(tmp_path, monkeypatch):
     leader_dir = tmp_path / "leader"
-    working_dir = leader_dir / ".copaw"
+    working_dir = leader_dir / ".qwenpaw"
     workspace = working_dir / "workspaces/default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _write_team_leader_runtime_config(leader_dir)
     _set_actor(monkeypatch, "@leader:domain")
     _mock_project_sync(monkeypatch)
@@ -415,9 +415,9 @@ async def test_cancel_task_rejects_unsafe_replacement_id_without_side_effects(
     replacement_task_id,
 ):
     leader_dir = tmp_path / "leader"
-    working_dir = leader_dir / ".copaw"
+    working_dir = leader_dir / ".qwenpaw"
     workspace = working_dir / "workspaces/default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _write_team_leader_runtime_config(leader_dir)
     _set_actor(monkeypatch, "@leader:domain")
     sync = _mock_project_sync(monkeypatch)
@@ -455,9 +455,9 @@ async def test_accept_task_result_retry_is_idempotent_but_conflicting_decision_i
     monkeypatch,
 ):
     leader_dir = tmp_path / "leader"
-    working_dir = leader_dir / ".copaw"
+    working_dir = leader_dir / ".qwenpaw"
     workspace = working_dir / "workspaces/default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _write_team_leader_runtime_config(leader_dir)
     _set_actor(monkeypatch, "@leader:domain")
     _mock_project_sync(monkeypatch)
@@ -491,9 +491,9 @@ async def test_accept_task_result_rejects_invalid_submission_evidence(
     case,
 ):
     leader_dir = tmp_path / "leader"
-    working_dir = leader_dir / ".copaw"
+    working_dir = leader_dir / ".qwenpaw"
     workspace = working_dir / "workspaces/default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _write_team_leader_runtime_config(leader_dir)
     _set_actor(monkeypatch, "@leader:domain")
     sync = _mock_project_sync(monkeypatch)
@@ -527,9 +527,9 @@ async def test_accept_task_result_rejects_invalid_submission_evidence(
 @pytest.mark.asyncio
 async def test_task_result_decision_requires_team_leader_role(tmp_path, monkeypatch):
     worker_dir = tmp_path / "worker"
-    working_dir = worker_dir / ".copaw"
+    working_dir = worker_dir / ".qwenpaw"
     workspace = working_dir / "workspaces/default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     runtime_dir = worker_dir / "runtime"
     runtime_dir.mkdir(parents=True)
     (runtime_dir / "runtime.yaml").write_text("member:\n  role: worker\n")
@@ -557,9 +557,9 @@ async def test_accept_task_result_sync_failure_returns_retryable_persisted_state
     monkeypatch,
 ):
     leader_dir = tmp_path / "leader"
-    working_dir = leader_dir / ".copaw"
+    working_dir = leader_dir / ".qwenpaw"
     workspace = working_dir / "workspaces/default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _write_team_leader_runtime_config(leader_dir)
     _set_actor(monkeypatch, "@leader:domain")
     sync = _mock_project_sync(monkeypatch)
@@ -591,9 +591,9 @@ async def test_project_plan_terminal_fences_opposite_retry_after_task_meta_write
     monkeypatch,
 ):
     leader_dir = tmp_path / "leader"
-    working_dir = leader_dir / ".copaw"
+    working_dir = leader_dir / ".qwenpaw"
     workspace = working_dir / "workspaces/default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _write_team_leader_runtime_config(leader_dir)
     _set_actor(monkeypatch, "@leader:domain")
     _mock_project_sync(monkeypatch)
@@ -671,9 +671,9 @@ def _write_team_leader_runtime_config(base_dir: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_taskflow_project_assignment_and_completion(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker-a:domain")
     _mock_sync(monkeypatch)
     _mock_notify(monkeypatch)
@@ -766,8 +766,8 @@ async def test_taskflow_project_assignment_and_completion(tmp_path, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_projectflow_check_active_tasks_reports_idle_worker(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    working_dir = tmp_path / "worker" / ".qwenpaw"
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@leader:domain")
     _mock_sync(monkeypatch)
     _mock_notify(monkeypatch)
@@ -835,8 +835,8 @@ async def test_projectflow_check_active_tasks_reports_idle_worker(tmp_path, monk
 
 @pytest.mark.asyncio
 async def test_projectflow_check_active_tasks_ignores_running_worker(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    working_dir = tmp_path / "worker" / ".qwenpaw"
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@leader:domain")
     _mock_sync(monkeypatch)
     _mock_notify(monkeypatch)
@@ -895,9 +895,9 @@ async def test_projectflow_check_active_tasks_ignores_running_worker(tmp_path, m
 
 @pytest.mark.asyncio
 async def test_projectflow_check_active_tasks_reports_pending_result(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@leader:domain")
     _mock_sync(monkeypatch)
     _mock_notify(monkeypatch)
@@ -953,8 +953,8 @@ async def test_projectflow_check_active_tasks_reports_pending_result(tmp_path, m
 
 @pytest.mark.asyncio
 async def test_projectflow_check_active_tasks_reports_ready_tasks_pending(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    working_dir = tmp_path / "worker" / ".qwenpaw"
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
 
     assert _response_json(
         await projectflow(
@@ -989,9 +989,9 @@ async def test_projectflow_check_active_tasks_reports_ready_tasks_pending(tmp_pa
 
 @pytest.mark.asyncio
 async def test_projectflow_check_active_tasks_reports_project_completion_pending(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
 
     assert _response_json(
         await projectflow(
@@ -1028,9 +1028,9 @@ async def test_projectflow_check_active_tasks_reports_project_completion_pending
 
 @pytest.mark.asyncio
 async def test_projectflow_check_active_tasks_reports_loop_iteration_decision_pending(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
 
     assert _response_json(
         await projectflow(
@@ -1077,8 +1077,8 @@ async def test_projectflow_check_active_tasks_reports_loop_iteration_decision_pe
 
 @pytest.mark.asyncio
 async def test_delegate_task_requires_room_id(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    working_dir = tmp_path / "worker" / ".qwenpaw"
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@leader:domain")
 
     response = await projectflow(
@@ -1125,9 +1125,9 @@ async def test_delegate_task_requires_room_id(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_delegate_task_rejects_team_leader_dm_room(tmp_path, monkeypatch):
     leader_dir = tmp_path / "leader"
-    working_dir = leader_dir / ".copaw"
+    working_dir = leader_dir / ".qwenpaw"
     _write_team_leader_runtime_config(leader_dir)
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@leader:domain")
 
     assert _response_json(
@@ -1171,9 +1171,9 @@ async def test_delegate_task_rejects_team_leader_dm_room(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_delegate_task_accepts_team_leader_team_room(tmp_path, monkeypatch):
     leader_dir = tmp_path / "leader"
-    working_dir = leader_dir / ".copaw"
+    working_dir = leader_dir / ".qwenpaw"
     _write_team_leader_runtime_config(leader_dir)
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@leader:domain")
     _mock_sync(monkeypatch)
     _mock_notify(monkeypatch)
@@ -1229,9 +1229,9 @@ async def test_delegate_task_accepts_team_leader_team_room(tmp_path, monkeypatch
 
 @pytest.mark.asyncio
 async def test_submit_task_writes_structured_result(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     _mock_sync(monkeypatch)
 
@@ -1282,9 +1282,9 @@ async def test_submit_task_writes_structured_result(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_submit_task_reuses_identity_for_same_result(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     _mock_sync(monkeypatch)
 
@@ -1758,9 +1758,9 @@ def test_two_different_concurrent_submissions_cannot_both_succeed(tmp_path):
 
 @pytest.mark.asyncio
 async def test_submit_task_rejects_different_result_without_overwriting(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     _mock_sync(monkeypatch)
 
@@ -1807,9 +1807,9 @@ async def test_submit_task_rejects_tampered_persisted_result_without_sync(
     tmp_path,
     monkeypatch,
 ):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     sync = _mock_sync(monkeypatch)
 
@@ -1867,9 +1867,9 @@ async def test_submit_task_rejects_terminal_task_without_rotating_identity(
     monkeypatch,
     terminal_status,
 ):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     _mock_sync(monkeypatch)
 
@@ -1926,9 +1926,9 @@ async def test_submit_task_retry_repairs_missing_result_after_sync_failure(
     tmp_path,
     monkeypatch,
 ):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     sync = _mock_sync(monkeypatch)
     # The result upload succeeds, then publishing submitted meta fails.  This
@@ -1994,9 +1994,9 @@ async def test_submit_task_retry_repairs_missing_result_after_sync_failure(
 
 @pytest.mark.asyncio
 async def test_ack_task_rejects_wrong_worker(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@wrong-worker:domain")
     _mock_sync(monkeypatch)
 
@@ -2025,9 +2025,9 @@ async def test_ack_task_rejects_wrong_worker(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ack_task_rejects_missing_room_id(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     _mock_sync(monkeypatch)
 
@@ -2055,9 +2055,9 @@ async def test_ack_task_rejects_missing_room_id(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ack_task_accepts_canonical_worker_identity(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@backend-platform-engineer:domain")
     _mock_sync(monkeypatch)
 
@@ -2089,9 +2089,9 @@ async def test_ack_task_accepts_canonical_worker_identity(tmp_path, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_ack_task_accepts_display_name_worker_identity(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "backend-platform-engineer 💕")
     _mock_sync(monkeypatch)
 
@@ -2122,9 +2122,9 @@ async def test_ack_task_accepts_display_name_worker_identity(tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_submit_task_rejects_wrong_worker(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@wrong-worker:domain")
 
     task_dir = workspace / "shared" / "tasks" / "st-01"
@@ -2161,8 +2161,8 @@ async def test_submit_task_rejects_wrong_worker(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_projectflow_plan_dag_accepts_json_string(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    working_dir = tmp_path / "worker" / ".qwenpaw"
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
 
     response = await projectflow(
         action="create_project",
@@ -2198,8 +2198,8 @@ async def test_projectflow_plan_dag_accepts_json_string(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_projectflow_plan_dag_generates_ready_nodes(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    working_dir = tmp_path / "worker" / ".qwenpaw"
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
 
     response = await projectflow(
         action="create_project",
@@ -2239,9 +2239,9 @@ async def test_projectflow_plan_dag_generates_ready_nodes(tmp_path, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_projectflow_plan_loop_generates_ready_loop_nodes(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
 
     response = await projectflow(
         action="create_project",
@@ -2294,9 +2294,9 @@ async def test_projectflow_plan_loop_generates_ready_loop_nodes(tmp_path, monkey
 
 @pytest.mark.asyncio
 async def test_loop_task_submission_waits_for_leader_acceptance(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@writer:domain")
     _mock_sync(monkeypatch)
     _mock_notify(monkeypatch)
@@ -2392,8 +2392,8 @@ async def test_loop_task_submission_waits_for_leader_acceptance(tmp_path, monkey
 
 @pytest.mark.asyncio
 async def test_dag_and_loop_ready_actions_are_separate(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    working_dir = tmp_path / "worker" / ".qwenpaw"
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
 
     assert _response_json(
         await projectflow(
@@ -2443,9 +2443,9 @@ async def test_dag_and_loop_ready_actions_are_separate(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_projectflow_record_loop_iteration_updates_history(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
 
     assert _response_json(
         await projectflow(
@@ -2487,9 +2487,9 @@ async def test_projectflow_record_loop_iteration_updates_history(tmp_path, monke
 
 @pytest.mark.asyncio
 async def test_complete_project_rejects_a_dag_with_non_terminal_tasks(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
 
     assert _response_json(
         await projectflow(
@@ -2542,9 +2542,9 @@ async def test_complete_project_rejects_a_dag_with_non_terminal_tasks(tmp_path, 
 
 @pytest.mark.asyncio
 async def test_complete_project_rejects_a_loop_iteration_with_non_terminal_tasks(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
 
     assert _response_json(
         await projectflow(
@@ -2591,9 +2591,9 @@ async def test_complete_project_rejects_a_loop_iteration_with_non_terminal_tasks
 
 @pytest.mark.asyncio
 async def test_project_lifecycle_actions_only_update_meta_status(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
 
     response = await projectflow(
         action="create_project",
@@ -2637,9 +2637,9 @@ async def test_project_lifecycle_actions_only_update_meta_status(tmp_path, monke
 
 @pytest.mark.asyncio
 async def test_check_task_reports_interrupted_as_ineffective(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     _mock_sync(monkeypatch)
 
@@ -2680,9 +2680,9 @@ async def test_check_task_reports_interrupted_as_ineffective(tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_projectflow_ready_nodes_rejects_ineffective_dependency(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     _mock_sync(monkeypatch)
     _mock_notify(monkeypatch)
@@ -2764,9 +2764,9 @@ def test_add_tasks_rejects_unknown_dependency(tmp_path):
 
 @pytest.mark.asyncio
 async def test_submit_task_rejects_invalid_deliverable_path(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
 
     task_dir = workspace / "shared" / "tasks" / "st-01"
@@ -2799,9 +2799,9 @@ async def test_submit_task_rejects_invalid_deliverable_path(tmp_path, monkeypatc
 
 @pytest.mark.asyncio
 async def test_ack_task_returns_spec_and_calls_sync(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     mock = _mock_sync(monkeypatch)
 
@@ -2841,9 +2841,9 @@ async def test_ack_task_rejects_terminal_task_without_reopening(
     monkeypatch,
     terminal_status,
 ):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     _mock_sync(monkeypatch)
 
@@ -2885,9 +2885,9 @@ async def test_ack_task_rejects_terminal_task_without_reopening(
 
 @pytest.mark.asyncio
 async def test_submit_task_calls_sync_and_stat(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     mock = _mock_sync(monkeypatch)
 
@@ -2942,9 +2942,9 @@ async def test_submit_task_does_not_publish_meta_when_deliverable_sync_fails(
     tmp_path,
     monkeypatch,
 ):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     sync = _mock_sync(monkeypatch)
     sync.push_shared_path.side_effect = [None, RuntimeError("deliverable unavailable")]
@@ -2980,9 +2980,9 @@ async def test_submit_task_does_not_publish_meta_when_deliverable_sync_fails(
 
 @pytest.mark.asyncio
 async def test_submit_task_publish_last_deduplicates_result_deliverable(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces/default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     sync = _mock_sync(monkeypatch)
     task_dir = workspace / "shared/tasks/st-result"
@@ -3015,9 +3015,9 @@ async def test_submit_task_publish_last_deduplicates_result_deliverable(tmp_path
 
 @pytest.mark.asyncio
 async def test_check_task_pulls_and_returns_meta(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     mock = _mock_sync(monkeypatch)
 
     task_dir = workspace / "shared" / "tasks" / "st-01"
@@ -3056,8 +3056,8 @@ async def test_check_task_pulls_and_returns_meta(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_delegate_task_pushes_after_creation(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    working_dir = tmp_path / "worker" / ".qwenpaw"
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@leader:domain")
     mock = _mock_sync(monkeypatch)
     _mock_notify(monkeypatch)
@@ -3106,9 +3106,9 @@ async def test_delegate_task_pushes_after_creation(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ack_task_missing_spec_does_not_write_in_progress(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@worker:domain")
     _mock_sync(monkeypatch)
 
@@ -3148,9 +3148,9 @@ async def test_delegate_task_notification_failure_leaves_task_prepared(
     recorded — a retry re-sends with a stable txn_id and only then
     marks the task assigned.
     """
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@lead:domain")
     _mock_sync(monkeypatch)
 
@@ -3212,9 +3212,9 @@ async def test_delegate_task_retry_after_notification_failure_sends_txn_id(
     ``delegate-{task_id}`` txn_id (idempotent), records the event_id,
     and marks the task assigned.
     """
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@lead:domain")
     mock = _mock_sync(monkeypatch)
 
@@ -3284,8 +3284,8 @@ async def test_delegate_task_notification_success_records_event_id(
     tmp_path, monkeypatch,
 ):
     """Successful notification includes eventId in the response."""
-    working_dir = tmp_path / "worker" / ".copaw"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    working_dir = tmp_path / "worker" / ".qwenpaw"
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@lead:domain")
     _mock_sync(monkeypatch)
     _mock_notify(monkeypatch)
@@ -3330,11 +3330,11 @@ async def test_validate_delegate_task_returns_task_without_writing(
     tmp_path, monkeypatch,
 ):
     """validate_delegate_task returns the DagTask without side effects."""
-    from copaw_worker.task import validate_delegate_task
+    from agentteams_manager.task import validate_delegate_task
 
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
 
     await projectflow(
         action="create_project",

@@ -72,7 +72,7 @@ if [ -f "${QWENPAW_WORKING_DIR}/config.json" ]; then
 fi
 
 log "Bridging openclaw.json -> CoPaw config (manager)..."
-/opt/venv/qwenpaw/bin/python3 -m copaw_worker.bridge \
+/opt/venv/qwenpaw/bin/python3 -m agentteams_manager.bridge \
         --profile manager \
         --openclaw-json "${OPENCLAW_JSON}" \
         --working-dir "${QWENPAW_WORKING_DIR}"
@@ -279,7 +279,7 @@ fi
         _curr_hash=$(md5sum "${OPENCLAW_JSON}" 2>/dev/null | awk '{print $1}')
         if [ -n "${_curr_hash}" ] && [ "${_curr_hash}" != "${_prev_hash}" ]; then
             log "openclaw.json changed, re-bridging..."
-            _bridge_out=$(/opt/venv/qwenpaw/bin/python3 -m copaw_worker.bridge \
+            _bridge_out=$(/opt/venv/qwenpaw/bin/python3 -m agentteams_manager.bridge \
                     --profile manager \
                     --openclaw-json "${OPENCLAW_JSON}" \
                     --working-dir "${QWENPAW_WORKING_DIR}" 2>&1)
@@ -351,5 +351,5 @@ python3 /opt/agentteams/scripts/init/qwenpaw_manager_skill_sync.py \
     --interval "${AGENTTEAMS_QWENPAW_SKILL_SYNC_INTERVAL_SECONDS:-1}" &
 log "QwenPaw Manager skill watcher started (PID: $!)"
 
-# run_copaw_app.py starts qwenpaw app (tools registered via agentteams-manager-tools plugin)
-exec python3 -m copaw_worker.run_copaw_app app --host 0.0.0.0 --port 18799
+# Start the QwenPaw app directly (tools registered via agentteams-manager-tools plugin)
+exec python3 -m qwenpaw app --host 0.0.0.0 --port 18799
