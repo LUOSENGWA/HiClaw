@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func newAppserviceTestScheme(t *testing.T) *runtime.Scheme {
@@ -557,5 +558,82 @@ func TestAppserviceIgnoresNonMessageEvents(t *testing.T) {
 	}
 	if updated.Spec.DesiredState() != "Sleeping" {
 		t.Fatalf("state=%q, want Sleeping (non-message events should be ignored)", updated.Spec.DesiredState())
+	}
+}
+
+// TestAppserviceDedupMarkedAfterConfirm: a failed wake must not consume the
+// dedup slot — a homeserver redelivery of the same eventID is then
+// processed (mark-after-confirm), instead of being silently dropped by a
+// mark made before the (failed) wake.
+func TestAppserviceDedupMarkedAfterConfirm(t *testing.T) {
+	scheme := newAppserviceTestScheme(t)
+	sleeping := "Sleeping"
+	worker := &v1beta1.Worker{
+		ObjectMeta: metav1.ObjectMeta{Name: "alpha-dev", Namespace: "default"},
+		Spec:       v1beta1.WorkerSpec{State: &sleeping},
+		Status: v1beta1.WorkerStatus{
+			MatrixUserID: "@alpha-dev:example.com",
+			RoomID:       "!worker-dm:example.com",
+		},
+	}
+	fakeBuilder := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&v1beta1.Worker{}).
+		WithObjects(worker).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				return context.DeadlineExceeded
+			},
+		})
+	failClient := fakeBuilder.Build()
+
+	handler := NewAppserviceHandler("test-hs-token", failClient, "default")
+
+	body := txnBody(t, []matrixEvent{
+		mentionEvent("!worker-dm:example.com", "$ev-fail", "@human:example.com", []string{"@alpha-dev:example.com"}),
+	})
+	req := httptest.NewRequest(http.MethodPut, "/_matrix/app/v1/transactions/txn-fail", body)
+	req.Header.Set("Authorization", "Bearer test-hs-token")
+	rec := httptest.NewRecorder()
+	handler.HandleTransactions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 (wake failure is logged, not surfaced)", rec.Code)
+	}
+
+	// The wake failed, so the worker stays Sleeping.
+	var updated v1beta1.Worker
+	if err := failClient.Get(context.Background(), client.ObjectKey{Name: "alpha-dev", Namespace: "default"}, &updated); err != nil {
+		t.Fatalf("get worker: %v", err)
+	}
+	if updated.Spec.DesiredState() != "Sleeping" {
+		t.Fatalf("state=%q, want Sleeping (wake failed)", updated.Spec.DesiredState())
+	}
+
+	// Swap in a healthy client on the SAME handler (the seen map carries
+	// over) and redeliver the identical event: with mark-after-confirm it
+	// must now be processed and wake the worker.
+	healthyClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&v1beta1.Worker{}).
+		WithObjects(worker).
+		Build()
+	handler.client = healthyClient
+
+	req2 := httptest.NewRequest(http.MethodPut, "/_matrix/app/v1/transactions/txn-retry", txnBody(t, []matrixEvent{
+		mentionEvent("!worker-dm:example.com", "$ev-fail", "@human:example.com", []string{"@alpha-dev:example.com"}),
+	}))
+	req2.Header.Set("Authorization", "Bearer test-hs-token")
+	rec2 := httptest.NewRecorder()
+	handler.HandleTransactions(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("redelivery status=%d, want 200", rec2.Code)
+	}
+
+	var after v1beta1.Worker
+	if err := healthyClient.Get(context.Background(), client.ObjectKey{Name: "alpha-dev", Namespace: "default"}, &after); err != nil {
+		t.Fatalf("get worker after retry: %v", err)
+	}
+	if after.Spec.DesiredState() != "Running" {
+		t.Fatalf("state=%q after redelivery, want Running (failed wake must not consume the dedup slot)", after.Spec.DesiredState())
 	}
 }

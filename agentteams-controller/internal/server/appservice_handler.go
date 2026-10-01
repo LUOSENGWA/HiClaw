@@ -170,8 +170,18 @@ func (h *AppserviceHandler) handleMention(ctx context.Context, roomID, eventID, 
 	logger := log.FromContext(ctx).WithName("appservice")
 
 	// Dedup by roomID/eventID/userID.
+	//
+	// Mark-after-confirm: we record the event as seen only AFTER a
+	// successful wake. Marking before the wake (the historical behavior)
+	// meant a transient failure (e.g. a K8s List/Update error) permanently
+	// swallowed the mention — the homeserver's redelivery of the same
+	// eventID hit the dedup and was dropped, so the worker was never woken.
+	// Leaving a failed wake unmarked lets the retry be processed. Wake is
+	// idempotent (Running is set only from Sleeping, under retry), so a
+	// concurrent duplicate push cannot double-apply the state change.
+	key := ""
 	if eventID != "" {
-		key := fmt.Sprintf("%s/%s/%s", roomID, eventID, userID)
+		key = fmt.Sprintf("%s/%s/%s", roomID, eventID, userID)
 		h.mu.Lock()
 		if _, ok := h.seen[key]; ok {
 			h.mu.Unlock()
@@ -179,7 +189,6 @@ func (h *AppserviceHandler) handleMention(ctx context.Context, roomID, eventID, 
 				"roomID", roomID, "eventID", eventID, "mentionedUser", userID)
 			return nil
 		}
-		h.seen[key] = struct{}{}
 		h.mu.Unlock()
 	}
 
@@ -192,6 +201,12 @@ func (h *AppserviceHandler) handleMention(ctx context.Context, roomID, eventID, 
 	}
 	if err := h.wakeTeamWorker(ctx, roomID, userID); err != nil {
 		return fmt.Errorf("wake team worker: %w", err)
+	}
+
+	if key != "" {
+		h.mu.Lock()
+		h.seen[key] = struct{}{}
+		h.mu.Unlock()
 	}
 	return nil
 }
