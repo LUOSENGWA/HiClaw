@@ -78,10 +78,10 @@ env:
   # Shard C: Keep runtime-dependent coverage in each supported CI worker runtime.
   # Run fixed runtime-switch/name-validation scenarios once (QwenPaw), and
   # Manager-only startup/migration once on QwenPaw, not per worker.
-  # CoPaw has no standalone shard; test-23 still uses its image as a migration source.
+  # CoPaw has no standalone shard; the legacy-upgrade coverage (test-29) runs on the pinned published image.
   SHARD_A_TESTS: "01 02 03 04 05 06"
   SHARD_C_TESTS: "15 17 18 19 20 22 24 100"
-  SHARD_C_QWENPAW_TESTS: "15 17 18 19 20 22 23 24 25 27 28 100"
+  SHARD_C_QWENPAW_TESTS: "15 17 18 19 20 22 23 24 25 27 28 29 100"
   SHARD_QWENPAW_TESTS: "26"
   NON_GITHUB_TESTS: "01 02 03 04 05 06 15 17 18 19 20 22 23 24 25 27 28 100"
 
@@ -252,8 +252,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # copaw-worker is retained for test-23 migration, not standalone regression.
-        target: [embedded, manager, manager-qwenpaw, worker, copaw-worker, qwenpaw-worker, hermes-worker, deepseek-harness-worker]
+        # The copaw-worker image is no longer built from the branch: the
+        # legacy-upgrade coverage (test-29) pulls the pinned published image
+        # (agentteams-copaw-worker) instead.
+        target: [embedded, manager, manager-qwenpaw, worker, qwenpaw-worker, hermes-worker, deepseek-harness-worker]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -289,9 +291,8 @@ jobs:
         run: |
           # When openclaw-base was rebuilt from this PR's source, point manager
           # and worker builds at the local image instead of pulling :latest from
-          # the published registry. Other targets (embedded, manager-qwenpaw,
-          # copaw-worker) do not depend on openclaw-base so the override is a
-          # no-op for them.
+          # the published registry. Other targets (embedded, manager-qwenpaw)
+          # do not depend on openclaw-base so the override is a no-op for them.
           EXTRA=""
           if [ "${{ needs.detect-changes.outputs.openclaw_base }}" = "true" ] && \
              { [ "${{ matrix.target }}" = "manager" ] || [ "${{ matrix.target }}" = "worker" ]; }; then
