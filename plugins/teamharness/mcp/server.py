@@ -2804,6 +2804,21 @@ def _canonical_room_id(value: Any) -> str:
     return text
 
 
+def _canonical_assignee(value: Any) -> str:
+    """Comparison key for assignee identifiers.
+
+    Matrix user-id localparts (and domains) are case-insensitive, and an
+    assignee may be supplied as a full MXID or as a leading ``room:``-style
+    alias. Normalizing the case makes a re-delegation to the *same* worker
+    (spelled differently) compare equal, so only a genuinely different
+    assignee counts as a new delegation attempt.
+    """
+    text = str(value or "").strip()
+    if text.startswith("room:"):
+        text = text[len("room:") :].strip()
+    return text.casefold()
+
+
 def _external_requester_channel(project: dict[str, Any]) -> str:
     reply_route = project.get("reply_route") if isinstance(project.get("reply_route"), dict) else {}
     channel = str(reply_route.get("channel") or project.get("source") or "").strip().lower()
@@ -4649,8 +4664,13 @@ def _send_delegate_notification(
     """Send the automatic Worker assignment notification for delegate_task.
 
     Publishes the assignment to the Task room with ``m.mentions`` using the
-    same Matrix HTTP send path as the message tool. The transaction ID is
-    stable per task so a retry cannot produce a duplicate assignment.
+    same Matrix HTTP send path as the message tool. Each send uses a fresh
+    transaction ID: a lost event id (broken-state repair) must be able to
+    re-notify the worker, and a re-delegation to a different worker must not
+    be silently deduplicated by the homeserver. Duplicate protection lives
+    in the task state instead — a task already ``assigned`` with a recorded
+    event id is reused, never re-sent (see the delegate_task idempotency
+    branch).
     Returns the Matrix ``eventId`` on success.
     """
     homeserver = os.getenv("AGENTTEAMS_MATRIX_URL", "").rstrip("/")
@@ -4678,7 +4698,10 @@ def _send_delegate_notification(
     content = _matrix_content(notification_text, mentions)
 
     room_enc = urllib.parse.quote(matrix_room_id, safe="")
-    txn = urllib.parse.quote(f"delegate-{task_id}", safe="")
+    # Fresh transaction id per send (see docstring): a stable id per task
+    # made the homeserver deduplicate a re-delegation or a broken-state
+    # re-send, silently swallowing the assignment notification.
+    txn = urllib.parse.quote(f"delegate-{task_id}-{uuid.uuid4().hex[:12]}", safe="")
     url = f"{homeserver}/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/{txn}"
     request = urllib.request.Request(
         url,
@@ -5187,7 +5210,22 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             # the existing assignment instead of sending a duplicate. The
             # assigned state must still reach shared storage: if the sync
             # fails, return a retryable failure so a later retry finishes it.
-            if str(existing_task.get("status") or "") == "assigned" and existing_task.get("eventId"):
+            #
+            # A re-delegation to a *different* assignee is not a retry:
+            # falling through re-prepares the task and sends a fresh
+            # notification (with a fresh transaction id) so the new worker
+            # actually receives the assignment instead of it being silently
+            # deduplicated by the homeserver.
+            existing_assignee = str(existing_task.get("assigned_to") or "").strip()
+            redelegate = bool(
+                assignment_mxid
+                and _canonical_assignee(assignment_mxid) != _canonical_assignee(existing_assignee)
+            )
+            if (
+                str(existing_task.get("status") or "") == "assigned"
+                and existing_task.get("eventId")
+                and not redelegate
+            ):
                 notification_reused = {
                     "sent": True,
                     "eventId": existing_task["eventId"],
@@ -5303,17 +5341,22 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 if _delegate_from != "prepared":
                     # Only prepared -> prepared retries are silent no-op
                     # re-entries. Any other reachable re-entry changes the
-                    # state and is recorded so the trail stays complete: an
-                    # assigned task without eventId is the broken-state
-                    # repair path (revision and the other terminal states
-                    # are frozen upstream by the mutability guard).
+                    # state and is recorded so the trail stays complete: a
+                    # re-delegation to a new assignee, or an assigned task
+                    # without eventId (the broken-state repair path;
+                    # revision and the other terminal states are frozen
+                    # upstream by the mutability guard).
                     _append_transition_history(
                         task,
                         _delegate_from,
                         "prepared",
                         "delegate_task",
                         _transition_actor(arguments),
-                        note="repair: assigned without eventId",
+                        note=(
+                            "re-delegate: new assignee"
+                            if redelegate
+                            else "repair: assigned without eventId"
+                        ),
                     )
             _write_task(arguments, task)
             # Publish task files to shared storage FIRST so a Worker that
