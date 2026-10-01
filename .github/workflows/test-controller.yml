@@ -4,7 +4,7 @@ on:
   pull_request:
     paths:
       - 'agentteams-controller/**'
-      - 'copaw/**'
+      - 'manager/src/**'
       - 'plugins/teamharness/**'
       - 'plugins/tests/**'
       - 'docs/design/teamharness/**'
@@ -13,7 +13,7 @@ on:
     branches: [main]
     paths:
       - 'agentteams-controller/**'
-      - 'copaw/**'
+      - 'manager/src/**'
       - 'plugins/teamharness/**'
       - 'plugins/tests/**'
       - 'docs/design/teamharness/**'
@@ -68,7 +68,7 @@ jobs:
           ruby plugins/tests/teamharness/test-contracts.rb
           python -m pytest plugins/tests/teamharness/mcp/test_continuation.py -q
           python -m pytest plugins/tests/teamharness/test_pull_project.py -q
-          PYTHONPATH="${GITHUB_WORKSPACE}/copaw/src" \
-            python -m pytest copaw/tests/test_taskflow_tool.py -q
+          PYTHONPATH="${GITHUB_WORKSPACE}/manager/src/agentteams_manager" \
+            python -m pytest manager/src/agentteams_manager/agentteams_manager/tests/ -q
           ruby plugins/tests/teamharness/mcp/tools/test-taskflow.rb
           ruby plugins/tests/teamharness/mcp/tools/test-transition-table.rb

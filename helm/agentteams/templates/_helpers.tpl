@@ -178,11 +178,6 @@ app.kubernetes.io/component: {{ .component }}
 {{- printf "%s:%s" .Values.worker.defaultImage.openclaw.repository $tag }}
 {{- end }}
 
-{{- define "agentteams.worker.copawImage" -}}
-{{- $tag := default (include "agentteams.globalImageTag" .) .Values.worker.defaultImage.copaw.tag }}
-{{- printf "%s:%s" .Values.worker.defaultImage.copaw.repository $tag }}
-{{- end }}
-
 {{- define "agentteams.worker.hermesImage" -}}
 {{- $tag := default (include "agentteams.globalImageTag" .) .Values.worker.defaultImage.hermes.tag }}
 {{- printf "%s:%s" .Values.worker.defaultImage.hermes.repository $tag }}

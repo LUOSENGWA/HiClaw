@@ -15,9 +15,9 @@ OPENCLAW_WORKSPACE="${HOME}"
 QWENPAW_WORKING_DIR="${HOME}/.qwenpaw"
 
 # ============================================================
-# 1. Create CoPaw directory structure
+# 1. Create QwenPaw directory structure
 # ============================================================
-log "Creating CoPaw directory structure..."
+log "Creating QwenPaw directory structure..."
 mkdir -p "${QWENPAW_WORKING_DIR}/custom_channels"
 mkdir -p "${QWENPAW_WORKING_DIR}/.secret"
 
@@ -71,7 +71,7 @@ if [ -f "${QWENPAW_WORKING_DIR}/config.json" ]; then
     fi
 fi
 
-log "Bridging openclaw.json -> CoPaw config (manager)..."
+log "Bridging openclaw.json -> QwenPaw config (manager)..."
 /opt/venv/qwenpaw/bin/python3 -m agentteams_manager.bridge \
         --profile manager \
         --openclaw-json "${OPENCLAW_JSON}" \
@@ -79,10 +79,10 @@ log "Bridging openclaw.json -> CoPaw config (manager)..."
 log "Config bridged from openclaw.json"
 
 # ============================================================
-# 3. Sync prompt files into CoPaw paths
+# 3. Sync prompt files into QwenPaw paths
 # ============================================================
 # Canonical AgentTeams layout is OPENCLAW_WORKSPACE ($HOME): SOUL.md, memory/, skills/ etc.
-# CoPaw reads from QWENPAW_WORKING_DIR/workspaces/default/; we sync into that path only.
+# QwenPaw reads from QWENPAW_WORKING_DIR/workspaces/default/; we sync into that path only.
 # Use cp -u / cp -ru so we never overwrite newer files already in workspaces/default/.
 # ============================================================
 WORKSPACE_DIR="${QWENPAW_WORKING_DIR}/workspaces/default"
@@ -108,7 +108,7 @@ if [ -f "${OPENCLAW_WORKSPACE}/MEMORY.md" ]; then
 fi
 
 # ============================================================
-# 4. Sync memory/ and skills/ (OpenClaw layout -> CoPaw)
+# 4. Sync memory/ and skills/ (OpenClaw layout -> QwenPaw)
 # ============================================================
 log "Syncing memory/ and skills/ (cp -ru: recursive, do not overwrite newer dest)..."
 if [ -d "${OPENCLAW_WORKSPACE}/memory" ]; then

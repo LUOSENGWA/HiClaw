@@ -70,7 +70,6 @@ MANAGER_IMAGE="agentteams/manager:local"
 QWENPAW_MANAGER_IMAGE="agentteams/manager-qwenpaw:local"
 CONTROLLER_IMAGE="agentteams/agentteams-controller:local"
 WORKER_IMAGE="agentteams/worker-agent:local"
-COPAW_WORKER_IMAGE="agentteams/copaw-worker:local"
 HERMES_WORKER_IMAGE="agentteams/hermes-worker:local"
 OPENHUMAN_WORKER_IMAGE="agentteams/openhuman-worker:local"
 HELM_IMAGE_OVERRIDES=""
@@ -97,25 +96,19 @@ if [ "$SKIP_BUILD" = "0" ]; then
             -f "${PROJECT_ROOT}/manager/Dockerfile" "${PROJECT_ROOT}"
     fi
 
-    # QwenPaw Manager (lightweight Python image with copaw_worker for bridge/sync)
+    # QwenPaw Manager (lightweight Python image with the agentteams_manager package)
     log "Building QwenPaw manager image..."
     docker build -t "$QWENPAW_MANAGER_IMAGE" \
         --build-arg AGENTTEAMS_CONTROLLER_IMAGE="$CONTROLLER_IMAGE" \
         -f "${PROJECT_ROOT}/manager/Dockerfile.qwenpaw" "${PROJECT_ROOT}"
 
-    # Worker images (openclaw + copaw)
+    # Worker images
     log "Building worker image (openclaw)..."
     docker build -t "$WORKER_IMAGE" \
         --build-arg OPENCLAW_BASE_IMAGE=higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/openclaw-base:20260423-8359cbc \
         --build-arg AGENTTEAMS_CONTROLLER_IMAGE="$CONTROLLER_IMAGE" \
         --build-context shared="${PROJECT_ROOT}/shared/lib" \
         -f "${PROJECT_ROOT}/worker/Dockerfile" "${PROJECT_ROOT}/worker"
-
-    log "Building worker image (copaw)..."
-    docker build -t "$COPAW_WORKER_IMAGE" \
-        --build-arg AGENTTEAMS_CONTROLLER_IMAGE="$CONTROLLER_IMAGE" \
-        --build-context shared="${PROJECT_ROOT}/shared/lib" \
-        -f "${PROJECT_ROOT}/copaw/Dockerfile" "${PROJECT_ROOT}/copaw"
 
     log "Building worker image (hermes)..."
     docker build -t "$HERMES_WORKER_IMAGE" \
@@ -132,7 +125,6 @@ if [ "$SKIP_BUILD" = "0" ]; then
     kind load docker-image "$QWENPAW_MANAGER_IMAGE" --name "$CLUSTER_NAME"
     kind load docker-image "$CONTROLLER_IMAGE" --name "$CLUSTER_NAME"
     kind load docker-image "$WORKER_IMAGE" --name "$CLUSTER_NAME"
-    kind load docker-image "$COPAW_WORKER_IMAGE" --name "$CLUSTER_NAME"
     kind load docker-image "$HERMES_WORKER_IMAGE" --name "$CLUSTER_NAME"
     kind load docker-image "$OPENHUMAN_WORKER_IMAGE" --name "$CLUSTER_NAME"
 
@@ -164,7 +156,6 @@ if [ "$SKIP_BUILD" = "0" ]; then
     HELM_IMAGE_OVERRIDES="--set manager.image.repository=agentteams/manager-qwenpaw --set manager.image.tag=local --set manager.image.pullPolicy=Never"
     HELM_IMAGE_OVERRIDES="${HELM_IMAGE_OVERRIDES} --set controller.image.repository=agentteams/agentteams-controller --set controller.image.tag=local --set controller.image.pullPolicy=Never"
     HELM_IMAGE_OVERRIDES="${HELM_IMAGE_OVERRIDES} --set worker.defaultImage.openclaw.repository=agentteams/worker-agent --set worker.defaultImage.openclaw.tag=local"
-    HELM_IMAGE_OVERRIDES="${HELM_IMAGE_OVERRIDES} --set worker.defaultImage.copaw.repository=agentteams/copaw-worker --set worker.defaultImage.copaw.tag=local"
     HELM_IMAGE_OVERRIDES="${HELM_IMAGE_OVERRIDES} --set worker.defaultImage.hermes.repository=agentteams/hermes-worker --set worker.defaultImage.hermes.tag=local"
     HELM_IMAGE_OVERRIDES="${HELM_IMAGE_OVERRIDES} --set worker.defaultImage.openhuman.repository=agentteams/openhuman-worker --set worker.defaultImage.openhuman.tag=local"
 

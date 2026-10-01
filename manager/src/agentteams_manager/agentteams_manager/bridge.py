@@ -770,7 +770,7 @@ def sync_inner_prompt_files_to_outer(local_dir):
                 )
 
 # ---------------------------------------------------------------------------
-# CLI entry point — used by manager/scripts/init/start-copaw-manager.sh
+# CLI entry point — used by manager/scripts/init/start-qwenpaw-manager.sh
 # ---------------------------------------------------------------------------
 
 def _main_cli(argv=None):
