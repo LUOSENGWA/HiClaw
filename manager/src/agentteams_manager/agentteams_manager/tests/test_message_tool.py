@@ -19,7 +19,7 @@ def _response_json(response):
 
 
 def _write_team_leader_runtime(tmp_path):
-    working_dir = tmp_path / "leader" / ".copaw"
+    working_dir = tmp_path / "leader" / ".qwenpaw"
     runtime_dir = tmp_path / "leader" / "runtime"
     runtime_dir.mkdir(parents=True)
     (tmp_path / "leader" / "AGENTS.md").write_text(
@@ -161,7 +161,7 @@ def test_validate_matrix_message_policy_blocks_team_leader_dm_preamble(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
 
     for text in (
         "Let me read the relevant skill documentation.",
@@ -179,7 +179,7 @@ def test_validate_matrix_message_policy_keeps_team_leader_worker_assignment(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
 
     filtered = validate_matrix_message_policy(
         "@dag-team-1-dev:hs.local Task assigned: implement the API.",
@@ -201,7 +201,7 @@ async def test_message_tool_routes_team_leader_assignment_to_team_room(
         sent_room_ids.append(room_id)
         return "$assignment"
 
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
     monkeypatch.setattr(
         "agentteams_manager.tools.message._send_matrix_room_message",
         fake_send_matrix_room_message,
@@ -222,7 +222,7 @@ async def test_message_tool_routes_team_leader_assignment_to_team_room(
     assert payload["roomId"] == "!team-room:hs.local"
     assert sent_room_ids == ["!team-room:hs.local"]
     session_path = _matrix_session_path(
-        working_dir=tmp_path / "leader" / ".copaw",
+        working_dir=tmp_path / "leader" / ".qwenpaw",
         room_id="!team-room:hs.local",
         account_id="default",
     )
@@ -236,7 +236,7 @@ async def test_message_tool_routes_localpart_assignment_to_team_room(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
 
     response = await message(
         action="send",
@@ -256,7 +256,7 @@ async def test_message_tool_routes_team_assignment_from_any_room_to_team_room(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
 
     response = await message(
         action="send",
@@ -276,7 +276,7 @@ async def test_message_tool_expands_worker_alias_before_routing(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
 
     response = await message(
         action="send",
@@ -297,7 +297,7 @@ def test_validate_matrix_message_policy_blocks_roster_preamble_with_mxids(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
 
     with pytest.raises(ValueError, match="Team Leader internal preamble"):
         validate_matrix_message_policy(
@@ -315,7 +315,7 @@ async def test_message_tool_dry_run_suppresses_team_leader_dm_preamble(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(_write_team_leader_runtime(tmp_path)))
 
     response = await message(
         action="send",
@@ -361,7 +361,7 @@ async def test_message_tool_records_outbound_in_target_matrix_session(
         assert account_id == "default"
         return "$event1"
 
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(tmp_path))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(tmp_path))
     (tmp_path / "workspaces" / "default").mkdir(parents=True)
     monkeypatch.setattr(
         "agentteams_manager.tools.message._send_matrix_room_message",

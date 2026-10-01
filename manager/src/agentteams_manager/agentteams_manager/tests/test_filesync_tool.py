@@ -16,7 +16,7 @@ def _response_json(response):
 
 def _sync(tmp_path):
     local_dir = tmp_path / "worker"
-    workspace_dir = local_dir / ".copaw" / "workspaces" / "default"
+    workspace_dir = local_dir / ".qwenpaw" / "workspaces" / "default"
     return FileSync(
         endpoint="http://minio:9000",
         access_key="minio",
@@ -50,7 +50,7 @@ def _mock_agentteams_worker(monkeypatch, payload, expected_name="dag-team-dev"):
 
 
 def test_create_sync_accepts_agentteams_environment(tmp_path, monkeypatch):
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(tmp_path / "worker" / ".copaw"))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(tmp_path / "worker" / ".qwenpaw"))
     monkeypatch.setenv("AGENTTEAMS_WORKER_NAME", "worker")
     monkeypatch.setenv("AGENTTEAMS_WORKER_CR_NAME", "worker-cr")
     monkeypatch.setenv("AGENTTEAMS_FS_ENDPOINT", "http://minio:9000")
@@ -117,6 +117,11 @@ def test_worker_metadata_query_uses_cr_name_while_storage_uses_runtime_name(tmp_
 
     monkeypatch.setattr("agentteams_manager.sync._mc", fake_mc)
 
+    # mirror_all requires openclaw.json locally after the primary mirror
+    # (the fake mirror above does not materialize files).
+    sync.local_dir.mkdir(parents=True, exist_ok=True)
+    (sync.local_dir / "openclaw.json").write_text("{}")
+
     sync.mirror_all()
 
     assert sync._prefix == "agents/novworker02"
@@ -178,8 +183,8 @@ def test_push_shared_path_rejects_global_shared(tmp_path):
 
 @pytest.mark.asyncio
 async def test_filesync_dry_run_returns_resolved_local_path(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    working_dir = tmp_path / "worker" / ".qwenpaw"
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     monkeypatch.setenv("AGENTTEAMS_WORKER_NAME", "dag-team-dev")
     monkeypatch.setenv("AGENTTEAMS_FS_ENDPOINT", "http://minio:9000")
     monkeypatch.setenv("AGENTTEAMS_FS_ACCESS_KEY", "minio")
@@ -197,7 +202,7 @@ async def test_filesync_dry_run_returns_resolved_local_path(tmp_path, monkeypatc
     assert payload["dryRun"] is True
     assert payload["action"] == "pull"
     assert payload["kind"] == "shared"
-    assert payload["localPath"].endswith(".copaw/workspaces/default/shared/tasks/st-01")
+    assert payload["localPath"].endswith(".qwenpaw/workspaces/default/shared/tasks/st-01")
 
 
 @pytest.mark.asyncio
@@ -205,8 +210,8 @@ async def test_filesync_normalizes_project_directory_without_trailing_slash(
     tmp_path,
     monkeypatch,
 ):
-    working_dir = tmp_path / "worker" / ".copaw"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    working_dir = tmp_path / "worker" / ".qwenpaw"
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     monkeypatch.setenv("AGENTTEAMS_WORKER_NAME", "dag-team-dev")
     monkeypatch.setenv("AGENTTEAMS_FS_ENDPOINT", "http://minio:9000")
     monkeypatch.setenv("AGENTTEAMS_FS_ACCESS_KEY", "minio")
@@ -223,14 +228,14 @@ async def test_filesync_normalizes_project_directory_without_trailing_slash(
     assert payload["ok"] is True
     assert payload["path"] == "shared/projects/project-20260512-001122/"
     assert payload["localPath"].endswith(
-        ".copaw/workspaces/default/shared/projects/project-20260512-001122"
+        ".qwenpaw/workspaces/default/shared/projects/project-20260512-001122"
     )
 
 
 @pytest.mark.asyncio
 async def test_filesync_accepts_action_payload_and_json_string_exclude(tmp_path, monkeypatch):
-    working_dir = tmp_path / "worker" / ".copaw"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    working_dir = tmp_path / "worker" / ".qwenpaw"
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     monkeypatch.setenv("AGENTTEAMS_WORKER_NAME", "dag-team-dev")
     monkeypatch.setenv("AGENTTEAMS_FS_ENDPOINT", "http://minio:9000")
     monkeypatch.setenv("AGENTTEAMS_FS_ACCESS_KEY", "minio")
@@ -254,7 +259,7 @@ async def test_filesync_accepts_action_payload_and_json_string_exclude(tmp_path,
 
 @pytest.mark.asyncio
 async def test_filesync_rejects_invalid_action(tmp_path, monkeypatch):
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(tmp_path / "worker" / ".copaw"))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(tmp_path / "worker" / ".qwenpaw"))
     monkeypatch.setenv("AGENTTEAMS_WORKER_NAME", "dag-team-dev")
     monkeypatch.setenv("AGENTTEAMS_FS_ENDPOINT", "http://minio:9000")
     monkeypatch.setenv("AGENTTEAMS_FS_ACCESS_KEY", "minio")

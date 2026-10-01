@@ -41,7 +41,7 @@ def _write_agents_roster(worker_root, worker_name: str, matrix_id: str) -> None:
 
 def test_resolve_worker_matrix_id_from_runtime_name(tmp_path, monkeypatch):
     worker_root = tmp_path / "leader"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(worker_root / ".copaw"))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(worker_root / ".qwenpaw"))
     _write_runtime_config(
         worker_root,
         "team:\n"
@@ -61,7 +61,7 @@ def test_resolve_worker_matrix_id_from_runtime_name(tmp_path, monkeypatch):
 
 def test_runtime_roster_takes_precedence_over_stale_agents(tmp_path, monkeypatch):
     worker_root = tmp_path / "leader"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(worker_root / ".copaw"))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(worker_root / ".qwenpaw"))
     _write_runtime_config(
         worker_root,
         "team:\n"
@@ -78,7 +78,7 @@ def test_runtime_roster_takes_precedence_over_stale_agents(tmp_path, monkeypatch
 
 def test_runtime_roster_does_not_fallback_for_unknown_member(tmp_path, monkeypatch):
     worker_root = tmp_path / "leader"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(worker_root / ".copaw"))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(worker_root / ".qwenpaw"))
     _write_runtime_config(
         worker_root,
         "team:\n"
@@ -93,7 +93,7 @@ def test_runtime_roster_does_not_fallback_for_unknown_member(tmp_path, monkeypat
 
 def test_resolve_worker_matrix_id_falls_back_to_agents(tmp_path, monkeypatch):
     worker_root = tmp_path / "leader"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(worker_root / ".copaw"))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(worker_root / ".qwenpaw"))
     _write_runtime_config(
         worker_root,
         "member:\n"
@@ -211,9 +211,9 @@ async def test_delegate_task_retry_reuses_event_id_and_skips_resend(
     existing meta with reused=True and does not call the notification
     boundary again.
     """
-    working_dir = tmp_path / "worker" / ".copaw"
+    working_dir = tmp_path / "worker" / ".qwenpaw"
     workspace = working_dir / "workspaces" / "default"
-    monkeypatch.setenv("COPAW_WORKING_DIR", str(working_dir))
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(working_dir))
     _set_actor(monkeypatch, "@lead:domain")
     mock = _mock_sync(monkeypatch)
 

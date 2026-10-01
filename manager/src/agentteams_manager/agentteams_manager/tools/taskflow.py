@@ -65,11 +65,10 @@ def _working_dir() -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
     # qwenpaw is the successor of copaw (renamed package).
-    # In the qwenpaw 2.0 venv the copaw package does not exist.
-    try:
-        from qwenpaw.constant import WORKING_DIR  # type: ignore[import-untyped]
-    except ImportError:
-        from copaw.constant import WORKING_DIR  # type: ignore[import-untyped]
+    # The Manager venv always ships qwenpaw (Dockerfile.qwenpaw installs
+    # it before this package); copaw 1.0.2 is not available here, so there
+    # is no legacy fallback.
+    from qwenpaw.constant import WORKING_DIR  # type: ignore[import-untyped]
     return Path(WORKING_DIR).expanduser().resolve()
 
 

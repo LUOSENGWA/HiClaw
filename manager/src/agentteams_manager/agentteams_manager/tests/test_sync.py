@@ -109,6 +109,11 @@ def test_mirror_all_restores_worker_prefix_and_shared_without_credentials(tmp_pa
 
     monkeypatch.setattr("agentteams_manager.sync._mc", fake_mc)
 
+    # mirror_all requires openclaw.json locally after the primary mirror
+    # (the fake mirror above does not materialize files).
+    sync.local_dir.mkdir(parents=True, exist_ok=True)
+    (sync.local_dir / "openclaw.json").write_text("{}")
+
     sync.mirror_all()
 
     mirror_commands = [cmd for cmd in commands if cmd[0] == "mirror"]
@@ -135,6 +140,14 @@ def test_mirror_all_falls_back_to_startup_files_when_prefix_missing(tmp_path, mo
     commands = []
 
     monkeypatch.setattr(sync, "_ensure_alias", lambda: None)
+    # The 2.2 line resolves the storage team via the Controller (agt CLI),
+    # not by reading team_id out of openclaw.json.
+    monkeypatch.setattr(
+        sync,
+        "_get_worker_info",
+        lambda: {"name": "dag-team-dev", "team": "dag-team", "role": "worker"},
+    )
+    monkeypatch.setattr(sync, "_get_team_id", lambda: "dag-team")
 
     def fake_mc(*args, **_kwargs):
         commands.append(args)
@@ -195,6 +208,10 @@ def test_mirror_all_restores_global_shared_for_team_leader(tmp_path, monkeypatch
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
     monkeypatch.setattr("agentteams_manager.sync._mc", fake_mc)
+
+    # mirror_all requires openclaw.json locally after the primary mirror.
+    sync.local_dir.mkdir(parents=True, exist_ok=True)
+    (sync.local_dir / "openclaw.json").write_text("{}")
 
     sync.mirror_all()
 

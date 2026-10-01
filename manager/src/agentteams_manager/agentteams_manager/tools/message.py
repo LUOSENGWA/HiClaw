@@ -237,12 +237,10 @@ def _resolve_copaw_working_dir() -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
 
-    # copaw is the legacy name for qwenpaw; the package was renamed.
-    # In the qwenpaw 2.0 venv only the new name exists.
-    try:
-        from qwenpaw.constant import WORKING_DIR
-    except ImportError:
-        from copaw.constant import WORKING_DIR
+    # The Manager venv always ships qwenpaw (Dockerfile.qwenpaw installs it
+    # before this package); copaw 1.0.2 is not available here, so there is
+    # no legacy fallback.
+    from qwenpaw.constant import WORKING_DIR
 
     return Path(WORKING_DIR).expanduser().resolve()
 
@@ -337,7 +335,12 @@ async def _record_matrix_outbound_to_session(
                 "source": "message_tool_outbound",
             },
         )
-        content.append([msg.to_dict(), []])
+        # model_dump() == the agentscope 1.x Msg.to_dict() shape that
+        # QwenPaw's _compat shim installs on import.  Call model_dump()
+        # directly so the session record does not depend on the shim
+        # (the shim only exists in processes that already imported
+        # qwenpaw; tests in a bare venv have no such guarantee).
+        content.append([msg.model_dump(), []])
         path.write_text(json.dumps(states, ensure_ascii=False), encoding="utf-8")
         logger.info(
             "message tool: recorded outbound Matrix message in session %s",

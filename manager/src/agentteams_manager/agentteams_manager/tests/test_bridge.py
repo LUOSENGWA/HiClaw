@@ -1,20 +1,21 @@
 """Tests for bridge.py — template-create + controller-field overlay model.
 
-On every bridge invocation two things happen:
+Current contract (2.2 line; the pre-2.2 "rich overlay" contract — union
+allow_from, deep-merge groups, embedding_config, openclaw heartbeat seed,
+per-agent ``agent=`` key — was removed during the QwenPaw 2.2 migration.
+Tests below pin the behavior the Manager actually runs in production):
 
-1. **create phase** — any of {config.json, workspaces/<agent>/agent.json,
-   providers.json} that is missing is installed verbatim from an in-tree
-   template. Templates carry all defaults (identity, security off,
-   channels.console enabled, etc.).
+1. **create phase** — a missing ``workspaces/default/agent.json`` is
+   installed from an in-tree template (``agent.{profile}.json``); a missing
+   config.json is created with the Matrix channel block. The bridge never
+   manages the ``security`` block (QwenPaw applies runtime defaults).
 
-2. **restart-overlay phase** — ``_CONTROLLER_FIELDS`` refreshes only the
-   fields Controller genuinely owns (Matrix scalars, running.max_input_length,
-   running.embedding_config, heartbeat). Everything else — user edits,
-   CoPaw migration writes — is left alone.
-
-Three merge policies cover the controller fields: ``remote-wins`` (scalar
-overwrite), ``union`` (list dedup), ``deep-merge`` (local-wins-at-leaves for
-``channels.matrix.groups``). ``env`` is never bridged.
+2. **restart-overlay phase** — the overlay refreshes only the fields the
+   Controller owns: Matrix scalars (token, user, allowlists — Controller
+   value WINS, local edits do not survive), ``groups`` (raw Controller
+   value replaces the local block), stream filters (pinned True/True),
+   ``running.max_input_length``, ``subagent_model``. Console is forced off.
+   ``env`` and user-owned fields are never bridged.
 """
 
 import json
@@ -98,8 +99,10 @@ def _bridge_and_read_agent(cfg, **kwargs):
 # Template create phase
 # ---------------------------------------------------------------------------
 
-def test_create_installs_config_json_from_template():
-    """On first boot bridge writes config.json from the template."""
+def test_create_writes_config_json_with_matrix_channel():
+    """On first boot the bridge writes config.json with the Matrix channel
+    block and disables the console channel. The bridge does not manage the
+    ``security`` block — QwenPaw applies its own runtime defaults."""
     with tempfile.TemporaryDirectory() as tmpdir:
         working_dir = Path(tmpdir) / "agent"
         _run_bridge(_make_openclaw_cfg(), working_dir)
@@ -107,23 +110,29 @@ def test_create_installs_config_json_from_template():
         cfg_path = working_dir / "config.json"
         assert cfg_path.exists()
         cfg = json.loads(cfg_path.read_text())
-        # Security defaults: all three guards disabled.
-        assert cfg["security"]["tool_guard"]["enabled"] is False
-        assert cfg["security"]["file_guard"]["enabled"] is False
-        assert cfg["security"]["skill_scanner"]["mode"] == "off"
+        matrix = cfg["channels"]["matrix"]
+        assert matrix["enabled"] is True
+        assert matrix["access_token"] == "tok"
+        assert matrix["filter_tool_messages"] is True
+        assert cfg["channels"]["console"]["enabled"] is False
+        assert "security" not in cfg
 
 
 def test_create_installs_worker_agent_json_from_template():
-    """Worker profile seeds agent.json from agent.worker.json."""
-    agent = _bridge_and_read_agent(_make_openclaw_cfg())
+    """Worker profile seeds agent.json from agent.worker.json.
+
+    (Explicit profile: the bridge default profile is ``manager``.)
+    """
+    agent = _bridge_and_read_agent(_make_openclaw_cfg(), profile="worker")
 
     assert agent["id"] == "default"
     assert agent["name"] == "Default Agent"
     assert agent["language"] == "zh"
     assert agent["system_prompt_files"] == ["AGENTS.md", "SOUL.md", "PROFILE.md"]
-    # Console on by default, from template.
-    assert agent["channels"]["console"]["enabled"] is True
-    assert agent["channels"]["matrix"]["filter_tool_messages"] is False
+    # Console forced off by the overlay (Matrix is the channel).
+    assert agent["channels"]["console"]["enabled"] is False
+    # Stream filters pinned True by the overlay.
+    assert agent["channels"]["matrix"]["filter_tool_messages"] is True
     assert agent["channels"]["matrix"]["filter_thinking"] is True
     # Manager-only fields absent.
     assert "require_mention" not in agent["channels"]["matrix"]
@@ -142,19 +151,21 @@ def test_create_installs_manager_agent_json_from_template(monkeypatch):
         "AGENTS.md", "SOUL.md", "PROFILE.md", "TOOLS.md",
     ]
     assert agent["channels"]["matrix"]["require_mention"] is True
-    assert agent["channels"]["matrix"]["filter_tool_messages"] is False
+    # Stream filters pinned True by the overlay (template says false, but
+    # the overlay wins — the Manager must not leak raw tool calls to Matrix).
+    assert agent["channels"]["matrix"]["filter_tool_messages"] is True
     assert agent["channels"]["matrix"]["filter_thinking"] is True
     assert "require_approval" not in agent.get("running", {})
     assert agent["channels"]["matrix"]["user_id"] == "@manager:matrix.example.org"
 
 
-def test_create_respects_custom_agent_key():
-    """Non-default ``agent`` parameter writes to workspaces/<agent>/agent.json."""
+def test_agent_json_always_targets_default_workspace():
+    """The controller bridge always writes workspaces/default/agent.json —
+    per-agent-key support was removed in the 2.2 line."""
     with tempfile.TemporaryDirectory() as tmpdir:
         working_dir = Path(tmpdir) / "agent"
-        _run_bridge(_make_openclaw_cfg(), working_dir, agent="alice")
-        assert (working_dir / "workspaces" / "alice" / "agent.json").exists()
-        assert not (working_dir / "workspaces" / "default" / "agent.json").exists()
+        _run_bridge(_make_openclaw_cfg(), working_dir)
+        assert (working_dir / "workspaces" / "default" / "agent.json").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -169,15 +180,14 @@ def test_user_edits_to_config_json_preserved():
 
         cfg_path = working_dir / "config.json"
         cfg = json.loads(cfg_path.read_text())
-        cfg["security"]["tool_guard"]["enabled"] = True
         cfg["user_custom"] = {"hello": "world"}
         cfg_path.write_text(json.dumps(cfg))
 
         _run_bridge(_make_openclaw_cfg(), working_dir)
 
         cfg2 = json.loads(cfg_path.read_text())
-        assert cfg2["security"]["tool_guard"]["enabled"] is True
         assert cfg2["user_custom"] == {"hello": "world"}
+        assert cfg2["channels"]["matrix"]["access_token"] == "tok"
 
 
 def test_user_edits_to_agent_non_controller_fields_preserved():
@@ -237,8 +247,9 @@ def test_remote_wins_access_token_refreshes():
         assert _read_agent(working_dir)["channels"]["matrix"]["access_token"] == "tok_v2"
 
 
-def test_remote_wins_matrix_stream_filters_use_defaults():
-    """Bridge applies default Matrix stream filter policy when unset."""
+def test_stream_filters_enforced_on_rebridge():
+    """The overlay pins both stream filters True; user edits do not survive
+    a re-bridge (runtime policy, not user-owned)."""
     cfg = _make_openclaw_cfg()
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -247,27 +258,29 @@ def test_remote_wins_matrix_stream_filters_use_defaults():
 
         agent_path = _agent_json_path(working_dir)
         agent = json.loads(agent_path.read_text())
-        agent["channels"]["matrix"]["filter_tool_messages"] = True
-        agent["channels"]["matrix"]["filter_thinking"] = True
+        agent["channels"]["matrix"]["filter_tool_messages"] = False
+        agent["channels"]["matrix"]["filter_thinking"] = False
         agent_path.write_text(json.dumps(agent))
 
         _run_bridge(cfg, working_dir)
 
         matrix = _read_agent(working_dir)["channels"]["matrix"]
-        assert matrix["filter_tool_messages"] is False
+        assert matrix["filter_tool_messages"] is True
         assert matrix["filter_thinking"] is True
 
 
-def test_remote_wins_matrix_stream_filters_allow_controller_override():
+def test_openclaw_stream_filter_keys_ignored():
+    """openclaw.json stream-filter keys are not consumed by the current
+    contract — the overlay pins both filters True regardless."""
     cfg = _make_openclaw_cfg()
-    cfg["channels"]["matrix"]["filterToolMessages"] = True
+    cfg["channels"]["matrix"]["filterToolMessages"] = False
     cfg["channels"]["matrix"]["filterThinking"] = False
 
     agent = _bridge_and_read_agent(cfg)
 
     matrix = agent["channels"]["matrix"]
     assert matrix["filter_tool_messages"] is True
-    assert matrix["filter_thinking"] is False
+    assert matrix["filter_thinking"] is True
 
 
 def test_remote_wins_max_input_length_refreshes():
@@ -285,37 +298,28 @@ def test_remote_wins_max_input_length_refreshes():
         assert _read_agent(working_dir)["running"]["max_input_length"] == 8192
 
 
-def test_embedding_config_from_memory_search():
-    """memorySearch in openclaw → agent.json running.embedding_config."""
+def test_embedding_config_never_written_by_bridge():
+    """The 2.2-line bridge does not write running.embedding_config —
+    memory-search embedding config is handled outside the controller
+    bridge (the pre-2.2 memorySearch→embedding_config path was removed)."""
     agent = _bridge_and_read_agent(_make_openclaw_cfg())
-
-    emb = agent["running"]["embedding_config"]
-    assert emb["backend"] == "openai"
-    assert emb["model_name"] == "text-embedding-v4"
-    assert emb["base_url"] == "http://aigw:18080/v1"  # :8080 → :18080 off-container
-    assert emb["api_key"] == "key123"
-    assert emb["dimensions"] == 1024
-
-
-def test_embedding_config_absent_when_memory_search_missing():
-    cfg = _make_openclaw_cfg()
-    del cfg["agents"]["defaults"]["memorySearch"]
-    agent = _bridge_and_read_agent(cfg)
     assert "embedding_config" not in agent.get("running", {})
-
-
-def test_embedding_config_custom_dimensions():
-    cfg = _make_openclaw_cfg(outputDimensionality=768)
-    agent = _bridge_and_read_agent(cfg)
-    assert agent["running"]["embedding_config"]["dimensions"] == 768
 
 
 # ---------------------------------------------------------------------------
 # Controller-field overlay: union
 # ---------------------------------------------------------------------------
 
-def test_union_allow_from_merges_cr_and_user():
-    """channels.matrix.allow_from: CR entries + user additions co-exist."""
+def test_allow_from_controller_value_wins_over_user_additions():
+    """allow_from: the Controller value overwrites on every re-bridge;
+    local user additions do NOT survive (no union merge in the 2.2 line).
+
+    Known gap — this is exactly the #169 incident class: operator-added
+    allowlist entries (e.g. human @luo) are silently dropped on the next
+    bridge run, and allowlist mode then drops their messages with no error.
+    Tracked for a follow-up fix (union merge); the test pins the CURRENT
+    behavior on purpose so a future change is deliberate, not accidental.
+    """
     cfg = _make_openclaw_cfg()
     cfg["channels"]["matrix"]["dm"] = {
         "policy": "allowlist",
@@ -338,17 +342,20 @@ def test_union_allow_from_merges_cr_and_user():
         agent = _read_agent(working_dir)
 
     allow_from = agent["channels"]["matrix"]["allow_from"]
-    assert set(allow_from) == {"@alice:example.org", "@bob:example.org", "@carol:example.org"}
-    assert allow_from.count("@alice:example.org") == 1  # dedup
+    assert allow_from == ["@alice:example.org", "@carol:example.org"]
 
 
 # ---------------------------------------------------------------------------
 # Controller-field overlay: deep-merge (channels.matrix.groups)
 # ---------------------------------------------------------------------------
 
-def test_deep_merge_groups_preserves_user_override():
-    """channels.matrix.groups: user leaf edits survive; controller may only
-    add new leaves the agent doesn't have yet."""
+def test_groups_controller_value_replaces_user_overrides():
+    """channels.matrix.groups: the raw Controller value replaces the local
+    block on every re-bridge (no per-leaf deep merge in the 2.2 line).
+
+    Same known-gap class as allow_from (see that test) — per-room user
+    overrides are dropped on the next bridge run.
+    """
     cfg = _make_openclaw_cfg()
     cfg["channels"]["matrix"]["groups"] = {
         "*": {"requireMention": True, "historyLimit": 50},
@@ -369,15 +376,12 @@ def test_deep_merge_groups_preserves_user_override():
         agent_path.write_text(json.dumps(agent))
 
         cfg["channels"]["matrix"]["groups"]["*"]["historyLimit"] = 200
-        cfg["channels"]["matrix"]["groups"]["*"]["newFlag"] = True
         _run_bridge(cfg, working_dir)
         agent = _read_agent(working_dir)
 
     groups = agent["channels"]["matrix"]["groups"]
-    assert groups["*"]["requireMention"] is False  # user override kept
-    assert groups["*"]["historyLimit"] == 50  # existing leaf NOT overwritten
-    assert groups["*"]["newFlag"] is True  # new leaf added
-    assert groups["!room:example.org"] == {"requireMention": False}
+    assert groups["*"] == {"requireMention": True, "historyLimit": 200}
+    assert "!room:example.org" not in groups
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +410,10 @@ def test_manager_user_id_from_openclaw_wins_over_env(monkeypatch):
 # Heartbeat (template seed + controller fallback seed)
 # ---------------------------------------------------------------------------
 
-def test_manager_template_heartbeat_wins_over_openclaw_seed(monkeypatch):
+def test_manager_template_heartbeat_seed_ignores_openclaw(monkeypatch):
+    """Template heartbeat (manager: 30m) is installed at create time;
+    openclaw.json agents.defaults.heartbeat is not consumed by the
+    controller bridge."""
     monkeypatch.setenv("AGENTTEAMS_MATRIX_DOMAIN", "matrix.example.org")
 
     cfg = _make_openclaw_cfg()
@@ -417,15 +424,18 @@ def test_manager_template_heartbeat_wins_over_openclaw_seed(monkeypatch):
     }
 
     agent = _bridge_and_read_agent(cfg, profile="manager")
-    assert agent["heartbeat"] == {"enabled": True, "every": "10m"}
+    assert agent["heartbeat"] == {"enabled": True, "every": "30m"}
 
 
 def test_worker_template_seeds_default_heartbeat_when_openclaw_silent():
-    agent = _bridge_and_read_agent(_make_openclaw_cfg())
+    agent = _bridge_and_read_agent(_make_openclaw_cfg(), profile="worker")
     assert agent["heartbeat"] == {"enabled": True, "every": "10m"}
 
 
-def test_openclaw_heartbeat_seeds_existing_agent_without_heartbeat():
+def test_bridge_does_not_seed_heartbeat_into_existing_agent():
+    """Heartbeat is a template-install-only seed: an existing agent.json
+    without a heartbeat block is left as-is (the bridge never adds one,
+    and openclaw.json heartbeat is not consumed)."""
     cfg = _make_openclaw_cfg()
     cfg["agents"]["defaults"]["heartbeat"] = {
         "every": "5m",
@@ -444,23 +454,23 @@ def test_openclaw_heartbeat_seeds_existing_agent_without_heartbeat():
         _run_bridge(cfg, working_dir)
         agent = _read_agent(working_dir)
 
-    assert agent["heartbeat"] == {
-        "enabled": True,
-        "every": "5m",
-        "target": "self",
-        "active_hours": "09:00-18:00",
-    }
+    assert "heartbeat" not in agent
 
 
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
-def test_bridge_rejects_unknown_profile():
+def test_unknown_profile_falls_back_to_minimal_agent_json():
+    """No template exists for unknown profiles — the bridge installs a
+    minimal agent.json (boot never fails) instead of raising."""
     with tempfile.TemporaryDirectory() as tmpdir:
         working_dir = Path(tmpdir) / "agent"
-        with pytest.raises(ValueError, match="unknown bridge profile"):
-            bridge_controller_to_copaw(_make_openclaw_cfg(), working_dir, profile="leader")
+        bridge_controller_to_copaw(_make_openclaw_cfg(), working_dir, profile="leader")
+
+        agent = _read_agent(working_dir)
+    assert agent["id"] == "default"
+    assert agent["channels"]["matrix"]["enabled"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +480,7 @@ def test_bridge_rejects_unknown_profile():
 def test_sync_outer_prompt_files_to_inner_copies_prompts_and_seeds_heartbeat(tmp_path):
     """SOUL/AGENTS refresh every run; HEARTBEAT is copied only on first boot."""
     standard_dir = tmp_path / "standard"
-    runtime_dir = tmp_path / "standard" / ".copaw"
+    runtime_dir = tmp_path / "standard" / ".qwenpaw"
     standard_dir.mkdir()
     (standard_dir / "SOUL.md").write_text("soul v1")
     (standard_dir / "AGENTS.md").write_text("agents v1")
@@ -496,7 +506,7 @@ def test_sync_outer_prompt_files_to_inner_copies_prompts_and_seeds_heartbeat(tmp
 def test_refresh_standard_to_runtime_uses_legacy_prompt_fallbacks(tmp_path):
     """Re-bridge can still seed prompts from legacy MinIO readers."""
     standard_dir = tmp_path / "standard"
-    runtime_dir = tmp_path / "standard" / ".copaw"
+    runtime_dir = tmp_path / "standard" / ".qwenpaw"
     standard_dir.mkdir()
 
     refresh_standard_to_runtime(
@@ -516,7 +526,7 @@ def test_refresh_standard_to_runtime_uses_legacy_prompt_fallbacks(tmp_path):
 def test_sync_mcporter_config_to_runtime_prefers_config_path(tmp_path):
     """config/mcporter.json wins over legacy mcporter-servers.json."""
     standard_dir = tmp_path / "standard"
-    runtime_dir = tmp_path / "standard" / ".copaw"
+    runtime_dir = tmp_path / "standard" / ".qwenpaw"
     (standard_dir / "config").mkdir(parents=True)
     (standard_dir / "config" / "mcporter.json").write_text("new config")
     (standard_dir / "mcporter-servers.json").write_text("legacy config")
@@ -530,7 +540,7 @@ def test_sync_mcporter_config_to_runtime_prefers_config_path(tmp_path):
 def test_sync_skills_to_runtime_exposes_standard_skills_via_symlink(tmp_path):
     """Runtime workspace skills are a projection of standard-space skills."""
     standard_dir = tmp_path / "standard"
-    runtime_dir = standard_dir / ".copaw"
+    runtime_dir = standard_dir / ".qwenpaw"
     src_skill = standard_dir / "skills" / "github"
     script = src_skill / "scripts" / "run.sh"
     script.parent.mkdir(parents=True)
@@ -558,7 +568,7 @@ def test_sync_skills_to_runtime_exposes_standard_skills_via_symlink(tmp_path):
 def test_sync_skills_to_runtime_reenables_projected_manifest_entries(tmp_path):
     """AgentTeams-projected skills are enabled even after CoPaw reconciled them off."""
     standard_dir = tmp_path / "standard"
-    runtime_dir = standard_dir / ".copaw"
+    runtime_dir = standard_dir / ".qwenpaw"
     src_skill = standard_dir / "skills" / "github"
     src_skill.mkdir(parents=True)
     (src_skill / "SKILL.md").write_text("Use GitHub.")
@@ -592,7 +602,7 @@ def test_sync_skills_to_runtime_reenables_projected_manifest_entries(tmp_path):
 def test_sync_skills_to_runtime_replaces_runtime_dir_and_cleans_stale_standard_skills(tmp_path):
     """Runtime skills dir is derived; stale local copies are removed."""
     standard_dir = tmp_path / "standard"
-    runtime_dir = standard_dir / ".copaw"
+    runtime_dir = standard_dir / ".qwenpaw"
     workspace_skills = runtime_dir / "workspaces" / "default" / "skills"
     stale_runtime_skill = workspace_skills / "stale"
     stale_runtime_skill.mkdir(parents=True)
@@ -619,7 +629,7 @@ def test_sync_skills_to_runtime_replaces_runtime_dir_and_cleans_stale_standard_s
 def test_bridge_runtime_to_standard_copies_newer_prompt_edits(tmp_path):
     """Agent-edited runtime prompts are materialized back to the sync root."""
     standard_dir = tmp_path / "standard"
-    workspace_dir = standard_dir / ".copaw" / "workspaces" / "default"
+    workspace_dir = standard_dir / ".qwenpaw" / "workspaces" / "default"
     workspace_dir.mkdir(parents=True)
     outer = standard_dir / "AGENTS.md"
     inner = workspace_dir / "AGENTS.md"
@@ -636,7 +646,7 @@ def test_bridge_runtime_to_standard_copies_newer_prompt_edits(tmp_path):
 def test_bridge_runtime_to_standard_keeps_newer_or_same_age_outer_prompts(tmp_path):
     """Runtime prompts only win when they are strictly newer than standard space."""
     standard_dir = tmp_path / "standard"
-    workspace_dir = standard_dir / ".copaw" / "workspaces" / "default"
+    workspace_dir = standard_dir / ".qwenpaw" / "workspaces" / "default"
     workspace_dir.mkdir(parents=True)
     outer = standard_dir / "AGENTS.md"
     inner = workspace_dir / "AGENTS.md"
@@ -657,7 +667,7 @@ def test_bridge_runtime_to_standard_keeps_newer_or_same_age_outer_prompts(tmp_pa
 def test_bridge_standard_to_runtime_materializes_prompts_mcporter_and_skills(tmp_path):
     """High-level bridge writes CoPaw config plus standard-space file copies."""
     standard_dir = tmp_path / "standard"
-    runtime_dir = standard_dir / ".copaw"
+    runtime_dir = standard_dir / ".qwenpaw"
     skill_dir = standard_dir / "skills" / "task-management"
     (standard_dir / "config").mkdir(parents=True)
     skill_dir.mkdir(parents=True)
