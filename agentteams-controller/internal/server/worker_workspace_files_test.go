@@ -1074,3 +1074,53 @@ func TestWorkspaceFilesWrite_RouteAcceptsAuthorizedWrite(t *testing.T) {
 		t.Fatalf("unknown worker status=%d body=%s, want 404 from the worker lookup", rec2.Code, rec2.Body.String())
 	}
 }
+
+// TestWorkspaceFiles_RuntimeAware400: a non-qwenpaw worker is rejected 400
+// (workspace file inspection is qwenpaw-specific).
+func TestWorkspaceFiles_RuntimeAware400(t *testing.T) {
+	var dialed bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dialed = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"directory":"memory","entries":[],"has_more":false,"next_cursor":null}`))
+	}))
+	defer upstream.Close()
+	w := checkpointWorker("oc-worker")
+	w.Spec.Runtime = "openclaw"
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream,
+		checkpointTeam("market-team", "oc-worker"), w)
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFiles(rec, adminCaller(kbRequest("oc-worker", "tree", "path=memory")))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 for non-qwenpaw worker", rec.Code)
+	}
+	if !containsAll(rec.Body.String(), "only supported for qwenpaw") {
+		t.Fatalf("body=%s, want qwenpaw-specific message", rec.Body.String())
+	}
+	if dialed {
+		t.Fatal("guard must reject before dialing the worker upstream")
+	}
+}
+
+// TestWorkspaceFiles_EmptyRuntimePasses: a worker CR without an explicit
+// runtime keeps the historical behavior (no 400) — backward compatibility.
+func TestWorkspaceFiles_EmptyRuntimePasses(t *testing.T) {
+	const payload = `{"directory":"memory","entries":[],"has_more":false,"next_cursor":null}`
+	var dialed bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dialed = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer upstream.Close()
+	h := newTestWorkspaceFilesHandler(t, "embedded", upstream,
+		kbWorkerFixture("market-team", "market-writer")...)
+	rec := httptest.NewRecorder()
+	h.proxyWorkspaceFiles(rec, adminCaller(kbRequest("market-writer", "tree", "path=memory")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 (empty runtime must not be rejected)", rec.Code, rec.Body.String())
+	}
+	if !dialed {
+		t.Fatal("empty runtime must fall through to the worker upstream")
+	}
+}

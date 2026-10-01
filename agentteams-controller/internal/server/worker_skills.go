@@ -141,6 +141,11 @@ func (h *WorkerSkillsHandler) skillScope(w http.ResponseWriter, r *http.Request,
 		writeK8sError(w, "get worker skills", err)
 		return "", false
 	}
+	// runtime-aware: skill runtime state is qwenpaw-specific.
+	if rt := worker.Spec.Runtime; rt != "" && rt != "qwenpaw" {
+		httputil.WriteError(w, http.StatusBadRequest, "skill runtime state is only supported for qwenpaw workers")
+		return "", false
+	}
 	// findTeamMember's second return value is the member (worker) name, not
 	// the team name — the scope check compares against the Team CR name.
 	// Standalone workers (no team) resolve to "" which TeamMatches rejects,

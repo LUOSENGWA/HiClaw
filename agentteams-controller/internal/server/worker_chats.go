@@ -250,6 +250,11 @@ func (h *ChatsHandler) proxy(w http.ResponseWriter, r *http.Request, name string
 		writeK8sError(w, "get worker chats", err)
 		return
 	}
+	// runtime-aware: worker session inspection is qwenpaw-specific.
+	if rt := worker.Spec.Runtime; rt != "" && rt != "qwenpaw" {
+		httputil.WriteError(w, http.StatusBadRequest, "worker chats are only supported for qwenpaw workers")
+		return
+	}
 	// Resolve the owning team for the scoped-caller check (same chain as
 	// ResourceHandler.GetWorker: standalone workers hide as 404). Note:
 	// findTeamMember's second return value is the member (worker) name,

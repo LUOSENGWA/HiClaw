@@ -771,3 +771,22 @@ func TestApprovalPut_L3Denied(t *testing.T) {
 		t.Fatal("upstream PUT must not be called for an L3 mutation")
 	}
 }
+
+// TestApproval_RuntimeAware400: a non-qwenpaw worker is rejected 400
+// (tool approval is qwenpaw-specific).
+func TestApproval_RuntimeAware400(t *testing.T) {
+	up := approvalUpstream(t, "AUTO", nil)
+	defer up.Close()
+	w := approvalWorker("oc-worker")
+	w.Spec.Runtime = "openclaw"
+	h := newTestApprovalHandler(t, "embedded", up,
+		approvalTeam("market-team", "oc-worker"), w)
+	rec := httptest.NewRecorder()
+	h.getWorkerApproval(rec, adminCaller(approvalRequest(http.MethodGet, "oc-worker", "")))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 for non-qwenpaw worker", rec.Code)
+	}
+	if !containsAll(rec.Body.String(), "only supported for qwenpaw") {
+		t.Fatalf("body=%s, want qwenpaw-specific message", rec.Body.String())
+	}
+}

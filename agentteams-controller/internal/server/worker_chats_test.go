@@ -916,3 +916,20 @@ func TestChatsProxy_DialsEffectiveRuntimeName(t *testing.T) {
 		}
 	}
 }
+
+// TestChat_RuntimeAware400: a non-qwenpaw worker is rejected 400
+// (worker session inspection is qwenpaw-specific).
+func TestChat_RuntimeAware400(t *testing.T) {
+	w := checkpointWorker("oc-worker")
+	w.Spec.Runtime = "openclaw"
+	h := newTestChatsHandler(t, "embedded", nil,
+		checkpointTeam("team-a", "oc-worker"), w)
+	rec := httptest.NewRecorder()
+	h.listChats(rec, adminCaller(chatsListRequest("oc-worker", "?user_id=alice&channel=qq")))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 for non-qwenpaw worker", rec.Code)
+	}
+	if !containsAll(rec.Body.String(), "only supported for qwenpaw") {
+		t.Fatalf("body=%s, want qwenpaw-specific message", rec.Body.String())
+	}
+}

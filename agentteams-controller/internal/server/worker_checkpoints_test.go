@@ -386,3 +386,20 @@ func TestCheckpointPort_MatchesContainerCreationEnvChain(t *testing.T) {
 		t.Fatalf("effective console port=%q, want %q (system default, user value must be discarded)", dockerSide, "8088")
 	}
 }
+
+// TestCheckpoint_RuntimeAware400: a non-qwenpaw worker is rejected 400
+// (checkpoint inspection is qwenpaw-specific).
+func TestCheckpoint_RuntimeAware400(t *testing.T) {
+	w := checkpointWorker("oc-worker")
+	w.Spec.Runtime = "openclaw"
+	h := newTestCheckpointHandler(t, "embedded", nil,
+		checkpointTeam("team-a", "oc-worker"), w)
+	rec := httptest.NewRecorder()
+	h.proxyCheckpoint(rec, adminCaller(checkpointRequest(http.MethodGet, "oc-worker", "graph", "")))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 for non-qwenpaw worker", rec.Code)
+	}
+	if !containsAll(rec.Body.String(), "only supported for qwenpaw") {
+		t.Fatalf("body=%s, want qwenpaw-specific message", rec.Body.String())
+	}
+}

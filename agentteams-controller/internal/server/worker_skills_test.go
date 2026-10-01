@@ -398,3 +398,35 @@ func TestSkillsUpstreamContract_PinnedTo221(t *testing.T) {
 		})
 	}
 }
+
+// TestSkills_RuntimeAware400: a non-qwenpaw worker is rejected 400 and the
+// worker upstream is never dialed (skill runtime state is qwenpaw-specific).
+func TestSkills_RuntimeAware400(t *testing.T) {
+	u := &skillsTestUpstream{status: http.StatusOK, response: `[]`}
+	w := checkpointWorker("oc-worker")
+	w.Spec.Runtime = "openclaw"
+	h := newTestSkillsHandler(t, "embedded", u.server(t),
+		checkpointTeam("team-a", "oc-worker"), w)
+	rec := httptest.NewRecorder()
+	h.getWorkerSkills(rec, adminCaller(skillsRequest(http.MethodGet, "/api/v1/workers/placeholder/skills", "", "name", "oc-worker")))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 for non-qwenpaw worker", rec.Code)
+	}
+	if !containsAll(rec.Body.String(), "only supported for qwenpaw") {
+		t.Fatalf("body=%s, want qwenpaw-specific message", rec.Body.String())
+	}
+}
+
+// TestSkills_EmptyRuntimePasses: a worker CR without an explicit runtime
+// keeps the historical behavior (no 400) — backward compatibility.
+func TestSkills_EmptyRuntimePasses(t *testing.T) {
+	const payload = `[{"name":"make_plan","enabled":true,"preload":false}]`
+	u := &skillsTestUpstream{status: http.StatusOK, response: payload}
+	h := newTestSkillsHandler(t, "embedded", u.server(t),
+		checkpointTeamWithWorkers(skillsTeam, skillsWorker)...)
+	rec := httptest.NewRecorder()
+	h.getWorkerSkills(rec, adminCaller(skillsRequest(http.MethodGet, "/api/v1/workers/placeholder/skills", "", "name", skillsWorker)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 (empty runtime must not be rejected)", rec.Code, rec.Body.String())
+	}
+}

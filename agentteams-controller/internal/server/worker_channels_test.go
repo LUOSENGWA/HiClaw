@@ -1330,3 +1330,41 @@ func TestChannelsL3UnparseableUpstreamFailsClosed(t *testing.T) {
 		t.Fatalf("unparseable upstream for an L3 reader must fail closed to {}: %s", rec.Body.String())
 	}
 }
+
+// TestChannels_RuntimeAware400: a non-qwenpaw worker is rejected 400 and the
+// worker upstream is never dialed (channel configuration is qwenpaw-specific).
+func TestChannels_RuntimeAware400(t *testing.T) {
+	u := &channelsTestUpstream{status: http.StatusOK, response: `{}`}
+	w := checkpointWorker("oc-worker")
+	w.Spec.Runtime = "openclaw"
+	h := newTestChannelsHandler(t, "embedded", u.server(t), nil,
+		checkpointTeam("team-a", "oc-worker"), w)
+	rec := httptest.NewRecorder()
+	h.getChannels(rec, adminCaller(channelsRequest(http.MethodGet, "/api/v1/workers/placeholder/channels", "", "name", "oc-worker")))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 for non-qwenpaw worker", rec.Code)
+	}
+	if !containsAll(rec.Body.String(), "only supported for qwenpaw") {
+		t.Fatalf("body=%s, want qwenpaw-specific message", rec.Body.String())
+	}
+	if u.dialed {
+		t.Fatal("guard must reject before dialing the worker upstream")
+	}
+}
+
+// TestChannels_EmptyRuntimePasses: a worker CR without an explicit runtime
+// keeps the historical behavior (no 400) — backward compatibility.
+func TestChannels_EmptyRuntimePasses(t *testing.T) {
+	const payload = `{"qq":{"enabled":true,"isBuiltin":true}}`
+	u := &channelsTestUpstream{status: http.StatusOK, response: payload}
+	h := newTestChannelsHandler(t, "embedded", u.server(t), nil,
+		checkpointTeamWithWorkers("team-a", "daily-carol")...)
+	rec := httptest.NewRecorder()
+	h.getChannels(rec, adminCaller(channelsRequest(http.MethodGet, "/api/v1/workers/placeholder/channels", "", "name", "daily-carol")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 (empty runtime must not be rejected)", rec.Code, rec.Body.String())
+	}
+	if !u.dialed {
+		t.Fatal("empty runtime must fall through to the worker upstream")
+	}
+}

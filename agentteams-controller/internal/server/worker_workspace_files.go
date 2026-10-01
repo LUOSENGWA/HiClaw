@@ -324,6 +324,11 @@ func (h *WorkspaceFilesHandler) proxyWorkspaceFiles(w http.ResponseWriter, r *ht
 		writeK8sError(w, "get worker workspace files", err)
 		return
 	}
+	// runtime-aware: workspace file inspection is qwenpaw-specific.
+	if rt := worker.Spec.Runtime; rt != "" && rt != "qwenpaw" {
+		httputil.WriteError(w, http.StatusBadRequest, "workspace files are only supported for qwenpaw workers")
+		return
+	}
 	// Resolve the owning team for the scoped-caller check (same chain as
 	// ResourceHandler.GetWorker and the checkpoint proxy: standalone
 	// workers hide as 404 for scoped callers).
@@ -466,6 +471,11 @@ func (h *WorkspaceFilesHandler) proxyWorkspaceFileWrite(w http.ResponseWriter, r
 			return
 		}
 		writeK8sError(w, "write worker workspace file", err)
+		return
+	}
+	// runtime-aware: workspace file inspection is qwenpaw-specific.
+	if rt := worker.Spec.Runtime; rt != "" && rt != "qwenpaw" {
+		httputil.WriteError(w, http.StatusBadRequest, "workspace files are only supported for qwenpaw workers")
 		return
 	}
 	// Same team-scope chain as the read path: findTeamMember's second return
