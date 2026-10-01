@@ -33,7 +33,7 @@ STORAGE_PREFIX="${STORAGE_PREFIX:-${TEST_STORAGE_PREFIX:-agentteams/agentteams-s
 
 # Pinned legacy CoPaw image — the "existing instance" fingerprint.
 # (May be pinned via @sha256: digest in the future.)
-LEGACY_IMAGE="${COPAW_LEGACY_IMAGE:-higress-registry.us-west-1.cr.aliyuncs.com/agentteams/agentteams-copaw-worker:v1.2.4}"
+LEGACY_IMAGE="${COPAW_LEGACY_IMAGE:-higress-registry.cn-hangzhou.cr.aliyuncs.com/agentteams/agentteams-copaw-worker:v1.2.4}"
 
 CTRL=agentteams-controller
 
