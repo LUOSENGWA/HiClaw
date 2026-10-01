@@ -109,6 +109,13 @@ func (h *ResourceHandler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 		containerManaged = *req.ContainerManaged
 	}
 	runtime := backend.ResolveRuntime(req.Runtime, h.defaultWorkerRuntime)
+	if strings.EqualFold(runtime, backend.RuntimeCopaw) {
+		httputil.WriteError(w, http.StatusBadRequest,
+			"runtime \"copaw\" is deprecated and no longer offered for new workers; "+
+				"use \"qwenpaw\" for new workers (existing CoPaw workers keep working "+
+				"and can be migrated to QwenPaw — see issue #1310)")
+		return
+	}
 	if strings.TrimSpace(req.Model) == "" {
 		req.Model = h.defaultWorkerModel
 	}
@@ -286,6 +293,16 @@ func (h *ResourceHandler) UpdateWorker(w http.ResponseWriter, r *http.Request) {
 			worker.Spec.WorkerName = req.WorkerName
 		}
 		if req.Runtime != "" {
+			// Switching *to* CoPaw is deprecated; existing CoPaw workers
+			// keep working and can be migrated to QwenPaw. A no-op
+			// re-apply that repeats the current value stays allowed.
+			if strings.EqualFold(req.Runtime, backend.RuntimeCopaw) &&
+				!strings.EqualFold(worker.Spec.Runtime, backend.RuntimeCopaw) {
+				httputil.WriteError(w, http.StatusBadRequest,
+					"switching runtime to \"copaw\" is no longer supported; "+
+						"migrate the worker to \"qwenpaw\" instead (see issue #1310)")
+				return
+			}
 			worker.Spec.Runtime = req.Runtime
 		}
 		if req.Image != "" {
@@ -1162,6 +1179,7 @@ func workerToResponse(w *v1beta1.Worker) WorkerResponse {
 		LastRunAt:        w.Status.LastRunAt,
 		LastFinishAt:     w.Status.LastFinishAt,
 	}
+	resp.RuntimeDeprecated = strings.EqualFold(w.Spec.Runtime, backend.RuntimeCopaw)
 	if resp.Phase == "" {
 		resp.Phase = "Pending"
 	}
@@ -1278,6 +1296,7 @@ func managerToResponse(m *v1beta1.Manager) ManagerResponse {
 		Message:      m.Status.Message,
 		WelcomeSent:  m.Status.WelcomeSent,
 	}
+	resp.RuntimeDeprecated = strings.EqualFold(m.Spec.Runtime, backend.RuntimeCopaw)
 	if resp.Phase == "" {
 		resp.Phase = "Pending"
 	}
