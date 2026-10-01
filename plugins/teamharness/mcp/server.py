@@ -2527,6 +2527,108 @@ def _resolve_filesync(arguments: dict[str, Any]) -> tuple[str, str, Path, str, b
     return action, normalized, local, remote, is_directory
 
 
+_PUSH_CLOCK_TOLERANCE = datetime.timedelta(seconds=5)
+
+
+def _parse_remote_mtime(value: Any) -> datetime.datetime | None:
+    """Parse a remote last-modified timestamp into an aware UTC datetime.
+
+    Accepts RFC3339 (``Z`` or numeric offset, fractional seconds of any
+    precision) and the ``mc stat`` text form ``YYYY-MM-DD HH:MM:SS UTC``.
+    Returns None when unparseable.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith(("UTC", "GMT")):
+        text = text[:-3].strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    # Cap fractional seconds at microseconds for pre-3.11 fromisoformat.
+    text = re.sub(r"(\.\d{6})\d+", r"\1", text)
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _filesync_remote_mtime(
+    remote: str, mc_env: dict[str, str]
+) -> tuple[datetime.datetime | None, str | None, str | None]:
+    """Probe the remote object before a single-file push.
+
+    Stale-overwrite guard (2026-09-21 incident: a stale local view clobbered
+    newer MinIO state). Returns (mtime, raw, warning):
+
+    - remote absent          -> (None, None, None): a normal first push
+    - probe/parse failed     -> (None, None, reason): push through, surface reason
+    - remote timestamp known -> (mtime, raw, None): caller compares vs local
+    """
+    try:
+        stat = subprocess.run(
+            ["mc", "stat", "--json", remote],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=mc_env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, None, f"remote stat probe failed: {exc}"
+
+    if stat.returncode != 0:
+        detail = "\n".join(part.strip() for part in (stat.stderr, stat.stdout) if part.strip())
+        if "does not exist" in detail.lower():
+            return None, None, None
+        return None, None, f"remote stat probe failed: {detail or 'unknown error'}"
+
+    raw: str | None = None
+    mtime: datetime.datetime | None = None
+    try:
+        payload = json.loads(stat.stdout)
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        candidate = str(payload.get("lastModified") or "").strip()
+        if candidate:
+            raw = candidate
+            mtime = _parse_remote_mtime(candidate)
+    if mtime is None:
+        # --json output lacked a usable lastModified; degrade to the text
+        # `mc stat` Date: line before giving up on the guard.
+        try:
+            text_stat = subprocess.run(
+                ["mc", "stat", remote],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=mc_env,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return None, None, f"remote stat probe failed: {exc}"
+        if text_stat.returncode != 0:
+            detail = "\n".join(part.strip() for part in (text_stat.stderr, text_stat.stdout) if part.strip())
+            if "does not exist" in detail.lower():
+                return None, None, None
+            return None, None, f"remote stat probe failed: {detail or 'unknown error'}"
+        for line in text_stat.stdout.splitlines():
+            date_match = re.match(r"^date\s*:\s*(.+)$", line.strip(), re.IGNORECASE)
+            if date_match:
+                raw = date_match.group(1).strip()
+                mtime = _parse_remote_mtime(raw)
+                break
+        if mtime is None:
+            return None, None, (
+                "could not determine remote lastModified; push passed through "
+                "without the freshness guard"
+            )
+    return mtime, raw, None
+
+
 def _filesync(arguments: dict[str, Any]) -> dict[str, Any]:
     try:
         action, normalized, local, remote, is_directory = _resolve_filesync(arguments)
@@ -2547,6 +2649,7 @@ def _filesync(arguments: dict[str, Any]) -> dict[str, Any]:
             command = ["mc", "cp", remote, str(local)]
     else:
         if is_directory:
+            # TODO(B13): consider a per-file guard for directory pushes
             source = str(local) + ("/" if not str(local).endswith("/") else "")
             command = ["mc", "mirror", source, remote, "--overwrite"]
             for pattern in exclude:
@@ -2580,6 +2683,31 @@ def _filesync(arguments: dict[str, Any]) -> dict[str, Any]:
             "path": normalized,
             "error": env_error,
         }
+    guard_warning: str | None = None
+    if action == "push" and not is_directory:
+        remote_mtime, remote_raw, guard_warning = _filesync_remote_mtime(remote, mc_env)
+        if remote_mtime is not None:
+            try:
+                local_mtime = datetime.datetime.fromtimestamp(
+                    local.stat().st_mtime, tz=datetime.timezone.utc
+                )
+            except OSError:
+                local_mtime = None
+            if (
+                local_mtime is not None
+                and remote_mtime > local_mtime + _PUSH_CLOCK_TOLERANCE
+            ):
+                return {
+                    "ok": False,
+                    "conflict": True,
+                    "tool": "filesync",
+                    "action": "push",
+                    "path": normalized,
+                    "remotePath": remote,
+                    "localMtime": local_mtime.isoformat(),
+                    "remoteLastModified": remote_raw,
+                    "error": "remote copy is newer than the local file; pull before pushing again",
+                }
     try:
         completed = subprocess.run(
             command,
@@ -2590,7 +2718,7 @@ def _filesync(arguments: dict[str, Any]) -> dict[str, Any]:
             env=mc_env,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return {
+        body: dict[str, Any] = {
             "ok": False,
             "tool": "filesync",
             "action": action,
@@ -2598,9 +2726,12 @@ def _filesync(arguments: dict[str, Any]) -> dict[str, Any]:
             "error": f"filesync process failed: {exc}",
             "retryable": True,
         }
+        if guard_warning is not None:
+            body["warning"] = guard_warning
+        return body
     command_error = _filesync_command_error(completed)
     if command_error:
-        return {
+        body = {
             "ok": False,
             "tool": "filesync",
             "action": action,
@@ -2608,10 +2739,15 @@ def _filesync(arguments: dict[str, Any]) -> dict[str, Any]:
             "error": command_error,
             "returncode": completed.returncode,
         }
+        if guard_warning is not None:
+            body["warning"] = guard_warning
+        return body
     if action == "list":
         base["entries"] = [line for line in completed.stdout.splitlines() if line.strip()]
     if action == "stat":
         base["exists"] = True
+    if guard_warning is not None:
+        base["warning"] = guard_warning
     return base
 
 
