@@ -356,6 +356,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Login to Higress registry
+        uses: docker/login-action@v3
+        with:
+          registry: higress-registry.us-west-1.cr.aliyuncs.com
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
       - name: Download all images
         uses: actions/download-artifact@v4
         with:
