@@ -1,11 +1,11 @@
 ---
 name: coding-cli-management
-description: "Execute AI coding CLI tools (Claude Code / Gemini CLI / qodercli) on behalf of Workers. Use when a Worker sends a coding-request: message, asking Manager to run coding operations in their workspace."
+description: "Execute AI coding CLI tools (Claude Code / Gemini CLI / qodercli / Qwen Code / OpenCode) on behalf of Workers. Use when a Worker sends a coding-request: message, asking Manager to run coding operations in their workspace."
 ---
 
 # Coding CLI Management
 
-This skill enables the Manager to execute AI coding CLI tools (claude/gemini/qodercli) on behalf of Workers. Workers generate precise prompts; the Manager runs the CLI in the Worker's workspace and returns the result.
+This skill enables the Manager to execute AI coding CLI tools (claude/gemini/qodercli/qwen/opencode) on behalf of Workers. Workers generate precise prompts; the Manager runs the CLI in the Worker's workspace and returns the result.
 
 ## Config File
 
@@ -22,7 +22,7 @@ Path: `~/coding-cli-config.json`
 | `enabled` | `cli` | Meaning |
 |-----------|-------|---------|
 | `false`   | any   | Admin declined; use normal task flow |
-| `true`    | `"claude"` / `"gemini"` / `"qodercli"` | Active — use this CLI |
+| `true`    | `"claude"` / `"gemini"` / `"qodercli"` / `"qwen"` / `"opencode"` | Active — use this CLI |
 
 ---
 
@@ -42,10 +42,10 @@ echo '{"enabled":false,"cli":null,"confirmed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ
 Proceed with normal task assignment (Worker codes on their own).
 
 **If CLIs are available**, ask the admin via the primary channel or Matrix DM — **in the language the admin used**:
-> I found the following AI coding CLI tools available: [list]. Would you like to enable CLI delegation mode? Workers will generate coding prompts, and I'll use the CLI tool to make the code changes. Reply with the tool name (claude/gemini/qodercli) to enable, or 'no' to have workers code on their own.
+> I found the following AI coding CLI tools available: [list]. Would you like to enable CLI delegation mode? Workers will generate coding prompts, and I'll use the CLI tool to make the code changes. Reply with the tool name (claude/gemini/qodercli/qwen/opencode) to enable, or 'no' to have workers code on their own.
 
 On admin reply:
-- Tool name (`claude` / `gemini` / `qodercli`):
+- Tool name (`claude` / `gemini` / `qodercli` / `qwen` / `opencode`):
   ```bash
   echo '{"enabled":true,"cli":"<chosen-tool>","confirmed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' \
     > ~/coding-cli-config.json
@@ -168,6 +168,7 @@ Worker {worker-name} 的编码委托任务 {task-id} 中，{cli} 工具执行失
 - ~/.{cli}/ 凭证是否有效（token 是否过期）
 - /host-share/.{cli}/ 软链是否正常（ls -la /root/.{cli}）
 - {cli} binary 是否在容器内可用（which {cli}）
+- qwen 凭证在 ~/.qwen（settings.json 的 security.auth 或模型环境变量）；opencode 凭证在 ~/.config/opencode（opencode auth / provider 配置）
 ```
 
 **Record in config** (optional, for heartbeat diagnostics):

@@ -60,8 +60,16 @@ case "$cli" in
             --yolo -w "$workspace" 2>&1 | tee "$log_file"
         exit_code=${PIPESTATUS[0]}
         ;;
+    qwen)
+        timeout "$timeout_secs" qwen --yolo "$(cat "$prompt_file")" 2>&1 | tee "$log_file"
+        exit_code=${PIPESTATUS[0]}
+        ;;
+    opencode)
+        timeout "$timeout_secs" opencode run --auto "$(cat "$prompt_file")" 2>&1 | tee "$log_file"
+        exit_code=${PIPESTATUS[0]}
+        ;;
     *)
-        echo "Unknown CLI tool: $cli. Supported: claude, gemini, qodercli" >&2 | tee -a "$log_file"
+        echo "Unknown CLI tool: $cli. Supported: claude, gemini, qodercli, qwen, opencode" >&2 | tee -a "$log_file"
         exit 1
         ;;
 esac
