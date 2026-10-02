@@ -1,6 +1,6 @@
 ---
 name: coding-cli
-description: 将编码工作委托给 Manager 持有的 AI CLI 工具（Claude Code / Gemini CLI / qodercli）执行
+description: 将编码工作委托给 Manager 持有的 AI CLI 工具（Claude Code / Gemini CLI / qodercli / Qwen Code / OpenCode）执行
 assign_when: Worker 需要完成编码任务（写代码、修改代码、重构、修 bug 等），且 Manager 已启用 Coding CLI 委托模式（spec.md 中包含"## Coding CLI Mode"章节）
 ---
 

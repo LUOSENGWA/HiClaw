@@ -5,7 +5,7 @@
 
 result='{"available":[],"details":{}}'
 
-for cli in claude gemini qodercli; do
+for cli in claude gemini qodercli qwen opencode; do
     binary_ok=false
     config_ok=false
 
@@ -17,6 +17,8 @@ for cli in claude gemini qodercli; do
         claude)   [ -d "$HOME/.claude" ]  && config_ok=true ;;
         gemini)   [ -d "$HOME/.gemini" ]  && config_ok=true ;;
         qodercli) [ -d "$HOME/.qoder" ]   && config_ok=true ;;
+        qwen)     [ -d "$HOME/.qwen" ]    && config_ok=true ;;
+        opencode) [ -d "$HOME/.config/opencode" ] && config_ok=true ;;
     esac
 
     if $binary_ok && $config_ok; then
