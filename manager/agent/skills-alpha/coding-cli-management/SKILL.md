@@ -7,6 +7,8 @@ description: "Execute AI coding CLI tools (Claude Code / Gemini CLI / qodercli) 
 
 This skill enables the Manager to execute AI coding CLI tools (claude/gemini/qodercli) on behalf of Workers. Workers generate precise prompts; the Manager runs the CLI in the Worker's workspace and returns the result.
 
+Operational guidance distilled from field operation — task-spec checklist, supervision and steering, approval expectations, preflight checks, and a pitfalls list — lives in [`references/delegation-guidance.md`](references/delegation-guidance.md).
+
 ## Config File
 
 Path: `~/coding-cli-config.json`

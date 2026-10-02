@@ -14,6 +14,8 @@ When the Manager assigns you a task with a "## Coding CLI Mode" section in `spec
 4. Delegate execution to the Manager's CLI tool
 5. Review the result
 
+**Operational reference**: [`../../coding-cli-management/references/delegation-guidance.md`](../../coding-cli-management/references/delegation-guidance.md) — task-spec checklist, supervision and steering, approval expectations, preflight checks, and a pitfalls list.
+
 ---
 
 ## When to Use This Skill
