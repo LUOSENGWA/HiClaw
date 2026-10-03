@@ -17,7 +17,7 @@ A delegated coding task should be a bounded, self-describing unit. The prompt ha
 - **Artifact location** — results and logs land in the shared task directory (`shared/tasks/<task-id>/`); session replies are not always re-readable, so "show me" must mean "write it to a file."
 - **Declared intent for long waits** — runner-side policies can gate individual commands (a bare standalone wait was blocked pending declared intent); annotate the intent of long waits inline so they clear the gate.
 - **Brief for a cold start** — the receiver starts with zero context: task and why it exists; relevant files by path (don't paste them); current state; what was tried and abandoned; decisions with rationale; acceptance criteria; constraints (must-not / must-preserve). Carry the exact task semantics — investigate-only means "do not edit files", a fix means "implement the fix", a refactor means "refactor, not rewrite".
-- **Isolate per task** — give delegated work its own branch/worktree (`branch-off`, `checkout-branch`, or `checkout-pr` when the runner manages worktrees); parallel writers never share a checkout.
+- **Isolate per task** — give delegated work its own branch or worktree (use the runner's native branch/worktree support when it has some; otherwise create the branch before starting the session); parallel writers never share a checkout.
 
 **Scaffolding scales with the runner.** For small/edge models, fully pre-write the change (near-ready spec, exact anchors). For stronger models, explicit goals + constraints + acceptance + self-verification are enough; over-constraining a strong model can reduce quality.
 
