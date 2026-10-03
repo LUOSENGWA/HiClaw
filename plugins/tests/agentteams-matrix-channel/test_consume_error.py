@@ -21,6 +21,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 pytest.importorskip("nio")
+# channel.py imports the qwenpaw runtime at module load; skip cleanly when it
+# is absent (the dedicated CI job installs it, so the suite runs there).
+pytest.importorskip("qwenpaw")
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CHANNEL_MODULE_PATH = (
