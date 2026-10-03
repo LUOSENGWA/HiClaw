@@ -338,6 +338,12 @@ jobs:
       contents: write
       pull-requests: write
       actions: read
+    env:
+      # Fork PR runs receive no repository secrets; gate the registry login on
+      # credential availability. The pinned legacy image is also anonymously
+      # pullable from the cn-hangzhou primary, so credential-less runs can
+      # still attempt it and skip with a note when unreachable.
+      REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.detect-changes.outputs.test_matrix) }}
@@ -356,11 +362,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Login to Higress registry
+      - name: Login to Higress registry (when credentials are available)
+        if: env.REGISTRY_USERNAME != ''
         uses: docker/login-action@v3
         with:
           registry: higress-registry.cn-hangzhou.cr.aliyuncs.com
-          username: ${{ secrets.REGISTRY_USERNAME }}
+          username: ${{ env.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
 
       - name: Download all images
@@ -377,6 +384,15 @@ jobs:
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y jq curl unzip
+
+      - name: Configure registry-dependent coverage
+        run: |
+          if [ -z "${REGISTRY_USERNAME}" ]; then
+            echo "COPAW_LEGACY_IMAGE_OPTIONAL=1" >> "$GITHUB_ENV"
+            echo "::notice::Registry credentials unavailable in this run — the legacy-upgrade test (29) will attempt an anonymous pull and skip with a note if the image is unreachable."
+          else
+            echo "COPAW_LEGACY_IMAGE_OPTIONAL=0" >> "$GITHUB_ENV"
+          fi
 
       - name: Run embedded integration tests
         id: tests
