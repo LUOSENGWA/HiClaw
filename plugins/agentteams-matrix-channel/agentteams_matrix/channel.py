@@ -151,6 +151,11 @@ _MATRIX_STREAMING_FINAL_TEXT_KEY = "matrix_streaming_final_text"
 _MATRIX_FORCE_NOTICE_KEY = "matrix_force_notice"
 _MATRIX_PLACEHOLDER_THREAD_ROOT_KEY = "matrix_placeholder_thread_root"
 
+# Per-turn flag: at least one tool call/output message was routed during
+# this turn. Used at process completion to distinguish a quiet-but-real
+# turn from a silent turn that produced nothing (#1320).
+_MATRIX_TURN_TOOL_ACTIVITY_KEY = "matrix_turn_tool_activity"
+
 # Send alignment gate (#1244): before the final reply of a turn is
 # flushed, check whether new room events landed after the turn's context
 # snapshot.  Unaligned turns are re-triggered with the fresh context
@@ -4156,6 +4161,8 @@ class AgentTeamsMatrixChannel(BaseChannel):
         if self._is_reasoning_message(
             message_type,
         ) or self._is_tool_call_message(message_type):
+            if self._is_tool_call_message(message_type):
+                send_meta[_MATRIX_TURN_TOOL_ACTIVITY_KEY] = True
             await self._ensure_thread_root(to_handle, send_meta)
             await self._flush_pending_final_message_to_thread(
                 to_handle,
@@ -4174,6 +4181,7 @@ class AgentTeamsMatrixChannel(BaseChannel):
             send_meta.pop(_MATRIX_FORCE_NOTICE_KEY, None)
             return
         if self._is_tool_output_message(message_type):
+            send_meta[_MATRIX_TURN_TOOL_ACTIVITY_KEY] = True
             await self._flush_pending_final_message_to_thread(
                 to_handle,
                 send_meta,
@@ -4467,6 +4475,10 @@ class AgentTeamsMatrixChannel(BaseChannel):
             None,
         )
         is_placeholder = send_meta.pop(_MATRIX_PLACEHOLDER_THREAD_ROOT_KEY, False)
+        had_tool_activity = send_meta.pop(_MATRIX_TURN_TOOL_ACTIVITY_KEY, False)
+        # A silent turn that never ran a tool produced nothing: do not
+        # report it as completed (#1320).
+        no_output_marker = "已完成" if had_tool_activity else "本回合无产出"
         if is_placeholder:
             if streaming_final_text:
                 raw_text = streaming_final_text.strip()
@@ -4478,7 +4490,7 @@ class AgentTeamsMatrixChannel(BaseChannel):
                     text = self._visible_final_text(raw_text)
                     if not text:
                         await self._edit_thread_root(
-                            to_handle, send_meta, "已完成",
+                            to_handle, send_meta, no_output_marker,
                         )
                     else:
                         html_body = _md_to_html(text)
@@ -4502,11 +4514,11 @@ class AgentTeamsMatrixChannel(BaseChannel):
                         )
                     else:
                         await self._edit_thread_root(
-                            to_handle, send_meta, "已完成",
+                            to_handle, send_meta, no_output_marker,
                         )
             else:
                 await self._edit_thread_root(
-                    to_handle, send_meta, "已完成",
+                    to_handle, send_meta, no_output_marker,
                 )
             self._active_thread_roots.pop(to_handle, None)
         elif streaming_final_text:
