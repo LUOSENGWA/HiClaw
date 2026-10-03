@@ -11,7 +11,7 @@
 #
 # The flow exercises:
 #   1. pull the fixed legacy CoPaw image (agentteams-copaw-worker:v1.2.4)
-#   2. seed Worker CR (runtime=copaw, image=legacy) via kubectl against
+#   2. seed Worker CR (runtime=copaw, image=legacy) via the REST API of
 #      the embedded kube-apiserver
 #   3. controller provisions the legacy instance; container runs the old image
 #   4. persist real .copaw workspace/session/secret state (MinIO-backed)
@@ -109,26 +109,24 @@ if [ -z "${TOKEN}" ]; then
     test_teardown "29-legacy-copaw-upgrade"; test_summary; exit 1
 fi
 
-if ! docker exec -i "$CTRL" kubectl \
-    --server=https://127.0.0.1:6443 \
-    --certificate-authority="${DATA_DIR}/pki/ca.crt" \
-    --token="${TOKEN}" apply -f - <<YAML
-apiVersion: agentteams.io/v1beta1
-kind: Worker
-metadata:
-  name: ${TEST_WORKER}
-  namespace: default
-spec:
-  runtime: copaw
-  image: ${LEGACY_IMAGE}
-  model: ${MODEL}
-  workerName: ${TEST_WORKER}
-YAML
-then
-    log_fail "kubectl apply of legacy Worker CR failed"
+# The embedded controller image ships the kube-apiserver and curl but not
+# kubectl; create the CR through the apiserver REST API instead.
+CR_BODY=$(cat <<JSON
+{"apiVersion":"agentteams.io/v1beta1","kind":"Worker","metadata":{"name":"${TEST_WORKER}","namespace":"default"},"spec":{"runtime":"copaw","image":"${LEGACY_IMAGE}","model":"${MODEL}","workerName":"${TEST_WORKER}"}}
+JSON
+)
+CR_CODE=$(printf '%s' "${CR_BODY}" | docker exec -i "$CTRL" curl -sS -o /tmp/legacy-worker-seed.json -w '%{http_code}' \
+    --cacert "${DATA_DIR}/pki/ca.crt" \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H "Content-Type: application/json" \
+    -X POST "https://127.0.0.1:6443/apis/agentteams.io/v1beta1/namespaces/default/workers" \
+    --data-binary @-)
+if [ "${CR_CODE}" != "200" ] && [ "${CR_CODE}" != "201" ]; then
+    CR_DETAIL=$(docker exec "$CTRL" cat /tmp/legacy-worker-seed.json 2>/dev/null | head -c 400 || true)
+    log_fail "REST create of legacy Worker CR failed (HTTP ${CR_CODE}): ${CR_DETAIL}"
     test_teardown "29-legacy-copaw-upgrade"; test_summary; exit 1
 fi
-log_pass "Legacy Worker CR applied via embedded kube-apiserver"
+log_pass "Legacy Worker CR created via the embedded kube-apiserver REST API"
 
 # ============================================================
 # Section 3: Legacy instance provisioned on the pinned image
