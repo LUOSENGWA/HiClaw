@@ -78,6 +78,13 @@ log_section "Pull Fixed Legacy CoPaw Image"
 
 if docker pull "${LEGACY_IMAGE}" >/dev/null 2>&1; then
     log_pass "Legacy CoPaw image pulled: ${LEGACY_IMAGE}"
+elif [ "${COPAW_LEGACY_IMAGE_OPTIONAL:-0}" = "1" ]; then
+    # Fork PR runs receive no registry credentials and may be unable to reach
+    # the registry at all; skip explicitly instead of failing the shard.
+    log_info "SKIP: unable to pull legacy CoPaw image and COPAW_LEGACY_IMAGE_OPTIONAL=1: ${LEGACY_IMAGE}"
+    test_teardown "29-legacy-copaw-upgrade"
+    test_summary
+    exit 0
 else
     log_fail "Unable to pull legacy CoPaw image: ${LEGACY_IMAGE}"
     test_teardown "29-legacy-copaw-upgrade"; test_summary; exit 1
