@@ -1503,6 +1503,27 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
             "payload": {"taskId": tid, "status": status, "summary": summary},
         })
 
+    def _lifecycle_accept(tid, pid, submitted):
+        # The leader accepts the submitted result (submitted -> completed).
+        # complete_project requires every project task to be terminal
+        # (reject-completion-with-non-terminal-tasks), so lifecycle
+        # scenarios that complete a project must run the real acceptance
+        # step first, mirroring the leader check_task -> accept flow.
+        os.environ["AGENTTEAMS_WORKER_ROLE"] = "leader"
+        accepted = payload("projectflow", {
+            "action": "accept_task_result",
+            "payload": {
+                "projectId": pid,
+                "taskId": tid,
+                "submissionId": submitted["task"]["submission_id"],
+                "resultStatus": "SUCCESS",
+            },
+        })
+        os.environ["AGENTTEAMS_WORKER_ROLE"] = "worker"
+        if not accepted.get("ok") or (accepted.get("task") or {}).get("status") != "completed":
+            raise AssertionError(f"accept_task_result failed for {tid}: {accepted!r}")
+        return accepted
+
     # --- P0 ordering: a failed shared-storage sync withholds the
     #     completion notification and returns a retryable failure; the
     #     idempotent retry delivers it once storage recovers. ---
@@ -1869,7 +1890,8 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     # --- complete_project: PROJECT_COMPLETED event + idempotent retry. ---
     comp_tid = "comp-task"
     comp_pid = _lifecycle_setup(comp_tid)
-    _lifecycle_submit(comp_tid, "SUCCESS", "Comp work done.")
+    comp_submitted = _lifecycle_submit(comp_tid, "SUCCESS", "Comp work done.")
+    _lifecycle_accept(comp_tid, comp_pid, comp_submitted)
     comp = payload("projectflow", {
         "action": "complete_project",
         "payload": {"projectId": comp_pid},
@@ -1909,7 +1931,8 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     #     retry delivers the event exactly once. ---
     ofail_tid = "order-fail-task"
     ofail_pid = _lifecycle_setup(ofail_tid)
-    _lifecycle_submit(ofail_tid, "SUCCESS", "Order-fail work done.")
+    ofail_submitted = _lifecycle_submit(ofail_tid, "SUCCESS", "Order-fail work done.")
+    _lifecycle_accept(ofail_tid, ofail_pid, ofail_submitted)
     os.environ["TEAMHARNESS_TEST_FAIL_SYNC_PROJECT"] = ofail_pid
     try:
         ofail = payload("projectflow", {

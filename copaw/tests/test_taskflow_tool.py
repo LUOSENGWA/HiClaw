@@ -1589,7 +1589,9 @@ def test_legacy_adoption_write_failure_is_atomic_and_retry_identity_is_stable(
         )
 
     assert meta_path.read_bytes() == original_meta
-    assert [path.name for path in task_dir.iterdir()] == ["meta.json", "result.md"]
+    # Order-independent: iterdir() order is filesystem-defined (flaked on
+    # CI runner image rotation — same two files, different readdir order).
+    assert sorted(path.name for path in task_dir.iterdir()) == ["meta.json", "result.md"]
 
     monkeypatch.setattr(os, "fsync", real_fsync)
     adopted = submit_task(
