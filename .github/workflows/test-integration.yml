@@ -421,7 +421,12 @@ jobs:
           if [ -z "$FILTER" ]; then
             FILTER="${{ env[matrix.filter_env] }}"
           fi
-          AGENTTEAMS_VERSION=v1.2.0-beta.1 SKIP_BUILD=1 make test-embedded \
+          # The branch no longer builds copaw-worker; resolve the embedded
+          # install's legacy image from the pinned published source instead
+          # of the (unavailable) local build tag.
+          AGENTTEAMS_VERSION=v1.2.0-beta.1 SKIP_BUILD=1 \
+          LOCAL_COPAW_WORKER=higress-registry.cn-hangzhou.cr.aliyuncs.com/agentteams/agentteams-copaw-worker:v1.2.4 \
+          make test-embedded \
             TEST_FILTER="$FILTER"
 
       # ============================================================
