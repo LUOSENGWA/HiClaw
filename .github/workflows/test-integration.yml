@@ -391,9 +391,17 @@ jobs:
         run: |
           if [ -z "${REGISTRY_USERNAME}" ]; then
             echo "COPAW_LEGACY_IMAGE_OPTIONAL=1" >> "$GITHUB_ENV"
-            echo "::notice::Registry credentials unavailable in this run — the legacy-upgrade test (29) will attempt an anonymous pull and skip with a note if the image is unreachable."
+            # Credential-less runs (fork PRs) cannot pull the pinned legacy
+            # image anonymously. Point the embedded install's copaw slot at
+            # a locally-built worker image so the install skips the pull:
+            # no test in this run actually starts a CoPaw worker (test-23
+            # rejects the copaw switch; test-29 skips via
+            # COPAW_LEGACY_IMAGE_OPTIONAL).
+            echo "CI_COPAW_WORKER_IMAGE=agentteams/qwenpaw-worker:latest" >> "$GITHUB_ENV"
+            echo "::notice::Registry credentials unavailable in this run — the legacy-upgrade test (29) will skip, and the copaw install slot uses a local placeholder image."
           else
             echo "COPAW_LEGACY_IMAGE_OPTIONAL=0" >> "$GITHUB_ENV"
+            echo "CI_COPAW_WORKER_IMAGE=higress-registry.cn-hangzhou.cr.aliyuncs.com/agentteams/agentteams-copaw-worker:v1.2.4" >> "$GITHUB_ENV"
           fi
 
       - name: Run embedded integration tests
@@ -424,9 +432,15 @@ jobs:
           # The branch no longer builds copaw-worker; resolve the embedded
           # install's legacy image from the pinned published source instead
           # of the (unavailable) local build tag.
+          # LOCAL_COPAW_WORKER must be a make command-line variable (after
+          # 'make'): the Makefile assigns it unconditionally ('='), so a
+          # shell env prefix is silently ignored and the install would pull
+          # the default agentteams/copaw-worker:latest, which this branch
+          # no longer builds. AGENTTEAMS_VERSION/SKIP_BUILD stay env
+          # prefixes because the install script (not make) consumes them.
           AGENTTEAMS_VERSION=v1.2.0-beta.1 SKIP_BUILD=1 \
-          LOCAL_COPAW_WORKER=higress-registry.cn-hangzhou.cr.aliyuncs.com/agentteams/agentteams-copaw-worker:v1.2.4 \
           make test-embedded \
+            LOCAL_COPAW_WORKER="${CI_COPAW_WORKER_IMAGE}" \
             TEST_FILTER="$FILTER"
 
       # ============================================================
