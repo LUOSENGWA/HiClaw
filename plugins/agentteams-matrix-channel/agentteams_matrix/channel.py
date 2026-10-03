@@ -77,6 +77,9 @@ from qwenpaw.constant import WORKING_DIR
 
 logger = logging.getLogger("qwenpaw.channels.matrix")
 
+# #1334: masked replacement sent to the room on non-cancellation consume
+# errors; the raw err_text is logged only and never reaches the room.
+_CONSUME_ERROR_NOTICE = '⚠️ 本轮处理遇到系统错误，已中断。请重新发送你的请求；若问题持续出现，请联系管理员查看日志。'
 
 CHANNEL_KEY = "agentteams_matrix"
 
@@ -4545,7 +4548,7 @@ class AgentTeamsMatrixChannel(BaseChannel):
         to_handle: str,
         err_text: str,
     ) -> None:
-        """Edit thread root on error; suppress user-visible cancellation noise."""
+        """Edit thread root on error; suppress cancellation noise; mask raw errors before room send."""
         root_id = self._active_thread_roots.pop(to_handle, None)
         if root_id:
             fallback_meta = {_MATRIX_OWN_THREAD_ROOT_KEY: root_id}
@@ -4558,7 +4561,8 @@ class AgentTeamsMatrixChannel(BaseChannel):
             )
             await self._send_typing(to_handle, False)
             return
-        await super()._on_consume_error(request, to_handle, err_text)
+        logger.warning('MatrixChannel: consume error masked before room send component=matrix handle=%s err_text=%r', to_handle, err_text)
+        await super()._on_consume_error(request, to_handle, _CONSUME_ERROR_NOTICE)
 
     # ------------------------------------------------------------------
     # Outgoing send — retry helper
