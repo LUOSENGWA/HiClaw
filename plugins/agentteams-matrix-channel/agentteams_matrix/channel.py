@@ -421,6 +421,7 @@ class AgentTeamsMatrixChannel(BaseChannel):
         self.vision_enabled: bool = vision_enabled
         self.history_limit: int = max(0, history_limit)
         self.sync_timeout_ms: int = sync_timeout_ms
+        self.show_thinking: bool = show_thinking
 
         self._workspace_dir = (
             Path(workspace_dir).expanduser() if workspace_dir else None
@@ -4158,6 +4159,9 @@ class AgentTeamsMatrixChannel(BaseChannel):
         """Route completed messages behind a processing root."""
         del request
         message_type = getattr(event, "type", None)
+        if self._is_reasoning_message(message_type) and not self.show_thinking:
+            # show_thinking disabled: reasoning is never rendered to the room.
+            return
         if self._is_reasoning_message(
             message_type,
         ) or self._is_tool_call_message(message_type):
@@ -4247,16 +4251,17 @@ class AgentTeamsMatrixChannel(BaseChannel):
         del request
         text = (accumulated_text or "").strip()
         if stream_type == "reasoning":
-            await self._ensure_thread_root(to_handle, send_meta)
-            if not text:
-                text = self._text_from_message_event(event)
-            if text:
-                text = f"Thinking:\n\n{text}"
-                await self._send_streaming_thread_text(
-                    to_handle,
-                    send_meta,
-                    text,
-                )
+            if self.show_thinking:
+                await self._ensure_thread_root(to_handle, send_meta)
+                if not text:
+                    text = self._text_from_message_event(event)
+                if text:
+                    text = f"Thinking:\n\n{text}"
+                    await self._send_streaming_thread_text(
+                        to_handle,
+                        send_meta,
+                        text,
+                    )
             send_meta.pop(_MATRIX_STREAMING_REASONING_EVENT_ID_KEY, None)
             send_meta.pop(_MATRIX_STREAMING_REASONING_LAST_EDIT_KEY, None)
             send_meta.pop(_MATRIX_STREAMING_REASONING_STREAM_ID_KEY, None)

@@ -26,3 +26,4 @@ python3 -m pytest plugins/tests/agentteams-matrix-channel/test_session_isolation
 python3 -m pytest plugins/tests/agentteams-matrix-channel/test_fake_completion_marker.py -q
 python3 -m pytest plugins/tests/agentteams-matrix-channel/test_consume_error.py -q
 
+python3 -m pytest plugins/tests/agentteams-matrix-channel/test_show_thinking_gate.py -q
