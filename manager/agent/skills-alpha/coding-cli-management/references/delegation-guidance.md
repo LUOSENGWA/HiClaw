@@ -16,6 +16,8 @@ A delegated coding task should be a bounded, self-describing unit. The prompt ha
 - **Stop conditions** — when to stop; include the escape hatch: "if blocked or a step cannot run, skip it and say so in the report."
 - **Artifact location** — results and logs land in the shared task directory (`shared/tasks/<task-id>/`); session replies are not always re-readable, so "show me" must mean "write it to a file."
 - **Declared intent for long waits** — runner-side policies can gate individual commands (a bare standalone wait was blocked pending declared intent); annotate the intent of long waits inline so they clear the gate.
+- **Brief for a cold start** — the receiver starts with zero context: task and why it exists; relevant files by path (don't paste them); current state; what was tried and abandoned; decisions with rationale; acceptance criteria; constraints (must-not / must-preserve). Carry the exact task semantics — investigate-only means "do not edit files", a fix means "implement the fix", a refactor means "refactor, not rewrite".
+- **Isolate per task** — give delegated work its own branch/worktree (`branch-off`, `checkout-branch`, or `checkout-pr` when the runner manages worktrees); parallel writers never share a checkout.
 
 **Scaffolding scales with the runner.** For small/edge models, fully pre-write the change (near-ready spec, exact anchors). For stronger models, explicit goals + constraints + acceptance + self-verification are enough; over-constraining a strong model can reduce quality.
 
@@ -28,10 +30,11 @@ A delegated session is not fire-and-forget. The supervising side should:
 - **Steer losslessly** — mid-turn instructions queue; issuing a cancel stops the current turn and the queued instruction resumes. Use this to redirect long runs; do not assume mid-turn messages interrupt.
 - **Keep state outside the session** — sessions expire between uses; durable state belongs in the workspace (task records, result files), not in session memory.
 - **Resolve pending approvals on cancel** — a client that cancels a turn must resolve any pending permission request as cancelled (ACP semantics).
-- **End the turn; let wakes drive** — no held session, no polling: completion, timeout and scheduled wakes each resume the orchestrator as a new turn, and the exchange is auditable in the session record.
+- **End the turn; let wakes drive** — no held session, no polling: completion, timeout and scheduled wakes each resume the orchestrator as a new turn, and the exchange is auditable in the session record. Don't poll, hurry-up, or interrupt — long reasoning runs can take 15–30 minutes; trust the finish notification.
 - **Claim before acting** — several watchers may observe the same completion; take an occupancy token first (idempotent handling).
 - **Size watch windows for worst case** — saturated local runners can queue sessions for ~10 minutes; an undersized window expires before completion (we missed one). Arm watchers before work starts; treat a "no activity observed" alert as a first-class signal; give long runs a deadline with a fallback chain: completion → timeout → scheduled self-wake → human.
 - **Scheduled runs isolate or share** — default isolated runs (own per-job session; silent — wakes nobody; right for periodic inspection) vs shared runs (delivered into the target session = a real self-wake; required for fallback wake-ups).
+- **Analysis helpers are read-only** — when you summon a second opinion or a two-model committee for root cause, end every prompt with the no-edits suffix ("This is analysis only. Do NOT edit, create, or delete any files. Do NOT write code."); an advisor gives a judgment — it does not drive the work.
 
 ## 3. Approval expectations
 
@@ -72,6 +75,8 @@ Before the first real task:
 | Completion missed — watch window shorter than queue delay | size windows for worst-case queue + execution (~10 min observed); arm watchers before work starts |
 | "No activity observed" alert | treat as a first-class signal — it may be the only closure trigger |
 | Watchers race on the same completion | claim an occupancy token before acting (idempotent wake handling) |
+| Analysis helper starts editing files | end every analysis prompt with the no-edits suffix |
+| Cold-start handoff repeats old mistakes | carry "what was tried and abandoned" + decisions in the briefing |
 
 ## 6. Related surfaces
 
