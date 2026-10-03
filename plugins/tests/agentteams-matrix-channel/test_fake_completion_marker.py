@@ -10,9 +10,11 @@ and consults it when finalizing the placeholder:
     NO_REPLY control line         -> 「已处理」 (unchanged)
     visible final text            -> the text itself (unchanged)
 
-NOTE: channel.py imports the qwenpaw runtime (schemas / BaseChannel), which
-is not part of the focused CI job's dependency set — this module is skipped
-there (importorskip) and runs for real in the QwenPaw dev container.
+NOTE: channel.py imports the qwenpaw runtime (schemas / BaseChannel). This
+module runs for real in the dedicated `matrix-channel-completion-guard` CI job
+(which installs matrix-nio + qwenpaw) and in the QwenPaw dev container; in
+environments without those runtime deps it skips (importorskip) instead of
+erroring.
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ AgentTeamsMatrixChannel = channel_module.AgentTeamsMatrixChannel
 PLACEHOLDER_KEY = channel_module._MATRIX_PLACEHOLDER_THREAD_ROOT_KEY
 ACTIVITY_KEY = channel_module._MATRIX_TURN_TOOL_ACTIVITY_KEY
 STREAMING_KEY = channel_module._MATRIX_STREAMING_FINAL_TEXT_KEY
+PENDING_KEY = channel_module._MATRIX_PENDING_FINAL_MESSAGE_KEY
 
 ROOM = "!room:test"
 
@@ -147,3 +150,77 @@ def test_tool_call_message_sets_activity_flag_and_reasoning_does_not(monkeypatch
         )
     )
     assert ACTIVITY_KEY not in reasoning_meta
+
+
+def test_whitespace_streaming_is_not_marked_done(monkeypatch):
+    """Streaming text that is empty after normalization is still "no output"."""
+    _silence_base_hooks(monkeypatch)
+    channel, captured = _make_channel()
+    _complete(channel, {PLACEHOLDER_KEY: True, STREAMING_KEY: "  \n\t "})
+    assert captured == ["本回合无产出"]
+
+
+def test_empty_pending_final_message_is_not_marked_done(monkeypatch):
+    """An empty pending final message must not flip the marker."""
+    _silence_base_hooks(monkeypatch)
+    channel, captured = _make_channel()
+    monkeypatch.setattr(channel, "_text_from_message_event", lambda event: "")
+    _complete(channel, {PLACEHOLDER_KEY: True, PENDING_KEY: object()})
+    assert captured == ["本回合无产出"]
+
+
+def test_tool_output_message_sets_activity_flag(monkeypatch):
+    """FUNCTION_CALL_OUTPUT messages set the turn tool-activity flag."""
+    _silence_base_hooks(monkeypatch)
+
+    async def noop(*args, **kwargs):
+        return None
+
+    channel, _ = _make_channel()
+    channel._flush_pending_final_message_to_thread = noop
+    channel._tool_output_media_parts = lambda event: []
+
+    class _Event:
+        def __init__(self, type_):
+            self.type = type_
+
+    tool_output_meta = {}
+    asyncio.run(
+        channel.on_event_message_completed(
+            None,
+            ROOM,
+            _Event(channel_module.MessageType.FUNCTION_CALL_OUTPUT),
+            tool_output_meta,
+        )
+    )
+    assert tool_output_meta.get(ACTIVITY_KEY) is True
+
+
+def test_quiet_tool_output_turn_keeps_the_done_marker(monkeypatch):
+    """Tool output alone (no visible text) finalizes as 已完成 — with the flag
+    set by the real event path rather than a manually seeded meta."""
+    _silence_base_hooks(monkeypatch)
+
+    async def noop(*args, **kwargs):
+        return None
+
+    channel, captured = _make_channel()
+    channel._flush_pending_final_message_to_thread = noop
+    channel._tool_output_media_parts = lambda event: []
+
+    class _Event:
+        def __init__(self, type_):
+            self.type = type_
+
+    send_meta = {}
+    asyncio.run(
+        channel.on_event_message_completed(
+            None,
+            ROOM,
+            _Event(channel_module.MessageType.FUNCTION_CALL_OUTPUT),
+            send_meta,
+        )
+    )
+    send_meta[PLACEHOLDER_KEY] = True
+    _complete(channel, send_meta)
+    assert captured == ["已完成"]
