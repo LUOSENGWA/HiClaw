@@ -303,6 +303,15 @@ func (h *ResourceHandler) UpdateWorker(w http.ResponseWriter, r *http.Request) {
 						"migrate the worker to \"qwenpaw\" instead (see issue #1310)")
 				return
 			}
+			if !strings.EqualFold(worker.Spec.Runtime, req.Runtime) && req.Image == "" {
+				// The runtime is changing without an explicit new image:
+				// drop the previous runtime's image pin so the recreated
+				// container resolves the new runtime's image instead of
+				// silently running on the old runtime's image — the CoPaw →
+				// QwenPaw upgrade path (see issue #1310). An image provided
+				// in this request still wins (applied below).
+				worker.Spec.Image = ""
+			}
 			worker.Spec.Runtime = req.Runtime
 		}
 		if req.Image != "" {

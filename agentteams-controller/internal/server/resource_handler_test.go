@@ -913,6 +913,58 @@ func TestUpdateWorkerRejectsSwitchToLegacyCopaw(t *testing.T) {
 	}
 }
 
+// A runtime switch must not keep the previous runtime's image pin: the
+// recreated container has to resolve the new runtime's image (issue #1310
+// upgrade path, exercised end-to-end by test-29).
+func TestUpdateWorkerRuntimeSwitchDropsStaleImagePin(t *testing.T) {
+	scheme := newServerTestScheme(t)
+	legacy := &v1beta1.Worker{}
+	legacy.Name = "pinned-legacy"
+	legacy.Namespace = "default"
+	legacy.Spec.Model = "qwen3.5-plus"
+	legacy.Spec.Runtime = backend.RuntimeCopaw
+	legacy.Spec.Image = "registry.example.com/agentteams-copaw-worker:v1.2.4"
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(legacy).Build()
+	handler := NewResourceHandler(k8sClient, "default", nil, "", nil)
+
+	// 1. copaw → qwenpaw without an explicit image clears the stale pin.
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/workers/pinned-legacy",
+		bytes.NewReader([]byte(`{"runtime":"qwenpaw"}`)))
+	req.SetPathValue("name", "pinned-legacy")
+	rec := httptest.NewRecorder()
+	handler.UpdateWorker(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	var got v1beta1.Worker
+	if err := k8sClient.Get(context.Background(), client.ObjectKey{Name: "pinned-legacy", Namespace: "default"}, &got); err != nil {
+		t.Fatalf("get worker: %v", err)
+	}
+	if got.Spec.Runtime != backend.RuntimeQwenPaw {
+		t.Fatalf("runtime = %q, want %q", got.Spec.Runtime, backend.RuntimeQwenPaw)
+	}
+	if got.Spec.Image != "" {
+		t.Fatalf("image pin = %q, want cleared when the runtime changes", got.Spec.Image)
+	}
+
+	// 2. An explicit image in the same request still wins.
+	req = httptest.NewRequest(http.MethodPut, "/api/v1/workers/pinned-legacy",
+		bytes.NewReader([]byte(`{"runtime":"qwenpaw","image":"registry.example.com/agentteams-qwenpaw-worker:v1.2.4"}`)))
+	req.SetPathValue("name", "pinned-legacy")
+	rec = httptest.NewRecorder()
+	handler.UpdateWorker(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	if err := k8sClient.Get(context.Background(), client.ObjectKey{Name: "pinned-legacy", Namespace: "default"}, &got); err != nil {
+		t.Fatalf("get worker: %v", err)
+	}
+	if got.Spec.Image != "registry.example.com/agentteams-qwenpaw-worker:v1.2.4" {
+		t.Fatalf("image = %q, want the explicitly provided image", got.Spec.Image)
+	}
+}
+
 func TestWorkerResponseFlagsLegacyCopawRuntime(t *testing.T) {
 	copawWorker := &v1beta1.Worker{}
 	copawWorker.Name = "legacy"
