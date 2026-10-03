@@ -117,3 +117,46 @@ def test_completed_message_branch_unaffected_by_gate():
         asyncio.run(channel.on_event_message_completed(None, ROOM, event, meta))
     root.assert_awaited_once()
     assert meta.get(PENDING_KEY) is event
+
+
+def test_completed_reasoning_default_on_routes():
+    """show_thinking default True: a completed REASONING event still routes."""
+    channel = _make_channel()
+    event = SimpleNamespace(type=_enum("REASONING"))
+    parts = [object()]
+    meta: dict = {}
+    with patch.object(channel, "_ensure_thread_root", AsyncMock()) as root, patch.object(
+        channel, "_flush_pending_final_message_to_thread", AsyncMock()
+    ) as flush, patch.object(
+        channel, "_message_to_content_parts", return_value=parts
+    ), patch.object(
+        channel, "_send_or_queue_thread_parts", AsyncMock()
+    ) as send:
+        asyncio.run(channel.on_event_message_completed(None, ROOM, event, meta))
+    root.assert_awaited_once()
+    flush.assert_awaited_once()
+    send.assert_awaited_once_with(ROOM, parts, meta)
+    assert channel_module._MATRIX_FORCE_NOTICE_KEY not in meta
+
+
+def test_streaming_end_clears_prepopulated_metadata_when_gated_off():
+    """show_thinking=False: stale reasoning-stream metadata is still cleaned up."""
+    channel = _make_channel(show_thinking=False)
+    reasoning_keys = (
+        channel_module._MATRIX_STREAMING_REASONING_EVENT_ID_KEY,
+        channel_module._MATRIX_STREAMING_REASONING_LAST_EDIT_KEY,
+        channel_module._MATRIX_STREAMING_REASONING_STREAM_ID_KEY,
+    )
+    meta = {key: "stream-state" for key in reasoning_keys}
+    with patch.object(channel, "_ensure_thread_root", AsyncMock()) as root, patch.object(
+        channel, "_send_streaming_thread_text", AsyncMock()
+    ) as send:
+        asyncio.run(
+            channel.on_streaming_end(
+                None, ROOM, SimpleNamespace(), meta, "reasoning", "long thinking"
+            )
+        )
+    send.assert_not_awaited()
+    root.assert_not_awaited()
+    for key in reasoning_keys:
+        assert key not in meta
