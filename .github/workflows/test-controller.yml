@@ -68,6 +68,7 @@ jobs:
         run: |
           ruby plugins/tests/teamharness/test-contracts.rb
           python -m pytest plugins/tests/teamharness/mcp/test_continuation.py -q
+          python -m pytest plugins/tests/teamharness/mcp/test_sensitive_scan_placeholder.py -q
           python -m pytest plugins/tests/teamharness/test_pull_project.py -q
           PYTHONPATH="${GITHUB_WORKSPACE}/manager/src/agentteams_manager" \
             python -m pytest manager/src/agentteams_manager/agentteams_manager/tests/ -q
