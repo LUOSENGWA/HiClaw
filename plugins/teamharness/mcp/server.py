@@ -55,22 +55,26 @@ SENSITIVE_ARTIFACT_TEXT_RE = [
     ),
 ]
 # A value that is an *explicit* angle-bracket template is documentation,
-# not a credential. Brackets alone do not establish that the enclosed
-# text is a placeholder, so credential-shaped content wrapped in brackets
-# (e.g. ``<sk-a1b2c3d4e5f607182930415263748596>``) must still be flagged.
-# Accepted forms (a single pair of angle brackets, no nested brackets,
-# no spaces):
-#   <YOUR_API_KEY>              UPPER_SNAKE name, at least two parts
-#   <paste-token-here>           lower-kebab words, at least 8 chars total
-#   <token:your_key_here>        one lower label, ':', then a value part
+# not a credential. The exemption requires more than shape: the enclosed
+# text must carry an explicit placeholder marker (case-insensitive, whole
+# component) — your, my, our, paste, insert, replace, placeholder,
+# example, sample, dummy, fake, redacted, masked, change[-_]?me, todo,
+# tbd, here, xxx, yyy, zzz. Neither the kebab shape alone
+# (``<sk-abcdefghijklmnopqrstuvwxyz>``) nor arbitrary label:value content
+# (``<token:abc123def4567890>``) is exempt. Content nouns
+# (token/key/secret/password/api) are NOT markers: they name what the
+# value is, not that it is a placeholder. Additionally the content may
+# not contain a run of 16+ consecutive alphanumerics (mirrors the
+# scanner's minimum credential length).
 PLACEHOLDER_CREDENTIAL_RE = re.compile(
     r"^['\"]*<"
-    r"(?:"
-    r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+"
-    r"|(?=(?:[a-z-]{8,})>)[a-z]+(?:-[a-z]+)+"
-    r"|[a-z]+:(?:[a-z0-9_]+(?:-[a-z0-9_]+)*)"
-    r")"
-    r">['\"]*$"
+    r"(?=[^<>\s]*(?<![A-Za-z0-9])(?:your|my|our|paste|insert|replace|"
+    r"placeholder|example|sample|dummy|fake|redacted|masked|change[-_]?me|"
+    r"todo|tbd|here|xxx|yyy|zzz)(?![A-Za-z0-9]))"
+    r"(?![^<>\s]*[A-Za-z0-9]{16,})"
+    r"[^<>\s]+"
+    r">['\"]*$",
+    re.IGNORECASE,
 )
 MATRIX_ATTACHMENT_REL_TYPE = "com.agentteams.attachment"
 MATRIX_ATTACHMENT_CONTEXT_FILE = "teamharness-matrix-context.json"

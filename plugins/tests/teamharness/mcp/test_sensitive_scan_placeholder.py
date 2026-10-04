@@ -1,9 +1,11 @@
 """P12/B7: the artifact sensitive scan must whitelist placeholder values.
 
-A value wrapped in a single pair of angle brackets (``<YOUR_API_KEY>``)
-is a documentation template, not a credential: room files showing the
-request contract were being blocked by the Bearer / key-equality
-patterns because the placeholder matched as an opaque token. Real
+A value wrapped in a single pair of angle brackets is a documentation
+template ONLY when it carries an explicit placeholder marker
+(``<YOUR_API_KEY>``, ``<paste-token-here>``, ``<token:your_key_here>``).
+Brackets around credential-shaped content stay flagged: neither the
+kebab shape alone (``<sk-abcdefghijklmnopqrstuvwxyz>``) nor arbitrary
+label:value content (``<token:abc123def4567890>``) is exempt. Real
 credential values must still be flagged.
 """
 
@@ -32,7 +34,7 @@ def _scan(tmp_path: Path, content: str) -> bool:
     "content",
     [
         "Authorization: Bearer <YOUR_API_KEY>",
-        "Authorization: Basic <basic-token>",
+        "Authorization: Basic <your-basic-token>",
         "curl -H 'Authorization: Bearer <your-jev-api-key>' https://api.example.test/v1",
         "api_key = <PLACEHOLDER_123456789012>",
         "export TOKEN=<PASTE_TOKEN_HERE>",
@@ -65,6 +67,10 @@ def test_real_credential_values_still_flagged(tmp_path: Path, content: str) -> N
         "Authorization: Bearer <sk-a1b2c3d4e5f607182930415263748596>",
         "Authorization: Basic <dXNlcjpwYXNzd29yZA==>",
         "Authorization: Bearer <sk-abc123def456>",
+        # Shape alone is never enough: no explicit marker -> still flagged.
+        "Authorization: Bearer <sk-abcdefghijklmnopqrstuvwxyz>",
+        "Authorization: Bearer <token:abc123def4567890>",
+        "Authorization: Basic <basic-token>",
     ],
 )
 def test_bracketed_credential_shapes_still_flagged(
