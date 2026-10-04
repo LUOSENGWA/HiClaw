@@ -42,15 +42,40 @@ SENSITIVE_ARTIFACT_NAME_RE = re.compile(
     r"(secret|token|cookie|authorization|private[_-]?key|credential|client[_-]?secret)",
     re.IGNORECASE,
 )
+# Each pattern's group 1 (when present) captures the credential value so the
+# scanner can whitelist placeholder templates. Patterns without a group
+# (the private-key header) never need it: group(0) is used instead.
 SENSITIVE_ARTIFACT_TEXT_RE = [
     re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE),
-    re.compile(r"\bAuthorization\s*:\s*(?:Bearer|Basic)\s+\S+", re.IGNORECASE),
+    re.compile(r"\bAuthorization\s*:\s*(?:Bearer|Basic)\s+(\S+)", re.IGNORECASE),
     re.compile(
         r"\b(?:access[_-]?key[_-]?secret|client[_-]?secret|secret[_-]?key|api[_-]?key|token)\b"
-        r"\s*[:=]\s*['\"]?[A-Za-z0-9_./+=:-]{16,}",
+        r"\s*[:=]\s*['\"]?([A-Za-z0-9_./+=:-]{16,})",
         re.IGNORECASE,
     ),
 ]
+# A value that is an *explicit* angle-bracket template is documentation,
+# not a credential. The exemption requires more than shape: the enclosed
+# text must carry an explicit placeholder marker (case-insensitive, whole
+# component) — your, my, our, paste, insert, replace, placeholder,
+# example, sample, dummy, fake, redacted, masked, change[-_]?me, todo,
+# tbd, here, xxx, yyy, zzz. Neither the kebab shape alone
+# (``<sk-abcdefghijklmnopqrstuvwxyz>``) nor arbitrary label:value content
+# (``<token:abc123def4567890>``) is exempt. Content nouns
+# (token/key/secret/password/api) are NOT markers: they name what the
+# value is, not that it is a placeholder. Additionally the content may
+# not contain a run of 16+ consecutive alphanumerics (mirrors the
+# scanner's minimum credential length).
+PLACEHOLDER_CREDENTIAL_RE = re.compile(
+    r"^['\"]*<"
+    r"(?=[^<>\s]*(?<![A-Za-z0-9])(?:your|my|our|paste|insert|replace|"
+    r"placeholder|example|sample|dummy|fake|redacted|masked|change[-_]?me|"
+    r"todo|tbd|here|xxx|yyy|zzz)(?![A-Za-z0-9]))"
+    r"(?![^<>\s]*[A-Za-z0-9]{16,})"
+    r"[^<>\s]+"
+    r">['\"]*$",
+    re.IGNORECASE,
+)
 MATRIX_ATTACHMENT_REL_TYPE = "com.agentteams.attachment"
 MATRIX_ATTACHMENT_CONTEXT_FILE = "teamharness-matrix-context.json"
 MATRIX_ATTACHMENT_CONTEXT_TTL_SECONDS = 30 * 60
@@ -1442,7 +1467,13 @@ def _artifact_text_has_sensitive_content(path: Path, mimetype: str) -> bool:
     if b"\x00" in sample:
         return False
     text = sample.decode("utf-8", errors="replace")
-    return any(pattern.search(text) for pattern in SENSITIVE_ARTIFACT_TEXT_RE)
+    for pattern in SENSITIVE_ARTIFACT_TEXT_RE:
+        for match in pattern.finditer(text):
+            value = match.group(1) if match.lastindex else match.group(0)
+            if PLACEHOLDER_CREDENTIAL_RE.match(value):
+                continue
+            return True
+    return False
 
 
 def _matrix_upload_artifact(homeserver: str, token: str, path: Path, filename: str, mimetype: str) -> str:

@@ -69,6 +69,7 @@ jobs:
         run: |
           ruby plugins/tests/teamharness/test-contracts.rb
           python -m pytest plugins/tests/teamharness/mcp/test_continuation.py -q
+          python -m pytest plugins/tests/teamharness/mcp/test_sensitive_scan_placeholder.py -q
           python -m pytest plugins/tests/teamharness/test_pull_project.py -q
           PYTHONPATH="${GITHUB_WORKSPACE}/copaw/src" \
             python -m pytest copaw/tests/test_taskflow_tool.py -q
@@ -119,3 +120,30 @@ jobs:
         run: |
           python -m pytest plugins/tests/agentteams-matrix-channel/test_consume_error.py -q
 
+
+  matrix-channel-show-thinking-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install matrix-channel runtime dependencies
+        run: |
+          python -m pip install             'matrix-nio>=0.25,<0.27'             'qwenpaw>=2.2.1,<2.3'             'pytest>=8.3,<10'             'pytest-asyncio>=0.23,<2'
+
+      - name: Verify matrix-nio is importable (tests must not skip)
+        run: |
+          python - <<'PY'
+          import importlib.metadata as md
+          import nio  # noqa: F401  the suite skips without matrix-nio
+          print("matrix-nio", md.version("matrix-nio"))
+          print("qwenpaw", md.version("qwenpaw"))
+          PY
+
+      - name: Run matrix-channel show_thinking gate tests
+        run: |
+          python -m pytest plugins/tests/agentteams-matrix-channel/test_show_thinking_gate.py -q -rs
