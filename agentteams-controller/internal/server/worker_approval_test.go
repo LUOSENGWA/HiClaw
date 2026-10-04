@@ -73,13 +73,15 @@ func approvalRequest(method, name, body string) *http.Request {
 	return req
 }
 
-// approvalUpstream simulates the worker's /workspace/running-config: GET
-// returns the full config, PUT validates the full-object round trip and
-// echoes the updated config.
+// approvalUpstream simulates the worker's /api/workspace/running-config:
+// GET returns the full config, PUT validates the full-object round trip
+// and echoes the updated config. The path check enforces the /api prefix
+// contract (any dial without it gets 404, as a pre-prefix build would
+// from a real qwenpaw worker behind its SPA catch-all).
 func approvalUpstream(t *testing.T, current string, gotPUT *[]byte) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/workspace/running-config") {
+		if !strings.HasPrefix(r.URL.Path, "/api/workspace/running-config") {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -111,6 +113,37 @@ func jsonQuote(s string) string {
 }
 
 // --- GET ---
+
+// TestApprovalGet_DialsAPIPrefix is the regression test for the #1216
+// dial-path bug: the proxy used to dial the worker without the /api
+// prefix, landing on the qwenpaw app's SPA catch-all, which answers
+// 200 + index.html — the proxy then failed with 502 "worker returned an
+// unparsable running config". The upstream here mimics that split: the
+// API path returns JSON, anything else returns 200 + HTML. A handler
+// dialing the non-API path gets the HTML and fails this test.
+func TestApprovalGet_DialsAPIPrefix(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/workspace/running-config" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"approval_level":"AUTO"}`))
+			return
+		}
+		// SPA catch-all behavior for non-API paths.
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><body>qwenpaw</body></html>`))
+	}))
+	defer up.Close()
+	h := newTestApprovalHandler(t, "embedded", up,
+		approvalTeamWithWorkers("market-team", "market-analyst")...)
+	rec := httptest.NewRecorder()
+	h.getWorkerApproval(rec, adminCaller(approvalRequest(http.MethodGet, "market-analyst", "")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 — the proxy must dial /api/workspace/running-config (the SPA catch-all answers HTML otherwise)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != `{"approval_level":"AUTO"}` {
+		t.Fatalf("body=%s, want the JSON approval_level passthrough", got)
+	}
+}
 
 func TestApprovalGet_InScopeL2Human(t *testing.T) {
 	up := approvalUpstream(t, "SMART", nil)
