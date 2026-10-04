@@ -267,3 +267,39 @@ def test_push_dry_run_does_not_probe(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert result["ok"] is True
     assert result["dryRun"] is True
     assert runner.calls == []
+
+
+# --- known-limitation regression (review follow-up, 2026-10-04) -----------
+#
+# The guard compares the remote lastModified with the local file's LAST
+# EDIT TIME, not the version the local file was derived from:
+#   1. A pulls version 1            (local mtime = T1)
+#   2. B publishes version 2        (remote lastModified = T2 > T1)
+#   3. A edits its stale version 1  (local mtime = T3 > T2)
+# The guard now sees the local file as newer and lets the push through,
+# overwriting version 2. Catching this needs a remote baseline captured at
+# pull time (tracked separately); this test pins the CURRENT best-effort
+# behavior so the limitation is explicit and a future fix has a regression
+# to update.
+def test_stale_read_edit_push_is_not_detected_known_limitation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Remote holds version 2, published at BASE + 100.
+    runner = McRunner(stat_json=_completed(0, stdout=json.dumps({"lastModified": _iso(BASE + 100)})))
+    monkeypatch.setattr(server.subprocess, "run", runner)
+    local = _write_local(tmp_path, BASE)  # A's pull of version 1 (mtime = BASE)
+    # A edits its stale copy AFTER B's publish: content changes, mtime
+    # moves to BASE + 200 (newer than the remote's BASE + 100).
+    local.write_text(
+        json.dumps({"project_id": "p1", "note": "stale edit"}), encoding="utf-8"
+    )
+    os.utime(local, (BASE + 200, BASE + 200))
+
+    result = _push(tmp_path)
+
+    # Current best-effort behavior: the guard cannot tell the local file
+    # is based on a stale version (its mtime is newer than the remote), so
+    # the push proceeds. Documented limitation, not a guard pass/fail.
+    assert result["ok"] is True
+    assert len(runner.cp_calls) == 1
+    assert "warning" not in result
