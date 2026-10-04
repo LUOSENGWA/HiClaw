@@ -186,6 +186,26 @@ def test_retry_with_different_casing_of_same_assignee_reuses(
     assert delegate_side_effects["notify"] == []
 
 
+def test_different_server_case_is_a_different_identity(
+    tmp_path: Path,
+    delegate_side_effects: dict[str, list[Any]],
+) -> None:
+    """Matrix server names are case-sensitive (spec: appendices#server-name):
+    `@alice:EXAMPLE.test` is a different identity from `@alice:example.test`.
+    A request for it must not silently reuse the old assignment."""
+    _write_assigned_task(tmp_path)
+
+    result = _delegate(tmp_path, "redep-project-01", "@alice:EXAMPLE.test")
+
+    # Not a retry: the recorded event must not be reused.
+    assert result["notification"].get("reused") is not True
+    # It re-delegates: a fresh notification goes to the requested identity.
+    assert len(delegate_side_effects["notify"]) == 1
+    assert delegate_side_effects["notify"][0]["assignee"] == "@alice:EXAMPLE.test"
+    assert result["task"]["assigned_to"] == "@alice:EXAMPLE.test"
+    assert result["task"]["eventId"] != "$original-event"
+
+
 def test_delegate_txn_is_unique_per_send(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each send must use a fresh transaction id (no homeserver dedup)."""
     captured_paths: list[str] = []
