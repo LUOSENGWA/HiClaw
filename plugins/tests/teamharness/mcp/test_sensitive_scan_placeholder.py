@@ -58,6 +58,22 @@ def test_real_credential_values_still_flagged(tmp_path: Path, content: str) -> N
     assert _scan(tmp_path, content) is True, content
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        # Brackets do not make credential-shaped content a placeholder.
+        "Authorization: Bearer <sk-a1b2c3d4e5f607182930415263748596>",
+        "Authorization: Basic <dXNlcjpwYXNzd29yZA==>",
+        "Authorization: Bearer <sk-abc123def456>",
+    ],
+)
+def test_bracketed_credential_shapes_still_flagged(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    assert _scan(tmp_path, content) is True, content
+
+
 def test_mixed_documentation_and_real_key_flags(
     tmp_path: Path,
 ) -> None:

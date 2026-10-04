@@ -54,10 +54,24 @@ SENSITIVE_ARTIFACT_TEXT_RE = [
         re.IGNORECASE,
     ),
 ]
-# A value that is a single angle-bracket template (e.g. ``<YOUR_API_KEY>``)
-# is documentation, not a credential — whitelisting it keeps the scanner
-# from blocking spec/facts files that show the request contract.
-PLACEHOLDER_CREDENTIAL_RE = re.compile(r"^['\"]*<[^<>]*>['\"]*$")
+# A value that is an *explicit* angle-bracket template is documentation,
+# not a credential. Brackets alone do not establish that the enclosed
+# text is a placeholder, so credential-shaped content wrapped in brackets
+# (e.g. ``<sk-a1b2c3d4e5f607182930415263748596>``) must still be flagged.
+# Accepted forms (a single pair of angle brackets, no nested brackets,
+# no spaces):
+#   <YOUR_API_KEY>              UPPER_SNAKE name, at least two parts
+#   <paste-token-here>           lower-kebab words, at least 8 chars total
+#   <token:your_key_here>        one lower label, ':', then a value part
+PLACEHOLDER_CREDENTIAL_RE = re.compile(
+    r"^['\"]*<"
+    r"(?:"
+    r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+"
+    r"|(?=(?:[a-z-]{8,})>)[a-z]+(?:-[a-z]+)+"
+    r"|[a-z]+:(?:[a-z0-9_]+(?:-[a-z0-9_]+)*)"
+    r")"
+    r">['\"]*$"
+)
 MATRIX_ATTACHMENT_REL_TYPE = "com.agentteams.attachment"
 MATRIX_ATTACHMENT_CONTEXT_FILE = "teamharness-matrix-context.json"
 MATRIX_ATTACHMENT_CONTEXT_TTL_SECONDS = 30 * 60
