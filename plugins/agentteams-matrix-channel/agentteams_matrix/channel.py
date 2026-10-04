@@ -1820,17 +1820,18 @@ class AgentTeamsMatrixChannel(BaseChannel):
         ):
             return True
         # 5. bare @localpart in plain text.
-        #    A Matrix localpart may contain [A-Za-z0-9._=] and '-', so the
-        #    mention token in text extends over those characters.
-        #    `@alice-dev` / `@alice2` are OTHER users (longer localparts)
-        #    and `@alice:other.test` is a full MXID on ANOTHER domain —
-        #    none of them is our user in bare form. Require the token to
-        #    end exactly where our localpart ends: the next character must
+        #    A Matrix localpart may contain [A-Za-z0-9._=/+-] (spec user
+        #    identifiers), so the mention token in text extends over those
+        #    characters. `@alice-dev`, `@alice+dev`, `@alice/dev` and
+        #    `@alice2` are OTHER users (longer localparts) and
+        #    `@alice:other.test` is a full MXID on ANOTHER domain — none
+        #    of them is our user in bare form. Require the token to end
+        #    exactly where our localpart ends: the next character must
         #    not be a localpart character or ':' (which would start an
         #    MXID domain we do not own).
         if localpart:
             token = re.compile(
-                rf"(?<![\w@])@{re.escape(localpart)}(?![A-Za-z0-9._=:-])"
+                rf"(?<![\w@])@{re.escape(localpart)}(?![A-Za-z0-9._=:/+-])"
             )
             if token.search(text):
                 return True

@@ -9,7 +9,7 @@ with ``require_mention`` enabled (default for group rooms) silently
 drops the message. This test pins the two fallbacks:
 
     4. matrix.to localpart-only link  https://matrix.to/#/@alice
-    5. bare @localpart in text (word-bounded, own localpart only)
+    5. bare @localpart in text (bounded by the full localpart charset)
 
 Regression: full-MXID forms (checks 1-3) must keep working.
 """
@@ -142,3 +142,23 @@ def test_valid_bare_mention_still_matches():
     channel = _make_channel()
     assert _mentioned(channel, "@alice please review") is True
     assert _mentioned(channel, "thanks @alice!") is True
+
+
+def test_plus_and_slash_suffix_localpart_do_not_match():
+    channel = _make_channel()
+    # `+` and `/` are valid Matrix localpart characters: longer localparts
+    # like `@alice+dev` / `@alice/dev` are OTHER users, not `@alice`, and
+    # full MXIDs on another domain must not be truncated to a match either.
+    assert _mentioned(channel, "@alice+dev:other.test hello") is False
+    assert _mentioned(channel, "@alice/dev:other.test hello") is False
+    assert _mentioned(channel, "@alice+dev hello") is False
+    assert _mentioned(channel, "@alice/dev hello") is False
+
+
+def test_own_localpart_with_plus_or_slash_still_matches():
+    # Our own localpart may also contain `+` / `/`; a bare mention of it
+    # must still match (the token boundary compares like-for-like).
+    plus_channel = _make_channel("@alice+dev:matrix.local")
+    assert _mentioned(plus_channel, "@alice+dev hello") is True
+    slash_channel = _make_channel("@alice/dev:matrix.local")
+    assert _mentioned(slash_channel, "@alice/dev hello") is True
