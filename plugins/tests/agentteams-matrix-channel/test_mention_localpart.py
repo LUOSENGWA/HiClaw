@@ -114,3 +114,31 @@ def test_substring_localpart_does_not_match():
 def test_no_mention_returns_false():
     channel = _make_channel()
     assert _mentioned(channel, "just a plain message") is False
+
+
+# --- A3: whole-token matching for bare mentions ---
+
+def test_hyphen_suffix_localpart_does_not_match():
+    channel = _make_channel()
+    # @alice-dev is a different user (longer localpart), not a mention of alice.
+    assert _mentioned(channel, "@alice-dev hello") is False
+    fb = '<a href="https://matrix.to/#/@alice-dev">Alice Dev</a> hi'
+    assert _mentioned(channel, "hi", formatted_body=fb) is False
+
+
+def test_dot_and_digit_suffix_localpart_do_not_match():
+    channel = _make_channel()
+    assert _mentioned(channel, "@alice.2 hello") is False
+    assert _mentioned(channel, "@alice2 hello") is False
+
+
+def test_other_domain_mxid_does_not_match():
+    channel = _make_channel()
+    # A full MXID on another domain is not a bare localpart mention of ours.
+    assert _mentioned(channel, "@alice:other.test hello") is False
+
+
+def test_valid_bare_mention_still_matches():
+    channel = _make_channel()
+    assert _mentioned(channel, "@alice please review") is True
+    assert _mentioned(channel, "thanks @alice!") is True
