@@ -4660,17 +4660,21 @@ def _send_delegate_notification(
     title: str,
     assignee: str,
     spec: str,
+    txn: str | None = None,
 ) -> dict[str, Any]:
     """Send the automatic Worker assignment notification for delegate_task.
 
     Publishes the assignment to the Task room with ``m.mentions`` using the
-    same Matrix HTTP send path as the message tool. Each send uses a fresh
-    transaction ID: a lost event id (broken-state repair) must be able to
-    re-notify the worker, and a re-delegation to a different worker must not
-    be silently deduplicated by the homeserver. Duplicate protection lives
-    in the task state instead — a task already ``assigned`` with a recorded
-    event id is reused, never re-sent (see the delegate_task idempotency
-    branch).
+    same Matrix HTTP send path as the message tool.
+
+    Transaction id: the caller passes the **persisted** transaction id for
+    this logical delegation attempt (``delegate-{task_id}-{nonce}``, stored
+    on the task BEFORE the send). A retry of the same attempt reuses it, so
+    a send that reached the room but whose response was lost is deduplicated
+    server-side instead of emitting a second assignment event. A genuinely
+    new delegation attempt (a different assignee, including A->B->A) rotates
+    the nonce, so its notification is never swallowed by a stale id. When
+    ``txn`` is omitted, a fresh id is generated for this send only.
     Returns the Matrix ``eventId`` on success.
     """
     homeserver = os.getenv("AGENTTEAMS_MATRIX_URL", "").rstrip("/")
@@ -4698,10 +4702,12 @@ def _send_delegate_notification(
     content = _matrix_content(notification_text, mentions)
 
     room_enc = urllib.parse.quote(matrix_room_id, safe="")
-    # Fresh transaction id per send (see docstring): a stable id per task
-    # made the homeserver deduplicate a re-delegation or a broken-state
-    # re-send, silently swallowing the assignment notification.
-    txn = urllib.parse.quote(f"delegate-{task_id}-{uuid.uuid4().hex[:12]}", safe="")
+    # Persisted transaction id for this delegation attempt (see docstring):
+    # the caller pre-mints it so a retry after a lost response reuses the
+    # same id and the homeserver deduplicates instead of double-sending.
+    if not txn:
+        txn = f"delegate-{task_id}-{uuid.uuid4().hex[:12]}"
+    txn = urllib.parse.quote(txn, safe="")
     url = f"{homeserver}/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/{txn}"
     request = urllib.request.Request(
         url,
@@ -5307,12 +5313,25 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             spec = str(payload.get("spec") or "")
             (task_dir / "spec.md").write_text(spec + ("\n" if spec else ""), encoding="utf-8")
             source_room_id = _source_room_id_from_payload(payload) or str(project.get("source_room_id") or "").strip()
+            # Transaction id for this logical delegation attempt:
+            # a re-delegation (different assignee) is a NEW attempt and
+            # rotates the nonce; a retry of the SAME attempt (previous send
+            # failed, or succeeded server-side but the client lost the
+            # response) REUSES the persisted nonce so the homeserver
+            # deduplicates the retry instead of emitting a second
+            # assignment event.
+            existing_notify_txn = str(existing_task.get("notifyTxn") or "").strip()
+            if redelegate or not existing_notify_txn:
+                notify_txn = f"delegate-{task_id}-{uuid.uuid4().hex[:12]}"
+            else:
+                notify_txn = existing_notify_txn
             task = {
                 "task_id": task_id,
                 "project_id": project_id,
                 "room_id": room_id,
                 "status": "prepared",
                 "spec_path": f"shared/tasks/{task_id}/spec.md",
+                "notifyTxn": notify_txn,
             }
             if assigned_to:
                 task["assigned_to"] = assigned_to
@@ -5406,6 +5425,7 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         title=task_title or task_id,
                         assignee=assignment_mxid,
                         spec=spec,
+                        txn=notify_txn,
                     )
                 except Exception as exc:
                     notification = {

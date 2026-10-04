@@ -228,3 +228,143 @@ def test_delegate_txn_is_unique_per_send(monkeypatch: pytest.MonkeyPatch) -> Non
         assert re.fullmatch(r"delegate-txn-task-01-[0-9a-f]{12}", txn_a)
     finally:
         httpd.shutdown()
+
+
+# --- txn persistence: lost-response retry + re-delegation rotation --------
+
+
+def _write_prepared_with_txn(
+    workspace: Path,
+    *,
+    assignee: str = WORKER_A,
+    txn: str = "delegate-redep-project-01-abcdef123456",
+) -> None:
+    """A task left in prepared state by a first attempt that persisted its
+    transaction nonce (the send failed, or succeeded server-side with the
+    response lost to the client)."""
+    project = {
+        "project_id": "redep-project",
+        "title": "Re-delegation contract",
+        "status": "active",
+        "tasks": [
+            {
+                "task_id": "redep-project-01",
+                "title": "Produce a result",
+                "assigned_to": assignee,
+                "depends_on": [],
+                "status": "prepared",
+            }
+        ],
+        "requester_report": {"pending": False, "sent_at": "2026-09-29T08:00:00Z"},
+    }
+    task = {
+        "task_id": "redep-project-01",
+        "project_id": "redep-project",
+        "room_id": ROOM,
+        "status": "prepared",
+        "assigned_to": assignee,
+        "notifyTxn": txn,
+        "spec_path": "shared/tasks/redep-project-01/spec.md",
+    }
+    spec_dir = workspace / "shared" / "tasks" / "redep-project-01"
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    (spec_dir / "spec.md").write_text("Do the thing.\n", encoding="utf-8")
+    server._write_json(workspace / "shared" / "projects" / "redep-project" / "meta.json", project)
+    server._write_json(workspace / "shared" / "tasks" / "redep-project-01" / "meta.json", task)
+
+
+def _make_lost_response_server(monkeypatch: pytest.MonkeyPatch):
+    """Fake Matrix /send endpoint with REAL transaction-id dedup semantics.
+
+    Unknown txn: the event is recorded server-side; in drop mode the
+    connection is closed WITHOUT a response (client sees a network error
+    although the event reached the room).
+    Known txn: returns the recorded event id again (Matrix idempotency),
+    no second event is created.
+    """
+    state = {"events": [], "seen": {}, "drop_next": True}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_PUT(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            txn = self.path.rsplit("/", 1)[-1]
+            if txn in state["seen"]:
+                body = json.dumps({"event_id": state["seen"][txn]}).encode()
+            else:
+                event_id = f"$evt-{len(state['events']) + 1}"
+                state["events"].append((txn, event_id))
+                state["seen"][txn] = event_id
+                if state["drop_next"]:
+                    state["drop_next"] = False
+                    self.close_connection = True
+                    return
+                body = json.dumps({"event_id": event_id}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt: str, *args: Any) -> None:  # silence
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    monkeypatch.setenv("AGENTTEAMS_MATRIX_URL", f"http://127.0.0.1:{port}")
+    monkeypatch.setenv("AGENTTEAMS_WORKER_MATRIX_TOKEN", "test-token")
+    monkeypatch.setattr(server, "_pull_project", lambda *_a, **_k: True)
+    monkeypatch.setattr(server, "_sync_task", lambda *_a, **_k: True)
+    monkeypatch.setattr(server, "_validate_assignee_membership", lambda *_a, **_k: {"ok": True})
+    return httpd, state
+
+
+def test_send_succeeds_but_response_lost_retry_reuses_txn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Server accepts the first send, client loses the response; the retry
+    must reuse the persisted transaction id so the homeserver deduplicates
+    (no second assignment event), and the task ends up assigned with the
+    original event id."""
+    httpd, state = _make_lost_response_server(monkeypatch)
+    _write_prepared_with_txn(tmp_path)
+    try:
+        first = _delegate(tmp_path, "redep-project-01", WORKER_A)
+        assert first["ok"] is False
+        assert first["retryable"] is True
+        assert first["notification"].get("sent") is False
+        # The event DID reach the room server-side, but the client lost the reply.
+        assert len(state["events"]) == 1
+
+        second = _delegate(tmp_path, "redep-project-01", WORKER_A)
+        assert second["ok"] is True
+        assert second["task"]["status"] == "assigned"
+        assert second["task"]["eventId"] == "$evt-1"
+        assert len(state["events"]) == 1, (
+            "retry must be deduplicated by the same transaction id"
+        )
+    finally:
+        httpd.shutdown()
+
+
+def test_redelegation_rotates_txn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuinely new delegation (different assignee) must NOT reuse the
+    previous attempt's transaction id."""
+    httpd, state = _make_lost_response_server(monkeypatch)
+    state["drop_next"] = False
+    old_txn = "delegate-redep-project-01-aaaaaaaaaaaa"
+    _write_prepared_with_txn(tmp_path, assignee=WORKER_A, txn=old_txn)
+    try:
+        result = _delegate(tmp_path, "redep-project-01", WORKER_B)
+        assert result["ok"] is True
+        assert result["task"]["assigned_to"] == WORKER_B
+        txn_used = state["events"][0][0]
+        assert txn_used != old_txn, "new delegation must rotate the txn nonce"
+        assert re.fullmatch(r"delegate-redep-project-01-[0-9a-f]{12}", txn_used)
+    finally:
+        httpd.shutdown()
