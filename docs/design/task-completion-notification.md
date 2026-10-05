@@ -210,6 +210,46 @@ Routing-salience note: v1 delivers all attention in the task room
 (room @mentions). A dedicated DM step for humans (higher salience) is
 recorded as a follow-up in the PR, not in this change.
 
+### Approvals (`kind=approval`): payload & routing (proposed)
+
+`request_attention` already carries approvals as a first-class kind.
+Wiring a *permission* approval end-to-end (the motivating case:
+delegated coding sessions asking to run a command — see the
+coding-agent delegation discussion, #1340) needs two conventions on
+top of the existing semantics.
+
+**1) Option payload — answers must echo the request's own ids.**
+A permission request is answerable only with one of its own option ids
+(strict echoing). The event carries the choices alongside the
+`question` line:
+
+- `options`: `[{ id, label }]` — the exact ids an answer must echo
+  (e.g. `proceed_once`, `deny`, `allow_once_and_switch_mode`);
+- optional `suggested: <id>` — advisory only, **never auto-applied**
+  (mode-switching options stay human-only);
+- optional `expires_at` — after it the configured timeout policy
+  applies (wait / deny / next responder); an expired request resolves
+  as denied with the reason recorded, not silently.
+
+**2) Routing policy — console-first, room opt-in.**
+Today all attention lands in the task room. For approvals the default
+should be configurable, because prompts typically carry code context:
+
+- `console-first` (recommended default): delivered on the operator's
+  console surface; the room stays untouched unless the operator opts in;
+- `room`: the current path (room @mentions, leader + humans) —
+  opt-in per use;
+- exactly one route per request — no double delivery.
+
+**Answers and audit.** An answer echoes one of the recorded option ids
+(the request's `options` set is the validation set); first responder
+wins; each answer records who / when / which request / whence in the
+audit trail; `accept_task_result` auto-resolution and explicit
+`resolved: true` close the loop as today.
+
+*(Conventions proposed in this change; no behavior change here. Until
+they land, the room-routing note above stays authoritative.)*
+
 ### `PROJECT_COMPLETED` on `complete_project` (v2, sync-first per the 2026-09-14 review)
 
 `complete_project` previously only wrote state; a finished project
