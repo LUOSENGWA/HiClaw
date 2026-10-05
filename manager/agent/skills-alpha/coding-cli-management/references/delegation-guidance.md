@@ -35,6 +35,10 @@ A delegated session is not fire-and-forget. The supervising side should:
 - **Size watch windows for worst case** — saturated local runners can queue sessions for ~10 minutes; an undersized window expires before completion (we missed one). Arm watchers before work starts; treat a "no activity observed" alert as a first-class signal; give long runs a deadline with a fallback chain: completion → timeout → scheduled self-wake → human.
 - **Scheduled runs isolate or share** — default isolated runs (own per-job session; silent — wakes nobody; right for periodic inspection) vs shared runs (delivered into the target session = a real self-wake; required for fallback wake-ups).
 - **Analysis helpers are read-only** — when you summon a second opinion or a two-model committee for root cause, end every prompt with the no-edits suffix ("This is analysis only. Do NOT edit, create, or delete any files. Do NOT write code."); an advisor gives a judgment — it does not drive the work.
+- **Delivery ≠ acceptance ≠ execution — three gates.** A ledger entry is not a delivery: field reports document assignments recorded with no notification event ever emitted, so the worker was never reached and the result was written by the assigner. Require a delivery event for every assignment, a receipt (or worker-side activity evidence) for completion rather than the assigner's word — and keep refusals and "no activity observed" as first-class signals.
+- **Route wakes explicitly.** With more than one orchestrator session live, a wake sent to the default target resumes the wrong session — a "vanished" wake is often a misroute, not a loss. Record the intended target at job creation; keep the owning session derivable from the wake payload, never guessed.
+- **Treat wake jobs as at-least-once.** One-shot jobs have been seen lingering past their fire time and duplicated with identical names. Keep handlers idempotent (see "Claim before acting"), have one-shots auto-expire, clean fired records, and make lost deliveries recoverable — a "mark-after-confirm" shape (the wake is marked delivered only after confirmation) where the platform supports it.
+- **Reset lifecycle state on wake.** Where the platform has an idle-sleep policy, a worker woken after a long idle can be re-slept by the very next idle scan because its idle marker is stale — a wake-to-re-sleep loop. Every wake and ensure-ready path must reset the idle clock: the wake and the lifecycle share the same moment.
 
 ## 3. Approval expectations
 
@@ -52,6 +56,9 @@ Before the first real task:
 - **Auth configured end-to-end** — settings file or environment, including base URL and model; secrets never in desired state (`docs/design/member-runtime-config-contract.md`).
 - **Environment hygiene** — if ambient variables break the runner, pin the invocation in a small wrapper and register that as the runner command.
 - **Network matrix** — on some links, connections are reset selectively by TLS stack generation; use a current stack or a local relay, and document the finding for the deployment.
+- **Placement.** Choose per side: a host-side daemon on the user's machine is the least-effort option (independent lifecycle, natural file locality, survives agent rebuilds); on a managed worker the in-container options are the host-independent ones — a subprocess for one-shot delegated runs, a daemon variant once parallelism matters; use the platform's dedicated node when it offers one. Keep files on mounts/shared volumes, and prefer the shape whose toolchain survives a re-install.
+- **Direction rule for user-local runners.** When the runner lives on the user's machine and the orchestrator in a managed deployment, assume inbound is unavailable (NAT/firewall): the local side must initiate — poll a queue, hold a connection, or run a local relay — and anything it sends out must leave through a surface the managed side accepts (a member-voice relay) until the runner itself has an identity. Membership fixes the voice, not reachability.
+- **Runner egress, not just the orchestration plane.** The chosen placement must satisfy the runner's own model egress: in field testing one runtime reached the provider endpoint directly while the other needed a local relay (TLS stack fingerprinting on the path). Verify egress per placement, not only the orchestration plane.
 
 ## 5. Pitfalls → what to do (field-verified)
 
@@ -77,6 +84,11 @@ Before the first real task:
 | Watchers race on the same completion | claim an occupancy token before acting (idempotent wake handling) |
 | Analysis helper starts editing files | end every analysis prompt with the no-edits suffix |
 | Cold-start handoff repeats old mistakes | carry "what was tried and abandoned" + decisions in the briefing |
+| Wake routed to a default target | record the intended session at job creation; keep the owner derivable from the payload |
+| Duplicate or lingering wake jobs | at-least-once discipline: idempotent claim; auto-expire one-shots; clean fired records; re-deliverable lost wakes |
+| Assignment recorded but never delivered | require a delivery event per assignment; receipts (or worker-side activity) for completion; refusals are signals |
+| A woken worker re-slept immediately | reset the idle marker on wake / ensure-ready paths |
+| Run longer than the watch window | hour-plus runs are normal; size windows for the long tail (~10 min queue observed + long execution) |
 
 ## 6. Related surfaces
 

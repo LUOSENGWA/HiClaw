@@ -14,7 +14,7 @@ When the delegating agent (Manager / Leader / 获授权 Worker) assigns you a ta
 4. Delegate execution to the delegating agent's CLI tool
 5. Review the result
 
-**Operational reference**: [`../../coding-cli-management/references/delegation-guidance.md`](../../coding-cli-management/references/delegation-guidance.md) — task-spec checklist, supervision and steering, approval expectations, preflight checks, and a pitfalls list.
+**Operational reference**: [`../../coding-cli-management/references/delegation-guidance.md`](../../coding-cli-management/references/delegation-guidance.md) — task-spec checklist, supervision and steering (including the delivery and wake contract), approval expectations, preflight checks (including runner placement), and a pitfalls list.
 
 ---
 
