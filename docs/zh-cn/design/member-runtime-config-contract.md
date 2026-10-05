@@ -1,8 +1,8 @@
 # 成员运行时配置契约
 
-本文档定义 AgentTeams 控制器为受管运行时成员写入对象存储的 YAML 配置快照。受管运行时 Worker 与 TeamHarness 插件适配器读取本文件，取代向 `agt` CLI 查询团队与成员事实。
+本文档定义 AgentTeams 控制器为受管运行时成员写入对象存储的 YAML 配置快照。受管运行时 worker 与 TeamHarness 插件适配器读取此文件，而不是查询 `agt` CLI 以获取团队与成员事实。
 
-配置仅供运行时消费。它承载非密期望状态与团队事实。密钥保留在环境变量、挂载文件或服务账户令牌中。
+该配置仅供运行时消费。它承载非密期望状态与团队事实。密钥保留在环境变量、挂载文件或服务账户令牌中。
 
 ## 存储路径
 
@@ -14,10 +14,10 @@ shared/runtime/members/{memberName}/runtime.yaml
 
 ## 范围
 
-- 当成员的非密期望状态或团队事实变更时，控制器写入本文件。
-- QwenPaw worker 轮询本文件，并在运行时内部应用变更后的模型、AgentSpec 包、MCP、通道与团队上下文配置。
-- 对 `runtime=qwenpaw`，控制器不写面向运行时的 `AGENTS.md`、`SOUL.md`、skills、`openclaw.json` 或 `mcporter-servers.json`。
-- AgentSpec 包版本变更会更新本文件，并应由 QwenPaw 在不重启 pod 的情况下应用。
+- 控制器在成员的非密期望状态或团队事实变更时写入此文件。
+- QwenPaw worker 轮询此文件，并在运行时内应用变更后的 model、AgentSpec 包、MCP、通道与团队上下文配置。
+- 对 `runtime=qwenpaw`，控制器不写面向运行时的 `AGENTS.md`、`SOUL.md`、技能、`openclaw.json` 或 `mcporter-servers.json`。
+- AgentSpec 包版本变更会更新此文件，且应由 QwenPaw 在不重启 pod 的前提下应用。
 
 `desired.agentPackage` 是 AgentTeams AgentSpec 包，不是 TeamHarness 插件包。TeamHarness 插件是运行时基础设施；AgentSpec 包是用户部署的 agent 模板与业务能力包。
 
