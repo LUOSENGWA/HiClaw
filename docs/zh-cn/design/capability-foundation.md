@@ -1,4 +1,4 @@
-# Capability Foundation
+# Capability 地基
 
 状态：已实现
 API：`PUT /api/v1/humans/{name}`（新字段） · CRD：`Human.spec.capabilities`
