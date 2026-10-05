@@ -7,7 +7,7 @@ description: "Execute AI coding CLI tools (Claude Code / Gemini CLI / qodercli /
 
 This skill enables the delegating agent (Manager, team Leader, or an authorized Worker) to execute AI coding CLI tools (claude/gemini/qodercli/qwen/opencode) on behalf of Workers. Workers generate precise prompts; the delegating agent runs the CLI in the Worker's workspace and returns the result.
 
-Operational guidance distilled from field operation — task-spec checklist, supervision and steering, approval expectations, preflight checks, and a pitfalls list — lives in [`references/delegation-guidance.md`](references/delegation-guidance.md).
+Operational guidance distilled from field operation — task-spec checklist, supervision and steering (including the delivery and wake contract), approval expectations, preflight checks (including runner placement), and a pitfalls list — lives in [`references/delegation-guidance.md`](references/delegation-guidance.md).
 
 ## Config File
 
