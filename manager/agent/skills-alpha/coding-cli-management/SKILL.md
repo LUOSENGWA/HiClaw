@@ -24,6 +24,8 @@ Path: `~/coding-cli-config.json`
 | `false`   | any   | Admin declined; use normal task flow |
 | `true`    | `"claude"` / `"gemini"` / `"qodercli"` / `"qwen"` / `"opencode"` | Active — use this CLI |
 
+**Runner notes (Qwen Code / OpenCode).** Headless invocations used by `run-coding-cli.sh`: `qwen --yolo "<prompt>"` and `opencode run --auto "<prompt>"`. Config surfaces: `~/.qwen` (`settings.json` `security.auth`, or provider env) and `~/.config/opencode` (`opencode auth` / provider config). Both runners were verified with a headless round trip before inclusion.
+
 ---
 
 ## Step 1: First-Time Detection (before assigning a coding task)
