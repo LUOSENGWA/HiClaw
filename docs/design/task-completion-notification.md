@@ -213,42 +213,45 @@ recorded as a follow-up in the PR, not in this change.
 ### Approvals (`kind=approval`): payload & routing (proposed)
 
 `request_attention` already carries approvals as a first-class kind.
-Wiring a *permission* approval end-to-end (the motivating case:
-delegated coding sessions asking to run a command — see the
-coding-agent delegation discussion, #1340) needs two conventions on
-top of the existing semantics.
+Wiring a *permission* approval end-to-end — the motivating case is a
+delegated coding session asking to run a command (see the coding-agent
+delegation discussion, #1340) — requires two conventions on top of
+the existing semantics.
 
 **1) Option payload — answers must echo the request's own ids.**
-A permission request is answerable only with one of its own option ids
-(strict echoing). The event carries the choices alongside the
-`question` line:
+A permission request can only be answered with one of its own option
+ids (strict echoing). The event therefore carries the choices
+alongside the `question` line:
 
 - `options`: `[{ id, label }]` — the exact ids an answer must echo
   (e.g. `proceed_once`, `deny`, `allow_once_and_switch_mode`);
 - optional `suggested: <id>` — advisory only, **never auto-applied**
   (mode-switching options stay human-only);
-- optional `expires_at` — after it the configured timeout policy
-  applies (wait / deny / next responder); an expired request resolves
-  as denied with the reason recorded, not silently.
+- optional `expires_at` — after expiry, the configured timeout policy
+  applies (wait / deny / hand over to the next responder); an expired
+  request resolves as denied with the reason recorded, never silently.
 
-**2) Routing policy — console-first, room opt-in.**
-Today all attention lands in the task room. For approvals the default
-should be configurable, because prompts typically carry code context:
+**2) Routing policy — console-first by default; the room is opt-in.**
+All attention is currently delivered to the task room. Because
+approval prompts typically carry code context, their default routing
+should remain configurable:
 
 - `console-first` (recommended default): delivered on the operator's
-  console surface; the room stays untouched unless the operator opts in;
-- `room`: the current path (room @mentions, leader + humans) —
-  opt-in per use;
+  console surface; the room is left untouched unless the operator opts
+  in;
+- `room`: the existing path (room @mentions — leader and human
+  members), enabled per use;
 - exactly one route per request — no double delivery.
 
 **Answers and audit.** An answer echoes one of the recorded option ids
-(the request's `options` set is the validation set); first responder
-wins; each answer records who / when / which request / whence in the
-audit trail; `accept_task_result` auto-resolution and explicit
-`resolved: true` close the loop as today.
+(that set is the validation set); the first responder wins; each
+answer records who / when / which request / on what basis in the audit
+trail. `accept_task_result` auto-resolution and explicit
+`resolved: true` continue to close the loop as before.
 
-*(Conventions proposed in this change; no behavior change here. Until
-they land, the room-routing note above stays authoritative.)*
+*(The conventions above are proposed in this change; no behavior
+change is included. Until they land, the room-routing note above
+remains authoritative.)*
 
 ### `PROJECT_COMPLETED` on `complete_project` (v2, sync-first per the 2026-09-14 review)
 
