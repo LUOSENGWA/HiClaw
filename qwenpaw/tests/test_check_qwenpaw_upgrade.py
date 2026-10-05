@@ -14,6 +14,7 @@ import json
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import zipfile
 from pathlib import Path
 
@@ -21,6 +22,20 @@ REPO = Path(__file__).resolve().parents[1]
 CHECKER = REPO / "scripts" / "check_qwenpaw_upgrade.py"
 
 OLD_LINE = "                await self._card_store.save(card)\n"
+
+# Verbatim copy of the replacement block in
+# scripts/patch-qwenpaw-driver-policy-reload.py (its ``new = (...)`` literal).
+# MANAGER_NEW must contain this exact text for the checker's whole-block
+# integration check to pass.
+NEW_BLOCK = (
+    "                # Policy may change while the replacement handler initializes.\n"
+    "                # Read it under the same lock as sync_driver_policy; never\n"
+    "                # write the stale card back over newer persisted configuration.\n"
+    "                latest = await self._card_store.load_path(path)\n"
+    "                card.policy = latest.policy\n"
+    "                if handler is not None:\n"
+    "                    handler.set_policy(card.policy)\n"
+)
 
 MANAGER_OLD = (
     "class DriverManager:\n"
@@ -34,6 +49,19 @@ MANAGER_OLD = (
 )
 
 MANAGER_NEW = (
+    "class DriverManager:\n"
+    "    async def reload_driver(self, name):\n"
+    "        card = None\n"
+    + NEW_BLOCK
+    + "        return card\n"
+    "\n"
+    "    async def refresh_driver(self, name):\n"
+    "        return None\n"
+)
+
+# Shape of a partially applied patch: marker comment and first code line
+# present, but the rest of the replacement block missing.
+MANAGER_PARTIAL = (
     "class DriverManager:\n"
     "    async def reload_driver(self, name):\n"
     "        card = None\n"
@@ -66,7 +94,14 @@ def load_checker():
     return module
 
 
+def _render_literal(line: str) -> str:
+    escaped = line.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'        "{escaped}"'
+
+
 def patch_script_text(guard: str = "2.2.1") -> str:
+    new_literals = "\n".join(
+        _render_literal(line) for line in NEW_BLOCK.splitlines(keepends=True))
     return (
         '"""Fake compatibility fix."""\n'
         "from importlib.metadata import distribution\n"
@@ -77,13 +112,16 @@ def patch_script_text(guard: str = "2.2.1") -> str:
         f'    if package.version != "{guard}":\n'
         '        raise RuntimeError("review")\n'
         f"    old = {json.dumps(OLD_LINE)}\n"
-        '    new = "..."\n'
+        "    new = (\n"
+        f"{new_literals}\n"
+        "    )\n"
         "    return old, new\n"
     )
 
 
 def build_repo(root: Path, gate: str = "2.2.1", dockerfile: str = "2.2.1",
-               manager: str = "2.2.1", pyproject: str = "2.2.1") -> Path:
+               manager: str = "2.2.1", pyproject: str = "2.2.1",
+               guard: str = "2.2.1") -> Path:
     qwenpaw = root / "qwenpaw"
     (qwenpaw / "src" / "qwenpaw_worker").mkdir(parents=True)
     (qwenpaw / "scripts").mkdir()
@@ -105,7 +143,7 @@ def build_repo(root: Path, gate: str = "2.2.1", dockerfile: str = "2.2.1",
         encoding="utf-8",
     )
     (qwenpaw / "scripts" / "patch-qwenpaw-driver-policy-reload.py").write_text(
-        patch_script_text(), encoding="utf-8")
+        patch_script_text(guard), encoding="utf-8")
     (qwenpaw / "tests" / "test_runtime_dependencies.py").write_text(
         'assert "qwenpaw==2.2.1" in deps\n', encoding="utf-8")
     return qwenpaw
@@ -250,6 +288,83 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(set(payload), {"target", "qwenpaw_dir", "overall", "exit_code", "checks"})
         for item in payload["checks"]:
             self.assertEqual(set(item), {"id", "name", "status", "evidence", "advice"})
+
+    # ------------------------------------------------------------------
+    # Round-2 regressions (AgentTeams#1343): the build-time patch contract
+    # must be enforced, and explicit wheel-acquisition failures must not be
+    # swallowed into a PASS/SKIP.
+    # ------------------------------------------------------------------
+
+    def test_patch_guard_lag_fails(self):
+        # Maintainer repro: every pin already bumped to the target, only the
+        # patch guard still lags - C3 must FAIL even though the old pattern
+        # is still applicable in the wheel's source.
+        qwenpaw = build_repo(self.root, gate="2.2.2", dockerfile="2.2.2",
+                             manager="2.2.2", pyproject="2.2.2")
+        wheel = build_wheel(Path(self.root), "2.2.2", MANAGER_OLD)
+        code, payload = run_json(self.module, [
+            "--target", "2.2.2", "--qwenpaw-dir", str(qwenpaw), "--wheel", str(wheel),
+        ])
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["overall"], "FAIL")
+        self.assertEqual(check_by_id(payload, "C1")["status"], "PASS")
+        self.assertEqual(check_by_id(payload, "C2")["status"], "PASS")
+        patch = check_by_id(payload, "C3")
+        self.assertEqual(patch["status"], "FAIL")
+        self.assertIn('guard expects "2.2.1"', patch["evidence"])
+        self.assertIn("2.2.2", patch["evidence"])
+
+    def test_patch_partial_replacement_not_integrated(self):
+        qwenpaw = build_repo(self.root)
+        wheel = build_wheel(Path(self.root), "2.2.1", MANAGER_PARTIAL)
+        code, payload = run_json(self.module, [
+            "--target", "2.2.1", "--qwenpaw-dir", str(qwenpaw), "--wheel", str(wheel),
+        ])
+        self.assertEqual(code, 1)
+        patch = check_by_id(payload, "C3")
+        self.assertEqual(patch["status"], "FAIL")
+        self.assertIn("marker present", patch["evidence"])
+        self.assertNotIn("already present", patch["evidence"])
+
+    def test_explicit_missing_wheel_fails(self):
+        qwenpaw = build_repo(self.root, gate="2.2.2", dockerfile="2.2.2",
+                             manager="2.2.2", pyproject="2.2.2")
+        code, payload = run_json(self.module, [
+            "--target", "2.2.2", "--qwenpaw-dir", str(qwenpaw),
+            "--wheel", "/nonexistent.whl",
+        ])
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["overall"], "FAIL")
+        patch = check_by_id(payload, "C3")
+        self.assertEqual(patch["status"], "FAIL")
+        self.assertIn("not found", patch["evidence"])
+
+    def test_empty_wheelhouse_fails(self):
+        qwenpaw = build_repo(self.root, gate="2.2.2", dockerfile="2.2.2",
+                             manager="2.2.2", pyproject="2.2.2")
+        house = self.root / "empty-wheelhouse"
+        house.mkdir()
+        code, payload = run_json(self.module, [
+            "--target", "2.2.2", "--qwenpaw-dir", str(qwenpaw),
+            "--wheelhouse", str(house),
+        ])
+        self.assertEqual(code, 1)
+        patch = check_by_id(payload, "C3")
+        self.assertEqual(patch["status"], "FAIL")
+        self.assertIn("no qwenpaw-2.2.2-*.whl", patch["evidence"])
+
+    def test_download_failure_fails(self):
+        qwenpaw = build_repo(self.root, gate="2.2.2", dockerfile="2.2.2",
+                             manager="2.2.2", pyproject="2.2.2")
+        with unittest.mock.patch.object(self.module, "_http_json",
+                                        side_effect=OSError("network disabled in tests")):
+            code, payload = run_json(self.module, [
+                "--target", "2.2.2", "--qwenpaw-dir", str(qwenpaw), "--download",
+            ])
+        self.assertEqual(code, 1)
+        patch = check_by_id(payload, "C3")
+        self.assertEqual(patch["status"], "FAIL")
+        self.assertIn("--download failed", patch["evidence"])
 
 
 if __name__ == "__main__":

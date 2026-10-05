@@ -163,7 +163,58 @@ def check_pins(qwenpaw_dir: Path, target: str) -> Check:
 # --------------------------------------------------------------------------- C3
 
 
-def _parse_patch_contract(patch_text: str) -> tuple[str | None, str | None]:
+def _decode_escaped(raw: str) -> str | None:
+    try:
+        return raw.encode("utf-8").decode("unicode_escape")
+    except UnicodeDecodeError:
+        return None
+
+
+def _find_closing_paren(text: str, open_index: int) -> int:
+    """Index of the ')' matching the '(' at open_index (string-aware), else -1."""
+    depth = 0
+    pos = open_index
+    in_string = False
+    while pos < len(text):
+        ch = text[pos]
+        if in_string:
+            if ch == "\\":
+                pos += 2
+                continue
+            if ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return pos
+        pos += 1
+    return -1
+
+
+def _parse_new_block(patch_text: str) -> str | None:
+    """The patch's ``new = (...)`` block: string literals concatenated, or None."""
+    marker = patch_text.find("new = (")
+    if marker < 0:
+        return None
+    open_index = patch_text.index("(", marker)
+    close_index = _find_closing_paren(patch_text, open_index)
+    if close_index < 0:
+        return None
+    segment = patch_text[open_index + 1:close_index]
+    parts: list[str] = []
+    for match in re.finditer(r'"((?:[^"\\]|\\.)*)"', segment):
+        decoded = _decode_escaped(match.group(1))
+        if decoded is None:
+            return None
+        parts.append(decoded)
+    return "".join(parts) if parts else None
+
+
+def _parse_patch_contract(patch_text: str) -> tuple[str | None, str | None, str | None]:
     guard = None
     match = re.search(r'if package\.version != "([^"]+)":', patch_text)
     if match:
@@ -172,19 +223,11 @@ def _parse_patch_contract(patch_text: str) -> tuple[str | None, str | None]:
     match = re.search(r'old = "((?:[^"\\]|\\.)*)"', patch_text)
     if match:
         raw = match.group(1)
-        try:
-            old_line = raw.encode("utf-8").decode("unicode_escape")
-        except UnicodeDecodeError:
+        old_line = _decode_escaped(raw)
+        if old_line is None:
             old_line = raw
-    return guard, old_line
-
-
-def _extract_method(text: str, start_sig: str, end_sig: str) -> str | None:
-    start = text.find(start_sig)
-    if start < 0:
-        return None
-    end = text.find(end_sig, start + len(start_sig))
-    return text[start:end] if end > start else text[start:]
+    new_block = _parse_new_block(patch_text)
+    return guard, old_line, new_block
 
 
 def _wheel_manager_source(wheel: Path) -> tuple[str | None, str | None]:
@@ -204,48 +247,58 @@ def _wheel_manager_source(wheel: Path) -> tuple[str | None, str | None]:
 
 
 def _resolve_wheel(target: str, args: argparse.Namespace,
-                   temp_dir: Path) -> tuple[Path | None, str]:
+                   temp_dir: Path) -> tuple[Path | None, str, bool]:
+    """Resolve the wheel to inspect.
+
+    Returns (path, note, error). ``error`` is True when the caller explicitly
+    asked for a wheel (--wheel / --wheelhouse / --download) and that request
+    failed; the check must then report FAIL instead of silently skipping.
+    """
     if args.wheel:
         path = Path(args.wheel).resolve()
         if path.is_file():
-            return path, f"--wheel {path}"
-        return None, f"--wheel {path} not found"
+            return path, f"--wheel {path}", False
+        return None, f"--wheel {path} not found", True
     if args.wheelhouse:
         house = Path(args.wheelhouse).resolve()
         candidates = sorted(house.glob(f"qwenpaw-{target}-*.whl"))
         if candidates:
-            return candidates[-1], f"--wheelhouse {house}"
-        return None, f"no qwenpaw-{target}-*.whl in {house}"
+            return candidates[-1], f"--wheelhouse {house}", False
+        return None, f"no qwenpaw-{target}-*.whl in {house}", True
     if args.download:
         try:
             data = _http_json(PYPI_JSON_URL.format(version=target))
         except Exception as exc:  # noqa: BLE001 - report, do not crash
-            return None, f"--download failed: {exc}"
+            return None, f"--download failed: {exc}", True
         wheels = [item for item in (data.get("urls") or []) if item.get("packagetype") == "bdist_wheel"]
         pick = next((item for item in wheels if item["filename"].endswith("py3-none-any.whl")),
                     wheels[0] if wheels else None)
         if pick is None:
-            return None, f"no wheel published for {target}"
+            return None, f"no wheel published for {target}", True
         dest = temp_dir / pick["filename"]
         try:
             req = urllib.request.Request(pick["url"], headers={"User-Agent": "qwenpaw-upgrade-preflight"})
             with urllib.request.urlopen(req, timeout=300) as resp, open(dest, "wb") as handle:
                 shutil.copyfileobj(resp, handle)
         except Exception as exc:  # noqa: BLE001
-            return None, f"--download failed: {exc}"
-        return dest, f"--download {dest.name}"
-    return None, "no wheel provided (use --wheel/--wheelhouse/--download)"
+            return None, f"--download failed: {exc}", True
+        return dest, f"--download {dest.name}", False
+    return None, "no wheel provided (use --wheel/--wheelhouse/--download)", False
 
 
 def check_patch(qwenpaw_dir: Path, target: str, wheel: Path | None,
-                wheel_note: str) -> Check:
+                wheel_note: str, wheel_error: bool = False) -> Check:
     patch_path = qwenpaw_dir / PATCH_SCRIPT_REL
     patch_text = _read(patch_path)
     if patch_text is None:
         return Check("C3", "compat patch", STATUS_SKIP,
                      evidence=f"{PATCH_SCRIPT_REL} not found")
-    guard, old_line = _parse_patch_contract(patch_text)
+    guard, old_line, new_block = _parse_patch_contract(patch_text)
     if wheel is None:
+        if wheel_error:
+            return Check("C3", "compat patch", STATUS_FAIL,
+                         evidence=f"wheel unavailable: {wheel_note}",
+                         advice="fix the wheel input or provide the target wheel via --wheel/--wheelhouse")
         return Check("C3", "compat patch", STATUS_SKIP,
                      evidence=f"wheel unavailable: {wheel_note}",
                      advice="provide --wheel/--wheelhouse (or --download) to check patch applicability offline")
@@ -261,38 +314,72 @@ def check_patch(qwenpaw_dir: Path, target: str, wheel: Path | None,
         return Check("C3", "compat patch", STATUS_FAIL,
                      evidence=f"wheel version {wheel_version} != target {target}")
 
-    notes = [f"wheel {wheel.name}"]
-    if guard is not None:
-        notes.append(f'patch guard expects "{guard}"')
-    note = "; ".join(notes)
-
-    if PATCH_NEW_MARKER in manager_source:
-        check = Check("C3", "compat patch", STATUS_PASS,
-                      evidence=f"replacement already present (patch integrated upstream). {note}")
-    else:
-        method = _extract_method(manager_source,
-                                 "    async def reload_driver(",
-                                 "    async def refresh_driver(")
-        scope = method if method is not None else manager_source
-        scope_name = "reload_driver()" if method is not None else "manager.py (method not isolated)"
-        if old_line is None:
-            check = Check("C3", "compat patch", STATUS_WARN,
-                          evidence=f"could not parse the old pattern from {PATCH_SCRIPT_REL}; {note}",
-                          advice="review patch-qwenpaw-driver-policy-reload.py manually")
-        else:
-            count = scope.count(old_line)
-            if count == 1:
-                check = Check("C3", "compat patch", STATUS_PASS,
-                              evidence=f"target pattern present once in {scope_name}; patch can be applied. {note}")
-            else:
-                check = Check("C3", "compat patch", STATUS_FAIL,
-                              evidence=f"target pattern occurs {count}x in {scope_name}; patch needs review. {note}",
-                              advice="rebase/refresh the Driver-reload patch for the target version")
-
+    # Build-time patch contract: the script refuses to run for any other
+    # qwenpaw version, so a stale guard breaks the build regardless of what
+    # the target's manager.py looks like.
     if guard is not None and guard != target:
-        check.advice = (check.advice + " " if check.advice else "") + \
-            f'update the patch version guard (currently "{guard}") when bumping to {target}'
-    return check
+        return Check("C3", "compat patch", STATUS_FAIL,
+                     evidence=(f'patch guard expects "{guard}" but target is "{target}" — '
+                               f"the patch raises for every other version and cannot run as checked; "
+                               f"wheel {wheel.name}"),
+                     advice=(f"update the guard in {PATCH_SCRIPT_REL} when bumping to {target} and "
+                             "re-verify the old/new patterns; retire the patch script if the "
+                             "replacement block is already integrated upstream"))
+
+    # The patch slices manager.py between two method signatures and raises
+    # ValueError when either is missing — there is no whole-file fallback.
+    start = manager_source.find("    async def reload_driver(")
+    if start < 0:
+        return Check("C3", "compat patch", STATUS_FAIL,
+                     evidence=(f"the patch would raise ValueError (reload_driver boundary not found) "
+                               f"in {wheel.name}"),
+                     advice="the target manager.py no longer matches the patch layout; review the patch")
+    end = manager_source.find("    async def refresh_driver(", start)
+    if end < 0:
+        return Check("C3", "compat patch", STATUS_FAIL,
+                     evidence=(f"the patch would raise ValueError (refresh_driver boundary not found) "
+                               f"in {wheel.name}"),
+                     advice="the target manager.py no longer matches the patch layout; review the patch")
+    method = manager_source[start:end]
+    note = f"wheel {wheel.name}"
+
+    if new_block is not None and new_block in method:
+        return Check("C3", "compat patch", STATUS_PASS,
+                     evidence=f"replacement already present (patch integrated upstream). {note}")
+    if PATCH_NEW_MARKER in method:
+        if new_block is not None:
+            return Check("C3", "compat patch", STATUS_FAIL,
+                         evidence=(f"marker present but the full replacement is not inside reload_driver - "
+                                   f"patch partially applied or upstream block changed. {note}"),
+                         advice="rebase/refresh the Driver-reload patch for the target version")
+        return Check("C3", "compat patch", STATUS_WARN,
+                     evidence=(f"replacement marker present in {wheel.name} but the full replacement "
+                               f"block could not be parsed from {PATCH_SCRIPT_REL} - marker-level check "
+                               f"only. {note}"),
+                     advice="review the patch manually; the whole-block verification is unavailable")
+    if old_line is None:
+        return Check("C3", "compat patch", STATUS_WARN,
+                     evidence=f"could not parse the old pattern from {PATCH_SCRIPT_REL}; {note}",
+                     advice="review patch-qwenpaw-driver-policy-reload.py manually")
+    count = method.count(old_line)
+    if count == 1:
+        if new_block is None:
+            return Check("C3", "compat patch", STATUS_WARN,
+                         evidence=(f"target pattern present once in reload_driver() but the full "
+                                   f"replacement block could not be parsed from {PATCH_SCRIPT_REL} - "
+                                   f"applicability check only. {note}"),
+                         advice="review the patch manually; the whole-block verification is unavailable")
+        return Check("C3", "compat patch", STATUS_PASS,
+                     evidence=f"target pattern present once in reload_driver(); patch can be applied. {note}")
+    if count == 0:
+        return Check("C3", "compat patch", STATUS_FAIL,
+                     evidence=(f"target pattern occurs 0x in reload_driver(); target pattern absent - "
+                               f"the patch cannot be applied. {note}"),
+                     advice="rebase/refresh the Driver-reload patch for the target version")
+    return Check("C3", "compat patch", STATUS_FAIL,
+                 evidence=(f"target pattern occurs {count}x in reload_driver(); ambiguous - "
+                           f"the patch needs review. {note}"),
+                 advice="rebase/refresh the Driver-reload patch for the target version")
 
 
 # --------------------------------------------------------------------------- C4
@@ -366,8 +453,8 @@ def main(argv: list[str] | None = None) -> int:
         check_pins(qwenpaw_dir, target),
     ]
     with tempfile.TemporaryDirectory(prefix="qwenpaw-preflight-") as temp:
-        wheel, wheel_note = _resolve_wheel(target, args, Path(temp))
-        checks.append(check_patch(qwenpaw_dir, target, wheel, wheel_note))
+        wheel, wheel_note, wheel_error = _resolve_wheel(target, args, Path(temp))
+        checks.append(check_patch(qwenpaw_dir, target, wheel, wheel_note, wheel_error))
         if args.check_deps:
             checks.append(check_deps(target))
         else:
