@@ -133,11 +133,6 @@ func (h *CheckpointHandler) proxyCheckpoint(w http.ResponseWriter, r *http.Reque
 		writeK8sError(w, "get worker checkpoints", err)
 		return
 	}
-	// runtime-aware: checkpoint inspection is qwenpaw-specific.
-	if rt := worker.Spec.Runtime; rt != "" && rt != "qwenpaw" {
-		httputil.WriteError(w, http.StatusBadRequest, "worker checkpoints are only supported for qwenpaw workers")
-		return
-	}
 	// Resolve the owning team for the scoped-caller check (same chain as
 	// ResourceHandler.GetWorker: standalone workers hide as 404). Note:
 	// findTeamMember's second return value is the member (worker) name,
@@ -155,6 +150,14 @@ func (h *CheckpointHandler) proxyCheckpoint(w http.ResponseWriter, r *http.Reque
 		(caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) &&
 		!caller.TeamMatches(teamName) {
 		httputil.WriteError(w, http.StatusNotFound, "worker not found")
+		return
+	}
+
+	// runtime-aware: checkpoint inspection is qwenpaw-specific. This runs
+	// after the team-scope check above so an out-of-scope caller sees 404
+	// (existence hidden) regardless of the worker's runtime.
+	if rt := worker.Spec.Runtime; rt != "" && rt != "qwenpaw" {
+		httputil.WriteError(w, http.StatusBadRequest, "worker checkpoints are only supported for qwenpaw workers")
 		return
 	}
 

@@ -168,11 +168,6 @@ func (h *ApprovalHandler) approvalScope(w http.ResponseWriter, r *http.Request, 
 		writeK8sError(w, "get worker approval", err)
 		return "", false
 	}
-	// runtime-aware: tool approval is qwenpaw-specific.
-	if rt := worker.Spec.Runtime; rt != "" && rt != "qwenpaw" {
-		httputil.WriteError(w, http.StatusBadRequest, "tool approval is only supported for qwenpaw workers")
-		return "", false
-	}
 	// findTeamMember's second return value is the member (worker) name,
 	// not the team name — the scope check compares against the Team CR
 	// name (first return value), the same chain as GetWorker.
@@ -199,6 +194,13 @@ func (h *ApprovalHandler) approvalScope(w http.ResponseWriter, r *http.Request, 
 			httputil.WriteError(w, http.StatusNotFound, "worker not found")
 			return "", false
 		}
+	}
+	// runtime-aware: tool approval is qwenpaw-specific. This runs after the
+	// team-scope check above so an out-of-scope caller sees 404 (existence
+	// hidden) regardless of the worker's runtime.
+	if rt := worker.Spec.Runtime; rt != "" && rt != "qwenpaw" {
+		httputil.WriteError(w, http.StatusBadRequest, "tool approval is only supported for qwenpaw workers")
+		return "", false
 	}
 	return h.workerBaseURL(name, worker.Spec.Env), true
 }

@@ -324,11 +324,6 @@ func (h *WorkspaceFilesHandler) proxyWorkspaceFiles(w http.ResponseWriter, r *ht
 		writeK8sError(w, "get worker workspace files", err)
 		return
 	}
-	// runtime-aware: workspace file inspection is qwenpaw-specific.
-	if rt := worker.Spec.Runtime; rt != "" && rt != "qwenpaw" {
-		httputil.WriteError(w, http.StatusBadRequest, "workspace files are only supported for qwenpaw workers")
-		return
-	}
 	// Resolve the owning team for the scoped-caller check (same chain as
 	// ResourceHandler.GetWorker and the checkpoint proxy: standalone
 	// workers hide as 404 for scoped callers).
@@ -348,6 +343,14 @@ func (h *WorkspaceFilesHandler) proxyWorkspaceFiles(w http.ResponseWriter, r *ht
 		(caller.Role == authpkg.RoleTeamLeader || caller.Role == authpkg.RoleHuman) &&
 		!caller.TeamMatches(teamName) {
 		httputil.WriteError(w, http.StatusNotFound, "worker not found")
+		return
+	}
+
+	// runtime-aware: workspace file inspection is qwenpaw-specific. This
+	// runs after the team-scope check above so an out-of-scope caller sees
+	// 404 (existence hidden) regardless of the worker's runtime.
+	if rt := worker.Spec.Runtime; rt != "" && rt != "qwenpaw" {
+		httputil.WriteError(w, http.StatusBadRequest, "workspace files are only supported for qwenpaw workers")
 		return
 	}
 
@@ -473,11 +476,6 @@ func (h *WorkspaceFilesHandler) proxyWorkspaceFileWrite(w http.ResponseWriter, r
 		writeK8sError(w, "write worker workspace file", err)
 		return
 	}
-	// runtime-aware: workspace file inspection is qwenpaw-specific.
-	if rt := worker.Spec.Runtime; rt != "" && rt != "qwenpaw" {
-		httputil.WriteError(w, http.StatusBadRequest, "workspace files are only supported for qwenpaw workers")
-		return
-	}
 	// Same team-scope chain as the read path: findTeamMember's second return
 	// value is the member name, not the team name — the scope check must
 	// compare against the Team CR name.
@@ -501,6 +499,14 @@ func (h *WorkspaceFilesHandler) proxyWorkspaceFileWrite(w http.ResponseWriter, r
 			return
 		}
 	}
+	// runtime-aware: workspace file inspection is qwenpaw-specific. This
+	// runs after the team-scope check above so an out-of-scope caller sees
+	// 404 (existence hidden) regardless of the worker's runtime.
+	if rt := worker.Spec.Runtime; rt != "" && rt != "qwenpaw" {
+		httputil.WriteError(w, http.StatusBadRequest, "workspace files are only supported for qwenpaw workers")
+		return
+	}
+
 	// Write-role boundary (see the function comment).
 	switch caller.Role {
 	case authpkg.RoleAdmin, authpkg.RoleManager:
