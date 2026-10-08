@@ -2591,8 +2591,28 @@ def _filesync_remote_mtime(
 ) -> tuple[datetime.datetime | None, str | None, str | None]:
     """Probe the remote object before a single-file push.
 
-    Stale-overwrite guard (2026-09-21 incident: a stale local view clobbered
-    newer MinIO state). Returns (mtime, raw, warning):
+    Best-effort freshness guard (2026-09-21 incident: a stale local view
+    clobbered newer MinIO state).  The comparison is against the local
+    file's *last edit time*, not the remote version that file was derived
+    from, so this is scoped as a check for unedited (synced) local copies.
+
+    Known limitations (documented, not enforced here):
+
+    - **Stale-read/edit/push**: if a local copy is pulled (v1), a newer
+      remote version is published (v2), and the local copy is then edited
+      *after* that remote write, the local mtime is newer and the guard
+      permits the overwrite.  A version-baseline or conditional-put check
+      is required to close that case; tracked as a follow-up.
+    - **Probe failure is fail-open by design**: the guard is a freshness
+      hint, not a write lock.  When the remote cannot be stat'ed the push
+      proceeds and the reason is surfaced via ``warning``; blocking on an
+      unavailable probe would make filesync unusable during transient
+      MinIO outages, while the guarded incident class (known-stale local
+      view) is unaffected by probe failures.
+    - **Not atomic**: stat and cp are separate steps (TOCTOU); this is not
+      a concurrent-write lock.
+
+    Returns (mtime, raw, warning):
 
     - remote absent          -> (None, None, None): a normal first push
     - probe/parse failed     -> (None, None, reason): push through, surface reason

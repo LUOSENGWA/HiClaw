@@ -188,6 +188,35 @@ def test_push_allows_absent_remote_without_warning(
     assert "warning" not in result
 
 
+def test_push_stale_edited_local_passes_guard_documented_limitation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stale-read/edit/push sequence (documented limitation, pinned).
+
+    Timeline: A pulls v1 (local mtime = BASE); B publishes v2 to the
+    remote (remote lastModified = BASE + 100); A then edits its stale v1
+    copy (local mtime = BASE + 200, *after* B's write).  The guard
+    compares the local last edit time against the remote write time and
+    sees local-newer, so it permits the push — overwriting v2.
+
+    Closing this case requires a recorded remote baseline/version or a
+    conditional put (follow-up); this test pins the current best-effort
+    behavior for unedited copies and makes the gap explicit.
+    """
+    runner = McRunner(stat_json=_completed(0, stdout=json.dumps({"lastModified": _iso(BASE + 100)})))
+    monkeypatch.setattr(server.subprocess, "run", runner)
+    _write_local(tmp_path, BASE + 200)
+
+    result = _push(tmp_path)
+
+    # Current behavior: the guard passes (local edit is newer than the
+    # remote write) and the overwrite proceeds.  Do NOT change this to a
+    # rejection without also implementing the baseline/version follow-up.
+    assert result["ok"] is True
+    assert len(runner.cp_calls) == 1
+    assert "warning" not in result
+
+
 def test_push_probe_failure_passes_through_with_warning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
