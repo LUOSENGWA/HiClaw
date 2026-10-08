@@ -113,7 +113,29 @@ A delegated session is not fire-and-forget. The supervising side should:
 - **Delivery ≠ acceptance ≠ execution — three gates.** A ledger entry is not a delivery: field reports document assignments recorded with no notification event ever emitted, so the worker was never reached and the result was written by the assigner. Require a delivery event for every assignment, a receipt (or worker-side activity evidence) for completion rather than the assigner's word — and keep refusals and "no activity observed" as first-class signals.
 - **Route wakes explicitly.** With more than one orchestrator session live, a wake sent to the default target resumes the wrong session — a "vanished" wake is often a misroute, not a loss. Record the intended target at job creation; keep the owning session derivable from the wake payload, never guessed.
 - **Treat wake jobs as at-least-once.** One-shot jobs have been seen lingering past their fire time and duplicated with identical names. Keep handlers idempotent (see "Claim before acting"), have one-shots auto-expire, clean fired records, and make lost deliveries recoverable — a "mark-after-confirm" shape (the wake is marked delivered only after confirmation) where the platform supports it.
-- **Reset lifecycle state on wake.** Where the platform has an idle-sleep policy, a worker woken after a long idle can be re-slept by the very next idle scan because its idle marker is stale — a wake-to-re-sleep loop. Every wake and ensure-ready path must reset the idle clock: the wake and the lifecycle share the same moment.
+- **Reset lifecycle state on wake.** Where the platform has an idle-sleep policy, a worker woken after a long idle can be re-slept by the very next idle scan because its idle marker is stale — a wake-to-re-sleep loop. Every wake and ensure-ready path must reset the idle clock: the wake and the lifecycle share the same moment. The platform's own wake/ensure-ready paths now reset the marker upstream (#1352, closing the framework half of the #1239 DEF-001 report); keep this as a contract for custom wake paths and verify the deployed version contains the fix.
+
+### Wake delivery and relay
+
+The supervisor's completion signal must reach the orchestrating agent as a wake. Field-tested properties of the delivery path:
+
+- **Busy semantics are per-surface — probe, don't assume.** A task/submission API typically *queues* when busy, while a direct injection surface may *refuse* (HTTP 409). Latency when idle is seconds; when busy it is "next available turn". For refusing surfaces, the notification layer must retry with backoff or route through a queue-capable path.
+- **The wake must come from a member's voice.** Runners have no room identity, and a message does not wake its own author (own-skip) — so when a relay is needed, the @mention leg must be spoken by a member. Observed patterns, in increasing cost:
+  - **A (recommended).** Inject the notification into the delegating agent's own inbound surface using the room's session context; the agent wakes in that context and its reply posts back to the room as the agent itself — where the @mention wakes the next actor. The runner stays anonymous.
+  - **B.** Post the room message directly as the agent (via its credentials) — enough when only *others* need waking.
+  - **C.** Route through a coordinator/manager identity that @mentions the agent.
+  - **D.** A dedicated bridge account that joins rooms and @mentions on behalf of runners (scale-up).
+- **Cross-boundary reachability.** Same container/host: loopback, no extra auth. Host → agent container: the published port is the path (bridge IPs may not be routable), and the injection path must carry the **target agent scope** — without it the request silently lands on the default agent. Cross-node: routing + auth; otherwise degrade to the member-voice relay above.
+- **Identity upgrade path (orthogonal axis).** Pure delegation (no member identity) and declared-member relaying are zero-cost today. The platform's current main also provisions an edge-worker form — full member treatment minus the container: real Matrix identity, personal/team rooms, allowlists, workspace, and a projected runtime file carrying the runner's own credentials — with **zero upstream changes**; the managed-runtime direction remains deferred (per #1357). Evaluate a rung when a concrete requirement appears, not before.
+
+### Governed runners and injected requests
+
+A runner operating under workspace governance will refuse injected work — treat refusal as a feature, not a fault:
+
+- **Why it refuses.** An instruction appended after a memory/context block reads as smuggled content, not a user message; external side effects additionally require explicit authorization. In field testing a governed runner refused twice on exactly these grounds, then — once the request was re-sent as a standalone, authorized, verifiable message — verified the script, asked one clarifying question, and executed.
+- **Design implications.** Wake/notification messages must be *standalone and attributed* (who sent it, under what authority, exactly what to do) and *verifiable* (let the agent inspect what it is asked to do). Platform-level provenance marking materially helps agents distinguish notifications from smuggled content.
+- **Refusal is a signal.** Surface it back — it tells you what authorization or context is missing. Never blind-retry.
+- **Budget for due diligence.** A governed runner spent ~16 minutes (queue + verification) before executing; size timeouts and messaging for that.
 
 ### Approval expectations
 
@@ -123,7 +145,7 @@ A delegated session is not fire-and-forget. The supervising side should:
 - **Audit every decision** — who / when / what / why per answer; this is what lets a reviewer reconstruct an unattended run (the durable audit store behind `GET /api/v1/audit` is a natural home).
 - **Unanswered requests stall sessions indefinitely.** Plan the human surface (`approval_level` / attention events) so long runs do not depend on someone being online.
 - **The room leg already exists upstream.** The runner's channel base ships a productized permission relay: per-channel dispatch, a pending table, a rendered approval (allow-once / always-allow / deny, with a request-id suffix under multi-task), and the human reply parsed back into the strict option-id vote the flow requires (single-flight; a lost race surfaces as a 404 → cancel); unroutable or failed delivery auto-cancels — no orphaned pending state. The room leg of the approval bridge is therefore inherited by any channel; the open question is which surface renders the approval card and how it is audited — a routing/UX decision, not a protocol one.
-- **Ride the attention model, don't add a surface.** Notifications should use the taskflow attention model (`request_attention`, kind=approval — sync-before-notify, idempotent per kind, mentions the leader and the human initiator, auto-resolved on result acceptance). The pieces missing today: an option-id payload (strict echoing needs the choice ids, not just a question line) and a configurable console-vs-room routing choice — console-first for sensitive approvals (payloads carry code context), room opt-in.
+- **Ride the attention model, don't add a surface.** Notifications should use the taskflow attention model (`request_attention`, kind=approval — sync-before-notify, idempotent per kind, mentions the leader and the human initiator, auto-resolved on result acceptance). The payload and routing conventions are now defined in the same design doc — an option payload (`options: [{id, label}]` with optional `suggested` / `expires_at`, strict option-id echoing, mode-switching options human-only, expiry resolving as denied-with-reason) and routing with `console-first` as the default and `room` as opt-in (exactly one route). The remaining gap is implementation: emitting and transporting those payloads on the attention-event path.
 
 ### Pitfalls → what to do (field-verified)
 
@@ -147,6 +169,10 @@ A delegated session is not fire-and-forget. The supervising side should:
 | A woken worker re-slept immediately | reset the idle marker on wake / ensure-ready paths |
 | Run longer than the watch window | hour-plus runs are normal; size windows for the long tail (~10 min queue observed + long execution) |
 | Cross-boundary supervisor cannot vote | a local-only permission mode gates votes by loopback origin — a host-side/remote supervisor gets nothing under it; use first-responder voting (or that mode's intended local UI) for delegated sessions that cross a boundary |
+| Injection lands on the wrong agent | the injection path must carry the target agent scope — without it the request silently lands on the default agent |
+| Busy injection rejected (HTTP 409) | busy semantics are per-surface (some queue, some refuse); probe each surface; back off or use the queue-capable path for refusing ones |
+| Deliverable lost on runner restart | judge closure by commit existence, not file presence; keep commits on the orchestration side where the sandbox blocks VCS |
+| Model calls fail in one placement only | egress is placement-dependent (TLS fingerprinting); verify the runner's own reachability per placement, not only the orchestration plane |
 
 ## Related surfaces
 
