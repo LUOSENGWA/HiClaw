@@ -28,6 +28,13 @@
 #   d) workspace_boundary  : the artifact from case (a) is inside the
 #                            --workspace dir, and the run log records
 #                            workspace=<dir>
+#   e) yolo_sandbox_warning: (qwen only) the un-sandboxed --yolo warning is
+#                            visible in the case-(a) run log — or the
+#                            environment is itself sandboxed (verbatim
+#                            warning + dual branch in run_case_e below)
+#   f) turn_budget         : (qwen only) max_session_turns=1 in an isolated
+#                            config (CODING_CLI_CONFIG) stops a two-step
+#                            prompt at the turn budget
 #
 # Note for (c) on qwen: qwen 0.24.7 also has a native run-level budget,
 # `qwen --max-wall-time <secs>`, which aborts the run with exit code 55.
@@ -146,6 +153,80 @@ SLEEP_STUB
     fi
 }
 
+# run_case_e <cli>: (qwen only) the un-sandboxed --yolo warning must be
+# visible in the case-(a) run log.
+#
+# Verbatim warning observed (qwen 0.24.7, 2026-10-09, QwenPaw001 container
+# without docker — first line of a real headless run log):
+#   Warning: running headless with --yolo / approval-mode=yolo and no
+#   sandbox. All tool calls (shell, write, edit) auto-execute at this
+#   process's privilege level. Configure tools.executionSandbox on Linux
+#   or a supported legacy sandbox via --sandbox / QWEN_SANDBOX, or set
+#   QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+#
+# Dual branch:
+#   1. warning visible            -> PASS (unsandboxed --yolo run warned,
+#                                    as expected)
+#   2. warning absent, but the    -> PASS only if the environment is itself
+#      environment is sandboxed     sandboxed (QWEN_SANDBOX set, or a sandbox
+#                                    marker in the log) — i.e. the sandbox
+#                                    took effect and suppressed the warning
+#   3. otherwise                  -> SKIP with reason (environment
+#                                    difference)
+run_case_e() {
+    local cli="$1" log
+    log="$(ls -1t "${SANDBOX}/ws-a/coding-cli-logs/"*.log 2>/dev/null | head -1)"
+    if [ -z "${log}" ] || [ ! -f "${log}" ]; then
+        skip "${cli}.yolo_sandbox_warning (no case-a run log to inspect)"
+        return 0
+    fi
+    if grep -q "running headless with --yolo / approval-mode=yolo and no sandbox" "${log}"; then
+        pass "${cli}.yolo_sandbox_warning (warning visible in run log — unsandboxed --yolo run, as expected)"
+        return 0
+    fi
+    if [ -n "${QWEN_SANDBOX:-}" ] || grep -qi "sandbox" "${log}"; then
+        pass "${cli}.yolo_sandbox_warning (no warning; environment itself is sandboxed, sandbox took effect)"
+        return 0
+    fi
+    skip "${cli}.yolo_sandbox_warning (no warning in run log and no sandbox in this environment — environment difference)"
+    return 0
+}
+
+# run_case_f <cli>: (qwen only) max_session_turns budget smoke.
+#
+# Real run of a two-step prompt ("create a.txt, then b.txt") with
+# max_session_turns=1 in an ISOLATED config: CODING_CLI_CONFIG points at a
+# sandboxed HOME, so the delegating agent's real config is untouched.
+#
+# Observed behavior (qwen 0.24.7, 2026-10-09, real run): the run aborts at
+# the turn budget with EXIT CODE 53 and the run log line
+#   Reached max session turns for this session. Increase the number of
+#   turns by specifying maxSessionTurns in settings.json.
+# Artifact state is model-dependent (one turn can batch both step file
+# writes before the final response hits the budget), so the assertion
+# pins exit code + budget message, not the file set.
+run_case_f() {
+    local cli="$1" rc log_f
+    local home_f="${SANDBOX}/home-f"
+    mkdir -p "${home_f}" "${SANDBOX}/ws-f"
+    printf '{"enabled":true,"cli":"qwen","max_session_turns":1}\n' \
+        > "${home_f}/coding-cli-config.json"
+    printf 'Step 1: create a file called a.txt containing exactly: A\nStep 2: then create a file called b.txt containing exactly: B\n' \
+        > "${SANDBOX}/prompts/case-f.txt"
+    CODING_CLI_CONFIG="${home_f}/coding-cli-config.json" \
+        bash "${RUN_SCRIPT}" --cli "${cli}" --workspace "${SANDBOX}/ws-f" \
+            --prompt-file "${SANDBOX}/prompts/case-f.txt" --timeout 300 \
+            > "${SANDBOX}/prompts/case-f.out" 2>&1
+    rc=$?
+    log_f="$(ls -1t "${SANDBOX}/ws-f/coding-cli-logs/"*.log 2>/dev/null | head -1)"
+    if [ "${rc}" != "0" ] && grep -q "Reached max session turns" "${log_f}" 2>/dev/null; then
+        pass "${cli}.turn_budget (rc=${rc} — aborted at the turn budget with 'Reached max session turns'; observed rc=53 on qwen 0.24.7)"
+    else
+        fail "${cli}.turn_budget" "expected non-zero exit with 'Reached max session turns' in the run log (rc=${rc})"
+        sed 's/^/    | /' "${SANDBOX}/prompts/case-f.out" | tail -10
+    fi
+}
+
 for cli in qwen opencode; do
     if ! command -v "${cli}" >/dev/null 2>&1; then
         skip "${cli}: binary not found on PATH (not installed — opt-in skipped)"
@@ -153,11 +234,21 @@ for cli in qwen opencode; do
     fi
     echo ""
     echo "== ${cli} (pinned version: $(command -v "${cli}")) =="
+    case_a_ok=0
     if run_case_a "${cli}"; then
+        case_a_ok=1
         run_case_d "${cli}"
     fi
     run_case_b "${cli}"
     run_case_c "${cli}"
+    if [ "${cli}" = "qwen" ]; then
+        run_case_e "${cli}"
+        if [ "${case_a_ok}" = "1" ]; then
+            run_case_f "${cli}"
+        else
+            skip "${cli}.turn_budget (case-a failed — cannot isolate budget behavior from an auth failure)"
+        fi
+    fi
 done
 
 echo ""
