@@ -12,7 +12,8 @@ COMMON_ARGS=(
 )
 
 render="$(mktemp)"
-trap 'rm -f "${render}"' EXIT
+copaw_render="$(mktemp)"
+trap 'rm -f "${render}" "${copaw_render}"' EXIT
 
 helm template agentteams "${CHART}" "${COMMON_ARGS[@]}" > "${render}"
 
@@ -37,13 +38,13 @@ if grep -q "AGENTTEAMS_COPAW_WORKER_IMAGE" "${render}"; then
     exit 1
 fi
 
-copaw_render="$(helm template agentteams "${CHART}" "${COMMON_ARGS[@]}" \
+if ! helm template agentteams "${CHART}" "${COMMON_ARGS[@]}" \
     --set worker.defaultImage.copaw.repository=private.registry.example/agentteams-copaw-worker \
-    --set worker.defaultImage.copaw.tag=v1.2.3 2>&1)" || {
+    --set worker.defaultImage.copaw.tag=v1.2.3 > "${copaw_render}"; then
     echo "FAIL: helm template (copaw image values) failed:"
-    echo "${copaw_render}"
+    cat "${copaw_render}" || true
     exit 1
-}
+fi
 
 if ! grep -q "name: AGENTTEAMS_COPAW_WORKER_IMAGE" "${copaw_render}"; then
     echo "FAIL: explicitly pinned copaw image is not injected as AGENTTEAMS_COPAW_WORKER_IMAGE"
