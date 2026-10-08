@@ -2,8 +2,8 @@
 # verify-coding-cli.sh — opt-in execution verification for the coding CLI
 # runners of run-coding-cli.sh.
 #
-# Pinned runner versions (verified on the AgentTeams dev host, 2026-10-09):
-#   qwen     0.24.7  (verified flags: --yolo, --approval-mode, --max-wall-time)
+# Pinned runner versions (verified on the AgentTeams dev host, 2026-10-08):
+#   qwen     0.25.0  (verified flags: --yolo, --approval-mode, --max-wall-time, --max-session-turns)
 #   opencode 1.18.34 (field-verified 2026-10-02; not pinned — re-run this
 #            suite before relying on any other version)
 #
@@ -37,7 +37,7 @@
 #                            config (CODING_CLI_CONFIG) stops a two-step
 #                            prompt at the turn budget
 #
-# Note for (c) on qwen: qwen 0.24.7 also has a native run-level budget,
+# Note for (c) on qwen: qwen also has a native run-level budget,
 # `qwen --max-wall-time <secs>`, which aborts the run with exit code 55.
 # The outer `timeout` in run-coding-cli.sh remains the hard backstop for
 # all runners; the stub case above verifies that wrapper path without
@@ -157,7 +157,7 @@ SLEEP_STUB
 # run_case_e <cli>: (qwen only) the un-sandboxed --yolo warning must be
 # visible in the case-(a) run log.
 #
-# Verbatim warning observed (qwen 0.24.7, 2026-10-09, QwenPaw001 container
+# Verbatim warning observed (qwen 0.24.7 and 0.25.0, QwenPaw001 container
 # without docker — first line of a real headless run log):
 #   Warning: running headless with --yolo / approval-mode=yolo and no
 #   sandbox. All tool calls (shell, write, edit) auto-execute at this
@@ -199,7 +199,7 @@ run_case_e() {
 # max_session_turns=1 in an ISOLATED config: CODING_CLI_CONFIG points at a
 # sandboxed HOME, so the delegating agent's real config is untouched.
 #
-# Observed behavior (qwen 0.24.7, 2026-10-09, real run): the run aborts at
+# Observed behavior (qwen 0.24.7 and 0.25.0, real run): the run aborts at
 # the turn budget with EXIT CODE 53 and the run log line
 #   Reached max session turns for this session. Increase the number of
 #   turns by specifying maxSessionTurns in settings.json.
@@ -221,7 +221,7 @@ run_case_f() {
     rc=$?
     log_f="$(ls -1t "${SANDBOX}/ws-f/coding-cli-logs/"*.log 2>/dev/null | head -1)"
     if [ "${rc}" != "0" ] && grep -q "Reached max session turns" "${log_f}" 2>/dev/null; then
-        pass "${cli}.turn_budget (rc=${rc} — aborted at the turn budget with 'Reached max session turns'; observed rc=53 on qwen 0.24.7)"
+        pass "${cli}.turn_budget (rc=${rc} — aborted at the turn budget with 'Reached max session turns'; observed rc=53 on qwen 0.24.7 and 0.25.0)"
     else
         fail "${cli}.turn_budget" "expected non-zero exit with 'Reached max session turns' in the run log (rc=${rc})"
         sed 's/^/    | /' "${SANDBOX}/prompts/case-f.out" | tail -10

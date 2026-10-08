@@ -17,13 +17,13 @@
 # Values are never read into the output, echoed, or stored.
 #
 # Env var names checked (names only, never values):
-#   qwen (verified against qwen 0.24.7):
+#   qwen (verified against qwen 0.25.0):
 #     DASHSCOPE_API_KEY        Qwen Cloud provider key; referenced by this
 #                              repo's installer (install/agentteams-install.sh)
 #     QWEN_OAUTH_DYNAMIC_TOKEN OAuth dynamic-token form; found in the qwen
-#                              0.24.7 CLI bundle
+#                              0.25.0 CLI bundle
 #     QWEN_API_KEY             provider key for the qwen endpoint; found in
-#                              the qwen 0.24.7 CLI bundle
+#                              the qwen 0.25.0 CLI bundle
 #     OPENAI_API_KEY           provider key for `qwen --auth-type openai`
 #     ANTHROPIC_API_KEY        provider key for `qwen --auth-type anthropic`
 #     GEMINI_API_KEY           provider key for `qwen --auth-type gemini`
