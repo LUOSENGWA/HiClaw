@@ -18,7 +18,7 @@
 #                            ("Create a file called hello.txt containing
 #                            exactly: ok") -> run-coding-cli.sh exit 0 and
 #                            workspace/hello.txt contains "ok"
-#   b) exit_code_propagate : run under a clean HOME (no auth) ->
+#   b) auth_failure_exit    : run under a clean HOME (no auth) ->
 #                            run-coding-cli.sh exits non-zero (the CLI's
 #                            non-zero code is passed through; the `tee` in
 #                            the pipeline does not swallow it — the script
@@ -126,9 +126,9 @@ run_case_b() {
             > "${SANDBOX}/prompts/case-b.out" 2>&1
     rc=$?
     if [ "${rc}" != "0" ]; then
-        pass "${cli}.exit_code_propagate (rc=${rc})"
+        pass "${cli}.auth_failure_exit (rc=${rc})"
     else
-        fail "${cli}.exit_code_propagate" "expected non-zero exit, got 0"
+        fail "${cli}.auth_failure_exit" "expected non-zero exit on auth failure, got 0"
         sed 's/^/    | /' "${SANDBOX}/prompts/case-b.out" | tail -10
     fi
 }
