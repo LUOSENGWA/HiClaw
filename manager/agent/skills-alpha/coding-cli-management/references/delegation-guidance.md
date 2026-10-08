@@ -64,6 +64,17 @@ Before the first real task:
 - **Direction rule for user-local runners.** When the runner lives on the user's machine and the orchestrator in a managed deployment, assume inbound is unavailable (NAT/firewall): the local side must initiate — poll a queue, hold a connection, or run a local relay — and anything it sends out must leave through a surface the managed side accepts (a member-voice relay) until the runner itself has an identity. Membership fixes the voice, not reachability.
 - **Runner egress, not just the orchestration plane.** The chosen placement must satisfy the runner's own model egress: in field testing one runtime reached the provider endpoint directly while the other needed a local relay (TLS stack fingerprinting on the path). Verify egress per placement, not only the orchestration plane.
 
+### Scenario adaptation (toolchain, model, knowledge, artifacts)
+
+A one-shot run is only as good as what the delegating agent has prepared in the workspace and on the host. For real development scenarios — mobile, embedded, web, device toolchains — prepare four layers before dispatching, then name them all in the task spec:
+
+1. **Toolchain placement.** Build toolchains (SDKs, compilers, platform CLTs) live on a shared volume (e.g. a team NFS `toolchains/<platform>/` directory) and are referenced by **absolute path** in the spec — never assumed to be on the runner's default PATH. Pin the exact version in the spec; the runner install is generic, the toolchain is the scenario's.
+2. **Model defaults.** The platform supplies the model default (provider settings rendered once at bootstrap); the task spec may override per run (`run-coding-cli.sh --model <name>`). Two tiers: platform default carries cost/policy, the per-run flag carries the job.
+3. **Knowledge and file sharing.** Project knowledge (offline doc corpora, API docs, team conventions, prior specs) must be *reachable from the workspace* — mounted into the workspace or named by path in the spec. A runner cannot read what it cannot path-reach: "the team knows X" is not context, a path is. Share artifacts the same way: a stable location both sides can reach (team storage / MinIO), not a chat attachment.
+4. **Artifact flow.** Name where deliverables land (build output dir → team storage key) and how completion is judged (build passes / tests pass), not "done".
+
+The same four layers apply to every scenario class (Android, iOS, web, HarmonyOS-style device SDKs, embedded/MCU) with its own toolchain, knowledge corpus, and artifact specifics.
+
 ### Pitfalls → what to do (field-verified)
 
 | Symptom | What to do |
