@@ -4,7 +4,8 @@
 #
 # Pinned runner versions (verified on the AgentTeams dev host, 2026-10-09):
 #   qwen     0.24.7  (verified flags: --yolo, --approval-mode, --max-wall-time)
-#   opencode not pinned yet — install to verify
+#   opencode 1.18.34 (field-verified 2026-10-02; not pinned — re-run this
+#            suite before relying on any other version)
 #
 # Opt-in by design: a CLI whose binary is not on PATH is reported as
 # [SKIP] <cli>: <reason> and does NOT fail the suite. Run this where a real

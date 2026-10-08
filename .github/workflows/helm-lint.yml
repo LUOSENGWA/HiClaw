@@ -38,6 +38,8 @@ on:
       - 'hack/local-k8s-up.sh'
       - 'tests/check-create-project-grant-admin.sh'
       - 'manager/agent/skills/project-management/**'
+      - 'manager/agent/skills-alpha/coding-cli-management/**'
+      - 'tests/check-coding-cli-detection.sh'
   workflow_dispatch: ~
 
 jobs:
@@ -119,3 +121,12 @@ jobs:
       - name: Template dry-run
         run: |
           bash tests/check-helm-agentteams.sh
+
+      - name: Check coding-CLI detection
+        run: bash tests/check-coding-cli-detection.sh
+
+      - name: Syntax-check coding-CLI skill scripts
+        run: |
+          bash -n manager/agent/skills-alpha/coding-cli-management/scripts/detect-available-cli.sh
+          bash -n manager/agent/skills-alpha/coding-cli-management/scripts/run-coding-cli.sh
+          bash -n manager/agent/skills-alpha/coding-cli-management/scripts/verify-coding-cli.sh

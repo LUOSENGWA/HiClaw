@@ -32,6 +32,12 @@
 #                                   -> NOT available (binary: false)
 #   7. sentinel_never_leaks       : stub qwen + opencode with sentinel env
 #                                   values set -> output contains no sentinel
+#   8. claude_binary_and_home_dir : stub claude + $HOME/.claude dir
+#                                   -> available; config_source.dir
+#   9. gemini_binary_and_home_dir : stub gemini + $HOME/.gemini dir
+#                                   -> available; config_source.dir
+#  10. qodercli_binary_and_home_dir: stub qodercli + $HOME/.qoder dir
+#                                   -> available; config_source.dir
 #
 # Usage:  bash tests/check-coding-cli-detection.sh
 # Exit:   0 if every scenario passes, 1 otherwise.
@@ -223,9 +229,45 @@ done
     || problems="${problems}env should list DASHSCOPE_API_KEY name; "
 finish "sentinel_never_leaks" "${problems}"
 
+# --- Scenario 8: claude binary + $HOME/.claude dir -> available via dir
+new_sandbox
+write_stubs "${SANDBOX}/bin" claude
+mkdir -p "${SANDBOX}/home/.claude"
+run_detect
+problems=""
+[ "${RUN_RC}" = "0" ] || problems="${problems}rc=${RUN_RC}; "
+[ "$(json_get '.available | index("claude")')" != "null" ] || problems="${problems}claude not available; "
+[ "$(json_get '.details.claude.config_source.dir')" = "true" ] || problems="${problems}config_source.dir != true; "
+[ "$(json_get '.details.claude.config_source.share_file')" = "false" ] || problems="${problems}config_source.share_file should be false; "
+finish "claude_binary_and_home_dir" "${problems}"
+
+# --- Scenario 9: gemini binary + $HOME/.gemini dir -> available via dir
+new_sandbox
+write_stubs "${SANDBOX}/bin" gemini
+mkdir -p "${SANDBOX}/home/.gemini"
+run_detect
+problems=""
+[ "${RUN_RC}" = "0" ] || problems="${problems}rc=${RUN_RC}; "
+[ "$(json_get '.available | index("gemini")')" != "null" ] || problems="${problems}gemini not available; "
+[ "$(json_get '.details.gemini.config_source.dir')" = "true" ] || problems="${problems}config_source.dir != true; "
+[ "$(json_get '.details.gemini.config_source.share_file')" = "false" ] || problems="${problems}config_source.share_file should be false; "
+finish "gemini_binary_and_home_dir" "${problems}"
+
+# --- Scenario 10: qodercli binary + $HOME/.qoder dir -> available via dir
+new_sandbox
+write_stubs "${SANDBOX}/bin" qodercli
+mkdir -p "${SANDBOX}/home/.qoder"
+run_detect
+problems=""
+[ "${RUN_RC}" = "0" ] || problems="${problems}rc=${RUN_RC}; "
+[ "$(json_get '.available | index("qodercli")')" != "null" ] || problems="${problems}qodercli not available; "
+[ "$(json_get '.details.qodercli.config_source.dir')" = "true" ] || problems="${problems}config_source.dir != true; "
+[ "$(json_get '.details.qodercli.config_source.share_file')" = "false" ] || problems="${problems}config_source.share_file should be false; "
+finish "qodercli_binary_and_home_dir" "${problems}"
+
 echo ""
 if [ "${SUITE_FAIL}" = "0" ]; then
-    echo "All 7 scenarios passed."
+    echo "All 10 scenarios passed."
     exit 0
 else
     echo "One or more scenarios FAILED."
