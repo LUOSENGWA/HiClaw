@@ -196,8 +196,11 @@ fi
 echo "ok: empty legacy value is not inherited"
 
 # case: the inheritance hook is wired into the upgrade branch of step_existing
-if ! sed -n '/^step_existing()/,/^}/p' "${INSTALLER}" \
-        | grep -q 'inherit_legacy_copaw_worker_image "\${existing_env}"'; then
+# (capture the range before grepping: `sed | grep -q` under `set -o pipefail`
+#  is racy — grep -q exits as soon as it matches, sed then dies on a broken
+#  pipe and the pipeline reports failure even though the call is present)
+step_existing_body="$(sed -n '/^step_existing()/,/^}/p' "${INSTALLER}")"
+if ! grep -Fq 'inherit_legacy_copaw_worker_image "${existing_env}"' <<<"${step_existing_body}"; then
     echo "FAIL: step_existing upgrade branch does not call inherit_legacy_copaw_worker_image" >&2
     exit 1
 fi
