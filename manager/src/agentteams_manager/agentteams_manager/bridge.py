@@ -478,14 +478,17 @@ def _write_agent_json(
 
     CoPaw 1.0.2+ reads workspace/agent.json for per-agent configuration.
     The template provides defaults; we overlay controller-owned fields
-    (Matrix access_token, homeserver, allowlists, context window).
+    (Matrix access_token, homeserver, allowlists, groups, context window).
 
-    ``allow_from`` / ``group_allow_from`` / ``groups`` are a
-    controller-wins projection: they are overwritten wholesale from the
-    controller source on every re-bridge, empty values included, so a
-    revocation from the source allowlist or a group-policy tightening
-    takes effect immediately. The package extraction must not change
-    this pre-extraction behavior.
+    The overlay is controller-wins: ``allow_from``, ``group_allow_from``
+    and ``groups`` are fully replaced by the openclaw.json values (an
+    empty source value clears the field), so revoking a user from a
+    source allowlist or tightening a group policy takes effect on the
+    next re-bridge.  Merging with the previously projected values would
+    be wrong here: those values are this bridge's own last projection,
+    not operator-owned overrides, and treating them as local would make
+    a revocation impossible.  This extraction is behavior-neutral by
+    design, so the pre-extraction controller-wins projection is kept.
     """
     workspace_dir = working_dir / "workspaces" / "default"
     workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -550,11 +553,10 @@ def _write_agent_json(
         matrix_ch["access_token"] = access_token
     if user_id:
         matrix_ch["user_id"] = user_id
-    # Controller-wins projection: the controller source is the single
-    # source of truth for the Matrix allowlists and group policy.
-    # Overwriting wholesale (empty values included) is what lets a
-    # revocation or a policy tightening take effect on the next
-    # re-bridge.
+    # Controller-wins: the source allowlists and group policy fully
+    # replace whatever a previous bridge wrote (an empty source value
+    # clears the field), so a revocation or a policy tightening in
+    # openclaw.json is effective on the next re-bridge.
     matrix_ch["allow_from"] = dm_allow_from
     matrix_ch["group_allow_from"] = group_allow_from
     matrix_ch["groups"] = groups
