@@ -551,8 +551,14 @@ func (h *SkillsHandler) DownloadSkill(w http.ResponseWriter, r *http.Request) {
 
 	files := map[string][]byte{}
 	if err := h.collectSkillFiles(r.Context(), prefix, "", files, 0); err != nil {
-		// 目录不存在（真实后端 mc ls 报错）或存储不可读：统一 404 + 原因，
-		// 下载动作两者都无法继续，调用侧拿到可读信息即可。
+		if _, ok := err.(*errSkillCollection); ok {
+			// 技能存在但包读取不完整（不可读文件/子树、超出深度上限）：
+			// 显式 500，而不是返回静默缺失文件的成功 zip。
+			httputil.WriteError(w, http.StatusInternalServerError,
+				fmt.Sprintf("incomplete skill package %q under %s: %v", name, prefix, err))
+			return
+		}
+		// 顶层列目录失败：技能前缀不存在（真实后端 mc ls 报错）——404 + 原因。
 		httputil.WriteError(w, http.StatusNotFound,
 			fmt.Sprintf("skill %q not found under %s (%v)", name, prefix, err))
 		return
@@ -573,7 +579,9 @@ func (h *SkillsHandler) DownloadSkill(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(paths)
 	for _, rel := range paths {
-		fw, err := zw.Create(rel)
+		// 保留技能根目录：上传契约（extractSkillZip）要求 <技能名>/<文件>
+		// 形态，下载包必须原样可再上传（round-trip）。
+		fw, err := zw.Create(name + "/" + rel)
 		if err != nil {
 			// 已开始写响应体——只能中断 zip（客户端解压报错比静默缺文件好）。
 			_ = zw.Close()
@@ -587,21 +595,37 @@ func (h *SkillsHandler) DownloadSkill(w http.ResponseWriter, r *http.Request) {
 	_ = zw.Close()
 }
 
+// errSkillCollection is returned when a skill package exists but could not
+// be fully collected (unreadable file, unreadable subtree, or nesting beyond
+// skillMaxDepth). The caller maps it to 500: the skill exists, the read
+// failed — distinct from "not found" (404).
+type errSkillCollection struct{ msg string }
+
+func (e *errSkillCollection) Error() string { return e.msg }
+
+// skillMaxDepth bounds the package walk — skill packages are shallow, and a
+// deeper nesting is an explicit failure rather than a silent partial zip.
+const skillMaxDepth = 6
+
 // collectSkillFiles walks a skill prefix and reads every file into out
 // (relpath -> bytes; rel accumulates the walked subdirectories so nested
-// resources keep their path inside the zip). Depth is bounded (skill
-// packages are shallow); a single unreadable file is skipped rather than
-// failing the whole archive.
+// resources keep their path inside the zip). An incomplete package is an
+// explicit failure: an unreadable file, an unlistable subtree, or nesting
+// beyond skillMaxDepth returns errSkillCollection instead of a successful
+// partial zip — a silently incomplete package would break the
+// upload → download → re-upload round trip. A top-level (depth 0) list
+// error is returned as-is: that is the "skill not found / unreadable
+// prefix" case the caller maps to 404.
 func (h *SkillsHandler) collectSkillFiles(ctx context.Context, prefix, rel string, out map[string][]byte, depth int) error {
-	if depth > 6 {
-		return nil
+	if depth > skillMaxDepth {
+		return &errSkillCollection{fmt.Sprintf("skill package nesting exceeds the %d-level limit at %s", skillMaxDepth, prefix)}
 	}
 	entries, err := h.oss.ListObjectsDetailed(ctx, prefix)
 	if err != nil {
 		if depth == 0 {
 			return err
 		}
-		return nil // 子目录列不出：跳过该子树
+		return &errSkillCollection{fmt.Sprintf("list subtree %s: %v", prefix, err)}
 	}
 	for _, entry := range entries {
 		raw := strings.TrimSpace(entry.Name)
@@ -617,7 +641,7 @@ func (h *SkillsHandler) collectSkillFiles(ctx context.Context, prefix, rel strin
 		}
 		data, err := h.oss.GetObject(ctx, prefix+raw)
 		if err != nil {
-			continue
+			return &errSkillCollection{fmt.Sprintf("read %s: %v", prefix+raw, err)}
 		}
 		out[rel+raw] = data
 	}
