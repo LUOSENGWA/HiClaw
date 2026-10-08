@@ -184,6 +184,16 @@ if [ "$CONTROLLER_REPLICAS" != "1" ]; then
     HELM_SET_OVERRIDES="${HELM_SET_OVERRIDES} --set controller.replicaCount=${CONTROLLER_REPLICAS}"
 fi
 
+# Fail-closed legacy CoPaw migration gate (issue #1310): if this namespace
+# already runs a controller with a resolved AGENTTEAMS_COPAW_WORKER_IMAGE,
+# the gate exits non-zero and this script stops (set -e) before the upgrade
+# can drop it. Fresh installs pass (no existing deployment). This script
+# assembles --set overrides inline, so the gate runs without --values: any
+# live legacy image requires an explicit pin, and the gate prints the exact
+# values snippet to add.
+log "Running legacy CoPaw upgrade gate (fail-closed)..."
+bash "${PROJECT_ROOT}/tests/copaw-helm-upgrade-gate.sh" --namespace "$NAMESPACE"
+
 log "Installing AgentTeams via Helm..."
 helm upgrade --install agentteams "$CHART_DIR" \
     --namespace "$NAMESPACE" --create-namespace \
