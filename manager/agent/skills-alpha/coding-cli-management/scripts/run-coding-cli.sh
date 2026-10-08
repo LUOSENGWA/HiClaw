@@ -1,6 +1,8 @@
 #!/bin/bash
 # Execute an AI coding CLI tool in a given workspace
 # Usage: run-coding-cli.sh --cli <tool> --workspace <dir> --prompt-file <file> [--timeout <secs>]
+#        [--model <name>] [--allowed-tools <csv>] [--allowed-mcp <csv>] [--safe-mode] [--bare]
+# (governance flags apply to the qwen runner; other runners warn and ignore them)
 
 set -e
 
@@ -8,6 +10,11 @@ cli=""
 workspace=""
 prompt_file=""
 timeout_secs=600
+g_model=""
+g_allowed_tools=""
+g_allowed_mcp=""
+g_safe_mode=0
+g_bare=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -15,6 +22,11 @@ while [[ $# -gt 0 ]]; do
         --workspace)   workspace="$2";   shift 2 ;;
         --prompt-file) prompt_file="$2"; shift 2 ;;
         --timeout)     timeout_secs="$2"; shift 2 ;;
+        --model)       g_model="$2";       shift 2 ;;
+        --allowed-tools) g_allowed_tools="$2"; shift 2 ;;
+        --allowed-mcp) g_allowed_mcp="$2"; shift 2 ;;
+        --safe-mode)   g_safe_mode=1;      shift ;;
+        --bare)        g_bare=1;           shift ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -32,6 +44,12 @@ fi
 if [ ! -d "$workspace" ]; then
     echo "Workspace directory not found: $workspace" >&2
     exit 1
+fi
+
+# Governance flags are defined by the qwen runner; other runners have no
+# equivalent surface, so warn and ignore rather than fail the run.
+if [ "$cli" != "qwen" ] && { [ -n "$g_model" ] || [ -n "$g_allowed_tools" ] || [ -n "$g_allowed_mcp" ] || [ "$g_safe_mode" = "1" ] || [ "$g_bare" = "1" ]; }; then
+    echo "[run-coding-cli] note: governance flags (--model/--allowed-tools/--allowed-mcp/--safe-mode/--bare) are qwen-specific and were ignored for cli=$cli" >&2
 fi
 
 # Save output to log file in the workspace's coding-cli-logs directory
@@ -88,6 +106,26 @@ case "$cli" in
         fi
         if [ "${sandbox_setting}" = "true" ]; then
             qwen_args+=(--sandbox)
+        fi
+        # Governance passthrough (delegating agent's per-run control surface):
+        # --model <name>       per-run model override (two-tier model control)
+        # --allowed-tools <csv> tool allowlist (code-level permission boundary)
+        # --allowed-mcp <csv>   MCP server allowlist (scenario isolation)
+        # --safe-mode / --bare  clean / minimal config loading
+        if [ -n "${g_model}" ]; then
+            qwen_args+=(-m "${g_model}")
+        fi
+        if [ -n "${g_allowed_tools}" ]; then
+            qwen_args+=(--allowed-tools "${g_allowed_tools}")
+        fi
+        if [ -n "${g_allowed_mcp}" ]; then
+            qwen_args+=(--allowed-mcp-server-names "${g_allowed_mcp}")
+        fi
+        if [ "${g_safe_mode}" = "1" ]; then
+            qwen_args+=(--safe-mode)
+        fi
+        if [ "${g_bare}" = "1" ]; then
+            qwen_args+=(--bare)
         fi
         timeout "$timeout_secs" qwen "${qwen_args[@]}" "$(cat "$prompt_file")" 2>&1 | tee -a "$log_file"
         exit_code=${PIPESTATUS[0]}

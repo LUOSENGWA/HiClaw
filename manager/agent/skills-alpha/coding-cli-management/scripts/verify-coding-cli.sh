@@ -2,7 +2,7 @@
 # verify-coding-cli.sh — opt-in execution verification for the coding CLI
 # runners of run-coding-cli.sh.
 #
-# Pinned runner versions (verified on the AgentTeams dev host, 2026-10-08):
+# Reference runner versions (the versions this suite was field-verified against on the AgentTeams dev host, 2026-10-08; deployments pick their own npm channel tag and re-run the suite on change):
 #   qwen     0.25.0  (verified flags: --yolo, --approval-mode, --max-wall-time, --max-session-turns)
 #   opencode 1.18.34 (field-verified 2026-10-02; not pinned — re-run this
 #            suite before relying on any other version)
