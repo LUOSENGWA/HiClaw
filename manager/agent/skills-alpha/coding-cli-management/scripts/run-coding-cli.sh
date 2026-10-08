@@ -75,7 +75,7 @@ case "$cli" in
         exit_code=${PIPESTATUS[0]}
         ;;
     qwen)
-        # qwen has no workspace flag (qwen 0.24.7); its workspace is the
+        # qwen has no workspace flag (verified through qwen 0.25.0); its workspace is the
         # process cwd, so pin the run to $workspace explicitly.
         cd "$workspace"
         # Optional budget flags from the config (see "Config File" in
