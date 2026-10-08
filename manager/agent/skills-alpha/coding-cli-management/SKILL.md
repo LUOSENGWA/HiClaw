@@ -1,15 +1,15 @@
 ---
 name: coding-cli-management
-description: "Execute AI coding CLI tools (Claude Code / Gemini CLI / qodercli / Qwen Code / OpenCode) on behalf of Workers. Use when a Worker sends a coding-request: message, asking Manager to run coding operations in their workspace."
+description: "Execute AI coding CLI tools (Claude Code / Gemini CLI / qodercli / Qwen Code / OpenCode) on behalf of Workers. Use when a Worker sends a coding-request: message, asking the delegating agent (Manager, team Leader, or an authorized Worker) to run coding operations in their workspace."
 ---
 
 # Coding CLI Management
 
-This skill enables the Manager to execute AI coding CLI tools (claude/gemini/qodercli/qwen/opencode) on behalf of Workers. Workers generate precise prompts; the Manager runs the CLI in the Worker's workspace and returns the result.
+This skill enables the delegating agent (Manager, team Leader, or an authorized Worker) to execute AI coding CLI tools (claude/gemini/qodercli/qwen/opencode) on behalf of Workers. Workers generate precise prompts; the delegating agent runs the CLI in the Worker's workspace and returns the result.
 
 ## Config File
 
-Path: `~/coding-cli-config.json`
+Path: `~/coding-cli-config.json` — this is the **delegating agent's own** config file (the agent running this skill), not a shared one.
 
 ```json
 {
@@ -24,7 +24,33 @@ Path: `~/coding-cli-config.json`
 | `false`   | any   | Admin declined; use normal task flow |
 | `true`    | `"claude"` / `"gemini"` / `"qodercli"` / `"qwen"` / `"opencode"` | Active — use this CLI |
 
-**Runner notes (Qwen Code / OpenCode).** Headless invocations used by `run-coding-cli.sh`: `qwen --yolo "<prompt>"` and `opencode run --auto "<prompt>"`. Config surfaces: `~/.qwen` (`settings.json` `security.auth`, or provider env) and `~/.config/opencode` (`opencode auth` / provider config). Both runners were verified with a headless round trip before inclusion.
+**Runner notes (Qwen Code / OpenCode).** Headless invocations used by `run-coding-cli.sh`: `qwen --yolo "<prompt>"` and `opencode run --auto --dir <workspace> "<prompt>"`. Config surfaces: `~/.qwen` (`settings.json` `security.auth`, or provider env) and `~/.config/opencode` plus `~/.local/share/opencode/auth.json` (credentials stored by `opencode auth login`) or provider env. Both runners were verified with a headless round trip before inclusion.
+
+**Unattended semantics — read before enabling.**
+- `qwen --yolo` automatically approves **all** tool calls — file edits and shell commands included, with no further prompts.
+- `opencode run --auto` auto-approves permissions, but **explicit deny rules are still enforced**.
+- **Neither changing the working directory nor adding a timeout establishes a permission boundary.** The workspace and the timeout shape scope and duration only; the runner keeps every capability of the delegating agent's process.
+
+---
+
+## Execution boundary
+
+The CLI process runs **as the delegating agent** (Manager, team Leader, or an authorized Worker). It therefore inherits that agent's filesystem visibility and its environment — including any credentials present as environment variables — and nothing in this skill changes that.
+
+When deciding whether to enable CLI delegation, assess at least:
+
+- **Workspace access scope** — the run is pinned to the task workspace, but a runner in auto-approve mode can reach anything the delegating agent's account can.
+- **Other teams' files** — anything on the shared filesystem the delegating agent can read or write (e.g. other tasks' directories).
+- **Delegating agent's credentials** — API keys and tokens in the agent's environment are visible to the CLI process.
+- **Mounted container sockets** — a mounted `docker.sock` (or equivalent) gives the CLI effective host-control capability.
+- **Admin-plane capability** — any orchestration/admin CLI or API the delegating agent can use is equally available to the runner.
+
+Mitigations:
+
+- The CLI's native permission controls: `qwen --approval-mode plan|default|auto-edit|auto|yolo` (lower tiers keep an approval gate), and `opencode` explicit deny rules (still enforced under `--auto`).
+- An isolated execution environment for the CLI: a dedicated container, a dedicated user, or restricted mounts.
+
+No new approval subsystem is introduced by this skill.
 
 ---
 
@@ -44,7 +70,7 @@ echo '{"enabled":false,"cli":null,"confirmed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ
 Proceed with normal task assignment (Worker codes on their own).
 
 **If CLIs are available**, ask the admin via the primary channel or Matrix DM — **in the language the admin used**:
-> I found the following AI coding CLI tools available: [list]. Would you like to enable CLI delegation mode? Workers will generate coding prompts, and I'll use the CLI tool to make the code changes. Reply with the tool name (claude/gemini/qodercli/qwen/opencode) to enable, or 'no' to have workers code on their own.
+> I found the following AI coding CLI tools available: [list]. Would you like to enable CLI delegation mode? Workers will generate coding prompts, and I'll use the CLI tool to make the code changes. Note: the CLI runs unattended — `qwen --yolo` auto-approves all tool calls, and `opencode --auto` still enforces explicit deny rules; the workspace and the timeout are not permission boundaries. Reply with the tool name (claude/gemini/qodercli/qwen/opencode) to enable, or 'no' to have workers code on their own.
 
 On admin reply:
 - Tool name (`claude` / `gemini` / `qodercli` / `qwen` / `opencode`):
@@ -170,7 +196,7 @@ Worker {worker-name} 的编码委托任务 {task-id} 中，{cli} 工具执行失
 - ~/.{cli}/ 凭证是否有效（token 是否过期）
 - /host-share/.{cli}/ 软链是否正常（ls -la /root/.{cli}）
 - {cli} binary 是否在容器内可用（which {cli}）
-- qwen 凭证在 ~/.qwen（settings.json 的 security.auth 或模型环境变量）；opencode 凭证在 ~/.config/opencode（opencode auth / provider 配置）
+- qwen 凭证在 ~/.qwen（settings.json 的 security.auth 或模型环境变量）；opencode 凭证在 ~/.config/opencode 或 ~/.local/share/opencode/auth.json（opencode auth login 存储 / provider 配置）
 ```
 
 **Record in config** (optional, for heartbeat diagnostics):

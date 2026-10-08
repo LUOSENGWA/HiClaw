@@ -40,7 +40,9 @@ mkdir -p "$log_dir"
 timestamp=$(date +%Y%m%d-%H%M%S)
 log_file="$log_dir/run-${timestamp}.log"
 
-echo "[run-coding-cli] cli=$cli workspace=$workspace prompt_file=$prompt_file timeout=${timeout_secs}s"
+# Write the run metadata header to the log (and stdout) so the log file itself
+# records which workspace/prompt/timeout this run used.
+echo "[run-coding-cli] cli=$cli workspace=$workspace prompt_file=$prompt_file timeout=${timeout_secs}s" | tee "$log_file"
 echo "[run-coding-cli] Log: $log_file"
 
 cd "$workspace"
@@ -48,24 +50,30 @@ cd "$workspace"
 case "$cli" in
     claude)
         timeout "$timeout_secs" claude -p "$(cat "$prompt_file")" \
-            --dangerously-skip-permissions --output-format text 2>&1 | tee "$log_file"
+            --dangerously-skip-permissions --output-format text 2>&1 | tee -a "$log_file"
         exit_code=${PIPESTATUS[0]}
         ;;
     gemini)
-        timeout "$timeout_secs" gemini -p "$(cat "$prompt_file")" -y 2>&1 | tee "$log_file"
+        timeout "$timeout_secs" gemini -p "$(cat "$prompt_file")" -y 2>&1 | tee -a "$log_file"
         exit_code=${PIPESTATUS[0]}
         ;;
     qodercli)
         timeout "$timeout_secs" qodercli -p "$(cat "$prompt_file")" \
-            --yolo -w "$workspace" 2>&1 | tee "$log_file"
+            --yolo -w "$workspace" 2>&1 | tee -a "$log_file"
         exit_code=${PIPESTATUS[0]}
         ;;
     qwen)
-        timeout "$timeout_secs" qwen --yolo "$(cat "$prompt_file")" 2>&1 | tee "$log_file"
+        # qwen has no workspace flag (qwen 0.24.7); its workspace is the
+        # process cwd, so pin the run to $workspace explicitly.
+        cd "$workspace"
+        timeout "$timeout_secs" qwen --yolo "$(cat "$prompt_file")" 2>&1 | tee -a "$log_file"
         exit_code=${PIPESTATUS[0]}
         ;;
     opencode)
-        timeout "$timeout_secs" opencode run --auto "$(cat "$prompt_file")" 2>&1 | tee "$log_file"
+        # `opencode run --dir <path>` is the native working-directory flag
+        # (opencode.ai/docs/cli); pin the run to $workspace explicitly.
+        cd "$workspace"
+        timeout "$timeout_secs" opencode run --auto --dir "$workspace" "$(cat "$prompt_file")" 2>&1 | tee -a "$log_file"
         exit_code=${PIPESTATUS[0]}
         ;;
     *)
