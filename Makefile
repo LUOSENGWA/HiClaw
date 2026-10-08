@@ -117,11 +117,11 @@ LINES          ?= 50
 # ---------- Phony targets ----------
 
 .PHONY: all build build-openclaw-base build-agentteams-controller build-embedded build-manager build-manager-qwenpaw build-worker build-copaw-worker build-hermes-worker build-openhuman-worker \
-        build-qwenpaw-worker build-qwen-code-worker \
+        build-qwenpaw-worker build-deepseek-harness-worker build-qwen-code-worker \
         tag push push-openclaw-base push-agentteams-controller push-embedded push-manager push-manager-qwenpaw push-worker push-copaw-worker push-hermes-worker push-openhuman-worker \
-        push-qwenpaw-worker push-qwen-code-worker \
+        push-qwenpaw-worker push-deepseek-harness-worker push-qwen-code-worker \
         push-native push-native-manager push-native-manager-qwenpaw push-native-worker push-native-copaw-worker push-native-hermes-worker push-native-openhuman-worker \
-        push-native-qwenpaw-worker push-native-qwen-code-worker \
+        push-native-qwenpaw-worker push-native-deepseek-harness-worker push-native-qwen-code-worker \
         buildx-setup \
         test test-quick test-installed test-embedded \
         install install-embedded uninstall uninstall-embedded replay replay-log \
@@ -220,6 +220,12 @@ build-qwenpaw-worker: ## Build QwenPaw Worker image
 		.
 
 build-deepseek-harness-worker: ## Build DeepSeek Harness Worker image
+	@echo "==> Building DeepSeek Harness Worker image: $(LOCAL_DEEPSEEK_HARNESS_WORKER) (registry: $(HIGRESS_REGISTRY))"
+	docker build $(PLATFORM_FLAG) $(REGISTRY_ARG) $(DOCKER_BUILD_ARGS) \
+		-f deepseek-harness/Dockerfile \
+		-t $(LOCAL_DEEPSEEK_HARNESS_WORKER) \
+		.
+
 build-qwen-code-worker: ## Build Qwen Code Worker image
 	@echo "==> Building Qwen Code Worker image: $(LOCAL_QWEN_CODE_WORKER) (registry: $(HIGRESS_REGISTRY))"
 	docker build $(PLATFORM_FLAG) $(REGISTRY_ARG) $(DOCKER_BUILD_ARGS) \
@@ -521,6 +527,26 @@ else
 endif
 
 push-deepseek-harness-worker: buildx-setup ## Build + push multi-arch DeepSeek Harness Worker image
+	@echo "==> Building + pushing multi-arch DeepSeek Harness Worker: $(DEEPSEEK_HARNESS_WORKER_TAG) [$(MULTIARCH_PLATFORMS)]"
+ifeq ($(IS_PODMAN),1)
+	-podman manifest rm $(DEEPSEEK_HARNESS_WORKER_TAG) 2>/dev/null
+	$(foreach plat,$(subst $(comma), ,$(MULTIARCH_PLATFORMS)), \
+		echo "  -> Building DeepSeek Harness Worker for $(plat)..." && \
+		podman build --platform $(plat) \
+			$(REGISTRY_ARG) $(DOCKER_BUILD_ARGS) \
+			--manifest $(DEEPSEEK_HARNESS_WORKER_TAG) \
+			-f deepseek-harness/Dockerfile . && ) true
+	podman manifest push --all $(DEEPSEEK_HARNESS_WORKER_TAG) docker://$(DEEPSEEK_HARNESS_WORKER_TAG)
+else
+	docker buildx build \
+		--builder $(BUILDX_BUILDER) \
+		--platform $(MULTIARCH_PLATFORMS) \
+		$(REGISTRY_ARG) $(DOCKER_BUILD_ARGS) \
+		-t $(DEEPSEEK_HARNESS_WORKER_TAG) \
+		--push \
+		-f deepseek-harness/Dockerfile .
+endif
+
 push-qwen-code-worker: buildx-setup ## Build + push multi-arch Qwen Code Worker image
 	@echo "==> Building + pushing multi-arch Qwen Code Worker: $(QWEN_CODE_WORKER_TAG) [$(MULTIARCH_PLATFORMS)]"
 ifeq ($(IS_PODMAN),1)
@@ -595,6 +621,9 @@ push-native-qwenpaw-worker: build-qwenpaw-worker ## Push native-arch QwenPaw Wor
 	docker push $(QWENPAW_WORKER_TAG)
 
 push-native-deepseek-harness-worker: build-deepseek-harness-worker ## Push native-arch DeepSeek Harness Worker only (dev)
+	docker tag $(LOCAL_DEEPSEEK_HARNESS_WORKER) $(DEEPSEEK_HARNESS_WORKER_TAG)
+	docker push $(DEEPSEEK_HARNESS_WORKER_TAG)
+
 push-native-qwen-code-worker: build-qwen-code-worker ## Push native-arch Qwen Code Worker only (dev)
 	docker tag $(LOCAL_QWEN_CODE_WORKER) $(QWEN_CODE_WORKER_TAG)
 	docker push $(QWEN_CODE_WORKER_TAG)
