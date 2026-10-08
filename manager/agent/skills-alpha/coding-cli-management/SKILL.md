@@ -33,26 +33,42 @@ Optional budget fields (consumed by `run-coding-cli.sh` for `qwen` only — the 
 
 The config path can be overridden with the `CODING_CLI_CONFIG` environment variable (the verify script uses this for its turn-budget case).
 
-**Runner notes (Qwen Code / OpenCode).** Headless invocations used by `run-coding-cli.sh`: `qwen --yolo "<prompt>"` and `opencode run --auto --dir <workspace> "<prompt>"`. Config surfaces: `~/.qwen` (`settings.json` `security.auth`, or provider env) and `~/.config/opencode` plus `~/.local/share/opencode/auth.json` (credentials stored by `opencode auth login`) or provider env. Both runners were verified with a headless round trip before inclusion (qwen pinned to `0.25.0`, the npm stable channel, field-verified 2026-10-08 with the full verify suite; the previous pin `0.24.7` remains the fallback if a deployment is held back on older behavior).
+**Per-run governance flags (qwen).** `run-coding-cli.sh` accepts optional per-run control flags for the qwen runner (other runners warn and ignore them — they have no equivalent surface):
 
-**Version channels and upgrades (Qwen Code).** qwen-code iterates fast (several hundred npm versions published) and ships three channels as dist-tags: `latest` (stable), `nightly` (dated + commit, published daily), and `preview`. Install or upgrade with npm (Node.js 22+), choosing the channel per the user's preference — stable by default, nightly only when the user explicitly wants newer behavior:
+| Flag | Maps to | Effect |
+|---|---|---|
+| `--model <name>` | `-m` | per-run model override — the task-level tier of two-tier model control (platform default from the runner's settings, per-task switch here) |
+| `--allowed-tools <csv>` | `--allowed-tools` | tool allowlist — a **code-level** permission boundary, independent of prompt discipline |
+| `--allowed-mcp <csv>` | `--allowed-mcp-server-names` | MCP server allowlist — scenario isolation (e.g. only this task's toolchain MCP) |
+| `--safe-mode` | `--safe-mode` | disable all customizations (hooks, extensions, skills, MCP, QWEN.md) — clean-environment runs |
+| `--bare` | `--bare` | minimal mode |
+
+Use the runner's own init frame (`-o json` prints a `tools` array and `permission_mode`) to size an allowlist from the actual capability list rather than from memory. All five were field-verified on qwen 0.25.0 (safe-mode banner, emptied MCP list, per-run model override observed in one run).
+
+**Updates.** Re-run the npm install command to upgrade in place, or use the runner's built-in `qwen update` self-update command (see `qwen update --help` for its channel behavior). Either way, re-run `verify-coding-cli.sh` afterwards (upgrade discipline above).
+
+**Runner notes (Qwen Code / OpenCode).** Headless invocations used by `run-coding-cli.sh`: `qwen --yolo "<prompt>"` and `opencode run --auto --dir <workspace> "<prompt>"`. Config surfaces: `~/.qwen` (`settings.json` `security.auth`, or provider env) and `~/.config/opencode` plus `~/.local/share/opencode/auth.json` (credentials stored by `opencode auth login`) or provider env. Both runners were verified with a headless round trip before inclusion. Qwen Code has **no fixed pin**: deployments choose their own npm channel tag (Section below, stable by default); `0.25.0` is the most recent field-verified reference (2026-10-08, full verify suite), and `0.24.7` the previous one. Re-run `verify-coding-cli.sh` whenever the version actually used changes.
+
+**Version channels and upgrades (Qwen Code).** qwen-code iterates fast (several hundred npm versions published) and ships three channels as dist-tags: `latest` (stable), `nightly` (dated + commit, published daily), and `preview`. Install or upgrade with npm (Node.js **22.20+ or 24.5+** — see the Node-generation note in the install matrix), choosing the channel per the user's preference — stable by default, nightly only when the user explicitly wants newer behavior:
 
 ```bash
 npm install -g @qwen-code/qwen-code@latest    # stable
 npm install -g @qwen-code/qwen-code@nightly   # nightly
 ```
 
-Re-running the same command upgrades in place; `qwen --version` confirms the result. **Upgrade discipline: after any version change — including a channel switch — re-run `scripts/verify-coding-cli.sh`; a channel switch is a pin promotion and needs the same verification.** The official standalone installer and Homebrew are fine for interactive use; the pinning and verify discipline above are defined for the npm channel.
+Re-running the same command upgrades in place; `qwen --version` confirms the result. **Upgrade discipline: after any version change — including a channel switch — re-run `scripts/verify-coding-cli.sh`; a channel switch is a pin promotion and needs the same verification.** The official standalone installer and Homebrew are fine for interactive use; the verify discipline above is defined for the npm channel.
 
-**Install matrix and network environment.** Three official installers; pick by what the execution site has (Node.js 22+ is only required for the npm channel):
+**Install matrix and network environment.** Three official installers; pick by what the execution site has (a Node.js generation requirement applies to the npm channel, below):
 
 | Installer | Requires | Version selection |
 |---|---|---|
-| npm: `npm install -g @qwen-code/qwen-code@<tag>` | Node.js 22+ | channel tag (`latest` / `nightly` / `preview`) — the route this skill's pin and verify discipline are defined for |
+| npm: `npm install -g @qwen-code/qwen-code@<tag>` | Node.js **22.20+ or 24.5+** (OpenSSL 3.5 generation — see note) | channel tag (`latest` / `nightly` / `preview`) — the route this skill's verify discipline is defined for |
 | official standalone script: `curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen-standalone.sh \| bash` (Windows: `irm …install-qwen-standalone.ps1 \| iex`) | bash, no Node | the build the script ships; re-run to refresh |
 | Homebrew: `brew install qwen-code` | brew | brew's current release |
 
 npm and the release assets cover Linux x64/arm64, macOS x64/arm64, and Windows. Restart the terminal after a standalone install so the PATH entry takes effect.
+
+**Node generation matters on restrictive links.** The npm package runs on Node.js; early Node 22.x (22.0–22.19) bundles OpenSSL 3.0, whose TLS client fingerprint is reset by some middle boxes, while Node 22.20+, 24.5+ and 25+ bundle OpenSSL 3.5 and pass. Field-verified 2026-10 (the cctechstudio WAN line RSTs the 3.0 generation but not 3.5); if installs or model-plane connections fail on a restricted link, check the Node/OpenSSL generation first (`node -p "process.versions.openssl"`).
 
 **Model configuration.** `qwen` authenticates either interactively (`/auth` inside a session, Qwen provider) or from `~/.qwen/settings.json`, where an OpenAI-compatible provider entry (`modelProviders[]` with `baseUrl` / API key) is the form headless delegation uses on self-hosted or gateway-backed deployments. Any OpenAI-compatible endpoint is a valid `baseUrl` — including a **transparent local proxy**, which is the standard lever for keeping the model plane working behind a restrictive link. Per-run overrides: `-m <model>` to pick a model and `-o text|json|stream-json` for machine-readable output.
 
