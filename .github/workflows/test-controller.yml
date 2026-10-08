@@ -6,6 +6,7 @@ on:
       - 'agentteams-controller/**'
       - 'copaw/**'
       - 'plugins/teamharness/**'
+      - 'plugins/agentteams-matrix-channel/**'
       - 'plugins/tests/**'
       - 'docs/design/teamharness/**'
       - '.github/workflows/test-controller.yml'
@@ -15,6 +16,7 @@ on:
       - 'agentteams-controller/**'
       - 'copaw/**'
       - 'plugins/teamharness/**'
+      - 'plugins/agentteams-matrix-channel/**'
       - 'plugins/tests/**'
       - 'docs/design/teamharness/**'
   workflow_dispatch:

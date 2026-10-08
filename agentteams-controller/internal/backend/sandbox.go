@@ -148,7 +148,7 @@ func (s *SandboxBackend) Create(ctx context.Context, req CreateRequest) (*Worker
 	workerImage := req.Image
 	if workerImage == "" {
 		switch {
-		case req.Runtime == RuntimeCopaw && s.config.CopawWorkerImage != "":
+		case req.Runtime == RuntimeCopaw:
 			workerImage = s.config.CopawWorkerImage
 		case req.Runtime == RuntimeHermes && s.config.HermesWorkerImage != "":
 			workerImage = s.config.HermesWorkerImage
