@@ -801,3 +801,20 @@ jobs:
 
       - name: Run the LLM-smoke regression suite (stubbed docker/curl)
         run: bash install/tests/verify-llm-regressions.sh
+
+# ============================================================
+# Offline pre-flight suite: qwenpaw upgrade checker (AgentTeams#1341)
+# No Docker or network needed - builds miniature trees and a fake wheel.
+# ============================================================
+
+  qwenpaw-upgrade-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run the offline pre-flight suite
+        run: python3 qwenpaw/tests/test_check_qwenpaw_upgrade.py
