@@ -651,14 +651,18 @@ func TestDockerCreateResolvesImageFromRuntime(t *testing.T) {
 // upgrade-compat regression (issue #1310): a CoPaw worker with an empty
 // spec.image, recreated after a controller upgrade, must run on the image
 // carried forward from the pre-upgrade deployment env (CopawWorkerImage,
-// e.g. a private registry pin), not on the generic worker image or the
-// built-in agentteams-copaw-worker:latest fallback. test-29 does not
+// e.g. the old chart default higress-registry.../agentteams-copaw-worker
+// plus the release's global image tag), not on the generic worker image or
+// the built-in agentteams-copaw-worker:latest fallback. test-29 does not
 // cover this case because it explicitly pins spec.image.
 func TestDockerCreateRecreationKeepsLegacyCopawImage(t *testing.T) {
 	capturedImages := captureCreateImagesServer(t)
 	defer capturedImages.srv.Close()
 
-	legacyImage := "private.registry.example/agentteams-copaw-worker:v1.2.3"
+	// Same image test-29 pins as the legacy fingerprint (old chart default
+	// resolved at v1.2.4) — one concrete value across chart check, gate,
+	// and recreation coverage.
+	legacyImage := "higress-registry.cn-hangzhou.cr.aliyuncs.com/agentteams/agentteams-copaw-worker:v1.2.4"
 	b := &DockerBackend{
 		config: DockerConfig{
 			WorkerImage:      "agentteams/agentteams-worker:latest",

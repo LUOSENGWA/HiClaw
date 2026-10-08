@@ -183,7 +183,7 @@ app.kubernetes.io/component: {{ .component }}
     values.yaml). New releases leave it empty so no
     AGENTTEAMS_COPAW_WORKER_IMAGE env is injected at all. */}}
 {{- define "agentteams.worker.copawImage" -}}
-{{- $tag := default (include "agentteams.globalImageTag" .) .Values.worker.defaultImage.copaw.tag }}
+{{- $tag := required "worker.defaultImage.copaw.tag is required for legacy CoPaw deployments: this release no longer builds CoPaw worker images, so the global image tag must not select one" .Values.worker.defaultImage.copaw.tag }}
 {{- printf "%s:%s" .Values.worker.defaultImage.copaw.repository $tag }}
 {{- end }}
 
