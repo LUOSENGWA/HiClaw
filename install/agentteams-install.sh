@@ -1529,6 +1529,31 @@ load_current_params_from_env() {
     fi
 }
 
+# Legacy CoPaw upgrade compatibility (issue #1310): existing workers
+# commonly carry an empty spec.image and resolve their CoPaw worker image
+# from the deployment's env file. When upgrading (never on fresh
+# installs), carry the pre-upgrade AGENTTEAMS_COPAW_WORKER_IMAGE forward
+# so a post-upgrade wake/recreation keeps pulling the same image instead
+# of falling back to the controller's built-in default. An explicit
+# AGENTTEAMS_INSTALL_COPAW_WORKER_IMAGE override (already resolved into
+# COPAW_WORKER_IMAGE) always wins.
+inherit_legacy_copaw_worker_image() {
+    local env_file="${1:-}"
+    if [ -n "${COPAW_WORKER_IMAGE:-}" ]; then
+        return 0
+    fi
+    if [ -z "${env_file}" ] || [ ! -f "${env_file}" ]; then
+        return 0
+    fi
+    local legacy_image
+    legacy_image="$(grep '^AGENTTEAMS_COPAW_WORKER_IMAGE=' "${env_file}" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '\r')"
+    if [ -n "${legacy_image}" ]; then
+        COPAW_WORKER_IMAGE="${legacy_image}"
+        log "Keeping legacy CoPaw worker image from ${env_file}: ${legacy_image}"
+    fi
+    return 0
+}
+
 # In non-interactive mode, uses default or errors if required and no default.
 # Usage: prompt VAR_NAME "Prompt text" "default" [true=secret]
 prompt() {
@@ -2066,6 +2091,9 @@ step_existing() {
             fi
             # Load current parameters for both Keep-All and confirm-each modes
             load_current_params_from_env
+            # Legacy CoPaw deployments: carry the pre-upgrade worker image
+            # forward (fresh installs keep the image-less default).
+            inherit_legacy_copaw_worker_image "${existing_env}"
             if [ -n "${running_manager}" ] || [ -n "${running_workers}" ]; then
                 echo ""
                 echo -e "\033[33m$(msg install.existing.warn_manager_stop)\033[0m"

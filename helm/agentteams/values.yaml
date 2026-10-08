@@ -291,6 +291,15 @@ worker:
     openclaw:
       repository: higress-registry.cn-hangzhou.cr.aliyuncs.com/agentteams/agentteams-worker
       tag: ""                 # defaults to global.imageTag
+    copaw:
+      # Legacy CoPaw deployments only (issue #1310): new releases must not
+      # inject AGENTTEAMS_COPAW_WORKER_IMAGE, so repository stays empty by
+      # default. Existing CoPaw deployments whose workers carry an empty
+      # spec.image should pin their previous image here so a controller
+      # upgrade/recreation keeps pulling it instead of the built-in
+      # agentteams-copaw-worker:latest fallback.
+      repository: ""
+      tag: ""                 # defaults to global.imageTag when repository is set
     hermes:
       repository: higress-registry.cn-hangzhou.cr.aliyuncs.com/agentteams/agentteams-hermes-worker
       tag: ""                 # defaults to global.imageTag

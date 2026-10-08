@@ -1,9 +1,9 @@
 """Tests for bridge.py — template-create + controller-field overlay model.
 
-Current contract (2.2 line; the pre-2.2 "rich overlay" contract — union
-allow_from, deep-merge groups, embedding_config, openclaw heartbeat seed,
-per-agent ``agent=`` key — was removed during the QwenPaw 2.2 migration.
-Tests below pin the behavior the Manager actually runs in production):
+Current contract (2.2 line; the pre-2.2 "rich overlay" contract —
+embedding_config, openclaw heartbeat seed, per-agent ``agent=`` key — was
+removed during the QwenPaw 2.2 migration. Tests below pin the behavior
+the Manager actually runs in production):
 
 1. **create phase** — a missing ``workspaces/default/agent.json`` is
    installed from an in-tree template (``agent.{profile}.json``); a missing
@@ -13,11 +13,12 @@ Tests below pin the behavior the Manager actually runs in production):
 2. **restart-overlay phase** — the overlay refreshes only the fields the
    Controller owns: Matrix scalars (token, user), ``running.max_input_length``,
    ``subagent_model``; stream filters are pinned True/True. Console is
-   forced off.  ``channels.matrix.allow_from`` / ``group_allow_from``
-   union-merge with local entries (a re-bridge never drops operator
-   additions — see the union test), and ``channels.matrix.groups``
-   deep-merges with local values winning at leaves.  ``env`` and other
-   user-owned fields are never bridged.
+   forced off.  ``channels.matrix.allow_from`` / ``group_allow_from`` /
+   ``groups`` are a controller-wins projection, overwritten wholesale from
+   the controller source on every re-bridge (empty values included), so
+   allowlist revocations and group-policy tightenings take effect — see
+   the two regression tests below.  ``env`` and other user-owned fields
+   are never bridged.
 """
 
 import json
@@ -309,15 +310,19 @@ def test_embedding_config_never_written_by_bridge():
 
 
 # ---------------------------------------------------------------------------
-# Controller-field overlay: union
+# Controller-field overlay: controller-wins (channels.matrix.allow_from)
 # ---------------------------------------------------------------------------
 
-def test_union_allow_from_merges_cr_and_user():
-    """channels.matrix.allow_from: CR entries + user additions co-exist.
+def test_allow_from_revocation_takes_effect_on_rebridge():
+    """channels.matrix.allow_from is a controller-wins projection.
 
-    Regression guard for the pre-2.2 union contract: a re-bridge must
-    not silently drop locally added allowlist entries (a dropped human
-    entry is then silently blocked in allowlist mode with no error).
+    Regression guard for the extraction (behavior must not change):
+    bridge twice — first with a user in the source allowlist, then with
+    that user removed from the source. The final agent.json must not
+    allow the user: previously projected values are controller values,
+    not local overrides, so any merge that preserved the locally written
+    value would silently keep the revoked user (and allowlist mode
+    would keep accepting their messages with no error).
     """
     cfg = _make_openclaw_cfg()
     cfg["channels"]["matrix"]["dm"] = {
@@ -328,59 +333,54 @@ def test_union_allow_from_merges_cr_and_user():
     with tempfile.TemporaryDirectory() as tmpdir:
         working_dir = Path(tmpdir) / "agent"
         _run_bridge(cfg, working_dir)
-
-        agent_path = _agent_json_path(working_dir)
-        agent = json.loads(agent_path.read_text())
-        agent["channels"]["matrix"]["allow_from"].append("@bob:example.org")
-        agent_path.write_text(json.dumps(agent))
-
-        cfg["channels"]["matrix"]["dm"]["allowFrom"] = [
-            "@alice:example.org", "@carol:example.org",
+        assert _read_agent(working_dir)["channels"]["matrix"]["allow_from"] == [
+            "@alice:example.org",
         ]
+
+        # The controller revokes the user from the source allowlist.
+        cfg["channels"]["matrix"]["dm"]["allowFrom"] = []
         _run_bridge(cfg, working_dir)
         agent = _read_agent(working_dir)
 
-    allow_from = agent["channels"]["matrix"]["allow_from"]
-    assert set(allow_from) == {"@alice:example.org", "@bob:example.org", "@carol:example.org"}
-    assert allow_from.count("@alice:example.org") == 1  # dedup
+    assert agent["channels"]["matrix"]["allow_from"] == []
 
 
 # ---------------------------------------------------------------------------
-# Controller-field overlay: deep-merge (channels.matrix.groups)
+# Controller-field overlay: controller-wins (channels.matrix.groups)
 # ---------------------------------------------------------------------------
 
-def test_deep_merge_groups_preserves_user_override():
-    """channels.matrix.groups: user leaf edits survive; controller may only
-    add new leaves the agent doesn't have yet (local-wins deep merge)."""
+def test_groups_policy_tightening_takes_effect_on_rebridge():
+    """channels.matrix.groups is a controller-wins projection.
+
+    Regression guard for the extraction (behavior must not change):
+    changing ``requireMention`` from false to true in the controller
+    group policy must reach agent.json on the next re-bridge. A
+    local-wins merge would keep the previously projected false (it was
+    written by the last re-bridge, not edited by a user), and the
+    tightening would never apply.
+    """
     cfg = _make_openclaw_cfg()
     cfg["channels"]["matrix"]["groups"] = {
-        "*": {"requireMention": True, "historyLimit": 50},
+        "*": {"requireMention": False},
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:
         working_dir = Path(tmpdir) / "agent"
         _run_bridge(cfg, working_dir)
-
-        agent_path = _agent_json_path(working_dir)
-        agent = json.loads(agent_path.read_text())
-        assert agent["channels"]["matrix"]["groups"]["*"]["historyLimit"] == 50
-
-        agent["channels"]["matrix"]["groups"]["*"]["requireMention"] = False
-        agent["channels"]["matrix"]["groups"]["!room:example.org"] = {
+        assert _read_agent(working_dir)["channels"]["matrix"]["groups"]["*"] == {
             "requireMention": False,
         }
-        agent_path.write_text(json.dumps(agent))
 
-        cfg["channels"]["matrix"]["groups"]["*"]["historyLimit"] = 200
-        cfg["channels"]["matrix"]["groups"]["*"]["newFlag"] = True
+        # The controller tightens the policy on the next reconcile.
+        cfg["channels"]["matrix"]["groups"] = {
+            "*": {"requireMention": True, "historyLimit": 200},
+        }
         _run_bridge(cfg, working_dir)
         agent = _read_agent(working_dir)
 
-    groups = agent["channels"]["matrix"]["groups"]
-    assert groups["*"]["requireMention"] is False  # user override kept
-    assert groups["*"]["historyLimit"] == 50  # existing leaf NOT overwritten
-    assert groups["*"]["newFlag"] is True  # new leaf added
-    assert groups["!room:example.org"] == {"requireMention": False}
+    assert agent["channels"]["matrix"]["groups"] == {
+        "*": {"requireMention": True, "historyLimit": 200},
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -467,51 +467,6 @@ def _write_config_json(
 # agent.json — per-agent config (CoPaw 1.0.2+ reads this, not config.json)
 # ---------------------------------------------------------------------------
 
-def _union_list(remote: Any, local: Any) -> list[Any]:
-    """Order-preserving, deduplicated union of the remote (controller)
-    value and the local (user-owned) value.
-
-    Entries already present locally keep their position; controller
-    entries are appended when missing.  Prevents a re-bridge from
-    silently dropping allowlist entries added locally (e.g. recovery
-    edits while the controller value was incomplete).
-    """
-    remote_list = remote if isinstance(remote, list) else []
-    local_list = local if isinstance(local, list) else []
-    seen: set[str] = set()
-    result: list[Any] = []
-    for item in local_list + remote_list:
-        key = (
-            json.dumps(item, sort_keys=True)
-            if isinstance(item, (dict, list))
-            else repr(item)
-        )
-        if key not in seen:
-            seen.add(key)
-            result.append(item)
-    return result
-
-
-def _deep_merge_local_wins(remote: Any, local: Any) -> Any:
-    """Recursively merge dicts; the local value wins at every leaf where
-    both sides define one.
-
-    The controller can only add leaves the agent does not have yet, so
-    per-room user overrides survive a re-bridge.
-    """
-    if isinstance(remote, dict) and isinstance(local, dict):
-        result: dict[str, Any] = {}
-        for key in remote.keys() | local.keys():
-            if key in remote and key in local:
-                result[key] = _deep_merge_local_wins(remote[key], local[key])
-            elif key in remote:
-                result[key] = remote[key]
-            else:
-                result[key] = local[key]
-        return result
-    return local
-
-
 def _write_agent_json(
     cfg: dict[str, Any],
     working_dir: Path,
@@ -522,11 +477,15 @@ def _write_agent_json(
     """Create agent.json from template, then overlay Matrix channel config.
 
     CoPaw 1.0.2+ reads workspace/agent.json for per-agent configuration.
-    The template provides defaults; we overlay controller-owned fields.
-    ``allow_from`` / ``group_allow_from`` union-merge with local entries
-    and ``groups`` deep-merges with local values winning at leaves, so
-    operator edits survive every re-bridge; other Matrix scalars and the
-    context window stay controller-wins.
+    The template provides defaults; we overlay controller-owned fields
+    (Matrix access_token, homeserver, allowlists, context window).
+
+    ``allow_from`` / ``group_allow_from`` / ``groups`` are a
+    controller-wins projection: they are overwritten wholesale from the
+    controller source on every re-bridge, empty values included, so a
+    revocation from the source allowlist or a group-policy tightening
+    takes effect immediately. The package extraction must not change
+    this pre-extraction behavior.
     """
     workspace_dir = working_dir / "workspaces" / "default"
     workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -591,19 +550,14 @@ def _write_agent_json(
         matrix_ch["access_token"] = access_token
     if user_id:
         matrix_ch["user_id"] = user_id
-    # Union / deep-merge (restored contract): a re-bridge must not drop
-    # allowlist entries the operator added locally, nor per-room user
-    # overrides.  See _union_list / _deep_merge_local_wins.
-    matrix_ch["allow_from"] = _union_list(
-        dm_allow_from, matrix_ch.get("allow_from")
-    )
-    matrix_ch["group_allow_from"] = _union_list(
-        group_allow_from, matrix_ch.get("group_allow_from")
-    )
-    existing_groups = matrix_ch.get("groups")
-    matrix_ch["groups"] = _deep_merge_local_wins(
-        groups, existing_groups if isinstance(existing_groups, dict) else {}
-    )
+    # Controller-wins projection: the controller source is the single
+    # source of truth for the Matrix allowlists and group policy.
+    # Overwriting wholesale (empty values included) is what lets a
+    # revocation or a policy tightening take effect on the next
+    # re-bridge.
+    matrix_ch["allow_from"] = dm_allow_from
+    matrix_ch["group_allow_from"] = group_allow_from
+    matrix_ch["groups"] = groups
     matrix_ch["filter_tool_messages"] = True
     matrix_ch["filter_thinking"] = True
 
