@@ -4,8 +4,15 @@
 > Distilled from field operation of delegated coding-CLI sessions (field notes
 > published on agentscope-ai/AgentTeams#1340). Content-only — no behavior change,
 > no new surface.
+>
+> **Part A** — first increment: one-shot delegation (supported by the current skills).
+> **Part B** — later capabilities (roadmap, not yet implemented; evaluated separately).
 
-## 1. Task-spec discipline
+## Part A — First increment: one-shot delegation (currently supported)
+
+The delegating agent invokes the coding CLI as an execution tool, reusing the existing identity, permissions, task flow, storage, and audit.
+
+### Task-spec discipline
 
 A delegated coding task should be a bounded, self-describing unit. The prompt handed to the CLI should carry:
 
@@ -21,7 +28,75 @@ A delegated coding task should be a bounded, self-describing unit. The prompt ha
 
 **Scaffolding scales with the runner.** For small/edge models, fully pre-write the change (near-ready spec, exact anchors). For stronger models, explicit goals + constraints + acceptance + self-verification are enough; over-constraining a strong model can reduce quality.
 
-## 2. Supervision and steering
+### Auth, opt-in and execution boundary
+
+Delegation reuses the delegating agent's identity and credentials; it adds no new approval subsystem.
+
+**Detection surface — existence only, never read values.**
+
+- `qwen` — `~/.qwen` or env-based auth.
+- `opencode` — `~/.config/opencode`, `~/.local/share/opencode/auth.json`, or env-based auth.
+- Detection checks that a configured surface exists; it does not read or log its contents.
+
+**Unattended semantics.** `qwen --yolo` auto-approves every tool call; `opencode --auto` still enforces explicit deny rules. A changed working directory or an added timeout is not a permission boundary — they alter behavior, not scope.
+
+**Execution boundary.** The CLI runs as the delegating agent and inherits its filesystem and environment-credential visibility. Evaluate per deployment: workspace scope, reach into other team files, the delegator's credentials, mounted sockets, and management-plane capabilities. Mitigations are the CLIs' native controls — qwen `--approval-mode` tiers, opencode deny rules — and/or an isolated execution environment.
+
+**Verification.** Run before relying on the delegation, with the tested CLI version pinned in the report (measured: qwen 0.24.7):
+
+1. Headless run succeeds and the artifact lands in the task directory.
+2. Auth failure propagates as a non-zero exit code.
+3. Timeout terminates the run.
+4. The workspace boundary holds — no writes outside the task directory.
+
+- **Progress channel.** Reuse, don't add: the console stream as primary progress surface, with file artifacts (results and logs in the task directory) as the durable record; supervision, when it exists, drives off status probes. An optional structured block is a welcome enhancement, never a dependency.
+- **Concurrency and cost.** Per-runner session limits and model-endpoint auth are explicit configuration, not implicit behavior.
+
+### Preflight and environment checks
+
+Before the first real task:
+
+- **Runner present where the session runs** — install or mount accordingly; verify with a trivial round-trip ("ping") before real work.
+- **Auth configured end-to-end** — settings file or environment, including base URL and model; secrets never in desired state (`docs/design/member-runtime-config-contract.md`).
+- **Environment hygiene** — if ambient variables break the runner, pin the invocation in a small wrapper and register that as the runner command.
+- **Network matrix** — on some links, connections are reset selectively by TLS stack generation; use a current stack or a local relay, and document the finding for the deployment.
+- **Placement.** Choose per side: a host-side daemon on the user's machine is the least-effort option (independent lifecycle, natural file locality, survives agent rebuilds); on a managed worker the in-container options are the host-independent ones — a subprocess for one-shot delegated runs, a daemon variant once parallelism matters; use the platform's dedicated node when it offers one. Keep files on mounts/shared volumes, and prefer the shape whose toolchain survives a re-install. Daemon and cross-boundary placement shapes belong to Part B.
+- **Direction rule for user-local runners.** When the runner lives on the user's machine and the orchestrator in a managed deployment, assume inbound is unavailable (NAT/firewall): the local side must initiate — poll a queue, hold a connection, or run a local relay — and anything it sends out must leave through a surface the managed side accepts (a member-voice relay) until the runner itself has an identity. Membership fixes the voice, not reachability.
+- **Runner egress, not just the orchestration plane.** The chosen placement must satisfy the runner's own model egress: in field testing one runtime reached the provider endpoint directly while the other needed a local relay (TLS stack fingerprinting on the path). Verify egress per placement, not only the orchestration plane.
+
+### Pitfalls → what to do (field-verified)
+
+| Symptom | What to do |
+|---|---|
+| Runner binary missing at spawn | install/mount where sessions run; ping before real work |
+| Auth errors in sequence (authenticate → missing API key) | configure the full auth surface (base URL + model + key) first |
+| Ambient environment breaks the runner | wrap the invocation; pin flags and settings |
+| Connections reset on some links | use a modern TLS stack or a local relay |
+| VCS operations denied inside sandboxes | keep git at the orchestrator; no git steps in delegation specs |
+| Parallel sessions clobber files | one writer per file; isolate workspaces |
+| A bare wait/sleep is blocked by policy | annotate intent on long waits; expect command-level gates even after the task is accepted |
+| Cold-start handoff repeats old mistakes | carry "what was tried and abandoned" + decisions in the briefing |
+
+## Part B — Later capabilities (roadmap; not yet implemented)
+
+> Later capabilities — evaluated separately when a concrete delegation requirement needs them; ACP sessions are covered here, not in the first increment.
+
+### API-level supervision contract (host-daemon form)
+
+These apply to the session/daemon form (Part B shapes), not to the one-shot path.
+
+- **Supervision probe** — the session status endpoint exposes an "active prompt" flag.
+  A lightweight poller is sufficient; no bespoke completion endpoint needed.
+- **First-responder voting** — the permission-vote endpoint answers with the selected option id or a cancel.
+  A 404 means the vote was already taken — first-responder semantics at the transport level, composing with claim-before-act.
+- **Session durability** — the transcript persists on disk and can be re-loaded after process death (suspend/crash/OOM).
+  A turn in flight during the crash is lost — re-issue the task into the same session: idempotency is the contract, not recovery of the interrupted turn.
+- **Polling-client protection** — the server's idle auto-close can be deferred by a grace setting.
+  A poll-based (non-SSE-attached) supervisor must be protected from its session being reaped mid-work.
+- **Model-endpoint reachability** — the runner's model base URL accepts any OpenAI-compatible endpoint, including a transparent local proxy.
+  The standard lever to keep the model plane working behind restrictive/DPI links without touching session config.
+
+### Supervision and steering
 
 A delegated session is not fire-and-forget. The supervising side should:
 
@@ -40,34 +115,20 @@ A delegated session is not fire-and-forget. The supervising side should:
 - **Treat wake jobs as at-least-once.** One-shot jobs have been seen lingering past their fire time and duplicated with identical names. Keep handlers idempotent (see "Claim before acting"), have one-shots auto-expire, clean fired records, and make lost deliveries recoverable — a "mark-after-confirm" shape (the wake is marked delivered only after confirmation) where the platform supports it.
 - **Reset lifecycle state on wake.** Where the platform has an idle-sleep policy, a worker woken after a long idle can be re-slept by the very next idle scan because its idle marker is stale — a wake-to-re-sleep loop. Every wake and ensure-ready path must reset the idle clock: the wake and the lifecycle share the same moment.
 
-## 3. Approval expectations
+### Approval expectations
 
 - **The routine is automated; the risky pauses.** Keep an allow-pattern (in-workspace edits, read-only inspection, build/test) and a hold-list that is never auto-answered: destructive operations, credential paths, secret reads, service managers, production-bound targets.
 - **Strict option echoing** — always answer a permission request with one of the option ids carried by that request.
 - **Never auto-select a mode-switching option** (e.g. "allow once and switch to default") — humans only.
 - **Audit every decision** — who / when / what / why per answer; this is what lets a reviewer reconstruct an unattended run (the durable audit store behind `GET /api/v1/audit` is a natural home).
 - **Unanswered requests stall sessions indefinitely.** Plan the human surface (`approval_level` / attention events) so long runs do not depend on someone being online.
+- **The room leg already exists upstream.** The runner's channel base ships a productized permission relay: per-channel dispatch, a pending table, a rendered approval (allow-once / always-allow / deny, with a request-id suffix under multi-task), and the human reply parsed back into the strict option-id vote the flow requires (single-flight; a lost race surfaces as a 404 → cancel); unroutable or failed delivery auto-cancels — no orphaned pending state. The room leg of the approval bridge is therefore inherited by any channel; the open question is which surface renders the approval card and how it is audited — a routing/UX decision, not a protocol one.
+- **Ride the attention model, don't add a surface.** Notifications should use the taskflow attention model (`request_attention`, kind=approval — sync-before-notify, idempotent per kind, mentions the leader and the human initiator, auto-resolved on result acceptance). The pieces missing today: an option-id payload (strict echoing needs the choice ids, not just a question line) and a configurable console-vs-room routing choice — console-first for sensitive approvals (payloads carry code context), room opt-in.
 
-## 4. Preflight and environment checks
-
-Before the first real task:
-
-- **Runner present where the session runs** — install or mount accordingly; verify with a trivial round-trip ("ping") before real work.
-- **Auth configured end-to-end** — settings file or environment, including base URL and model; secrets never in desired state (`docs/design/member-runtime-config-contract.md`).
-- **Environment hygiene** — if ambient variables break the runner, pin the invocation in a small wrapper and register that as the runner command.
-- **Network matrix** — on some links, connections are reset selectively by TLS stack generation; use a current stack or a local relay, and document the finding for the deployment.
-- **Placement.** Choose per side: a host-side daemon on the user's machine is the least-effort option (independent lifecycle, natural file locality, survives agent rebuilds); on a managed worker the in-container options are the host-independent ones — a subprocess for one-shot delegated runs, a daemon variant once parallelism matters; use the platform's dedicated node when it offers one. Keep files on mounts/shared volumes, and prefer the shape whose toolchain survives a re-install.
-- **Direction rule for user-local runners.** When the runner lives on the user's machine and the orchestrator in a managed deployment, assume inbound is unavailable (NAT/firewall): the local side must initiate — poll a queue, hold a connection, or run a local relay — and anything it sends out must leave through a surface the managed side accepts (a member-voice relay) until the runner itself has an identity. Membership fixes the voice, not reachability.
-- **Runner egress, not just the orchestration plane.** The chosen placement must satisfy the runner's own model egress: in field testing one runtime reached the provider endpoint directly while the other needed a local relay (TLS stack fingerprinting on the path). Verify egress per placement, not only the orchestration plane.
-
-## 5. Pitfalls → what to do (field-verified)
+### Pitfalls → what to do (field-verified)
 
 | Symptom | What to do |
 |---|---|
-| Runner binary missing at spawn | install/mount where sessions run; ping before real work |
-| Auth errors in sequence (authenticate → missing API key) | configure the full auth surface (base URL + model + key) first |
-| Ambient environment breaks the runner | wrap the invocation; pin flags and settings |
-| Connections reset on some links | use a modern TLS stack or a local relay |
 | "Done" appears instantly | prompts ack asynchronously — derive completion from status/events; detect send failures explicitly |
 | First status read is "not active" → false done | require "seen active at least once"; grace-timer never-started runs |
 | Sessions expire between uses | keep durable state in files/artifacts |
@@ -76,21 +137,18 @@ Before the first real task:
 | Unattended approval stalls a session | policy-answer with holds; escalate only the risky slice |
 | Reviewers stop reading approvals | automate the routine; keep the audit trail as the safety net |
 | Mid-turn steering doesn't interrupt | queue + cancel → resume |
-| VCS operations denied inside sandboxes | keep git at the orchestrator; no git steps in delegation specs |
-| Parallel sessions clobber files | one writer per file; isolate workspaces |
-| A bare wait/sleep is blocked by policy | annotate intent on long waits; expect command-level gates even after the task is accepted |
 | Completion missed — watch window shorter than queue delay | size windows for worst-case queue + execution (~10 min observed); arm watchers before work starts |
 | "No activity observed" alert | treat as a first-class signal — it may be the only closure trigger |
 | Watchers race on the same completion | claim an occupancy token before acting (idempotent wake handling) |
 | Analysis helper starts editing files | end every analysis prompt with the no-edits suffix |
-| Cold-start handoff repeats old mistakes | carry "what was tried and abandoned" + decisions in the briefing |
 | Wake routed to a default target | record the intended session at job creation; keep the owner derivable from the payload |
 | Duplicate or lingering wake jobs | at-least-once discipline: idempotent claim; auto-expire one-shots; clean fired records; re-deliverable lost wakes |
 | Assignment recorded but never delivered | require a delivery event per assignment; receipts (or worker-side activity) for completion; refusals are signals |
 | A woken worker re-slept immediately | reset the idle marker on wake / ensure-ready paths |
 | Run longer than the watch window | hour-plus runs are normal; size windows for the long tail (~10 min queue observed + long execution) |
+| Cross-boundary supervisor cannot vote | a local-only permission mode gates votes by loopback origin — a host-side/remote supervisor gets nothing under it; use first-responder voting (or that mode's intended local UI) for delegated sessions that cross a boundary |
 
-## 6. Related surfaces
+## Related surfaces
 
 - Adapter precedent and the natural home for runner installation / hook work: `plugins/teamharness/adapters/claude-code/`.
 - Team-level task contract: `plugins/teamharness/skills/team/task-delegation/` and `task-execution/`.
