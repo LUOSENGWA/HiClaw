@@ -76,9 +76,9 @@ for cli in claude gemini qodercli qwen opencode; do
     fi
 
     case "$cli" in
-        claude)   [ -d "$HOME/.claude" ]  && config_ok=true ;;
-        gemini)   [ -d "$HOME/.gemini" ]  && config_ok=true ;;
-        qodercli) [ -d "$HOME/.qoder" ]   && config_ok=true ;;
+        claude)   [ -d "$HOME/.claude" ]  && { config_ok=true; cfg_dir=true; } ;;
+        gemini)   [ -d "$HOME/.gemini" ]  && { config_ok=true; cfg_dir=true; } ;;
+        qodercli) [ -d "$HOME/.qoder" ]   && { config_ok=true; cfg_dir=true; } ;;
         qwen)
             [ -d "$HOME/.qwen" ] && { config_ok=true; cfg_dir=true; }
             env_found="$(env_names_set "$QWEN_ENV_NAMES")"
@@ -96,26 +96,18 @@ for cli in claude gemini qodercli qwen opencode; do
         result=$(echo "$result" | jq --arg c "$cli" '.available += [$c]')
     fi
 
-    case "$cli" in
-        qwen|opencode)
-            env_array=$(to_json_array "$env_found")
-            result=$(echo "$result" | jq \
-                --arg c "$cli" \
-                --argjson b "$binary_ok" \
-                --argjson co "$config_ok" \
-                --argjson dir "$cfg_dir" \
-                --argjson sf "$cfg_share_file" \
-                --argjson env "$env_array" \
-                '.details[$c] = {binary: $b, config: $co, config_source: {dir: $dir, share_file: $sf, env: $env}}')
-            ;;
-        *)
-            result=$(echo "$result" | jq \
-                --arg c "$cli" \
-                --argjson b "$binary_ok" \
-                --argjson co "$config_ok" \
-                '.details[$c] = {binary: $b, config: $co}')
-            ;;
-    esac
+    # Uniform details schema for all runners: config_source reports which
+    # surface(s) matched (dir / share_file / env), so `config: true` is
+    # never left unexplained.
+    env_array=$(to_json_array "$env_found")
+    result=$(echo "$result" | jq \
+        --arg c "$cli" \
+        --argjson b "$binary_ok" \
+        --argjson co "$config_ok" \
+        --argjson dir "$cfg_dir" \
+        --argjson sf "$cfg_share_file" \
+        --argjson env "$env_array" \
+        '.details[$c] = {binary: $b, config: $co, config_source: {dir: $dir, share_file: $sf, env: $env}}')
 done
 
 echo "$result"

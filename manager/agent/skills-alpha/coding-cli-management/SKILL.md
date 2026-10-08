@@ -33,7 +33,7 @@ Optional budget fields (consumed by `run-coding-cli.sh` for `qwen` only — the 
 
 The config path can be overridden with the `CODING_CLI_CONFIG` environment variable (the verify script uses this for its turn-budget case).
 
-**Runner notes (Qwen Code / OpenCode).** Headless invocations used by `run-coding-cli.sh`: `qwen --yolo "<prompt>"` and `opencode run --auto --dir <workspace> "<prompt>"`. Config surfaces: `~/.qwen` (`settings.json` `security.auth`, or provider env) and `~/.config/opencode` plus `~/.local/share/opencode/auth.json` (credentials stored by `opencode auth login`) or provider env. Both runners were verified with a headless round trip before inclusion (qwen pinned to `0.24.7`, field-verified 2026-10-02; `0.25.x` has since been released — no flag-level changes in the release notes as of 10/6, behavior unverified; re-run `verify.sh` before promoting the pin).
+**Runner notes (Qwen Code / OpenCode).** Headless invocations used by `run-coding-cli.sh`: `qwen --yolo "<prompt>"` and `opencode run --auto --dir <workspace> "<prompt>"`. Config surfaces: `~/.qwen` (`settings.json` `security.auth`, or provider env) and `~/.config/opencode` plus `~/.local/share/opencode/auth.json` (credentials stored by `opencode auth login`) or provider env. Both runners were verified with a headless round trip before inclusion (qwen pinned to `0.24.7`, field-verified 2026-10-02; `0.25.x` has since been released — no flag-level changes in the release notes as of 10/6, behavior unverified; re-run `verify-coding-cli.sh` before promoting the pin).
 
 **Unattended semantics — read before enabling.**
 - `qwen --yolo` automatically approves **all** tool calls — file edits and shell commands included, with no further prompts.
