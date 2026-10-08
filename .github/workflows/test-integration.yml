@@ -792,3 +792,12 @@ jobs:
       - name: Cleanup
         if: always()
         run: make uninstall-embedded 2>/dev/null || true && docker system prune -af || true
+
+  install-verify-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the LLM-smoke regression suite (stubbed docker/curl)
+        run: bash install/tests/verify-llm-regressions.sh
