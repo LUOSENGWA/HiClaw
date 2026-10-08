@@ -24,6 +24,15 @@ Path: `~/coding-cli-config.json` — this is the **delegating agent's own** conf
 | `false`   | any   | Admin declined; use normal task flow |
 | `true`    | `"claude"` / `"gemini"` / `"qodercli"` / `"qwen"` / `"opencode"` | Active — use this CLI |
 
+Optional budget fields (consumed by `run-coding-cli.sh` for `qwen` only — the other runners have no equivalent and ignore them):
+
+| Field | Type / default | Meaning |
+|-------|----------------|---------|
+| `max_session_turns` | integer, default absent / `0` (flag not passed) | Caps the qwen run at N model turns (`--max-session-turns <N>`); a run that reaches the cap terminates at the budget |
+| `sandbox` | boolean, default `false` | Adds `--sandbox` (Docker-backed) to the qwen run. Requires docker at the execution site — leave off where docker is unavailable (as in many agent containers) |
+
+The config path can be overridden with the `CODING_CLI_CONFIG` environment variable (the verify script uses this for its turn-budget case).
+
 **Runner notes (Qwen Code / OpenCode).** Headless invocations used by `run-coding-cli.sh`: `qwen --yolo "<prompt>"` and `opencode run --auto --dir <workspace> "<prompt>"`. Config surfaces: `~/.qwen` (`settings.json` `security.auth`, or provider env) and `~/.config/opencode` plus `~/.local/share/opencode/auth.json` (credentials stored by `opencode auth login`) or provider env. Both runners were verified with a headless round trip before inclusion.
 
 **Unattended semantics — read before enabling.**
@@ -45,12 +54,15 @@ When deciding whether to enable CLI delegation, assess at least:
 - **Mounted container sockets** — a mounted `docker.sock` (or equivalent) gives the CLI effective host-control capability.
 - **Admin-plane capability** — any orchestration/admin CLI or API the delegating agent can use is equally available to the runner.
 
-Mitigations:
+Mitigations, in three tiers:
 
-- The CLI's native permission controls: `qwen --approval-mode plan|default|auto-edit|auto|yolo` (lower tiers keep an approval gate), and `opencode` explicit deny rules (still enforced under `--auto`).
-- An isolated execution environment for the CLI: a dedicated container, a dedicated user, or restricted mounts.
+1. **Approval tiers (native).** Qwen Code: `--approval-mode` levels (plan / default / auto-edit / auto / yolo); lower tiers keep prompts on destructive shell and outbound calls. OpenCode: permission rules with `allow` / `ask` / `deny` actions, including command-prefix granularity (e.g. deny `rm ` while allowing `git ` / `npm `); `opencode agent create` can produce a scoped agent whose frontmatter denies everything not allowed.
+2. **Native sandbox (opt-in).** Qwen Code ships a Docker-backed sandbox (`--sandbox` / `QWEN_SANDBOX=1`) that runs shell/write/edit tools inside a sandbox image — **it is NOT auto-enabled by `--yolo`**; an un-sandboxed yolo run prints a warning to stderr, which lands in the run log. It requires docker at the execution site; where there is none (as in many agent containers) the flag must stay off. OpenCode has no native sandbox — its boundary is tier 1 plus tier 3.
+3. **Isolated execution environment (the baseline for skip-permissions-class flags).** Industry practice (Anthropic's own guidance for `--dangerously-skip-permissions`, and public incident reports from unsandboxed auto runs) is to run such sessions only in isolated environments — a dedicated container/VM/ephemeral runner — with budgets (`--max-session-turns` / wall time) so a stuck run cannot burn the host. In that case the delegating agent's ambient credentials and sockets should not be mounted into the environment at all.
 
 No new approval subsystem is introduced by this skill.
+
+Note: the pre-existing claude/gemini cases already run skip-permissions-class flags; per vendor guidance those are only sound inside an isolated environment, and headless runs should carry a turn cap (claude `--max-turns`).
 
 ---
 
@@ -70,7 +82,7 @@ echo '{"enabled":false,"cli":null,"confirmed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ
 Proceed with normal task assignment (Worker codes on their own).
 
 **If CLIs are available**, ask the admin via the primary channel or Matrix DM — **in the language the admin used**:
-> I found the following AI coding CLI tools available: [list]. Would you like to enable CLI delegation mode? Workers will generate coding prompts, and I'll use the CLI tool to make the code changes. Note: the CLI runs unattended — `qwen --yolo` auto-approves all tool calls, and `opencode --auto` still enforces explicit deny rules; the workspace and the timeout are not permission boundaries. Reply with the tool name (claude/gemini/qodercli/qwen/opencode) to enable, or 'no' to have workers code on their own.
+> I found the following AI coding CLI tools available: [list]. Would you like to enable CLI delegation mode? Workers will generate coding prompts, and I'll use the CLI tool to make the code changes. Note: the CLI runs unattended — `qwen --yolo` auto-approves all tool calls, and `opencode --auto` still enforces explicit deny rules; the workspace and the timeout are not permission boundaries. On a local or shared machine, consider the sandbox tier for Qwen Code (`--sandbox`, Docker-backed, off by default) and turn/wall budgets; on OpenCode there is no native sandbox, so prefer an isolated execution environment or tight deny rules. Reply with the tool name (claude/gemini/qodercli/qwen/opencode) to enable, or 'no' to have workers code on their own.
 
 On admin reply:
 - Tool name (`claude` / `gemini` / `qodercli` / `qwen` / `opencode`):

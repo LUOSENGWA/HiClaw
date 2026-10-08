@@ -45,6 +45,18 @@ log_file="$log_dir/run-${timestamp}.log"
 echo "[run-coding-cli] cli=$cli workspace=$workspace prompt_file=$prompt_file timeout=${timeout_secs}s" | tee "$log_file"
 echo "[run-coding-cli] Log: $log_file"
 
+# Optional per-runner budget fields from the delegating agent's config
+# (default ~/coding-cli-config.json, override with CODING_CLI_CONFIG for
+# tests). Only the qwen case consumes them today; absent/0/false -> no
+# extra flags.
+config_file="${CODING_CLI_CONFIG:-${HOME}/coding-cli-config.json}"
+max_session_turns=""
+sandbox_setting=""
+if command -v jq >/dev/null 2>&1 && [ -f "${config_file}" ]; then
+    max_session_turns=$(jq -r '.max_session_turns // empty' "${config_file}" 2>/dev/null || true)
+    sandbox_setting=$(jq -r '.sandbox // empty' "${config_file}" 2>/dev/null || true)
+fi
+
 cd "$workspace"
 
 case "$cli" in
@@ -66,7 +78,18 @@ case "$cli" in
         # qwen has no workspace flag (qwen 0.24.7); its workspace is the
         # process cwd, so pin the run to $workspace explicitly.
         cd "$workspace"
-        timeout "$timeout_secs" qwen --yolo "$(cat "$prompt_file")" 2>&1 | tee -a "$log_file"
+        # Optional budget flags from the config (see "Config File" in
+        # SKILL.md): max_session_turns -> --max-session-turns N (absent/0
+        # = omit); sandbox: true -> --sandbox (Docker-backed, requires
+        # docker at the execution site). No other runner consumes these.
+        qwen_args=(--yolo)
+        if [ -n "${max_session_turns}" ] && [ "${max_session_turns}" != "0" ]; then
+            qwen_args+=(--max-session-turns "${max_session_turns}")
+        fi
+        if [ "${sandbox_setting}" = "true" ]; then
+            qwen_args+=(--sandbox)
+        fi
+        timeout "$timeout_secs" qwen "${qwen_args[@]}" "$(cat "$prompt_file")" 2>&1 | tee -a "$log_file"
         exit_code=${PIPESTATUS[0]}
         ;;
     opencode)
