@@ -34,6 +34,9 @@ on:
       - 'tests/check-apply-wrapper-flags.sh'
       - 'tests/check-mcp-setup-domain-parsing.sh'
       - 'tests/check-helm-agentteams.sh'
+      - 'tests/check-copaw-helm-upgrade-gate.sh'
+      - 'tests/copaw-helm-upgrade-gate.sh'
+      - 'hack/local-k8s-up.sh'
       - 'tests/check-create-project-grant-admin.sh'
       - 'manager/agent/skills/project-management/**'
   workflow_dispatch: ~
@@ -96,6 +99,9 @@ jobs:
 
       - name: Check create-project grant-admin wiring
         run: bash tests/check-create-project-grant-admin.sh
+
+      - name: Check CoPaw upgrade gate failure modes
+        run: bash tests/check-copaw-helm-upgrade-gate.sh
 
       - name: Set up Helm
         uses: azure/setup-helm@v4

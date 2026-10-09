@@ -66,7 +66,7 @@ grep -Fq 'agentteams-qwen-code-worker:${AGENTTEAMS_QWEN_CODE_WORKER_VERSION}' "$
     fail "Bash installer must resolve the independently versioned Qwen Code Worker image"
 grep -Fq '_refresh_known_stable_version' "${BASH_INSTALLER}" ||
     fail "Bash installer must refresh the stable version used by the latest feature gate"
-grep -Fq '6) $(msg worker_runtime.qwen_code)' "${BASH_INSTALLER}" ||
+grep -Fq '5) $(msg worker_runtime.qwen_code)' "${BASH_INSTALLER}" ||
     fail "Bash installer Worker menu must list Qwen Code"
 grep -Fq 'AGENTTEAMS_DEFAULT_WORKER_RUNTIME="qwen-code"' "${BASH_INSTALLER}" ||
     fail "Bash installer must map menu choice 5 to qwen-code"
@@ -85,10 +85,10 @@ grep -Fq 'Update-AgentTeamsKnownStableVersion' "${POWERSHELL_INSTALLER}" ||
     fail "PowerShell installer must refresh the stable version used by the latest feature gate"
 grep -Fq 'repos/agentscope-ai/AgentTeams/releases/latest' "${POWERSHELL_INSTALLER}" ||
     fail "PowerShell installer must query the latest GitHub release"
-grep -Fq "6) \$(Get-Msg 'worker_runtime.qwen_code')" "${POWERSHELL_INSTALLER}" ||
+grep -Fq "5) \$(Get-Msg 'worker_runtime.qwen_code')" "${POWERSHELL_INSTALLER}" ||
     fail "PowerShell installer Worker menu must list Qwen Code"
-grep -Fq '"6" { if ($qwenCodeAvailable) { "qwen-code" }' "${POWERSHELL_INSTALLER}" ||
-    fail "PowerShell installer must map menu choice 6 to qwen-code"
+grep -Fq '"5" { if ($qwenCodeAvailable) { "qwen-code" }' "${POWERSHELL_INSTALLER}" ||
+    fail "PowerShell installer must map menu choice 5 to qwen-code"
 grep -Fq 'DEFAULT_WORKER_RUNTIME -eq "qwen-code" -and -not $qwenCodeAvailable' "${POWERSHELL_INSTALLER}" ||
     fail "PowerShell installer must reject unavailable non-interactive Qwen Code selections"
 grep -Fq '$workerImages += $script:QWEN_CODE_WORKER_IMAGE' "${POWERSHELL_INSTALLER}" ||
