@@ -228,6 +228,40 @@ run_case_f() {
     fi
 }
 
+# check_node_generation: environment-level check (runs once, not per-CLI). The npm
+# channel (qwen-code / opencode install) needs a Node in the OpenSSL 3.5 generation
+# to survive restrictive-network TLS-fingerprint filtering (see the SKILL "Node
+# generation" and "Restricted-network note"). WARN, not FAIL: on a local or
+# non-restrictive link an older Node still works, but flag the WAN risk so an
+# OpenSSL-3.0-generation Node is a known quantity, not a silent RST in production.
+check_node_generation() {
+    if ! command -v node >/dev/null 2>&1; then
+        skip "node_generation (node not on PATH — the npm install/upgrade route is unavailable)"
+        return
+    fi
+    local node_v ssl_v major eol
+    node_v="$(node -p 'process.version' 2>/dev/null || echo unknown)"
+    ssl_v="$(node -p 'process.versions.openssl' 2>/dev/null || echo unknown)"
+    major="${node_v#v}"; major="${major%%.*}"
+    eol=0
+    case "${major}" in 18|20|25) eol=1 ;; esac
+    case "${ssl_v}" in
+        3.5*|3.6*|4.*)
+            if [ "${eol}" = "1" ]; then
+                echo "[WARN] node_generation: node ${node_v} (OpenSSL ${ssl_v}) is EOL — fingerprint-safe but no longer security-patched; target Node 24 LTS."
+            else
+                pass "node_generation (node ${node_v}, OpenSSL ${ssl_v} — 3.5 generation, fingerprint-safe)"
+            fi ;;
+        *)
+            echo "[WARN] node_generation: node ${node_v} bundles OpenSSL ${ssl_v} (<3.5). On a restrictive-network link the qwen-code npm route can be RST'd by a TLS-fingerprint middle box — target Node 24 LTS (OpenSSL 3.5) or route the model plane through the local proxy. Local/non-restrictive links are unaffected."
+            if [ "${eol}" = "1" ]; then
+                echo "[WARN] node_generation: node ${node_v} is also EOL (no security patches)."
+            fi ;;
+    esac
+}
+
+check_node_generation
+
 for cli in qwen opencode; do
     if ! command -v "${cli}" >/dev/null 2>&1; then
         skip "${cli}: binary not found on PATH (not installed — opt-in skipped)"
