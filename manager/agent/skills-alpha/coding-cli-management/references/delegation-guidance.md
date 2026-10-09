@@ -42,7 +42,7 @@ Delegation reuses the delegating agent's identity and credentials; it adds no ne
 
 **Execution boundary.** The CLI runs as the delegating agent and inherits its filesystem and environment-credential visibility. Evaluate per deployment: workspace scope, reach into other team files, the delegator's credentials, mounted sockets, and management-plane capabilities. Mitigations are the CLIs' native controls — qwen `--approval-mode` tiers, opencode deny rules — and/or an isolated execution environment.
 
-**Verification.** Run before relying on the delegation, with the tested CLI version pinned in the report (measured: qwen 0.24.7):
+**Verification.** Run before relying on the delegation, with the tested CLI version pinned in the report (measured: qwen 0.25.0):
 
 1. Headless run succeeds and the artifact lands in the task directory.
 2. Auth failure propagates as a non-zero exit code.
