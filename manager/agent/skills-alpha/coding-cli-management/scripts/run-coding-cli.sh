@@ -127,6 +127,21 @@ case "$cli" in
         if [ "${g_bare}" = "1" ]; then
             qwen_args+=(--bare)
         fi
+        # Governance visibility (code-level signal, NOT a hard gate): an
+        # unattended qwen run that has none of a turn budget / sandbox / tool
+        # allowlist is "ungoverned" — all tools, no container isolation, bounded
+        # only by the wall-clock timeout above. Surface it in the run log (the
+        # durable record) so the risk is visible even if the caller never set
+        # the config. Tighten via ${config_file} (max_session_turns / sandbox)
+        # or the per-run flags above. A bare run stays a deliberate option —
+        # this only makes it visible, it never blocks it.
+        ungoverned=1
+        if [ -n "${max_session_turns}" ] && [ "${max_session_turns}" != "0" ]; then ungoverned=0; fi
+        if [ "${sandbox_setting}" = "true" ]; then ungoverned=0; fi
+        if [ -n "${g_allowed_tools}" ]; then ungoverned=0; fi
+        if [ "$ungoverned" = "1" ]; then
+            echo "[run-coding-cli] WARNING: unattended qwen run is UNGOVERNED (no turn budget, no --sandbox, no tool allowlist) — bounded only by the ${timeout_secs}s wall-clock timeout. Tighten via ${config_file} (max_session_turns/sandbox) or --allowed-tools." | tee -a "$log_file"
+        fi
         timeout "$timeout_secs" qwen "${qwen_args[@]}" "$(cat "$prompt_file")" 2>&1 | tee -a "$log_file"
         exit_code=${PIPESTATUS[0]}
         ;;
