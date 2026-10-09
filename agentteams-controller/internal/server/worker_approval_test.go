@@ -804,3 +804,83 @@ func TestApprovalPut_L3Denied(t *testing.T) {
 		t.Fatal("upstream PUT must not be called for an L3 mutation")
 	}
 }
+
+// TestApproval_RuntimeAware400: a non-qwenpaw worker is rejected 400
+// (tool approval is qwenpaw-specific).
+func TestApproval_RuntimeAware400(t *testing.T) {
+	up := approvalUpstream(t, "AUTO", nil)
+	defer up.Close()
+	w := approvalWorker("oc-worker")
+	w.Spec.Runtime = "openclaw"
+	h := newTestApprovalHandler(t, "embedded", up,
+		approvalTeam("market-team", "oc-worker"), w)
+	rec := httptest.NewRecorder()
+	h.getWorkerApproval(rec, adminCaller(approvalRequest(http.MethodGet, "oc-worker", "")))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 for non-qwenpaw worker", rec.Code)
+	}
+	if !containsAll(rec.Body.String(), "only supported for qwenpaw") {
+		t.Fatalf("body=%s, want qwenpaw-specific message", rec.Body.String())
+	}
+}
+
+// TestApproval_ScopeBeforeRuntime_CrossTeam404: an out-of-scope caller sees
+// 404 (worker existence hidden) even for a non-qwenpaw worker — the runtime
+// 400 must not leak worker type across the team boundary.
+func TestApproval_ScopeBeforeRuntime_CrossTeam404(t *testing.T) {
+	up := approvalUpstream(t, "AUTO", nil)
+	defer up.Close()
+	w := approvalWorker("oc-worker")
+	w.Spec.Runtime = "openclaw"
+	h := newTestApprovalHandler(t, "embedded", up,
+		approvalTeam("market-team", "oc-worker"), w)
+	rec := httptest.NewRecorder()
+	req := withCaller(approvalRequest(http.MethodGet, "oc-worker", ""),
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "bob", Teams: []string{"biz-team"}})
+	h.getWorkerApproval(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 for cross-team caller (W8)", rec.Code)
+	}
+	if containsAll(rec.Body.String(), "only supported for qwenpaw") {
+		t.Fatalf("body=%s, runtime guard must not leak across the scope boundary", rec.Body.String())
+	}
+}
+
+// TestApproval_ScopeBeforeRuntime_Standalone404: a scoped standalone worker
+// (no team) hides as 404 for a team-scoped caller regardless of runtime.
+func TestApproval_ScopeBeforeRuntime_Standalone404(t *testing.T) {
+	for _, rt := range []string{"openclaw", ""} {
+		w := approvalWorker("standalone-oc")
+		w.Spec.Runtime = rt
+		h := newTestApprovalHandler(t, "embedded", approvalUpstream(t, "AUTO", nil), w)
+		rec := httptest.NewRecorder()
+		req := withCaller(approvalRequest(http.MethodGet, "standalone-oc", ""),
+			&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "bob", Teams: []string{"biz-team"}})
+		h.getWorkerApproval(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("runtime=%q status=%d, want 404 for scoped standalone worker", rt, rec.Code)
+		}
+	}
+}
+
+// TestApproval_ScopeBeforeRuntime_Authorized400: an in-scope caller still
+// gets the explicit runtime 400 for a non-qwenpaw worker (the guard stays
+// in force after the scope check, before the dial).
+func TestApproval_ScopeBeforeRuntime_Authorized400(t *testing.T) {
+	up := approvalUpstream(t, "AUTO", nil)
+	defer up.Close()
+	w := approvalWorker("oc-worker")
+	w.Spec.Runtime = "openclaw"
+	h := newTestApprovalHandler(t, "embedded", up,
+		approvalTeam("market-team", "oc-worker"), w)
+	rec := httptest.NewRecorder()
+	req := withCaller(approvalRequest(http.MethodGet, "oc-worker", ""),
+		&authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "bob", Teams: []string{"market-team"}})
+	h.getWorkerApproval(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 for authorized non-qwenpaw caller", rec.Code)
+	}
+	if !containsAll(rec.Body.String(), "only supported for qwenpaw") {
+		t.Fatalf("body=%s, want qwenpaw-specific message", rec.Body.String())
+	}
+}
