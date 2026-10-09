@@ -430,6 +430,42 @@ func TestCodingCliStartInstall_BusyIsPerWorker(t *testing.T) {
 	close(release)
 }
 
+// An install task belongs to exactly one worker. Querying a task under a
+// DIFFERENT worker must 404 (no cross-worker existence oracle); under the
+// owning worker it resolves. Regression for the global task-map scope leak.
+func TestCodingCliInstallStatus_CrossWorker_404(t *testing.T) {
+	exec := &fakeExecBackend{fileWrites: map[string]string{}}
+	release := make(chan struct{})
+	exec.respond = func(cmd []string) (string, string, int, error) {
+		if cmd[0] == "npm" {
+			<-release // keep the install running so the task is visible
+			return "", "", 0, nil
+		}
+		return "", "", 1, nil
+	}
+	h := newTestCodingCliHandler(t, "embedded", exec, nil, checkpointTeamWithWorkers("team-a", "daily-carol", "daily-dave")...)
+	rec := httptest.NewRecorder()
+	h.startInstall(rec, adminCaller(codingCliRequest(http.MethodPost, "/api/v1/workers/daily-carol/coding-cli/qwen-code/install", `{"action":"install","version":"latest"}`, "name", "daily-carol", "cli", "qwen-code")))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("worker A install: %d %s", rec.Code, rec.Body.String())
+	}
+	taskID := decodeJSON(t, rec.Body.String())["task_id"].(string)
+
+	// Same task id under a different worker -> 404 (no leak).
+	recB := httptest.NewRecorder()
+	h.getInstallStatus(recB, adminCaller(codingCliRequest(http.MethodGet, "/api/v1/workers/daily-dave/coding-cli/qwen-code/install/"+taskID, "", "name", "daily-dave", "cli", "qwen-code", "task_id", taskID)))
+	if recB.Code != http.StatusNotFound {
+		t.Fatalf("cross-worker status: %d want 404: %s", recB.Code, recB.Body.String())
+	}
+	// Under the owning worker -> 200.
+	recA := httptest.NewRecorder()
+	h.getInstallStatus(recA, adminCaller(codingCliRequest(http.MethodGet, "/api/v1/workers/daily-carol/coding-cli/qwen-code/install/"+taskID, "", "name", "daily-carol", "cli", "qwen-code", "task_id", taskID)))
+	if recA.Code != http.StatusOK {
+		t.Fatalf("same-worker status: %d want 200: %s", recA.Code, recA.Body.String())
+	}
+	close(release)
+}
+
 func TestCodingCliStartInstall_InvalidVersion_400(t *testing.T) {
 	exec := &fakeExecBackend{fileWrites: map[string]string{}}
 	exec.respond = func(cmd []string) (string, string, int, error) { return "", "", 1, nil }
