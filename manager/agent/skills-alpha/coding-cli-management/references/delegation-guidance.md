@@ -69,6 +69,10 @@ Before the first real task:
 A one-shot run is only as good as what the delegating agent has prepared in the workspace and on the host. For real development scenarios — mobile, embedded, web, device toolchains — prepare four layers before dispatching, then name them all in the task spec:
 
 1. **Toolchain placement.** Build toolchains (SDKs, compilers, platform CLTs) live on a shared volume (e.g. a team NFS `toolchains/<platform>/` directory) and are referenced by **absolute path** in the spec — never assumed to be on the runner's default PATH. Pin the exact version in the spec; the runner install is generic, the toolchain is the scenario's.
+Some toolchains are **host-OS/architecture-specific**, so "reachable by absolute path" is not
+enough: iOS builds need a macOS host (a Linux agent container cannot run Xcode), and cross-compiles
+need the target toolchain (e.g. `arm-none-eabi-gcc`) installed on the runner host. Verify the runner's
+host can actually *host* the toolchain before dispatching, not just that the files are reachable.
 2. **Model defaults.** The platform supplies the model default (provider settings rendered once at bootstrap); the task spec may override per run (`run-coding-cli.sh --model <name>`). Two tiers: platform default carries cost/policy, the per-run flag carries the job.
 3. **Knowledge and file sharing.** Project knowledge (offline doc corpora, API docs, team conventions, prior specs) must be *reachable from the workspace* — mounted into the workspace or named by path in the spec. A runner cannot read what it cannot path-reach: "the team knows X" is not context, a path is. Share artifacts the same way: a stable location both sides can reach (team storage / MinIO), not a chat attachment.
 4. **Artifact flow.** Name where deliverables land (build output dir → team storage key) and how completion is judged (build passes / tests pass), not "done".
