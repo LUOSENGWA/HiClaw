@@ -37,7 +37,7 @@ data:
 
 > `pod-template.yaml` 下的值是一个 `PodTemplateSpec`，只有两个顶层字段：`metadata:` 与 `spec:`。**不要**用 `apiVersion: v1` / `kind: PodTemplate` 包裹它。
 
-可直接应用的示例见 [`docs/examples/agent-pod-template-cm.yaml`](../examples/agent-pod-template-cm.yaml)。
+可直接应用的示例见 [`docs/examples/agent-pod-template-cm.yaml`](../../examples/agent-pod-template-cm.yaml)。
 
 ## 合并语义
 
