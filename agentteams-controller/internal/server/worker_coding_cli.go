@@ -72,13 +72,6 @@ const (
 )
 
 var (
-	// codingCliIDs is the allow-list of CLIs this surface manages. It
-	// must stay in sync with the qwenpaw registry ids; an unknown id is
-	// rejected (400) so the route never doubles as a path oracle.
-	codingCliIDs = map[string]bool{
-		"qwen-code": true,
-		"opencode":  true,
-	}
 	// codingCliTaskIDPattern matches controller-produced task ids.
 	codingCliTaskIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 )
@@ -95,22 +88,37 @@ type codingCliSpec struct {
 	ExtraAuthFiles []string
 }
 
-// codingCliRegistry is the fixed set of managed CLIs.
-var codingCliRegistry = map[string]codingCliSpec{
-	"qwen-code": {
+// codingCliRegistry is the ordered single source of truth for managed CLIs:
+// membership = presence in the slice, display order = slice order. There is no
+// parallel id allow-list (a second list drifts — the whack-a-mole trap). A new
+// CLI is added here once and picked up by probe/settings/install automatically.
+var codingCliRegistry = []codingCliSpec{
+	{
 		ID:           "qwen-code",
 		NpmPackage:   "@qwen-code/qwen-code",
 		BinName:      "qwen",
 		SettingsPath: "~/.qwen/settings.json",
 		AuthDotPaths: []string{"security.auth.apiKey"},
 	},
-	"opencode": {
+	{
 		ID:             "opencode",
 		NpmPackage:     "opencode-ai",
 		BinName:        "opencode",
 		SettingsPath:   "~/.config/opencode/opencode.json",
 		ExtraAuthFiles: []string{"~/.local/share/opencode/auth.json"},
 	},
+}
+
+// codingCliSpecByID resolves a CLI by id against the registry (the single
+// source). Unknown ids are rejected (400) so the route never doubles as a
+// path oracle.
+func codingCliSpecByID(id string) (codingCliSpec, bool) {
+	for _, s := range codingCliRegistry {
+		if s.ID == id {
+			return s, true
+		}
+	}
+	return codingCliSpec{}, false
 }
 
 // codingCliExecer is the minimal backend capability this handler needs.
@@ -141,6 +149,7 @@ type CodingCliHandler struct {
 }
 
 type codingCliInstallTask struct {
+	worker     string // owning worker: busy gate + status lookup are per-worker
 	cli        string
 	action     string // install | uninstall
 	version    string // npm version tag (install only)
@@ -233,8 +242,8 @@ func (h *CodingCliHandler) codingCliScope(w http.ResponseWriter, r *http.Request
 
 // requireKnownCLI validates the {cli} path value against the allow-list.
 func requireKnownCLI(w http.ResponseWriter, cli string) (codingCliSpec, bool) {
-	spec, ok := codingCliRegistry[cli]
-	if !ok || !codingCliIDs[cli] {
+	spec, ok := codingCliSpecByID(cli)
+	if !ok {
 		httputil.WriteError(w, http.StatusBadRequest, "unknown coding CLI: "+cli)
 		return spec, false
 	}
@@ -249,11 +258,9 @@ func (h *CodingCliHandler) listCLIs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ids := []string{"qwen-code", "opencode"}
 	result := map[string]interface{}{}
-	for _, id := range ids {
-		spec := codingCliRegistry[id]
-		result[id] = h.probeCLI(r.Context(), eb, r.PathValue("name"), spec)
+	for _, spec := range codingCliRegistry {
+		result[spec.ID] = h.probeCLI(r.Context(), eb, r.PathValue("name"), spec)
 	}
 	writeCodingCliJSON(w, http.StatusOK, result)
 }
@@ -516,7 +523,7 @@ func (h *CodingCliHandler) startInstall(w http.ResponseWriter, r *http.Request) 
 	// Busy gate: one install per CLI (npm global lock anyway).
 	h.tasksMu.Lock()
 	for _, t := range h.tasks {
-		if t.state == "running" && t.cli == spec.ID {
+		if t.state == "running" && t.worker == name && t.cli == spec.ID {
 			h.tasksMu.Unlock()
 			httputil.WriteError(w, http.StatusConflict, "install already running for "+spec.ID)
 			return
@@ -524,7 +531,7 @@ func (h *CodingCliHandler) startInstall(w http.ResponseWriter, r *http.Request) 
 	}
 	taskID := newCodingCliTaskID()
 	h.tasks[taskID] = &codingCliInstallTask{
-		cli: spec.ID, action: req.Action, version: req.Version, state: "running", pkg: spec.NpmPackage,
+		worker: name, cli: spec.ID, action: req.Action, version: req.Version, state: "running", pkg: spec.NpmPackage,
 	}
 	h.tasksMu.Unlock()
 
@@ -581,6 +588,7 @@ func (h *CodingCliHandler) getInstallStatus(w http.ResponseWriter, r *http.Reque
 	if _, ok := h.codingCliScope(w, r, r.PathValue("name")); !ok {
 		return
 	}
+	name := r.PathValue("name")
 	taskID := r.PathValue("task_id")
 	if !codingCliTaskIDPattern.MatchString(taskID) {
 		httputil.WriteError(w, http.StatusBadRequest, "invalid install task id")
@@ -589,6 +597,12 @@ func (h *CodingCliHandler) getInstallStatus(w http.ResponseWriter, r *http.Reque
 	h.tasksMu.Lock()
 	h.pruneFinishedLocked()
 	t, ok := h.tasks[taskID]
+	// The task map is global, but a task belongs to exactly one worker. A
+	// caller scoped to worker A must not read a task created for worker B —
+	// treat a cross-worker id as not-found (no existence oracle).
+	if ok && t.worker != name {
+		ok = false
+	}
 	var snapshot map[string]interface{}
 	if ok {
 		snapshot = map[string]interface{}{

@@ -402,6 +402,34 @@ func TestCodingCliStartInstall_BusyConflict(t *testing.T) {
 	close(release)
 }
 
+// The busy gate is per-(worker, cli), not per-CLI globally: a blocked install
+// on worker A must not reject a same-CLI install on worker B. Regression for
+// the cross-worker false-conflict that the global per-CLI gate caused.
+func TestCodingCliStartInstall_BusyIsPerWorker(t *testing.T) {
+	exec := &fakeExecBackend{fileWrites: map[string]string{}}
+	release := make(chan struct{})
+	exec.respond = func(cmd []string) (string, string, int, error) {
+		if cmd[0] == "npm" {
+			<-release // block until the test releases
+			return "", "", 0, nil
+		}
+		return "", "", 1, nil
+	}
+	h := newTestCodingCliHandler(t, "embedded", exec, nil, checkpointTeamWithWorkers("team-a", "daily-carol", "daily-dave")...)
+	rec := httptest.NewRecorder()
+	h.startInstall(rec, adminCaller(codingCliRequest(http.MethodPost, "/api/v1/workers/daily-carol/coding-cli/qwen-code/install", `{"action":"install","version":"latest"}`, "name", "daily-carol", "cli", "qwen-code")))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("worker A install: %d %s", rec.Code, rec.Body.String())
+	}
+	// Same CLI on a DIFFERENT worker: must be accepted, not a 409.
+	rec2 := httptest.NewRecorder()
+	h.startInstall(rec2, adminCaller(codingCliRequest(http.MethodPost, "/api/v1/workers/daily-dave/coding-cli/qwen-code/install", `{"action":"install","version":"latest"}`, "name", "daily-dave", "cli", "qwen-code")))
+	if rec2.Code != http.StatusAccepted {
+		t.Fatalf("worker B install: %d want 202 (different worker is not busy): %s", rec2.Code, rec2.Body.String())
+	}
+	close(release)
+}
+
 func TestCodingCliStartInstall_InvalidVersion_400(t *testing.T) {
 	exec := &fakeExecBackend{fileWrites: map[string]string{}}
 	exec.respond = func(cmd []string) (string, string, int, error) { return "", "", 1, nil }
