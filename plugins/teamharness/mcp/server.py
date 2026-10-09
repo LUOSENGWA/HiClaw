@@ -2835,6 +2835,27 @@ def _canonical_room_id(value: Any) -> str:
     return text
 
 
+def _canonical_assignee(value: Any) -> str:
+    """Comparison key for assignee identifiers.
+
+    Matrix user-id *localparts* are case-insensitive (the spec requires
+    reaching ``@user:matrix.org`` as ``@USER:matrix.org``), but *server
+    names* are case-sensitive (spec appendices §server-name: ``@user:matrix.org``
+    is a different person from ``@user:MATRIX.ORG``). An assignee may be
+    supplied as a full MXID or as a leading ``room:``-style alias.
+    Normalize only the localpart so a re-delegation to the *same* worker
+    (spelled with different localpart casing) compares equal, while a
+    different server name remains a genuinely different identity.
+    """
+    text = str(value or "").strip()
+    if text.startswith("room:"):
+        text = text[len("room:") :].strip()
+    if text.startswith("@") and ":" in text:
+        localpart, _, server = text[1:].partition(":")
+        return f"@{localpart.casefold()}:{server}"
+    return text.casefold()
+
+
 def _external_requester_channel(project: dict[str, Any]) -> str:
     reply_route = project.get("reply_route") if isinstance(project.get("reply_route"), dict) else {}
     channel = str(reply_route.get("channel") or project.get("source") or "").strip().lower()
@@ -4676,12 +4697,21 @@ def _send_delegate_notification(
     title: str,
     assignee: str,
     spec: str,
+    txn: str | None = None,
 ) -> dict[str, Any]:
     """Send the automatic Worker assignment notification for delegate_task.
 
     Publishes the assignment to the Task room with ``m.mentions`` using the
-    same Matrix HTTP send path as the message tool. The transaction ID is
-    stable per task so a retry cannot produce a duplicate assignment.
+    same Matrix HTTP send path as the message tool.
+
+    Transaction id: the caller passes the **persisted** transaction id for
+    this logical delegation attempt (``delegate-{task_id}-{nonce}``, stored
+    on the task BEFORE the send). A retry of the same attempt reuses it, so
+    a send that reached the room but whose response was lost is deduplicated
+    server-side instead of emitting a second assignment event. A genuinely
+    new delegation attempt (a different assignee, including A->B->A) rotates
+    the nonce, so its notification is never swallowed by a stale id. When
+    ``txn`` is omitted, a fresh id is generated for this send only.
     Returns the Matrix ``eventId`` on success.
     """
     homeserver = os.getenv("AGENTTEAMS_MATRIX_URL", "").rstrip("/")
@@ -4709,7 +4739,12 @@ def _send_delegate_notification(
     content = _matrix_content(notification_text, mentions)
 
     room_enc = urllib.parse.quote(matrix_room_id, safe="")
-    txn = urllib.parse.quote(f"delegate-{task_id}", safe="")
+    # Persisted transaction id for this delegation attempt (see docstring):
+    # the caller pre-mints it so a retry after a lost response reuses the
+    # same id and the homeserver deduplicates instead of double-sending.
+    if not txn:
+        txn = f"delegate-{task_id}-{uuid.uuid4().hex[:12]}"
+    txn = urllib.parse.quote(txn, safe="")
     url = f"{homeserver}/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/{txn}"
     request = urllib.request.Request(
         url,
@@ -5218,7 +5253,22 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             # the existing assignment instead of sending a duplicate. The
             # assigned state must still reach shared storage: if the sync
             # fails, return a retryable failure so a later retry finishes it.
-            if str(existing_task.get("status") or "") == "assigned" and existing_task.get("eventId"):
+            #
+            # A re-delegation to a *different* assignee is not a retry:
+            # falling through re-prepares the task and sends a fresh
+            # notification (with a fresh transaction id) so the new worker
+            # actually receives the assignment instead of it being silently
+            # deduplicated by the homeserver.
+            existing_assignee = str(existing_task.get("assigned_to") or "").strip()
+            redelegate = bool(
+                assignment_mxid
+                and _canonical_assignee(assignment_mxid) != _canonical_assignee(existing_assignee)
+            )
+            if (
+                str(existing_task.get("status") or "") == "assigned"
+                and existing_task.get("eventId")
+                and not redelegate
+            ):
                 notification_reused = {
                     "sent": True,
                     "eventId": existing_task["eventId"],
@@ -5300,12 +5350,25 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             spec = str(payload.get("spec") or "")
             (task_dir / "spec.md").write_text(spec + ("\n" if spec else ""), encoding="utf-8")
             source_room_id = _source_room_id_from_payload(payload) or str(project.get("source_room_id") or "").strip()
+            # Transaction id for this logical delegation attempt:
+            # a re-delegation (different assignee) is a NEW attempt and
+            # rotates the nonce; a retry of the SAME attempt (previous send
+            # failed, or succeeded server-side but the client lost the
+            # response) REUSES the persisted nonce so the homeserver
+            # deduplicates the retry instead of emitting a second
+            # assignment event.
+            existing_notify_txn = str(existing_task.get("notifyTxn") or "").strip()
+            if redelegate or not existing_notify_txn:
+                notify_txn = f"delegate-{task_id}-{uuid.uuid4().hex[:12]}"
+            else:
+                notify_txn = existing_notify_txn
             task = {
                 "task_id": task_id,
                 "project_id": project_id,
                 "room_id": room_id,
                 "status": "prepared",
                 "spec_path": f"shared/tasks/{task_id}/spec.md",
+                "notifyTxn": notify_txn,
             }
             if assigned_to:
                 task["assigned_to"] = assigned_to
@@ -5334,17 +5397,22 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 if _delegate_from != "prepared":
                     # Only prepared -> prepared retries are silent no-op
                     # re-entries. Any other reachable re-entry changes the
-                    # state and is recorded so the trail stays complete: an
-                    # assigned task without eventId is the broken-state
-                    # repair path (revision and the other terminal states
-                    # are frozen upstream by the mutability guard).
+                    # state and is recorded so the trail stays complete: a
+                    # re-delegation to a new assignee, or an assigned task
+                    # without eventId (the broken-state repair path;
+                    # revision and the other terminal states are frozen
+                    # upstream by the mutability guard).
                     _append_transition_history(
                         task,
                         _delegate_from,
                         "prepared",
                         "delegate_task",
                         _transition_actor(arguments),
-                        note="repair: assigned without eventId",
+                        note=(
+                            "re-delegate: new assignee"
+                            if redelegate
+                            else "repair: assigned without eventId"
+                        ),
                     )
             _write_task(arguments, task)
             # Publish task files to shared storage FIRST so a Worker that
@@ -5394,6 +5462,7 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         title=task_title or task_id,
                         assignee=assignment_mxid,
                         spec=spec,
+                        txn=notify_txn,
                     )
                 except Exception as exc:
                     notification = {

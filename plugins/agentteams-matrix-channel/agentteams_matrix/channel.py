@@ -1811,6 +1811,30 @@ class AgentTeamsMatrixChannel(BaseChannel):
             re.IGNORECASE,
         ):
             return True
+        # 4. matrix.to localpart-only link (domain omitted by some clients)
+        localpart = self._user_id.lstrip("@").split(":", 1)[0]
+        if localpart and formatted_body and re.search(
+            rf'href=["\']https://matrix\.to/#/{re.escape("@" + localpart)}["\']',
+            formatted_body,
+            re.IGNORECASE,
+        ):
+            return True
+        # 5. bare @localpart in plain text.
+        #    A Matrix localpart may contain [A-Za-z0-9._=/+-] (spec user
+        #    identifiers), so the mention token in text extends over those
+        #    characters. `@alice-dev`, `@alice+dev`, `@alice/dev` and
+        #    `@alice2` are OTHER users (longer localparts) and
+        #    `@alice:other.test` is a full MXID on ANOTHER domain — none
+        #    of them is our user in bare form. Require the token to end
+        #    exactly where our localpart ends: the next character must
+        #    not be a localpart character or ':' (which would start an
+        #    MXID domain we do not own).
+        if localpart:
+            token = re.compile(
+                rf"(?<![\w@])@{re.escape(localpart)}(?![A-Za-z0-9._=:/+-])"
+            )
+            if token.search(text):
+                return True
         return False
 
     def _teamharness_self_trigger(self, room_id: str, event: Any) -> dict[str, Any] | None:
