@@ -1523,6 +1523,7 @@ load_current_params_from_env() {
         [ -z "${AGENTTEAMS_DASHBOARD_VERSION:+x}" ] && AGENTTEAMS_DASHBOARD_VERSION="$(grep '^AGENTTEAMS_DASHBOARD_VERSION=' "${env_file}" 2>/dev/null | cut -d= -f2- | tr -d '\r')"
         [ -z "${AGENTTEAMS_PORT_DASHBOARD:+x}" ] && AGENTTEAMS_PORT_DASHBOARD="$(grep '^AGENTTEAMS_PORT_DASHBOARD=' "${env_file}" 2>/dev/null | cut -d= -f2- | tr -d '\r')"
         [ -z "${AGENTTEAMS_DASHBOARD_IMAGE:+x}" ] && AGENTTEAMS_DASHBOARD_IMAGE="$(grep '^AGENTTEAMS_DASHBOARD_IMAGE=' "${env_file}" 2>/dev/null | cut -d= -f2- | tr -d '\r')"
+        [ -z "${DASHBOARD_SESSION_SECRET:+x}" ] && DASHBOARD_SESSION_SECRET="$(grep '^DASHBOARD_SESSION_SECRET=' "${env_file}" 2>/dev/null | cut -d= -f2- | tr -d '\r')"
         [ -z "${AGENTTEAMS_AI_GATEWAY_ADMIN_URL:+x}" ] && AGENTTEAMS_AI_GATEWAY_ADMIN_URL="$(grep '^AGENTTEAMS_AI_GATEWAY_ADMIN_URL=' "${env_file}" 2>/dev/null | cut -d= -f2- | tr -d '\r')"
         [ -z "${AGENTTEAMS_DATA_DIR:+x}" ] && AGENTTEAMS_DATA_DIR="$(grep '^AGENTTEAMS_DATA_DIR=' "${env_file}" 2>/dev/null | cut -d= -f2- | tr -d '\r')"
         return 0
@@ -3390,6 +3391,49 @@ _start_dashboard() {
     env_args+=(-e NEXT_PUBLIC_MATRIX_API_URL="http://${CTRL_CONTAINER}:6167")
     env_args+=(-e MATRIX_HOMESERVER_ALLOWLIST="${CTRL_CONTAINER},matrix-local.agentteams.io,matrix.org")
 
+    # Session secret for dashboard multi-user login (issue #1311): the
+    # dashboard fail-closes when it is missing. Resolve in order — exported
+    # env (upgrade / dashboard subcommand), then the env file, then generate.
+    # Persist the resolved value whenever the stored field is missing, empty,
+    # or stale (explicit env override), keeping exactly one field, so a later
+    # process reuses this secret instead of generating a different one.
+    local _dash_env="${AGENTTEAMS_ENV_FILE:-${HOME}/agentteams-manager.env}"
+    if [ -z "${DASHBOARD_SESSION_SECRET:-}" ]; then
+        DASHBOARD_SESSION_SECRET="$(grep '^DASHBOARD_SESSION_SECRET=' "${_dash_env}" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r')"
+    fi
+    if [ -z "${DASHBOARD_SESSION_SECRET:-}" ]; then
+        DASHBOARD_SESSION_SECRET="$(openssl rand -hex 32)"
+    fi
+    local _dash_stored
+    _dash_stored="$(grep '^DASHBOARD_SESSION_SECRET=' "${_dash_env}" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\r')"
+    if [ "${_dash_stored}" != "${DASHBOARD_SESSION_SECRET}" ]; then
+        local _dash_tmp="${_dash_env}.secret.tmp"
+        local _persisted=0
+        if grep -q '^DASHBOARD_SESSION_SECRET=' "${_dash_env}" 2>/dev/null; then
+            # Replace the first field in place and drop any duplicate fields.
+            if awk -v secret="${DASHBOARD_SESSION_SECRET}" '
+                    !replaced && /^DASHBOARD_SESSION_SECRET=/ {
+                        print "DASHBOARD_SESSION_SECRET=" secret
+                        replaced = 1
+                        next
+                    }
+                    /^DASHBOARD_SESSION_SECRET=/ { next }
+                    { print }
+                ' "${_dash_env}" > "${_dash_tmp}" 2>/dev/null &&
+                cat "${_dash_tmp}" > "${_dash_env}" 2>/dev/null; then
+                _persisted=1
+            fi
+            rm -f "${_dash_tmp}" 2>/dev/null || true
+        elif printf 'DASHBOARD_SESSION_SECRET=%s\n' "${DASHBOARD_SESSION_SECRET}" >> "${_dash_env}" 2>/dev/null; then
+            _persisted=1
+        fi
+        if [ "${_persisted}" -ne 1 ]; then
+            log "WARNING: could not persist DASHBOARD_SESSION_SECRET to ${_dash_env}; a later start may generate a different secret"
+        fi
+    fi
+    chmod 600 "${_dash_env}" 2>/dev/null || true
+    env_args+=(-e DASHBOARD_SESSION_SECRET="${DASHBOARD_SESSION_SECRET}")
+
     if ${DOCKER_CMD} ps --format '{{.Names}}' | grep -qx "${CTRL_CONTAINER}"; then
         local env_out
         env_out=$(${DOCKER_CMD} inspect "${CTRL_CONTAINER}" --format='{{range .Config.Env}}{{.}}{{"\n"}}{{end}}')
@@ -3686,6 +3730,9 @@ install_manager() {
     fi
     AGENTTEAMS_MINIO_PASSWORD="${AGENTTEAMS_MINIO_PASSWORD:-${AGENTTEAMS_ADMIN_PASSWORD}}"
     AGENTTEAMS_MANAGER_GATEWAY_KEY="${AGENTTEAMS_MANAGER_GATEWAY_KEY:-$(generate_key)}"
+    # Dashboard session secret for multi-user login (issue #1311).
+    # Generated once and written to the env file so upgrades and rebuilds reuse it.
+    DASHBOARD_SESSION_SECRET="${DASHBOARD_SESSION_SECRET:-$(generate_key)}"
 
     # Matrix AppService tokens — generate once during install/upgrade if not provided.
     # Persisted to env file so they survive controller restarts.
@@ -3835,6 +3882,7 @@ AGENTTEAMS_DASHBOARD_VERSION=${AGENTTEAMS_DASHBOARD_VERSION:-v1.2.4.9}
 AGENTTEAMS_PORT_DASHBOARD=${AGENTTEAMS_PORT_DASHBOARD:-13000}
 AGENTTEAMS_DASHBOARD_IMAGE=${AGENTTEAMS_DASHBOARD_IMAGE:-${AGENTTEAMS_REGISTRY}/agentteams/agentteams-dashboard:${AGENTTEAMS_DASHBOARD_VERSION}}
 AGENTTEAMS_AI_GATEWAY_ADMIN_URL=${AGENTTEAMS_AI_GATEWAY_ADMIN_URL:-}
+DASHBOARD_SESSION_SECRET=${DASHBOARD_SESSION_SECRET:-}
 EOF
 
     chmod 600 "${ENV_FILE}"
