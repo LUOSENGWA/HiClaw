@@ -74,6 +74,8 @@ npm and the release assets cover Linux x64/arm64, macOS x64/arm64, and Windows. 
 
 **Restricted-network note.** If installing or reaching the model endpoint fails with connection resets while plain `curl` from the same machine succeeds, suspect middle-box filtering by TLS-stack fingerprint rather than a plain outage; running a current Node (OpenSSL 3.5 generation) or routing the model plane through the local proxy above is the working fix. (Field-verified 2026-10; see #1340 notes 4/5 for the full deployment matrix.)
 
+**OpenCode is a Bun binary, not Node.** Its TLS client is Bun's (a BoringSSL-lineage stack), not Node's OpenSSL, so on the restrictive lines above OpenCode's *own* connection can be reset by the middle box even where a Node/OpenSSL-3.5 runner (Qwen Code) on the same machine passes. Field-verified 2026-10-10 on the cctechstudio WAN line: `qwen` (Node 24) reached the endpoint and completed a task while `opencode 1.18.35` was RST ("socket connection closed unexpectedly") on the identical link, at the same moment — the only variable being the client's TLS stack. For OpenCode the "use a current Node" advice does not apply (it is not Node, and its TLS stack is not user-selectable); the working lever is the **transparent local relay/proxy** in front of the model endpoint — point OpenCode's `baseURL` (or `OPENAI_BASE_URL`) at the same-machine proxy that holds a working TLS stack.
+
 **Unattended semantics — read before enabling.**
 - `qwen --yolo` automatically approves **all** tool calls — file edits and shell commands included, with no further prompts.
 - `opencode run --auto` auto-approves permissions, but **explicit deny rules are still enforced**.
