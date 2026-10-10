@@ -30,7 +30,7 @@ The prompt you hand over is the whole contract. It should carry:
 
 ## Scenario reality: which scenarios close in the worker
 
-The base image ships Node, Python, and the C/C++ toolchain, so those scenarios close inside the worker (write + build + verify). It does **not** ship Go, Rust, Java/Android, or device-SDK toolchains — for those, the worker writes the code and build/verification happens on a host or build node; iOS additionally needs a macOS host (a Linux worker cannot build it). When a task needs a toolchain the base image lacks, provision it on a shared volume and name it by absolute path in the spec — do not assume it is on the runner's PATH. Full matrix and the four-layer scenario preparation (toolchain / model / knowledge / artifacts): see the management-side guidance.
+The base image ships Node 24 + npm/pnpm, a C/C++ toolchain, and a bare Python 3.12 (**no pip, no third-party packages**), so web, C/C++, stdlib-only Python, and docs/comment changes close inside the worker (write + build + verify). It does **not** ship Go, Rust, Java/Android, device-SDK, or data-science toolchains, and — because the worker is itself a container — no `docker`/`kubectl`/`helm` for infra work: for those, the worker writes the code or files and build/verification happens on a host or build node; iOS additionally needs a macOS host (a Linux worker cannot build it). When a task needs a toolchain the base image lacks, provision it on a shared volume and name it by absolute path in the spec — do not assume it is on the runner's PATH. Full matrix (including the Python stdlib/third-party split and infra-as-code) and the four-layer scenario preparation (toolchain / model / knowledge / artifacts): see the management-side guidance.
 
 ## Where results and logs land
 
