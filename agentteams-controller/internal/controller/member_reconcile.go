@@ -91,6 +91,13 @@ type MemberContext struct {
 	// An explicit Spec.SubagentModel always takes precedence.
 	TeamSubagentModel string
 
+	// TeamLlmStreamFirstContentTimeout / TeamLlmStreamIdleTimeout are the
+	// Team.spec defaults for the worker LLM stream timeouts, resolved by the
+	// owning reconciler (read-time merge input). An explicit Spec.* value
+	// always takes precedence.
+	TeamLlmStreamFirstContentTimeout string
+	TeamLlmStreamIdleTimeout         string
+
 	// Generation / ObservedGeneration are metadata included in logs to aid
 	// debugging. They are NOT used for spec-change detection — callers must
 	// set SpecChanged explicitly (see field doc below).

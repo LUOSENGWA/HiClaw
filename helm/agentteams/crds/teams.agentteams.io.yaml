@@ -79,6 +79,19 @@ spec:
                     explicit Worker.spec.subagentModel inherit this value (read-time
                     merge); an explicit worker value always wins. Empty disables the
                     default.
+                llmStreamFirstContentTimeout:
+                  type: string
+                  description: >
+                    Team-wide default for the worker LLM stream first-content timeout
+                    (seconds). Members without an explicit
+                    Worker.spec.llmStreamFirstContentTimeout inherit this value
+                    (read-time merge); an explicit worker value always wins. Empty
+                    disables the default.
+                llmStreamIdleTimeout:
+                  type: string
+                  description: >
+                    Team-wide default for the worker LLM stream idle timeout (seconds).
+                    Same inheritance semantics as llmStreamFirstContentTimeout.
                 admin:
                   type: object
                   description: "Team-specific admin (human). Has admin authority within this team."

@@ -92,6 +92,11 @@ type WorkerReconciler struct {
 	// ContainerPrefix + EffectiveWorkerConsolePort.
 	subagentModelURLFor func(w *v1beta1.Worker, spec v1beta1.WorkerSpec) string
 
+	// envsURLFor overrides the worker console base URL for LLM stream
+	// timeout hot-apply (tests). nil → the same derivation the subagent
+	// model dial uses.
+	envsURLFor func(w *v1beta1.Worker, spec v1beta1.WorkerSpec) string
+
 	// AuthCache is cleared after deleting a rotated Edge Worker's
 	// ServiceAccount so old SA tokens cannot pass via cached TokenReview.
 	AuthCache interface{ InvalidateCache() }
@@ -242,6 +247,13 @@ func (r *WorkerReconciler) reconcileNormal(ctx context.Context, w *v1beta1.Worke
 	if w.Spec.SubagentModel == "" && w.Annotations[v1beta1.AnnotationWorkerTeamName] != "" {
 		configContext.TeamSubagentModel = r.owningTeamSubagentModel(ctx, w)
 	}
+	// Team-wide LLM stream timeout defaults (read-time merge), same gating:
+	// only when the worker is actually a team member and at least one value
+	// is not set explicitly (the annotation check keeps the List call rare).
+	if w.Annotations[v1beta1.AnnotationWorkerTeamName] != "" &&
+		(w.Spec.LlmStreamFirstContentTimeout == "" || w.Spec.LlmStreamIdleTimeout == "") {
+		configContext.TeamLlmStreamFirstContentTimeout, configContext.TeamLlmStreamIdleTimeout = r.owningTeamLlmStreamTimeouts(ctx, w)
+	}
 
 	if mctx.DeployMode == v1beta1.DeployModeEdge {
 		// Edge UUID rotation: when the UUID label changes, delete the SA so any
@@ -363,6 +375,12 @@ func (r *WorkerReconciler) reconcileNormal(ctx context.Context, w *v1beta1.Worke
 	// leaves the annotation unset and the periodic reconcile retries.
 	r.applySubagentModelHot(ctx, w, effectiveSpec, configContext, state)
 
+	// Hot-apply changed LLM stream timeouts to the running worker process
+	// via the QwenPaw envs API (the runtime re-reads the envs on every
+	// stream, so no restart is needed). Same best-effort contract as the
+	// subagent model dial.
+	r.applyLlmStreamTimeoutsHot(ctx, w, effectiveSpec, configContext, state)
+
 	r.reconcileManagerAccess(ctx, w, mctx, state)
 
 	if w.Status.ObservedGeneration == 0 {
@@ -397,6 +415,30 @@ func (r *WorkerReconciler) owningTeamSubagentModel(ctx context.Context, w *v1bet
 		}
 	}
 	return ""
+}
+
+// owningTeamLlmStreamTimeouts returns the LLM stream timeout defaults
+// declared on the team that owns this worker (the fallback for workers
+// without an explicit value). It mirrors owningTeamSubagentModel: it scans
+// Team.spec.workerMembers rather than trusting the annotation, and a lookup
+// failure degrades to empty strings (no default), never to a reconcile
+// error.
+func (r *WorkerReconciler) owningTeamLlmStreamTimeouts(ctx context.Context, w *v1beta1.Worker) (string, string) {
+	var teams v1beta1.TeamList
+	if err := r.List(ctx, &teams, client.InNamespace(w.Namespace)); err != nil {
+		logger := log.FromContext(ctx)
+		logger.Error(err, "list teams for LLM stream timeout defaults (non-fatal)", "worker", w.Name)
+		return "", ""
+	}
+	for i := range teams.Items {
+		team := &teams.Items[i]
+		for _, member := range team.Spec.WorkerMembers {
+			if member.Name == w.Name {
+				return team.Spec.LlmStreamFirstContentTimeout, team.Spec.LlmStreamIdleTimeout
+			}
+		}
+	}
+	return "", ""
 }
 
 func (r *WorkerReconciler) workerTeamName(ctx context.Context, w *v1beta1.Worker) (string, error) {
