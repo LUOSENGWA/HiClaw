@@ -9,7 +9,10 @@ set -e
 cli=""
 workspace=""
 prompt_file=""
-timeout_secs=600
+# Default wall-clock bound for an unattended run. Field data (delegated
+# coding runs) shows hour-plus runs are normal, not the tail — size for the
+# long tail, not the common case.
+timeout_secs=3600
 g_model=""
 g_allowed_tools=""
 g_allowed_mcp=""

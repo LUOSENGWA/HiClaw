@@ -188,8 +188,10 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# 3. Create processing marker
-bash /opt/agentteams/agent/skills/task-coordination/scripts/create-processing-marker.sh "$task_id" "manager" 15
+# 3. Create processing marker (TTL in minutes; must outlive the longest
+#    in-flight run or a second actor can enter the workspace mid-run —
+#    75 = 60-min run + sync/review slack)
+bash /opt/agentteams/agent/skills/task-coordination/scripts/create-processing-marker.sh "$task_id" "manager" 75
 
 # 4. Save prompt to file
 timestamp=$(date +%Y%m%d-%H%M%S)
@@ -204,11 +206,14 @@ PROMPT_EOF
 cli=$(jq -r '.cli' ~/coding-cli-config.json)
 
 # 6. Run CLI
+# --timeout is the wall-clock bound for the run. Delegated coding runs are
+# routinely hour-plus (field data), so size for the long tail, not the common
+# case. Keep the .processing marker TTL above (step 3) longer than this.
 bash /opt/agentteams/agent/skills/coding-cli-management/scripts/run-coding-cli.sh \
   --cli "$cli" \
   --workspace "$workspace" \
   --prompt-file "$prompt_file" \
-  --timeout 600
+  --timeout 3600
 exit_code=$?
 
 # 7. Remove processing marker
