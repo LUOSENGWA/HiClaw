@@ -29,6 +29,20 @@ spec:
                     the team AI gateway; not catalog-validated (unknown ids surface as a
                     visible upstream error at spawn time). Empty inherits the runtime
                     default — a team-wide default applies when the Worker is a team member.
+                llmStreamFirstContentTimeout:
+                  type: string
+                  description: >
+                    Seconds to wait for the first meaningful LLM stream chunk before
+                    failing the request. Hot-applied at runtime to the worker's QwenPaw
+                    envs (no restart); requires QwenPaw >= 2.2.1. Empty inherits the
+                    team-wide default (when the Worker is a team member), else the
+                    entrypoint default.
+                llmStreamIdleTimeout:
+                  type: string
+                  description: >
+                    Seconds of allowed silence between stream chunks after the first
+                    meaningful content. Same hot-apply semantics as
+                    llmStreamFirstContentTimeout.
                 runtime:
                   type: string
                   enum: [openclaw, copaw, hermes, qwenpaw, deepseek-harness]
