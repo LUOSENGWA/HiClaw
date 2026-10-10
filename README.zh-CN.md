@@ -529,8 +529,9 @@ python scripts/export-debug-log.py --range 1h
 | [docs/zh-cn/design/l3-worker-scoped-read.md](docs/zh-cn/design/l3-worker-scoped-read.md) | L3 Worker 范围读访问 |
 | [docs/zh-cn/design/member-runtime-config-contract.md](docs/zh-cn/design/member-runtime-config-contract.md) | 成员运行时配置契约 |
 | [docs/zh-cn/design/teamharness/boundary-and-contracts.md](docs/zh-cn/design/teamharness/boundary-and-contracts.md) | TeamHarness v0.1 边界与契约 |
+| [docs/zh-cn/design/task-completion-notification.md](docs/zh-cn/design/task-completion-notification.md) | 任务完成通知（submit_task）与生命周期 attention 事件 |
 
-> 注：以下设计文档上游原生即为中文，未建镜像，请直接阅读 `docs/design/` 下的原文：`docs/design/internal/` 全部 5 篇，以及 `docs/design/teamharness/project-task-runtime-design.md`、`docs/design/teamharness/runtime-integration-tdd-plan.md`、`docs/design/teamharness/task-transition-engine.md`。`docs/design/task-completion-notification.md` 上游为英文，其中文版待上游 #1353 定稿后补译。
+> 注：以下设计文档上游原生即为中文，未建镜像，请直接阅读 `docs/design/` 下的原文：`docs/design/internal/` 全部 5 篇，以及 `docs/design/teamharness/project-task-runtime-design.md`、`docs/design/teamharness/runtime-integration-tdd-plan.md`、`docs/design/teamharness/task-transition-engine.md`。
 
 ## 构建与测试
 
