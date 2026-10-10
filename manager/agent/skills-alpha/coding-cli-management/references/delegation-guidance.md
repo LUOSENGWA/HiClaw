@@ -77,6 +77,20 @@ host can actually *host* the toolchain before dispatching, not just that the fil
 3. **Knowledge and file sharing.** Project knowledge (offline doc corpora, API docs, team conventions, prior specs) must be *reachable from the workspace* — mounted into the workspace or named by path in the spec. A runner cannot read what it cannot path-reach: "the team knows X" is not context, a path is. Share artifacts the same way: a stable location both sides can reach (team storage / MinIO), not a chat attachment.
 4. **Artifact flow.** Name where deliverables land (build output dir → team storage key) and how completion is judged (build passes / tests pass), not "done".
 
+**Default toolchain reality (field-verified on the standard worker base image).** The four layers assume the delegator names what the runner needs; the matrix below is what the standard base image already ships, so a delegator knows up front which scenarios close inside the worker and which must route build verification to a host or build node — before dispatching, not when the runner hits the wall:
+
+| Scenario | Writes in worker | Build/verify in worker | Route |
+|---|---|---|---|
+| Web (Node / React / Vue) | yes | yes (`npm run build` / tests) | closed in the worker |
+| Python | yes | yes (`python3` + its test runners) | closed in the worker |
+| C / C++ | yes | yes (`gcc` / `g++` / `make`) | closed in the worker |
+| Go / Rust | yes | no — no `go` / `cargo` in the base image | code in the worker; build/verify on a host or build node |
+| Java / Android | yes | no — no `java` / `gradle` / Android SDK | code in the worker; build on a host with the SDK |
+| iOS | yes | no — requires a macOS host with Xcode, which a Linux worker cannot provide | code in the worker; build on a macOS host or CI |
+| HarmonyOS / other device SDKs | yes | no — no platform CLT in the base image | code in the worker; build on a host with the platform toolchain |
+
+When a task genuinely needs a toolchain the matrix marks missing, layer 1 applies: provision it on the shared volume and name it by absolute path in the spec — do not assume the base image carries it, and do not make the runner install it mid-task.
+
 The same four layers apply to every scenario class (Android, iOS, web, HarmonyOS-style device SDKs, embedded/MCU) with its own toolchain, knowledge corpus, and artifact specifics.
 
 ### Pitfalls → what to do (field-verified)
