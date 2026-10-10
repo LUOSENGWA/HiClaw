@@ -1,6 +1,6 @@
 #!/bin/bash
 # check-coding-cli-detection.sh — regression tests for
-# manager/agent/skills-alpha/coding-cli-management/scripts/detect-available-cli.sh
+# manager/agent/skills/coding-cli-management/scripts/detect-available-cli.sh
 #
 # Pure bash + coreutils + jq; no network and no real CLI binaries — each
 # scenario runs detect-available-cli.sh against a sandbox whose HOME is a
@@ -50,7 +50,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}" || exit 1
 
-DETECT_SCRIPT="${REPO_ROOT}/manager/agent/skills-alpha/coding-cli-management/scripts/detect-available-cli.sh"
+DETECT_SCRIPT="${REPO_ROOT}/manager/agent/skills/coding-cli-management/scripts/detect-available-cli.sh"
 if [ ! -f "${DETECT_SCRIPT}" ]; then
     echo "FAIL setup (detect-available-cli.sh not found: ${DETECT_SCRIPT})"
     exit 1
@@ -265,9 +265,34 @@ problems=""
 [ "$(json_get '.details.qodercli.config_source.share_file')" = "false" ] || problems="${problems}config_source.share_file should be false; "
 finish "qodercli_binary_and_home_dir" "${problems}"
 
+# --- Skill placement & reference path chain
+# The manager image mounts manager/agent/ at /opt/agentteams/agent/ and the
+# runtime loads skills only from the official layers (skills/, worker-skills/):
+# skills-alpha/ is a dead zone at runtime (no upgrade-builtins.sh sync, no
+# push-worker-skills.sh source entry, no start-manager-agent.sh render).
+# This section pins placement and the script-reference chain.
+PATH_PROBLEMS=""
+MGMT_SKILL="manager/agent/skills/coding-cli-management/SKILL.md"
+WORKER_SKILL="manager/agent/worker-skills/coding-cli/SKILL.md"
+[ -f "${MGMT_SKILL}" ] || PATH_PROBLEMS="${PATH_PROBLEMS}management SKILL.md missing from official skills/ layer; "
+[ -f "${WORKER_SKILL}" ] || PATH_PROBLEMS="${PATH_PROBLEMS}worker SKILL.md missing from official worker-skills/ layer; "
+[ -d "manager/agent/skills-alpha/coding-cli-management" ] && PATH_PROBLEMS="${PATH_PROBLEMS}management SKILL still present in skills-alpha dead zone; "
+if [ -f "${MGMT_SKILL}" ]; then
+    while IFS= read -r ref; do
+        rel="${ref#/opt/agentteams/agent/}"
+        [ -f "manager/agent/${rel}" ] || PATH_PROBLEMS="${PATH_PROBLEMS}unresolved script ref ${rel}; "
+    done < <(grep -oE '/opt/agentteams/agent/[A-Za-z0-9._/-]+\.sh' "${MGMT_SKILL}" | sort -u)
+fi
+if [ -z "${PATH_PROBLEMS}" ]; then
+    echo "[PASS] skill_placement_and_path_chain"
+else
+    echo "[FAIL] skill_placement_and_path_chain (${PATH_PROBLEMS})"
+    SUITE_FAIL=1
+fi
+
 echo ""
 if [ "${SUITE_FAIL}" = "0" ]; then
-    echo "All 10 scenarios passed."
+    echo "All scenarios + path-chain check passed."
     exit 0
 else
     echo "One or more scenarios FAILED."

@@ -28,7 +28,7 @@
 set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUN_SCRIPT="${REPO_ROOT}/manager/agent/skills-alpha/coding-cli-management/scripts/run-coding-cli.sh"
+RUN_SCRIPT="${REPO_ROOT}/manager/agent/skills/coding-cli-management/scripts/run-coding-cli.sh"
 if [ ! -f "${RUN_SCRIPT}" ]; then
     echo "FAIL setup (run-coding-cli.sh not found: ${RUN_SCRIPT})"
     exit 1
