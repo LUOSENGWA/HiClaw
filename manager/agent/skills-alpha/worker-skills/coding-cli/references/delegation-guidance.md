@@ -28,6 +28,10 @@ The prompt you hand over is the whole contract. It should carry:
 
 **Scaffolding scales with the runner.** For small/edge models, pre-write the change nearly ready (near-ready spec, exact anchors); for stronger models, explicit goals plus constraints and acceptance are enough.
 
+## Scenario reality: which scenarios close in the worker
+
+The base image ships Node, Python, and the C/C++ toolchain, so those scenarios close inside the worker (write + build + verify). It does **not** ship Go, Rust, Java/Android, or device-SDK toolchains — for those, the worker writes the code and build/verification happens on a host or build node; iOS additionally needs a macOS host (a Linux worker cannot build it). When a task needs a toolchain the base image lacks, provision it on a shared volume and name it by absolute path in the spec — do not assume it is on the runner's PATH. Full matrix and the four-layer scenario preparation (toolchain / model / knowledge / artifacts): see the management-side guidance.
+
 ## Where results and logs land
 
 - Task directory: `shared/tasks/<task-id>/` (workspace, artifacts, reports).
