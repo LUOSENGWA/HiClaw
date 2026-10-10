@@ -378,6 +378,143 @@ func TestCodingCliStartInstall_AcceptsAndCompletes(t *testing.T) {
 	}
 }
 
+// A non-zero npm exit must land as state=failed carrying the exit code and a
+// stderr tail, so a caller polling the task can surface the real reason
+// instead of a bare "done" or a hung "running".
+func TestCodingCliStartInstall_NpmNonZeroExit_Failed(t *testing.T) {
+	exec := &fakeExecBackend{fileWrites: map[string]string{}}
+	exec.respond = func(cmd []string) (string, string, int, error) {
+		if cmd[0] == "npm" {
+			return "", "npm ERR! network timeout", 1, nil
+		}
+		return "", "", 1, nil
+	}
+	h := newTestCodingCliHandler(t, "embedded", exec, nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+	rec := httptest.NewRecorder()
+	h.startInstall(rec, adminCaller(codingCliRequest(http.MethodPost, "/api/v1/workers/daily-carol/coding-cli/qwen-code/install", `{"action":"install","version":"0.25.0"}`, "name", "daily-carol", "cli", "qwen-code")))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	taskID, _ := decodeJSON(t, rec.Body.String())["task_id"].(string)
+	if taskID == "" {
+		t.Fatalf("no task id: %s", rec.Body.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var sdoc map[string]interface{}
+	for time.Now().Before(deadline) {
+		statusRec := httptest.NewRecorder()
+		h.getInstallStatus(statusRec, adminCaller(codingCliRequest(http.MethodGet, "/api/v1/workers/daily-carol/coding-cli/qwen-code/install/"+taskID, "", "name", "daily-carol", "cli", "qwen-code", "task_id", taskID)))
+		if statusRec.Code == http.StatusOK {
+			sdoc = decodeJSON(t, statusRec.Body.String())
+			if sdoc["state"] == "failed" {
+				break
+			}
+		} else {
+			t.Fatalf("status probe: %d %s", statusRec.Code, statusRec.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sdoc == nil {
+		t.Fatalf("task never reached a terminal state")
+	}
+	if sdoc["state"] != "failed" {
+		t.Fatalf("state=%v want failed: %v", sdoc["state"], sdoc)
+	}
+	if sdoc["exit_code"] != float64(1) {
+		t.Fatalf("exit_code=%v want 1: %v", sdoc["exit_code"], sdoc)
+	}
+	if tail, _ := sdoc["stderr_tail"].(string); !strings.Contains(tail, "npm ERR!") {
+		t.Fatalf("stderr_tail=%v want to carry npm stderr: %v", sdoc["stderr_tail"], sdoc)
+	}
+}
+
+// An exec-level error (transport/docker failure, not a non-zero exit) must
+// also land as state=failed, not hang as "running".
+func TestCodingCliStartInstall_ExecError_Failed(t *testing.T) {
+	exec := &fakeExecBackend{fileWrites: map[string]string{}}
+	exec.respond = func(cmd []string) (string, string, int, error) {
+		if cmd[0] == "npm" {
+			return "", "", 0, context.DeadlineExceeded
+		}
+		return "", "", 1, nil
+	}
+	h := newTestCodingCliHandler(t, "embedded", exec, nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+	rec := httptest.NewRecorder()
+	h.startInstall(rec, adminCaller(codingCliRequest(http.MethodPost, "/api/v1/workers/daily-carol/coding-cli/qwen-code/install", `{"action":"install","version":"latest"}`, "name", "daily-carol", "cli", "qwen-code")))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	taskID, _ := decodeJSON(t, rec.Body.String())["task_id"].(string)
+	deadline := time.Now().Add(2 * time.Second)
+	var sdoc map[string]interface{}
+	for time.Now().Before(deadline) {
+		statusRec := httptest.NewRecorder()
+		h.getInstallStatus(statusRec, adminCaller(codingCliRequest(http.MethodGet, "/api/v1/workers/daily-carol/coding-cli/qwen-code/install/"+taskID, "", "name", "daily-carol", "cli", "qwen-code", "task_id", taskID)))
+		if statusRec.Code == http.StatusOK {
+			sdoc = decodeJSON(t, statusRec.Body.String())
+			if sdoc["state"] == "failed" {
+				break
+			}
+		} else {
+			t.Fatalf("status probe: %d %s", statusRec.Code, statusRec.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sdoc == nil {
+		t.Fatalf("task never reached a terminal state")
+	}
+	if sdoc["state"] != "failed" {
+		t.Fatalf("state=%v want failed: %v", sdoc["state"], sdoc)
+	}
+}
+
+// The uninstall action drives npm uninstall -g (no version tag) and lands
+// done on a clean exit — the same async contract as install, minus version.
+func TestCodingCliStartInstall_UninstallCompletes(t *testing.T) {
+	exec := &fakeExecBackend{fileWrites: map[string]string{}}
+	exec.respond = func(cmd []string) (string, string, int, error) {
+		if cmd[0] == "npm" {
+			return "removed 1 package in 3s\n", "", 0, nil
+		}
+		return "", "", 1, nil
+	}
+	h := newTestCodingCliHandler(t, "embedded", exec, nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+	rec := httptest.NewRecorder()
+	h.startInstall(rec, adminCaller(codingCliRequest(http.MethodPost, "/api/v1/workers/daily-carol/coding-cli/qwen-code/install", `{"action":"uninstall"}`, "name", "daily-carol", "cli", "qwen-code")))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	taskID, _ := decodeJSON(t, rec.Body.String())["task_id"].(string)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		statusRec := httptest.NewRecorder()
+		h.getInstallStatus(statusRec, adminCaller(codingCliRequest(http.MethodGet, "/api/v1/workers/daily-carol/coding-cli/qwen-code/install/"+taskID, "", "name", "daily-carol", "cli", "qwen-code", "task_id", taskID)))
+		if statusRec.Code == http.StatusOK {
+			sdoc := decodeJSON(t, statusRec.Body.String())
+			if sdoc["state"] != "running" {
+				if sdoc["state"] != "done" || sdoc["exit_code"] != float64(0) {
+					t.Fatalf("task state: %v", sdoc)
+				}
+				break
+			}
+		} else {
+			t.Fatalf("status probe: %d %s", statusRec.Code, statusRec.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var sawUninstall bool
+	exec.mu.Lock()
+	for _, c := range exec.commands {
+		if c[0] == "npm" && len(c) >= 4 && c[1] == "uninstall" && c[2] == "-g" && c[3] == "@qwen-code/qwen-code" {
+			sawUninstall = true
+		}
+	}
+	exec.mu.Unlock()
+	if !sawUninstall {
+		t.Fatalf("npm uninstall -g never executed: %v", exec.commands)
+	}
+}
+
 func TestCodingCliStartInstall_BusyConflict(t *testing.T) {
 	exec := &fakeExecBackend{fileWrites: map[string]string{}}
 	release := make(chan struct{})
