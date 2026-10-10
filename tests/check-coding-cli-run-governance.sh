@@ -1,10 +1,11 @@
 #!/bin/bash
 # check-coding-cli-run-governance.sh
 #
-# Tests run-coding-cli.sh's governance passthrough and its "ungoverned"
-# visibility warning, using a STUB qwen on PATH — no real runner required, so
-# this runs in CI. Closes the gap where the delegation executor (the script
-# that actually runs the CLI) had no automated test (only detect + verify did).
+# Tests run-coding-cli.sh's governance passthrough, its "ungoverned"
+# visibility warning, and its success/failure/timeout outcome detection,
+# using a STUB qwen on PATH — no real runner required, so this runs in CI.
+# Closes the gap where the delegation executor (the script that actually runs
+# the CLI) had no automated test (only detect + verify did).
 #
 # Cases:
 #   1. flag passthrough (jq-independent): --allowed-tools reaches the runner
@@ -13,6 +14,10 @@
 #      UNGOVERNED warning (code-level visibility), exit still 0.
 #   3. tool-only   — only --allowed-tools (no budget/sandbox): still governed,
 #      so NO warning (a tool allowlist is a real boundary).
+#   4. timeout     — the runner outlives --timeout: exit 124 + TIMEOUT message
+#      (the timeout-detection half of success/failure/timeout verification).
+#   5. failure     — the runner exits non-zero: the code is propagated and NO
+#      TIMEOUT is reported (the failure-detection half).
 #
 # jq is optional: the config-driven budget/sandbox assertions are skipped (with
 # a note) when jq is absent, matching the detect suite's "skip when a
@@ -32,14 +37,20 @@ command -v jq >/dev/null 2>&1 && HAS_JQ=1
 TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP}"' EXIT
 
-# Stub qwen: record its argv (one token per line) to $QWEN_STUB_ARGS, exit 0.
+# Stub qwen: record its argv (one token per line) to $QWEN_STUB_ARGS. Behavior
+# is selected by QWEN_STUB_MODE — default (exit 0) / sleep (sleep 5, to trip
+# the timeout) / fail (exit 7). No real runner required, so this runs in CI.
 STUB_BIN="${TMP}/bin"
 STUB_ARGS="${TMP}/qwen-args.txt"
 mkdir -p "${STUB_BIN}"
 cat > "${STUB_BIN}/qwen" <<'STUB'
 #!/bin/bash
 printf '%s\n' "$@" > "${QWEN_STUB_ARGS}"
-exit 0
+case "${QWEN_STUB_MODE:-default}" in
+    sleep) sleep 5; exit 0 ;;
+    fail)  exit 7 ;;
+    *)     exit 0 ;;
+esac
 STUB
 chmod +x "${STUB_BIN}/qwen"
 
@@ -53,7 +64,8 @@ have_arg() { grep -qxF -- "$1" "${STUB_ARGS}" 2>/dev/null; }
 argv_show() { tr '\n' ' ' < "${STUB_ARGS}" 2>/dev/null; }
 
 run_qwen() {
-    # $@ = extra run-coding-cli.sh flags; $CFG (may be empty) selects the config.
+    # $@ = extra run-coding-cli.sh flags; $CFG (may be empty) selects the config;
+    # $QWEN_STUB_MODE (may be empty) selects the stub behavior.
     PATH="${STUB_BIN}:${PATH}" \
     QWEN_STUB_ARGS="${STUB_ARGS}" \
     CODING_CLI_CONFIG="${CFG:-${TMP}/nonexistent.json}" \
@@ -110,6 +122,36 @@ if grep -q "UNGOVERNED" <<<"${out}"; then
 fi
 if ! have_arg "--allowed-tools" || ! have_arg "Read"; then
     echo "FAIL case3: --allowed-tools Read should reach the runner argv (got: $(argv_show))"
+    fail=1
+fi
+
+# --- case 4: timeout — runner outlives --timeout -> exit 124 + TIMEOUT --------
+rm -f "${STUB_ARGS}"
+out="$(QWEN_STUB_MODE=sleep run_qwen --timeout 1)"
+rc=$?
+if [ "${rc}" -ne 124 ]; then
+    echo "FAIL case4: expected exit 124 on timeout (got ${rc}): ${out}"
+    fail=1
+fi
+if ! grep -q "TIMEOUT" <<<"${out}"; then
+    echo "FAIL case4: expected TIMEOUT message, got: ${out}"
+    fail=1
+fi
+
+# --- case 5: failure — runner exits non-zero -> propagate code, no TIMEOUT ----
+rm -f "${STUB_ARGS}"
+out="$(QWEN_STUB_MODE=fail run_qwen)"
+rc=$?
+if [ "${rc}" -ne 7 ]; then
+    echo "FAIL case5: expected exit 7 (the runner's code) (got ${rc}): ${out}"
+    fail=1
+fi
+if grep -q "TIMEOUT" <<<"${out}"; then
+    echo "FAIL case5: no TIMEOUT expected for a plain failure (got: ${out})"
+    fail=1
+fi
+if ! grep -q "exit code 7" <<<"${out}"; then
+    echo "FAIL case5: expected 'Finished with exit code 7' (got: ${out})"
     fail=1
 fi
 
