@@ -60,10 +60,12 @@ const llmStreamEnvsDialTimeout = 5 * time.Second
 //
 // Clear semantics: when the resolved pair becomes empty after a previous
 // apply, each applied key is reset (POST /api/envs/{key}/reset), so the env
-// falls back to its inherited value — the deployment/entrypoint value when
-// one is set, otherwise the registry default (30s for both timeouts). A
-// plain DELETE is rejected by the QwenPaw router for known registry keys
-// ("Known variable must be reset").
+// falls back to its inherited value — for these two keys that is the
+// worker-entrypoint export (qwenpaw-worker-entrypoint.sh defaults both to
+// 300s via AGENTTEAMS_LLM_STREAM_TIMEOUT_S; the QwenPaw registry default of
+// 30s is only the last resort when nothing is exported). A plain DELETE is
+// rejected by the QwenPaw router for known registry keys ("Known variable
+// must be reset").
 //
 // Best-effort by design: a failed dial (worker restarting, transient network,
 // invalid value) logs and leaves the annotation untouched, so the next
@@ -105,7 +107,8 @@ func (r *WorkerReconciler) applyLlmStreamTimeoutsHot(ctx context.Context, w *v1b
 
 	if desired == "" {
 		// Clear: reset every key the previous annotation applied (known
-		// registry keys reject DELETE; reset restores the inherited value).
+		// registry keys reject DELETE; reset restores the inherited value,
+		// i.e. the worker-entrypoint 300s default).
 		for _, key := range appliedLlmStreamEnvKeys(applied) {
 			if err := resetWorkerEnv(ctx, baseURL, key); err != nil {
 				log.FromContext(ctx).Error(err, "LLM stream timeout clear failed, will retry on next reconcile", "worker", w.Name, "key", key)
@@ -204,7 +207,8 @@ func patchWorkerEnvs(ctx context.Context, baseURL string, payload map[string]str
 
 // resetWorkerEnv calls the worker console's POST /api/envs/{key}/reset,
 // clearing a previously applied override so the env falls back to its
-// inherited value. The QwenPaw router rejects a plain DELETE for known
+// inherited value (the worker-entrypoint export — 300s by default for the
+// stream timeouts). The QwenPaw router rejects a plain DELETE for known
 // registry keys ("Known variable must be reset"), so reset is the only
 // clearing path for the stream timeout keys.
 func resetWorkerEnv(ctx context.Context, baseURL, key string) error {
