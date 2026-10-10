@@ -40,13 +40,30 @@ deliberately — for example a leader scheduling a cross-session follow-up.
 
 ## Do not rely on HEARTBEAT for room wakeups
 
-The runtime heartbeat facility is not a room wakeup channel:
+The runtime heartbeat facility is not a room wakeup channel. One rule holds
+for every runtime: a heartbeat that surfaces into a room is a plain
+self-message from the agent's own Matrix user id, so it never passes the
+self-skip above unless it carries the structured trigger.
 
-- it is disabled by default, and its default period is measured in hours;
-- a missed tick is silently dropped (short misfire window);
-- ticks run in the agent's **main session**, not in a room session;
-- a heartbeat message is a plain self-message and therefore never passes the
-  self-skip above unless it carries the structured trigger.
+The specifics below are **QwenPaw runtime** settings (verified against
+QwenPaw v2.2.x; file paths refer to the QwenPaw repository as of this
+writing), not a shared TeamHarness contract — other runtimes may differ:
+
+- **Disabled by default** — `HeartbeatConfig.enabled` defaults to `False`
+  (`src/qwenpaw/config/config.py`); nothing runs until the operator turns
+  it on.
+- **Default period is hours** — `heartbeat.every` defaults to `6h`
+  (`HEARTBEAT_DEFAULT_EVERY`, `src/qwenpaw/constant.py`).
+- **A missed tick is silently dropped** — the heartbeat job runs with a
+  60-second misfire grace (`HEARTBEAT_MISFIRE_GRACE_SECONDS`,
+  `src/qwenpaw/app/crons/manager.py`); a tick that comes in late beyond
+  the grace is dropped without catch-up. This is a shorter window than the
+  600-second grace used by regular scheduled jobs.
+- **Ticks run in the main session by default** — `heartbeat.target`
+  defaults to `main` (`HEARTBEAT_DEFAULT_TARGET`,
+  `src/qwenpaw/constant.py`); a tick executes as a request against that
+  session rather than as a room event. The target is configurable
+  (`main` / `last` / `inbox`).
 
 For time-based activation use a scheduled task; for cross-session activation
 use the `PROJECT_REQUESTED` trigger; for same-session continuation simply
