@@ -40,7 +40,7 @@ Delegation reuses the delegating agent's identity and credentials; it adds no ne
 
 **Unattended semantics.** `qwen --yolo` auto-approves every tool call; `opencode --auto` still enforces explicit deny rules. A changed working directory or an added timeout is not a permission boundary — they alter behavior, not scope.
 
-**Execution boundary.** The CLI runs as the delegating agent and inherits its filesystem and environment-credential visibility. Evaluate per deployment: workspace scope, reach into other team files, the delegator's credentials, mounted sockets, and management-plane capabilities. Mitigations are the CLIs' native controls — qwen `--approval-mode` tiers, opencode deny rules — and/or an isolated execution environment.
+**Execution boundary.** The CLI runs as the delegating agent and inherits its filesystem and environment-credential visibility. Evaluate per deployment: workspace scope, reach into other team files, the delegator's credentials, mounted sockets, and management-plane capabilities. Mitigations are the CLIs' native controls — qwen `--approval-mode` tiers and `--include-directories` (declare any directory beyond the task workspace explicitly, e.g. shared toolchains or reference code, rather than relying on ambient filesystem reach), opencode deny rules — and/or an isolated execution environment.
 
 **Verification.** Run the verify suite before relying on the delegation and record the tested version in the report — there is **no fixed version pin**: the deployment picks its own npm channel tag (stable by default; `0.25.0` is the most recent field-verified reference), and any version or channel change re-runs the suite:
 
