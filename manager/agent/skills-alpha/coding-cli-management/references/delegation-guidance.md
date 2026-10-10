@@ -81,13 +81,21 @@ host can actually *host* the toolchain before dispatching, not just that the fil
 
 | Scenario | Writes in worker | Build/verify in worker | Route |
 |---|---|---|---|
-| Web (Node / React / Vue) | yes | yes (`npm run build` / tests) | closed in the worker |
-| Python | yes | yes (`python3` + its test runners) | closed in the worker |
+| Web (Node / React / Vue) | yes | yes (Node 24 + npm 11 / pnpm) | closed in the worker |
+| Python, stdlib-only | yes | yes (bare `python3` 3.12 — no pip, no third-party packages) | closed in the worker |
+| Python, third-party (requests / pandas / numpy …) | yes | no — no pip in the base image | code in the worker; verify on a host or build node that has the packages |
 | C / C++ | yes | yes (`gcc` / `g++` / `make`) | closed in the worker |
 | Go / Rust | yes | no — no `go` / `cargo` in the base image | code in the worker; build/verify on a host or build node |
 | Java / Android | yes | no — no `java` / `gradle` / Android SDK | code in the worker; build on a host with the SDK |
 | iOS | yes | no — requires a macOS host with Xcode, which a Linux worker cannot provide | code in the worker; build on a macOS host or CI |
-| HarmonyOS / other device SDKs | yes | no — no platform CLT in the base image | code in the worker; build on a host with the platform toolchain |
+| HarmonyOS / Flutter / other device SDKs | yes | no — no platform CLT or SDK in the base image | code in the worker; build on a host with the platform toolchain |
+| Infra-as-code (Dockerfiles / CI / k8s / Terraform) | yes | no — the worker is itself a container and ships no `docker` / `kubectl` / `helm` | write the files in the worker; apply and verify on the host |
+| ML / data (numpy / pandas / torch) | yes | no — no data-science packages and no pip | code in the worker; run on a host or build node with the environment |
+| Docs / comments / text config | yes | yes (no build step) | closed in the worker |
+
+Two task-shape notes on top of the language axis:
+- **Greenfield** (scaffolding a new project) is more constrained than modifying one: the base image can scaffold Node, stdlib-Python and C projects, but has no `go mod init` / `cargo new` / `gradle init`, so greenfield for those stacks ends at the source files.
+- **Debug and refactor** inherit the build/verify column above — they need the failing test or the regression suite to run; if the worker cannot run the tests, the worker diagnoses from the code and the test run happens on the host.
 
 When a task genuinely needs a toolchain the matrix marks missing, layer 1 applies: provision it on the shared volume and name it by absolute path in the spec — do not assume the base image carries it, and do not make the runner install it mid-task.
 
