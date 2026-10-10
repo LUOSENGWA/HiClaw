@@ -132,11 +132,19 @@ func (h *ResourceHandler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 			Namespace: h.namespace,
 		},
 		Spec: v1beta1.WorkerSpec{
-			Env:                        req.Env,
-			Model:                      req.Model,
-			SubagentModel:              req.SubagentModel,
+			Env:                          req.Env,
+			Model:                        req.Model,
+			SubagentModel:                req.SubagentModel,
 			LlmStreamFirstContentTimeout: req.LlmStreamFirstContentTimeout,
 			LlmStreamIdleTimeout:         req.LlmStreamIdleTimeout,
+			LlmMaxRetries:                req.LlmMaxRetries,
+			LlmBackoffBase:               req.LlmBackoffBase,
+			LlmBackoffCap:                req.LlmBackoffCap,
+			LlmMaxConcurrent:             req.LlmMaxConcurrent,
+			LlmMaxQpm:                    req.LlmMaxQpm,
+			LlmRateLimitPause:            req.LlmRateLimitPause,
+			LlmRateLimitJitter:           req.LlmRateLimitJitter,
+			LlmAcquireTimeout:            req.LlmAcquireTimeout,
 			ModelProvider:                req.ModelProvider,
 			WorkerName:                   req.WorkerName,
 			Runtime:                      runtime,
@@ -316,6 +324,30 @@ func (h *ResourceHandler) UpdateWorker(w http.ResponseWriter, r *http.Request) {
 		if req.LlmStreamIdleTimeout != nil {
 			worker.Spec.LlmStreamIdleTimeout = *req.LlmStreamIdleTimeout
 		}
+		if req.LlmMaxRetries != nil {
+			worker.Spec.LlmMaxRetries = *req.LlmMaxRetries
+		}
+		if req.LlmBackoffBase != nil {
+			worker.Spec.LlmBackoffBase = *req.LlmBackoffBase
+		}
+		if req.LlmBackoffCap != nil {
+			worker.Spec.LlmBackoffCap = *req.LlmBackoffCap
+		}
+		if req.LlmMaxConcurrent != nil {
+			worker.Spec.LlmMaxConcurrent = *req.LlmMaxConcurrent
+		}
+		if req.LlmMaxQpm != nil {
+			worker.Spec.LlmMaxQpm = *req.LlmMaxQpm
+		}
+		if req.LlmRateLimitPause != nil {
+			worker.Spec.LlmRateLimitPause = *req.LlmRateLimitPause
+		}
+		if req.LlmRateLimitJitter != nil {
+			worker.Spec.LlmRateLimitJitter = *req.LlmRateLimitJitter
+		}
+		if req.LlmAcquireTimeout != nil {
+			worker.Spec.LlmAcquireTimeout = *req.LlmAcquireTimeout
+		}
 		if req.ModelProvider != "" {
 			worker.Spec.ModelProvider = req.ModelProvider
 		}
@@ -465,6 +497,14 @@ func (h *ResourceHandler) CreateTeam(w http.ResponseWriter, r *http.Request) {
 			HeartbeatEvery:               req.HeartbeatEvery,
 			LlmStreamFirstContentTimeout: req.LlmStreamFirstContentTimeout,
 			LlmStreamIdleTimeout:         req.LlmStreamIdleTimeout,
+			LlmMaxRetries:                req.LlmMaxRetries,
+			LlmBackoffBase:               req.LlmBackoffBase,
+			LlmBackoffCap:                req.LlmBackoffCap,
+			LlmMaxConcurrent:             req.LlmMaxConcurrent,
+			LlmMaxQpm:                    req.LlmMaxQpm,
+			LlmRateLimitPause:            req.LlmRateLimitPause,
+			LlmRateLimitJitter:           req.LlmRateLimitJitter,
+			LlmAcquireTimeout:            req.LlmAcquireTimeout,
 			PeerMentions:                 req.PeerMentions,
 			ChannelPolicy:                req.ChannelPolicy,
 		},
@@ -586,6 +626,30 @@ func (h *ResourceHandler) UpdateTeam(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.LlmStreamIdleTimeout != nil {
 			team.Spec.LlmStreamIdleTimeout = *req.LlmStreamIdleTimeout
+		}
+		if req.LlmMaxRetries != nil {
+			team.Spec.LlmMaxRetries = *req.LlmMaxRetries
+		}
+		if req.LlmBackoffBase != nil {
+			team.Spec.LlmBackoffBase = *req.LlmBackoffBase
+		}
+		if req.LlmBackoffCap != nil {
+			team.Spec.LlmBackoffCap = *req.LlmBackoffCap
+		}
+		if req.LlmMaxConcurrent != nil {
+			team.Spec.LlmMaxConcurrent = *req.LlmMaxConcurrent
+		}
+		if req.LlmMaxQpm != nil {
+			team.Spec.LlmMaxQpm = *req.LlmMaxQpm
+		}
+		if req.LlmRateLimitPause != nil {
+			team.Spec.LlmRateLimitPause = *req.LlmRateLimitPause
+		}
+		if req.LlmRateLimitJitter != nil {
+			team.Spec.LlmRateLimitJitter = *req.LlmRateLimitJitter
+		}
+		if req.LlmAcquireTimeout != nil {
+			team.Spec.LlmAcquireTimeout = *req.LlmAcquireTimeout
 		}
 
 		if err := h.client.Update(ctx, &team); err != nil {
@@ -1214,6 +1278,14 @@ func workerToResponse(w *v1beta1.Worker) WorkerResponse {
 		SubagentModel:                w.Spec.SubagentModel,
 		LlmStreamFirstContentTimeout: w.Spec.LlmStreamFirstContentTimeout,
 		LlmStreamIdleTimeout:         w.Spec.LlmStreamIdleTimeout,
+		LlmMaxRetries:                w.Spec.LlmMaxRetries,
+		LlmBackoffBase:               w.Spec.LlmBackoffBase,
+		LlmBackoffCap:                w.Spec.LlmBackoffCap,
+		LlmMaxConcurrent:             w.Spec.LlmMaxConcurrent,
+		LlmMaxQpm:                    w.Spec.LlmMaxQpm,
+		LlmRateLimitPause:            w.Spec.LlmRateLimitPause,
+		LlmRateLimitJitter:           w.Spec.LlmRateLimitJitter,
+		LlmAcquireTimeout:            w.Spec.LlmAcquireTimeout,
 		Runtime:                      w.Spec.Runtime,
 		Image:                        w.Spec.Image,
 		Identity:                     w.Spec.Identity,
@@ -1315,6 +1387,14 @@ func teamToResponse(t *v1beta1.Team) TeamResponse {
 		SubagentModel:                t.Spec.SubagentModel,
 		LlmStreamFirstContentTimeout: t.Spec.LlmStreamFirstContentTimeout,
 		LlmStreamIdleTimeout:         t.Spec.LlmStreamIdleTimeout,
+		LlmMaxRetries:                t.Spec.LlmMaxRetries,
+		LlmBackoffBase:               t.Spec.LlmBackoffBase,
+		LlmBackoffCap:                t.Spec.LlmBackoffCap,
+		LlmMaxConcurrent:             t.Spec.LlmMaxConcurrent,
+		LlmMaxQpm:                    t.Spec.LlmMaxQpm,
+		LlmRateLimitPause:            t.Spec.LlmRateLimitPause,
+		LlmRateLimitJitter:           t.Spec.LlmRateLimitJitter,
+		LlmAcquireTimeout:            t.Spec.LlmAcquireTimeout,
 	}
 	if resp.Phase == "" {
 		resp.Phase = "Pending"
@@ -1449,6 +1529,30 @@ func (h *ResourceHandler) checkScopedWorkerUpdate(ctx context.Context, caller *a
 	}
 	if req.LlmStreamIdleTimeout != nil {
 		forbidden = append(forbidden, "llmStreamIdleTimeout")
+	}
+	if req.LlmMaxRetries != nil {
+		forbidden = append(forbidden, "llmMaxRetries")
+	}
+	if req.LlmBackoffBase != nil {
+		forbidden = append(forbidden, "llmBackoffBase")
+	}
+	if req.LlmBackoffCap != nil {
+		forbidden = append(forbidden, "llmBackoffCap")
+	}
+	if req.LlmMaxConcurrent != nil {
+		forbidden = append(forbidden, "llmMaxConcurrent")
+	}
+	if req.LlmMaxQpm != nil {
+		forbidden = append(forbidden, "llmMaxQpm")
+	}
+	if req.LlmRateLimitPause != nil {
+		forbidden = append(forbidden, "llmRateLimitPause")
+	}
+	if req.LlmRateLimitJitter != nil {
+		forbidden = append(forbidden, "llmRateLimitJitter")
+	}
+	if req.LlmAcquireTimeout != nil {
+		forbidden = append(forbidden, "llmAcquireTimeout")
 	}
 	if req.ModelProvider != "" {
 		forbidden = append(forbidden, "modelProvider")

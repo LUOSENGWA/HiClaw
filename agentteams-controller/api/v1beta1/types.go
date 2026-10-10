@@ -204,7 +204,25 @@ type WorkerSpec struct {
 	// ignore them.
 	LlmStreamFirstContentTimeout string                     `json:"llmStreamFirstContentTimeout,omitempty"`
 	LlmStreamIdleTimeout         string                     `json:"llmStreamIdleTimeout,omitempty"`
-	Runtime                      string                     `json:"runtime,omitempty"`    // openclaw | copaw | hermes | qwenpaw | deepseek-harness (default: openclaw)
+	// Llm* tuning knobs are the QwenPaw startup-only LLM settings
+	// (QWENPAW_LLM_MAX_RETRIES and friends). The controller projects the
+	// effective value (worker over team default) into the worker container
+	// environment at (re)creation, so a change takes effect when the
+	// container is recreated (spec-hash driven) — not hot, matching the
+	// QwenPaw registry's startup_only mutability. Values must be
+	// non-negative numbers matching the registry value type (integer or
+	// float); invalid values are skipped with a log, never breaking the
+	// container. All eight default to empty = "do not set the env" (the
+	// QwenPaw registry default then applies: 3/1/10/10/600/5/1/300).
+	LlmMaxRetries       string `json:"llmMaxRetries,omitempty"`
+	LlmBackoffBase      string `json:"llmBackoffBase,omitempty"`
+	LlmBackoffCap       string `json:"llmBackoffCap,omitempty"`
+	LlmMaxConcurrent    string `json:"llmMaxConcurrent,omitempty"`
+	LlmMaxQpm           string `json:"llmMaxQpm,omitempty"`
+	LlmRateLimitPause   string `json:"llmRateLimitPause,omitempty"`
+	LlmRateLimitJitter  string `json:"llmRateLimitJitter,omitempty"`
+	LlmAcquireTimeout   string `json:"llmAcquireTimeout,omitempty"`
+	Runtime             string `json:"runtime,omitempty"`    // openclaw | copaw | hermes | qwenpaw | deepseek-harness (default: openclaw)
 	Image                        string                     `json:"image,omitempty"`      // custom Docker image
 	WorkerName                   string                     `json:"workerName,omitempty"` // business/runtime identity (Matrix localpart, OSS path key)
 	Identity                     string                     `json:"identity,omitempty"`
@@ -497,6 +515,20 @@ type TeamSpec struct {
 	// read-time merge during their config reconcile.
 	LlmStreamFirstContentTimeout string `json:"llmStreamFirstContentTimeout,omitempty"`
 	LlmStreamIdleTimeout         string `json:"llmStreamIdleTimeout,omitempty"`
+
+	// Llm* tuning knobs are the team-wide defaults for the QwenPaw
+	// startup-only LLM settings (see WorkerSpec.LlmMaxRetries and friends).
+	// A worker's own value always takes precedence; members without an
+	// explicit value inherit these defaults into their container environment
+	// at (re)creation.
+	LlmMaxRetries      string `json:"llmMaxRetries,omitempty"`
+	LlmBackoffBase     string `json:"llmBackoffBase,omitempty"`
+	LlmBackoffCap      string `json:"llmBackoffCap,omitempty"`
+	LlmMaxConcurrent   string `json:"llmMaxConcurrent,omitempty"`
+	LlmMaxQpm          string `json:"llmMaxQpm,omitempty"`
+	LlmRateLimitPause  string `json:"llmRateLimitPause,omitempty"`
+	LlmRateLimitJitter string `json:"llmRateLimitJitter,omitempty"`
+	LlmAcquireTimeout  string `json:"llmAcquireTimeout,omitempty"`
 }
 
 // TeamWorkerRef references an existing Worker CR as a team member.
