@@ -36,6 +36,10 @@
 #   f) turn_budget         : (qwen only) max_session_turns=1 in an isolated
 #                            config (CODING_CLI_CONFIG) stops a two-step
 #                            prompt at the turn budget
+#   g) json_file           : (qwen only) --json-file <path> writes the final
+#                            structured result to <path>; a real minimal
+#                            prompt asserts the file exists and parses as
+#                            JSON (python3 -m json.tool)
 #
 # Note for (c) on qwen: qwen also has a native run-level budget,
 # `qwen --max-wall-time <secs>`, which aborts the run with exit code 55.
@@ -228,6 +232,44 @@ run_case_f() {
     fi
 }
 
+# run_case_g <cli>: (qwen only) --json-file structured-output smoke.
+#
+# Real run of a minimal prompt with `--json-file <path>`: the qwen runner
+# writes its final structured result to <path> (config.ts, mutually exclusive
+# with --json-fd). The assertion pins that the file exists at that path AND
+# parses as JSON (`python3 -m json.tool`) — i.e. the wrapper's passthrough
+# produced a machine-auditable artifact end to end. Requires a real qwen with
+# working auth (the same environment case (a) needs).
+run_case_g() {
+    local cli="$1" rc json_out
+    if ! command -v python3 >/dev/null 2>&1; then
+        skip "${cli}.json_file (python3 not on PATH — JSON-parse assertion unavailable)"
+        return 0
+    fi
+    json_out="${SANDBOX}/ws-g/result.json"
+    mkdir -p "${SANDBOX}/ws-g"
+    bash "${RUN_SCRIPT}" --cli "${cli}" --workspace "${SANDBOX}/ws-g" \
+        --prompt-file "${PROMPT_FILE}" --timeout 300 \
+        --json-file "${json_out}" \
+        > "${SANDBOX}/prompts/case-g.out" 2>&1
+    rc=$?
+    if [ "${rc}" != "0" ]; then
+        fail "${cli}.json_file" "run with --json-file exited ${rc} (expected 0)"
+        sed 's/^/    | /' "${SANDBOX}/prompts/case-g.out" | tail -10
+        return 0
+    fi
+    if [ ! -f "${json_out}" ]; then
+        fail "${cli}.json_file" "--json-file produced no file at ${json_out}"
+        sed 's/^/    | /' "${SANDBOX}/prompts/case-g.out" | tail -10
+        return 0
+    fi
+    if ! python3 -m json.tool "${json_out}" >/dev/null 2>&1; then
+        fail "${cli}.json_file" "file at ${json_out} is not valid JSON"
+        return 0
+    fi
+    pass "${cli}.json_file (structured result written to the --json-file path and parses as JSON)"
+}
+
 # check_node_generation: environment-level check (runs once, not per-CLI). The npm
 # channel (qwen-code / opencode install) needs a Node in the OpenSSL 3.5 generation
 # to survive restrictive-network TLS-fingerprint filtering (see the SKILL "Node
@@ -283,6 +325,7 @@ for cli in qwen opencode; do
         else
             skip "${cli}.turn_budget (case-a failed — cannot isolate budget behavior from an auth failure)"
         fi
+        run_case_g "${cli}"
     fi
 done
 

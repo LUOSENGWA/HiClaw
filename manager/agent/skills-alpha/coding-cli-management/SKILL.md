@@ -49,6 +49,8 @@ Use the runner's own init frame (`-o json` prints a `tools` array and `permissio
 
 **Runner notes (Qwen Code / OpenCode).** Headless invocations used by `run-coding-cli.sh`: `qwen --yolo "<prompt>"` and `opencode run --auto --dir <workspace> "<prompt>"`. Config surfaces: `~/.qwen` (`settings.json` `security.auth`, or provider env) and `~/.config/opencode` plus `~/.local/share/opencode/auth.json` (credentials stored by `opencode auth login`) or provider env. Both runners were verified with a headless round trip before inclusion. Qwen Code has **no fixed pin**: deployments choose their own npm channel tag (Section below, stable by default); `0.25.0` is the most recent field-verified reference (2026-10-08, full verify suite), and `0.24.7` the previous one. Re-run `verify-coding-cli.sh` whenever the version actually used changes.
 
+- --json-file <path> — optional structured output: the final result JSON is written to <path> for machine audit; default off, raw stream still tees to the run log (the audit source of truth when the flag is absent).
+
 **Version channels and upgrades (Qwen Code).** qwen-code iterates fast (several hundred npm versions published) and ships three channels as dist-tags: `latest` (stable), `nightly` (dated + commit, published daily), and `preview`. Install or upgrade with npm (Node.js **24 LTS** — floor 22.20+ / 24.5+, OpenSSL 3.5 generation; see the Node-generation note in the install matrix), choosing the channel per the user's preference — stable by default, nightly only when the user explicitly wants newer behavior:
 
 ```bash
