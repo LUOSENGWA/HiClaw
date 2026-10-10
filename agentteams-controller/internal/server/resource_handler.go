@@ -132,24 +132,26 @@ func (h *ResourceHandler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 			Namespace: h.namespace,
 		},
 		Spec: v1beta1.WorkerSpec{
-			Env:              req.Env,
-			Model:            req.Model,
-			SubagentModel:    req.SubagentModel,
-			ModelProvider:    req.ModelProvider,
-			WorkerName:       req.WorkerName,
-			Runtime:          runtime,
-			Image:            req.Image,
-			Identity:         req.Identity,
-			Soul:             req.Soul,
-			Agents:           req.Agents,
-			Skills:           req.Skills,
-			McpServers:       req.McpServers,
-			Package:          req.Package,
-			Expose:           req.Expose,
-			ChannelPolicy:    req.ChannelPolicy,
-			Resources:        req.Resources,
-			ContainerManaged: &containerManaged,
-			State:            req.State,
+			Env:                        req.Env,
+			Model:                      req.Model,
+			SubagentModel:              req.SubagentModel,
+			LlmStreamFirstContentTimeout: req.LlmStreamFirstContentTimeout,
+			LlmStreamIdleTimeout:         req.LlmStreamIdleTimeout,
+			ModelProvider:                req.ModelProvider,
+			WorkerName:                   req.WorkerName,
+			Runtime:                      runtime,
+			Image:                        req.Image,
+			Identity:                     req.Identity,
+			Soul:                         req.Soul,
+			Agents:                       req.Agents,
+			Skills:                       req.Skills,
+			McpServers:                   req.McpServers,
+			Package:                      req.Package,
+			Expose:                       req.Expose,
+			ChannelPolicy:                req.ChannelPolicy,
+			Resources:                    req.Resources,
+			ContainerManaged:             &containerManaged,
+			State:                        req.State,
 		},
 	}
 
@@ -308,6 +310,12 @@ func (h *ResourceHandler) UpdateWorker(w http.ResponseWriter, r *http.Request) {
 		if req.SubagentModel != nil {
 			worker.Spec.SubagentModel = *req.SubagentModel
 		}
+		if req.LlmStreamFirstContentTimeout != nil {
+			worker.Spec.LlmStreamFirstContentTimeout = *req.LlmStreamFirstContentTimeout
+		}
+		if req.LlmStreamIdleTimeout != nil {
+			worker.Spec.LlmStreamIdleTimeout = *req.LlmStreamIdleTimeout
+		}
 		if req.ModelProvider != "" {
 			worker.Spec.ModelProvider = req.ModelProvider
 		}
@@ -449,14 +457,16 @@ func (h *ResourceHandler) CreateTeam(w http.ResponseWriter, r *http.Request) {
 			Namespace: h.namespace,
 		},
 		Spec: v1beta1.TeamSpec{
-			Description:    req.Description,
-			TeamName:       req.TeamName,
-			Admin:          req.Admin,
-			HumanMembers:   req.HumanMembers,
-			WorkerMembers:  req.WorkerMembers,
-			HeartbeatEvery: req.HeartbeatEvery,
-			PeerMentions:   req.PeerMentions,
-			ChannelPolicy:  req.ChannelPolicy,
+			Description:                  req.Description,
+			TeamName:                     req.TeamName,
+			Admin:                        req.Admin,
+			HumanMembers:                 req.HumanMembers,
+			WorkerMembers:                req.WorkerMembers,
+			HeartbeatEvery:               req.HeartbeatEvery,
+			LlmStreamFirstContentTimeout: req.LlmStreamFirstContentTimeout,
+			LlmStreamIdleTimeout:         req.LlmStreamIdleTimeout,
+			PeerMentions:                 req.PeerMentions,
+			ChannelPolicy:                req.ChannelPolicy,
 		},
 	}
 
@@ -570,6 +580,12 @@ func (h *ResourceHandler) UpdateTeam(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.HeartbeatEvery != nil {
 			team.Spec.HeartbeatEvery = *req.HeartbeatEvery
+		}
+		if req.LlmStreamFirstContentTimeout != nil {
+			team.Spec.LlmStreamFirstContentTimeout = *req.LlmStreamFirstContentTimeout
+		}
+		if req.LlmStreamIdleTimeout != nil {
+			team.Spec.LlmStreamIdleTimeout = *req.LlmStreamIdleTimeout
 		}
 
 		if err := h.client.Update(ctx, &team); err != nil {
@@ -1188,34 +1204,36 @@ func (h *ResourceHandler) DeleteManager(w http.ResponseWriter, r *http.Request) 
 
 func workerToResponse(w *v1beta1.Worker) WorkerResponse {
 	resp := WorkerResponse{
-		EnvEditable:      true,
-		Env:              w.Spec.Env,
-		Name:             w.Name,
-		WorkerName:       w.Spec.WorkerName,
-		Phase:            w.Status.Phase,
-		State:            w.Spec.DesiredState(),
-		Model:            w.Spec.Model,
-		SubagentModel:    w.Spec.SubagentModel,
-		Runtime:          w.Spec.Runtime,
-		Image:            w.Spec.Image,
-		Identity:         w.Spec.Identity,
-		Soul:             w.Spec.Soul,
-		Agents:           w.Spec.Agents,
-		Skills:           w.Spec.Skills,
-		McpServers:       w.Spec.McpServers,
-		Package:          w.Spec.Package,
-		BackendRuntime:   w.Spec.GetBackendRuntime(),
-		ContainerManaged: w.Spec.DesiredContainerMan(),
-		ChannelPolicy:    w.Spec.ChannelPolicy,
-		ContainerState:   w.Status.ContainerState,
-		MatrixUserID:     w.Status.MatrixUserID,
-		RoomID:           w.Status.RoomID,
-		Message:          w.Status.Message,
-		LastActiveAt:     w.Status.LastActiveAt,
-		AgentStatus:      w.Status.AgentStatus,
-		RunningTaskCount: w.Status.RunningTaskCount,
-		LastRunAt:        w.Status.LastRunAt,
-		LastFinishAt:     w.Status.LastFinishAt,
+		EnvEditable:                  true,
+		Env:                          w.Spec.Env,
+		Name:                         w.Name,
+		WorkerName:                   w.Spec.WorkerName,
+		Phase:                        w.Status.Phase,
+		State:                        w.Spec.DesiredState(),
+		Model:                        w.Spec.Model,
+		SubagentModel:                w.Spec.SubagentModel,
+		LlmStreamFirstContentTimeout: w.Spec.LlmStreamFirstContentTimeout,
+		LlmStreamIdleTimeout:         w.Spec.LlmStreamIdleTimeout,
+		Runtime:                      w.Spec.Runtime,
+		Image:                        w.Spec.Image,
+		Identity:                     w.Spec.Identity,
+		Soul:                         w.Spec.Soul,
+		Agents:                       w.Spec.Agents,
+		Skills:                       w.Spec.Skills,
+		McpServers:                   w.Spec.McpServers,
+		Package:                      w.Spec.Package,
+		BackendRuntime:               w.Spec.GetBackendRuntime(),
+		ContainerManaged:             w.Spec.DesiredContainerMan(),
+		ChannelPolicy:                w.Spec.ChannelPolicy,
+		ContainerState:               w.Status.ContainerState,
+		MatrixUserID:                 w.Status.MatrixUserID,
+		RoomID:                       w.Status.RoomID,
+		Message:                      w.Status.Message,
+		LastActiveAt:                 w.Status.LastActiveAt,
+		AgentStatus:                  w.Status.AgentStatus,
+		RunningTaskCount:             w.Status.RunningTaskCount,
+		LastRunAt:                    w.Status.LastRunAt,
+		LastFinishAt:                 w.Status.LastFinishAt,
 	}
 	resp.RuntimeDeprecated = strings.EqualFold(w.Spec.Runtime, backend.RuntimeCopaw)
 	if resp.Phase == "" {
@@ -1280,21 +1298,23 @@ func sanitizeMCPURLForL3(raw string) string {
 
 func teamToResponse(t *v1beta1.Team) TeamResponse {
 	resp := TeamResponse{
-		Name:           t.Name,
-		TeamName:       t.Spec.EffectiveTeamName(t.Name),
-		Phase:          t.Status.Phase,
-		Description:    t.Spec.Description,
-		Admin:          t.Spec.Admin,
-		HumanMembers:   t.Spec.HumanMembers,
-		WorkerMembers:  t.Spec.WorkerMembers,
-		HeartbeatEvery: t.Spec.HeartbeatEvery,
-		TeamRoomID:     t.Status.TeamRoomID,
-		LeaderDMRoomID: t.Status.LeaderDMRoomID,
-		LeaderReady:    t.Status.LeaderReady,
-		ReadyWorkers:   t.Status.ReadyWorkers,
-		TotalWorkers:   t.Status.TotalWorkers,
-		Message:        t.Status.Message,
-		SubagentModel:  t.Spec.SubagentModel,
+		Name:                         t.Name,
+		TeamName:                     t.Spec.EffectiveTeamName(t.Name),
+		Phase:                        t.Status.Phase,
+		Description:                  t.Spec.Description,
+		Admin:                        t.Spec.Admin,
+		HumanMembers:                 t.Spec.HumanMembers,
+		WorkerMembers:                t.Spec.WorkerMembers,
+		HeartbeatEvery:               t.Spec.HeartbeatEvery,
+		TeamRoomID:                   t.Status.TeamRoomID,
+		LeaderDMRoomID:               t.Status.LeaderDMRoomID,
+		LeaderReady:                  t.Status.LeaderReady,
+		ReadyWorkers:                 t.Status.ReadyWorkers,
+		TotalWorkers:                 t.Status.TotalWorkers,
+		Message:                      t.Status.Message,
+		SubagentModel:                t.Spec.SubagentModel,
+		LlmStreamFirstContentTimeout: t.Spec.LlmStreamFirstContentTimeout,
+		LlmStreamIdleTimeout:         t.Spec.LlmStreamIdleTimeout,
 	}
 	if resp.Phase == "" {
 		resp.Phase = "Pending"
@@ -1420,6 +1440,15 @@ func (h *ResourceHandler) checkScopedWorkerUpdate(ctx context.Context, caller *a
 	// The pointer check also covers an explicit clear ("" present).
 	if req.SubagentModel != nil {
 		forbidden = append(forbidden, "subagentModel")
+	}
+	// llmStream* sit with model: LLM behavior tuning is a decision-layer
+	// field of the team owner / admin (L1). Same pointer check covers the
+	// explicit-clear case.
+	if req.LlmStreamFirstContentTimeout != nil {
+		forbidden = append(forbidden, "llmStreamFirstContentTimeout")
+	}
+	if req.LlmStreamIdleTimeout != nil {
+		forbidden = append(forbidden, "llmStreamIdleTimeout")
 	}
 	if req.ModelProvider != "" {
 		forbidden = append(forbidden, "modelProvider")
