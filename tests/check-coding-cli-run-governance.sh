@@ -18,6 +18,9 @@
 #      (the timeout-detection half of success/failure/timeout verification).
 #   5. failure     — the runner exits non-zero: the code is propagated and NO
 #      TIMEOUT is reported (the failure-detection half).
+#   6. json-file   — --json-file reaches the runner argv and the runner's
+#      structured-output file lands on disk (the stub writes it there), i.e.
+#      the optional structured-output passthrough is wired end to end.
 #
 # jq is optional: the config-driven budget/sandbox assertions are skipped (with
 # a note) when jq is absent, matching the detect suite's "skip when a
@@ -46,6 +49,16 @@ mkdir -p "${STUB_BIN}"
 cat > "${STUB_BIN}/qwen" <<'STUB'
 #!/bin/bash
 printf '%s\n' "$@" > "${QWEN_STUB_ARGS}"
+# Emulate `qwen --json-file <path>`: write a minimal structured result to the
+# given path so the wrapper's passthrough can be asserted end to end. A no-op
+# for the other cases (none of them pass --json-file).
+prev=""
+for a in "$@"; do
+    if [ "${prev}" = "--json-file" ]; then
+        printf '{"type":"result","subtype":"success","result":"stub"}\n' > "${a}"
+    fi
+    prev="${a}"
+done
 case "${QWEN_STUB_MODE:-default}" in
     sleep) sleep 5; exit 0 ;;
     fail)  exit 7 ;;
@@ -152,6 +165,21 @@ if grep -q "TIMEOUT" <<<"${out}"; then
 fi
 if ! grep -q "exit code 7" <<<"${out}"; then
     echo "FAIL case5: expected 'Finished with exit code 7' (got: ${out})"
+    fail=1
+fi
+
+# --- case 6: --json-file passthrough — the flag reaches the runner argv and ---
+#             the runner's structured-output file lands on disk --------------
+json_out="${TMP}/json-out/result.json"
+mkdir -p "$(dirname "${json_out}")"
+rm -f "${STUB_ARGS}" "${json_out}"
+out="$(CFG="" run_qwen --json-file "${json_out}")"
+if ! have_arg "--json-file" || ! have_arg "${json_out}"; then
+    echo "FAIL case6: --json-file should reach the runner argv (got: $(argv_show))"
+    fail=1
+fi
+if [ ! -f "${json_out}" ]; then
+    echo "FAIL case6: runner did not write the --json-file output at ${json_out}"
     fail=1
 fi
 

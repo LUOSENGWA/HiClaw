@@ -1,7 +1,7 @@
 #!/bin/bash
 # Execute an AI coding CLI tool in a given workspace
 # Usage: run-coding-cli.sh --cli <tool> --workspace <dir> --prompt-file <file> [--timeout <secs>]
-#        [--model <name>] [--allowed-tools <csv>] [--allowed-mcp <csv>] [--safe-mode] [--bare]
+#        [--model <name>] [--allowed-tools <csv>] [--allowed-mcp <csv>] [--safe-mode] [--bare] [--json-file <path>]
 # (governance flags apply to the qwen runner; other runners warn and ignore them)
 
 set -e
@@ -15,6 +15,7 @@ g_allowed_tools=""
 g_allowed_mcp=""
 g_safe_mode=0
 g_bare=0
+g_json_file=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -27,6 +28,7 @@ while [[ $# -gt 0 ]]; do
         --allowed-mcp) g_allowed_mcp="$2"; shift 2 ;;
         --safe-mode)   g_safe_mode=1;      shift ;;
         --bare)        g_bare=1;           shift ;;
+        --json-file)   g_json_file="$2";   shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -48,8 +50,8 @@ fi
 
 # Governance flags are defined by the qwen runner; other runners have no
 # equivalent surface, so warn and ignore rather than fail the run.
-if [ "$cli" != "qwen" ] && { [ -n "$g_model" ] || [ -n "$g_allowed_tools" ] || [ -n "$g_allowed_mcp" ] || [ "$g_safe_mode" = "1" ] || [ "$g_bare" = "1" ]; }; then
-    echo "[run-coding-cli] note: governance flags (--model/--allowed-tools/--allowed-mcp/--safe-mode/--bare) are qwen-specific and were ignored for cli=$cli" >&2
+if [ "$cli" != "qwen" ] && { [ -n "$g_model" ] || [ -n "$g_allowed_tools" ] || [ -n "$g_allowed_mcp" ] || [ "$g_safe_mode" = "1" ] || [ "$g_bare" = "1" ] || [ -n "$g_json_file" ]; }; then
+    echo "[run-coding-cli] note: governance flags (--model/--allowed-tools/--allowed-mcp/--safe-mode/--bare/--json-file) are qwen-specific and were ignored for cli=$cli" >&2
 fi
 
 # Save output to log file in the workspace's coding-cli-logs directory
@@ -126,6 +128,12 @@ case "$cli" in
         fi
         if [ "${g_bare}" = "1" ]; then
             qwen_args+=(--bare)
+        fi
+        # Optional structured-output passthrough (qwen --json-file <path>):
+        # writes the final result JSON to <path> for machine audit. Off by
+        # default, so the raw stream remains the audit source of truth.
+        if [ -n "${g_json_file}" ]; then
+            qwen_args+=(--json-file "${g_json_file}")
         fi
         # Governance visibility (code-level signal, NOT a hard gate): an
         # unattended qwen run that has none of a turn budget / sandbox / tool
