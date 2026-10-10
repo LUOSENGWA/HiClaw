@@ -71,6 +71,7 @@ jobs:
           ruby plugins/tests/teamharness/test-contracts.rb
           python -m pytest plugins/tests/teamharness/mcp/test_continuation.py -q
           python -m pytest plugins/tests/teamharness/mcp/test_delegate_redelegation.py -q
+          python -m pytest plugins/tests/teamharness/mcp/test_filesync_remote_guard.py -q
           python -m pytest plugins/tests/teamharness/mcp/test_sensitive_scan_placeholder.py -q
           python -m pytest plugins/tests/teamharness/test_pull_project.py -q
           PYTHONPATH="${GITHUB_WORKSPACE}/manager/src/agentteams_manager" \
