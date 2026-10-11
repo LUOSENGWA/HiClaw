@@ -816,3 +816,17 @@ jobs:
 
       - name: Run the offline pre-flight suite
         run: python3 qwenpaw/tests/test_check_qwenpaw_upgrade.py
+
+# ============================================================
+# In-place upgrade orchestrator battery (AgentTeams#1341 lifecycle S3-S6)
+# Fully stubbed (--selftest): no Docker, no network, no package changes.
+# ============================================================
+
+  qwenpaw-runtime-upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the in-place upgrade battery (stubbed selftest)
+        run: bash qwenpaw/scripts/upgrade_qwenpaw_runtime.sh --selftest
