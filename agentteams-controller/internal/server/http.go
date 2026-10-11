@@ -234,7 +234,7 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	mux.Handle("POST /api/v1/workers/{name}/channels/{channel}/restart", mw.RequireAuthz(authpkg.ActionUpdate, "worker", nameFn)(http.HandlerFunc(chh.restartChannel)))
 	mux.Handle("POST /api/v1/workers/{name}/channels/{channel}/conflict-check", mw.RequireAuthz(authpkg.ActionUpdate, "worker", nameFn)(http.HandlerFunc(chh.checkChannelConflict)))
 
-	// --- Worker coding CLIs (qwen-code / opencode; controller-side
+	// --- Worker coding CLIs (qwen-code / opencode / qoder; controller-side
 	// management via container exec — runtime-agnostic, works for any
 	// current runtime without worker-side cooperation or a QwenPaw
 	// release; see worker_coding_cli.go) ---

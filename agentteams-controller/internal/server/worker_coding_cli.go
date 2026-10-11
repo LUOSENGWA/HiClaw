@@ -1,6 +1,6 @@
 // Package server — worker coding-CLI management surface (P2, controller-side).
 //
-// The controller manages each worker's coding CLIs (qwen-code, opencode)
+// The controller manages each worker's coding CLIs (qwen-code, opencode, qoder)
 // by running commands INSIDE the worker container through the backend's
 // exec capability (embedded docker mode holds the docker socket). No
 // worker-side cooperation is required: no worker router, no image change,
@@ -86,6 +86,11 @@ type codingCliSpec struct {
 	SettingsPath  string // ~ expanded at use time via the container shell
 	AuthDotPaths  []string
 	ExtraAuthFiles []string
+	// AuthEnvVars are container env vars whose non-empty value counts as
+	// configured auth (reported with method "env"). Qoder's headless auth
+	// is QODER_PERSONAL_ACCESS_TOKEN; env values are never echoed in the
+	// probe response.
+	AuthEnvVars []string
 }
 
 // codingCliRegistry is the ordered single source of truth for managed CLIs:
@@ -106,6 +111,18 @@ var codingCliRegistry = []codingCliSpec{
 		BinName:        "opencode",
 		SettingsPath:   "~/.config/opencode/opencode.json",
 		ExtraAuthFiles: []string{"~/.local/share/opencode/auth.json"},
+	},
+	{
+		ID:           "qoder",
+		NpmPackage:   "@qoder-ai/qodercli",
+		BinName:      "qoder",
+		SettingsPath: "~/.qoder/settings.json",
+		// Qoder auth is not an OpenAI-style settings dot-path: headless/CI
+		// auth is the QODER_PERSONAL_ACCESS_TOKEN env var, interactive
+		// /login keeps an auto-refreshed token in its config dir (no
+		// documented stable file name — not probed). Settings still
+		// manages model/tools/mcp like the other CLIs.
+		AuthEnvVars: []string{"QODER_PERSONAL_ACCESS_TOKEN"},
 	},
 }
 
@@ -321,6 +338,14 @@ func isVersionLike(s string) bool {
 }
 
 func (h *CodingCliHandler) probeCLIAuth(ctx context.Context, eb codingCliExecer, name string, spec codingCliSpec) map[string]interface{} {
+	// Auth env vars (qoder QODER_PERSONAL_ACCESS_TOKEN): a non-empty value
+	// means configured. Qoder's own precedence rule is PAT-over-login, so
+	// env is checked first. Only presence is reported, never the value.
+	for _, ev := range spec.AuthEnvVars {
+		if _, _, exit, err := eb.Exec(ctx, name, []string{"sh", "-c", "test -n \"$" + ev + "\""}, codingCliExecTimeout); err == nil && exit == 0 {
+			return map[string]interface{}{"configured": true, "method": "env"}
+		}
+	}
 	// Extra auth files (opencode auth.json): check existence.
 	for _, f := range spec.ExtraAuthFiles {
 		if _, _, exit, err := eb.Exec(ctx, name, []string{"sh", "-c", "test -s " + f}, codingCliExecTimeout); err == nil && exit == 0 {

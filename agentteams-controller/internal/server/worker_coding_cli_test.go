@@ -123,8 +123,10 @@ func TestCodingCliList_ProbesAllCLIs(t *testing.T) {
 			return "0.25.0\n", "", 0, nil
 		case "opencode":
 			return "opencode: command not found\n", "stderr", 127, nil
+		case "qoder":
+			return "qoder: command not found\n", "stderr", 127, nil
 		case "sh":
-			// test -s auth file / test -f settings → absent
+			// test -n PAT env / test -s auth file / test -f settings → absent
 			return "", "", 1, nil
 		}
 		return "", "", 127, nil
@@ -143,6 +145,43 @@ func TestCodingCliList_ProbesAllCLIs(t *testing.T) {
 	oc, _ := doc["opencode"].(map[string]interface{})
 	if oc["installed"] != false {
 		t.Fatalf("opencode probe: %v", oc)
+	}
+	qd, _ := doc["qoder"].(map[string]interface{})
+	if qd["installed"] != false {
+		t.Fatalf("qoder probe: %v", qd)
+	}
+}
+
+// TestCodingCliList_AuthFromEnv covers qoder's PAT env auth: a non-empty
+// QODER_PERSONAL_ACCESS_TOKEN reports configured with method "env".
+func TestCodingCliList_AuthFromEnv(t *testing.T) {
+	exec := &fakeExecBackend{fileWrites: map[string]string{}}
+	exec.respond = func(cmd []string) (string, string, int, error) {
+		switch cmd[0] {
+		case "qoder":
+			return "qoder 1.2.3\n", "", 0, nil
+		case "sh":
+			if strings.Contains(cmd[2], `test -n "$QODER_PERSONAL_ACCESS_TOKEN"`) {
+				return "", "", 0, nil // PAT present in the container env
+			}
+			return "", "", 1, nil
+		}
+		return "", "", 127, nil
+	}
+	h := newTestCodingCliHandler(t, "embedded", exec, nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+	rec := httptest.NewRecorder()
+	h.listCLIs(rec, adminCaller(codingCliRequest(http.MethodGet, "/api/v1/workers/daily-carol/coding-cli", "", "name", "daily-carol")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	doc := decodeJSON(t, rec.Body.String())
+	qd, _ := doc["qoder"].(map[string]interface{})
+	if qd["installed"] != true || qd["version"] != "1.2.3" {
+		t.Fatalf("qoder probe: %v", qd)
+	}
+	auth, _ := qd["auth"].(map[string]interface{})
+	if auth["configured"] != true || auth["method"] != "env" {
+		t.Fatalf("qoder env auth probe: %v", auth)
 	}
 }
 
@@ -376,6 +415,61 @@ func TestCodingCliStartInstall_AcceptsAndCompletes(t *testing.T) {
 	}
 	if !auditActionPresent(t, store, "coding_cli_install") {
 		t.Fatalf("install audit missing")
+	}
+}
+
+// TestCodingCliStartInstall_QoderNpmPackage pins the qoder registry entry's
+// npm reference so a package rename upstream fails loudly here first.
+func TestCodingCliStartInstall_QoderNpmPackage(t *testing.T) {
+	exec := &fakeExecBackend{fileWrites: map[string]string{}}
+	exec.respond = func(cmd []string) (string, string, int, error) {
+		if cmd[0] == "npm" {
+			return "added 1 package in 40s\n", "", 0, nil
+		}
+		return "", "", 1, nil
+	}
+	store := ossfake.NewMemory()
+	h := newTestCodingCliHandler(t, "embedded", exec, store, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+	rec := httptest.NewRecorder()
+	h.startInstall(rec, adminCaller(codingCliRequest(http.MethodPost, "/api/v1/workers/daily-carol/coding-cli/qoder/install", `{"action":"install","version":"latest"}`, "name", "daily-carol", "cli", "qoder")))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	doc := decodeJSON(t, rec.Body.String())
+	taskID, _ := doc["task_id"].(string)
+	if taskID == "" {
+		t.Fatalf("no task id: %s", rec.Body.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		statusRec := httptest.NewRecorder()
+		h.getInstallStatus(statusRec, adminCaller(codingCliRequest(http.MethodGet, "/api/v1/workers/daily-carol/coding-cli/qoder/install/"+taskID, "", "name", "daily-carol", "cli", "qoder", "task_id", taskID)))
+		if statusRec.Code == http.StatusOK {
+			sdoc := decodeJSON(t, statusRec.Body.String())
+			if sdoc["state"] != "running" {
+				if sdoc["state"] != "done" || sdoc["exit_code"] != float64(0) {
+					t.Fatalf("task state: %v", sdoc)
+				}
+				break
+			}
+		} else {
+			t.Fatalf("status probe: %d %s", statusRec.Code, statusRec.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var sawNpm bool
+	exec.mu.Lock()
+	for _, c := range exec.commands {
+		if c[0] == "npm" {
+			sawNpm = true
+			if c[len(c)-1] != "@qoder-ai/qodercli@latest" {
+				t.Fatalf("npm argv: %v", c)
+			}
+		}
+	}
+	exec.mu.Unlock()
+	if !sawNpm {
+		t.Fatalf("npm install never executed: %v", exec.commands)
 	}
 }
 
