@@ -494,6 +494,18 @@ func (d *DockerBackend) Exec(ctx context.Context, name string, command []string,
 // updating it (e.g. CLI auth flows writing credentials back).
 func (d *DockerBackend) WriteFile(ctx context.Context, name, filePath, content string) error {
 	containerName := d.containerPrefix + name
+	// Docker's archive upload 404s when the parent directory does not yet
+	// exist in the container (first-ever write, e.g. ~/.qwen/settings.json
+	// before the CLI has run once) — field-verified on the Pi embedded
+	// stack, 2026-10-11. WriteFile is only used against running workers,
+	// so a container exec is safe here (NOT in writeContainerFileWithMode:
+	// the Create-path auth-token projection runs before the container
+	// starts, where exec 409s).
+	if dir := path.Dir(path.Clean(filePath)); dir != "/" {
+		if err := d.execContainer(ctx, containerName, []string{"mkdir", "-p", dir}); err != nil {
+			return fmt.Errorf("prepare parent dir for %s: %w", filePath, err)
+		}
+	}
 	nextPath := filePath + ".next"
 	if err := d.writeContainerFileWithMode(ctx, containerName, nextPath, content, 0600); err != nil {
 		return fmt.Errorf("write next file: %w", err)
