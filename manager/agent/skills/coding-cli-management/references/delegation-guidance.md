@@ -36,9 +36,10 @@ Delegation reuses the delegating agent's identity and credentials; it adds no ne
 
 - `qwen` — `~/.qwen` or env-based auth.
 - `opencode` — `~/.config/opencode`, `~/.local/share/opencode/auth.json`, or env-based auth.
+- `qoder` — `QODER_PERSONAL_ACCESS_TOKEN` env var or `~/.qoder` login state (existence only; the PAT value is never read).
 - Detection checks that a configured surface exists; it does not read or log its contents.
 
-**Unattended semantics.** `qwen --yolo` auto-approves every tool call; `opencode --auto` still enforces explicit deny rules. A changed working directory or an added timeout is not a permission boundary — they alter behavior, not scope.
+**Unattended semantics.** `qwen --yolo` auto-approves every tool call; `opencode --auto` still enforces explicit deny rules; `qodercli --yolo` only takes effect in a trusted directory — an untrusted workspace silently falls back to `default` mode, where headless auto-denies every would-ask operation (the run degrades to read-only without error), and org policy `security.disableYoloMode` disables `--yolo` outright. A changed working directory or an added timeout is not a permission boundary — they alter behavior, not scope.
 
 **Execution boundary.** The CLI runs as the delegating agent and inherits its filesystem and environment-credential visibility. Evaluate per deployment: workspace scope, reach into other team files, the delegator's credentials, mounted sockets, and management-plane capabilities. Mitigations are the CLIs' native controls — qwen `--approval-mode` tiers and `--include-directories` (declare any directory beyond the task workspace explicitly, e.g. shared toolchains or reference code, rather than relying on ambient filesystem reach), opencode deny rules — and/or an isolated execution environment.
 
