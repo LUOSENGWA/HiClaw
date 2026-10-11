@@ -12,14 +12,19 @@
 #   S0  pre-flight   external checker (default: the co-located
 #                    check_qwenpaw_upgrade.py); nonzero exit aborts before
 #                    anything is installed (exit 2)
-#   S3  package swap `uv pip install --reinstall-package qwenpaw` into the
-#                    runtime venv (~3s cross-version; full-tree reinstalls
-#                    deliberately avoided)
+#   S3  package swap surgical reinstall into the runtime venv: uv
+#                    `--reinstall-package qwenpaw` when uv is available, else
+#                    venv pip `--force-reinstall --no-deps` (AgentTeams
+#                    worker images ship no uv)
 #   S4  restart      backend-specific primitive (see backends below); a
 #                    failed restart is not rolled back immediately — the
 #                    health gate below is the arbiter
 #   S5  health gate  poll until the reported version equals the target
-#                    (timeout Ns); timeout/mismatch triggers rollback
+#                    (timeout Ns); on first match, hold a settle window
+#                    (--settle, default 65s) verifying the runtime stays
+#                    alive and the version stays put, to catch a delayed
+#                    wrapper crash the raw version endpoint would not reveal;
+#                    timeout/mismatch/settle-death triggers rollback
 #   S6  rollback     install the recorded old version -> restart -> verify
 #                    the old version is ready; success exit 3, failure exit 4
 #                    with a loud FATAL banner (manual intervention)
@@ -51,8 +56,8 @@
 #
 # Usage:
 #   upgrade_qwenpaw_runtime.sh --target X.Y.Z [--checker PATH] [--skip-check]
-#       [--container NAME] [--venv PATH] [--restart-mode supervisorctl|kill]
-#       [--timeout 90] [--record-file PATH] [--dry-run] [--selftest]
+#       [--container NAME] [--venv PATH] [--uv PATH] [--restart-mode supervisorctl|kill]
+#       [--timeout 90] [--settle 65] [--record-file PATH] [--dry-run] [--selftest]
 #
 # Environment hooks (all overridable; --selftest stubs every external action):
 #   UG_VERSION_CMD   print the current version (raw "X.Y.Z" or the JSON
@@ -61,6 +66,13 @@
 #   UG_INSTALL_CMD   install command with a {target} placeholder
 #   UG_RESTART_CMD   restart command
 #   UG_CHECKER_CMD   checker command with a {target} placeholder
+#   UG_ALIVE_CMD     liveness probe (docker backend: prints the container
+#                    Running state); used by the S5 settle window to catch a
+#                    delayed wrapper crash that the raw version endpoint
+#                    (served by the app subprocess) would not reveal
+#   UG_PRE_INSTALL_CMD pre-install hook (docker backend: starts a stopped
+#                    container, since the rollback's `docker exec ... pip
+#                    install` needs a running container; no-op in-container)
 #
 # Red line: --selftest runs a fully stubbed battery and never touches a real
 # deployment; --dry-run prints the resolved commands without executing them.
@@ -76,6 +88,8 @@ UG_RESTART_CMD="${UG_RESTART_CMD:-}"
 UG_CHECKER_CMD="${UG_CHECKER_CMD:-}"
 UG_VENV="${UG_VENV:-}"
 UG_UV="${UG_UV:-}"
+UG_ALIVE_CMD="${UG_ALIVE_CMD:-}"
+UG_PRE_INSTALL_CMD="${UG_PRE_INSTALL_CMD:-}"
 
 # ---------- CLI state ----------
 TARGET=""
@@ -85,6 +99,8 @@ CONTAINER=""
 VENV=""
 RESTART_MODE="supervisorctl"
 TIMEOUT=90
+SETTLE=65
+SETTLE_POLL="${UG_SETTLE_POLL:-5}"
 RECORD_FILE=""
 DRY_RUN=0
 SELFTEST=0
@@ -142,6 +158,12 @@ sub_target() {
 
 run_install() {
   local t="$1" cmd
+  if [ -n "$UG_PRE_INSTALL_CMD" ]; then
+    if ! bash -c "$UG_PRE_INSTALL_CMD"; then
+      err "pre-install hook failed: $UG_PRE_INSTALL_CMD"
+      return 1
+    fi
+  fi
   cmd="$(sub_target "$UG_INSTALL_CMD" "$t")"
   log "install: $cmd"
   bash -c "$cmd"
@@ -152,9 +174,46 @@ run_restart() {
   bash -c "$UG_RESTART_CMD"
 }
 
-# $1=expected version  $2=timeout seconds; poll until version == expected
+# $1=expected version; 1 when the runtime is still alive (and version-stable)
+# for the whole settle window. Polls every 5s. The wrapper's own version gate
+# (qwenpaw_worker._wait_for_qwenpaw_api, 60s deadline) can kill the runtime
+# AFTER the app already reports the right version, so the raw version endpoint
+# alone is not a liveness proof - this window is.
+settle_window() {
+  local want="$1" settle="$2" now deadline v alive
+  now="$(date +%s)"
+  deadline=$(( now + settle ))
+  log "health gate: settle window ${settle}s (detecting delayed wrapper crash)"
+  while :; do
+    sleep "$SETTLE_POLL"
+    if [ -n "$UG_ALIVE_CMD" ]; then
+      if ! alive="$(bash -c "$UG_ALIVE_CMD" 2>/dev/null)"; then
+        log "health gate: settle: liveness probe failed (runtime gone)"
+        return 1
+      fi
+      case "$alive" in
+        true|True|TRUE|1|yes|Yes|running|Running) ;;
+        *) log "health gate: settle: runtime not alive (state='$alive')"; return 1 ;;
+      esac
+    fi
+    if ! v="$(get_version)"; then
+      log "health gate: settle: version probe failed (runtime gone)"
+      return 1
+    fi
+    if [ "$v" != "$want" ]; then
+      log "health gate: settle: version drift '$v' != '$want'"
+      return 1
+    fi
+    now="$(date +%s)"
+    [ "$now" -ge "$deadline" ] && break
+  done
+  log "health gate: settle window ${settle}s held - runtime stable"
+  return 0
+}
+
+# $1=expected version  $2=timeout seconds  $3=settle seconds (0 disables the window)
 health_gate() {
-  local want="$1" limit="$2" now deadline v last=""
+  local want="$1" limit="$2" settle="${3:-0}" now deadline v last=""
   now="$(date +%s)"
   deadline=$(( now + limit ))
   log "health gate: waiting for version == '$want' (timeout ${limit}s)"
@@ -162,6 +221,10 @@ health_gate() {
     if v="$(get_version)"; then
       last="$v"
       if [ "$v" = "$want" ]; then
+        log "health gate: version='$v' matched"
+        if [ "$settle" -gt 0 ] && ! settle_window "$want" "$settle"; then
+          return 1
+        fi
         log "health gate: version='$v' OK"
         return 0
       fi
@@ -214,7 +277,7 @@ do_rollback() {
     echo "SUMMARY: status=rollback-failed"
     exit 4
   fi
-  if ! health_gate "$old" "$TIMEOUT"; then
+  if ! health_gate "$old" "$TIMEOUT" "$SETTLE"; then
     fatal_rollback_failed
     err "rollback failed: post-rollback health gate not reached (want='$old')"
     echo "SUMMARY: status=rollback-failed"
@@ -264,7 +327,7 @@ do_upgrade() {
   fi
 
   # 5) health gate
-  if ! health_gate "$TARGET" "$TIMEOUT"; then
+  if ! health_gate "$TARGET" "$TIMEOUT" "$SETTLE"; then
     do_rollback "$old"
   fi
 
@@ -319,7 +382,9 @@ run_selftest() {
   local tmp d rc
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/online_upgrade_v1.selftest.XXXXXX")" \
     || { err "cannot create temp dir"; return 1; }
-  log "selftest: starting (7 scenarios, all external commands stubbed; tmp dir: $tmp)"
+  log "selftest: starting (8 scenarios, all external commands stubbed; tmp dir: $tmp)"
+  # Keep the default scenarios fast; T8 exercises the settle window explicitly.
+  SETTLE=0
 
   # ============ T1 all green ============
   d="$tmp/T1"; mkdir -p "$d"
@@ -450,6 +515,7 @@ run_selftest() {
       case "$UG_RESTART_CMD" in "docker restart agentteams-worker-demo") printf 'rok' ;; *) printf 'rbad' ;; esac
       case "$UG_VERSION_CMD" in *"/opt/venv/qwenpaw"*) printf 'pok' ;; *) printf 'pbad' ;; esac
       case "$UG_INSTALL_CMD" in *"--reinstall-package qwenpaw qwenpaw=={target}"*) printf 'uok' ;; *) printf 'ubad' ;; esac
+      case "$UG_INSTALL_CMD" in *"--force-reinstall --no-deps qwenpaw=={target}"*) printf 'fok' ;; *) printf 'fbad' ;; esac
       case "$UG_CHECKER_CMD" in *"--target {target}") printf 'cok' ;; *) printf 'cbad' ;; esac
     } > "$d/asserts"
     exit 0
@@ -458,7 +524,7 @@ run_selftest() {
   SC_ID="T6"
   st_begin T6 "docker backend default command assembly"
   st_check "exit" "0" "$rc"
-  st_check "six assertions" "vokiokrokpokuokcok" "$(cat "$d/asserts" 2>/dev/null)"
+  st_check "seven assertions" "vokiokrokpokuokfokcok" "$(cat "$d/asserts" 2>/dev/null)"
   st_end T6 "docker backend default command assembly"
 
   # ============ T7 docker backend full stubbed flow + record ============
@@ -487,12 +553,36 @@ run_selftest() {
   st_check "record JSON (docker)" "rok" "$(cat "$d/rchk" 2>/dev/null)"
   st_end T7 "docker backend full stubbed flow + record written"
 
+  # ============ T8 settle window catches a delayed wrapper crash -> rollback ============
+  # The app reports the right version immediately, but the wrapper (whose own
+  # version gate outlives the app) dies a few seconds later. The raw version
+  # endpoint alone would pass; the settle window's liveness probe must not.
+  d="$tmp/T8"; mkdir -p "$d"
+  printf '2.2.1' > "$d/version"
+  TARGET="2.2.2"; TIMEOUT=30; CHECKER=""; SKIP_CHECK=1; BACKEND="docker"
+  SETTLE=10; SETTLE_POLL=1; RECORD_FILE=""
+  UG_VERSION_CMD="cat $d/version"
+  UG_INSTALL_CMD='printf %s {target} > '"$d"'/version'
+  UG_RESTART_CMD='c=$(cat '"$d"'/rc 2>/dev/null || echo 0); c=$((c+1)); echo $c > '"$d"'/rc; echo r >> '"$d"'/restarts'
+  # Alive: stay up during the first settle window until the 3rd poll, then die
+  # (rc==1); stay up for the whole post-rollback settle window (rc>=2).
+  UG_ALIVE_CMD='rc=$(cat '"$d"'/rc 2>/dev/null || echo 0); a=$(cat '"$d"'/ac 2>/dev/null || echo 0); a=$((a+1)); echo $a > '"$d"'/ac; if [ "$rc" -eq 1 ] && [ $a -ge 3 ]; then echo false; else echo true; fi'
+  ( do_upgrade ) > "$d/out.log" 2>&1
+  rc=$?
+  SC_ID="T8"
+  st_begin T8 "settle window catches delayed wrapper crash -> rollback"
+  st_check "exit" "3" "$rc"
+  st_check "version restored" "2.2.1" "$(cat "$d/version" 2>/dev/null)"
+  st_grep "settle detected" "$d/out.log" "health gate: settle"
+  st_grep "rolled back" "$d/out.log" "SUMMARY: status=rolledback old=2.2.1 target=2.2.2"
+  st_end T8 "settle window catches delayed wrapper crash -> rollback"
+
   log "selftest: tmp dir kept at $tmp (not removed automatically)"
   if [ "$SELFTEST_TOTAL_FAIL" -eq 0 ]; then
-    echo "SELFTEST: 7/7 PASS"
+    echo "SELFTEST: 8/8 PASS"
     return 0
   fi
-  echo "SELFTEST: $SELFTEST_TOTAL_FAIL/7 scenarios FAIL"
+  echo "SELFTEST: $SELFTEST_TOTAL_FAIL/8 scenarios FAIL"
   return 1
 }
 
@@ -520,8 +610,15 @@ Options:
                         (venv defaults to /opt/venv/qwenpaw; restart primitive =
                         docker restart NAME)
   --venv PATH           runtime venv (overrides the backend default)
+  --uv PATH             uv binary (forces the uv install form; when unset the
+                        install command auto-detects uv and falls back to venv pip)
   --restart-mode MODE   supervisorctl (in-container default) | kill
   --timeout N           health-gate timeout in seconds (default 90)
+  --settle N            post-match settle window in seconds (default 65; 0
+                        disables). After the version first matches, the runtime
+                        must stay alive and version-stable for this long; it
+                        catches a delayed wrapper crash the raw version
+                        endpoint (served by the app subprocess) would not reveal
   --record-file PATH    write a JSON version record after a successful upgrade
                         (verified, then recorded)
   --dry-run             print the resolved commands only; no install/restart/health gate
@@ -530,7 +627,8 @@ Options:
 
 Environment hooks (all overridable; selftest relies on this mechanism):
   UG_VERSION_CMD / UG_INSTALL_CMD({target}) / UG_RESTART_CMD / UG_CHECKER_CMD({target})
-  UG_VENV (default /app/venv, /opt/venv/qwenpaw with --container) / UG_UV (default /usr/bin/uv)
+  UG_VENV (default /app/venv, /opt/venv/qwenpaw with --container) / UG_UV (uv path;
+  when unset the install command auto-detects uv and falls back to venv pip)
 
 Exit codes:
   0 upgraded   2 pre-flight/usage failure (nothing installed)   3 rolled back
@@ -558,6 +656,10 @@ parse_args() {
         [ $# -ge 2 ] || { err "--venv missing value"; exit 2; }
         VENV="$2"; shift 2 ;;
       --venv=*)       VENV="${1#*=}"; shift ;;
+      --uv)
+        [ $# -ge 2 ] || { err "--uv missing value"; exit 2; }
+        UG_UV="$2"; shift 2 ;;
+      --uv=*)         UG_UV="${1#*=}"; shift ;;
       --record-file)
         [ $# -ge 2 ] || { err "--record-file missing value"; exit 2; }
         RECORD_FILE="$2"; shift 2 ;;
@@ -570,6 +672,10 @@ parse_args() {
         [ $# -ge 2 ] || { err "--timeout missing value"; exit 2; }
         TIMEOUT="$2"; shift 2 ;;
       --timeout=*)    TIMEOUT="${1#*=}"; shift ;;
+      --settle)
+        [ $# -ge 2 ] || { err "--settle missing value"; exit 2; }
+        SETTLE="$2"; shift 2 ;;
+      --settle=*)     SETTLE="${1#*=}"; shift ;;
       --dry-run)      DRY_RUN=1; shift ;;
       --selftest)     SELFTEST=1; shift ;;
       -h|--help)      usage; exit 0 ;;
@@ -613,9 +719,12 @@ main() {
     if [ -n "$CHECKER" ] && [ "$SKIP_CHECK" -eq 0 ]; then
       log "  0) check   : $(sub_target "$UG_CHECKER_CMD" "$TARGET")"
     fi
+    if [ -n "$UG_PRE_INSTALL_CMD" ]; then
+      log "  1a) ensure : $UG_PRE_INSTALL_CMD"
+    fi
     log "  1) install : $(sub_target "$UG_INSTALL_CMD" "$TARGET")"
     log "  2) restart : $UG_RESTART_CMD"
-    log "  3) health  : $UG_VERSION_CMD (poll until output == '$TARGET', timeout ${TIMEOUT}s)"
+    log "  3) health  : $UG_VERSION_CMD (poll until output == '$TARGET', timeout ${TIMEOUT}s; settle ${SETTLE}s)"
     if [ -n "$RECORD_FILE" ]; then
       log "  4) record  : $RECORD_FILE (written only after the health gate is all green)"
     fi
@@ -643,16 +752,32 @@ resolve_defaults() {
       UG_VENV="/app/venv"
     fi
   fi
-  [ -n "$UG_UV" ] || UG_UV="/usr/bin/uv"
+  # Install tool: the runtime image may ship uv (fast path, surgical
+  # --reinstall-package) or only pip (AgentTeams worker images, v1.2.x).
+  # Explicit UG_UV/--uv forces the uv form; otherwise the install command
+  # auto-detects at execution time and falls back to the venv pip with the
+  # equivalent surgical flags (--force-reinstall --no-deps).
 
   if [ "$BACKEND" = "docker" ]; then
     # Host-side run: version probe and swap execute inside the container; restart = docker restart (writable layer kept)
     [ -n "$UG_VERSION_CMD" ] || UG_VERSION_CMD="docker exec $CONTAINER sh -c 'curl -fsS $VERSION_ENDPOINT || $UG_VENV/bin/qwenpaw --version'"
-    [ -n "$UG_INSTALL_CMD" ] || UG_INSTALL_CMD="docker exec $CONTAINER sh -c 'VIRTUAL_ENV=$UG_VENV $UG_UV pip install --reinstall-package qwenpaw qwenpaw=={target}'"
+    if [ -n "$UG_UV" ]; then
+      [ -n "$UG_INSTALL_CMD" ] || UG_INSTALL_CMD="docker exec $CONTAINER sh -c 'VIRTUAL_ENV=$UG_VENV $UG_UV pip install --reinstall-package qwenpaw qwenpaw=={target}'"
+    else
+      [ -n "$UG_INSTALL_CMD" ] || UG_INSTALL_CMD="docker exec $CONTAINER sh -c 'if command -v uv >/dev/null 2>&1; then VIRTUAL_ENV=$UG_VENV uv pip install --reinstall-package qwenpaw qwenpaw=={target}; else $UG_VENV/bin/pip install --force-reinstall --no-deps qwenpaw=={target}; fi'"
+    fi
     [ -n "$UG_RESTART_CMD" ] || UG_RESTART_CMD="docker restart $CONTAINER"
+    [ -n "$UG_ALIVE_CMD" ] || UG_ALIVE_CMD="docker inspect -f '{{.State.Running}}' $CONTAINER"
+    # The rollback's `docker exec ... pip install` needs a running container;
+    # after a wrapper crash the container is stopped, so start it first.
+    [ -n "$UG_PRE_INSTALL_CMD" ] || UG_PRE_INSTALL_CMD='if [ "$(docker inspect -f "{{.State.Running}}" '"$CONTAINER"' 2>/dev/null)" != "true" ]; then echo "[upgrade] pre-install: container not running, starting it"; docker start '"$CONTAINER"'; fi'
   else
     [ -n "$UG_VERSION_CMD" ] || UG_VERSION_CMD="curl -fsS $VERSION_ENDPOINT || $UG_VENV/bin/qwenpaw --version"
-    [ -n "$UG_INSTALL_CMD" ] || UG_INSTALL_CMD="VIRTUAL_ENV=$UG_VENV $UG_UV pip install --reinstall-package qwenpaw qwenpaw=={target}"
+    if [ -n "$UG_UV" ]; then
+      [ -n "$UG_INSTALL_CMD" ] || UG_INSTALL_CMD="VIRTUAL_ENV=$UG_VENV $UG_UV pip install --reinstall-package qwenpaw qwenpaw=={target}"
+    else
+      [ -n "$UG_INSTALL_CMD" ] || UG_INSTALL_CMD="sh -c 'if command -v uv >/dev/null 2>&1; then VIRTUAL_ENV=$UG_VENV uv pip install --reinstall-package qwenpaw qwenpaw=={target}; else $UG_VENV/bin/pip install --force-reinstall --no-deps qwenpaw=={target}; fi'"
+    fi
     [ -n "$UG_RESTART_CMD" ] || UG_RESTART_CMD="$DEFAULT_RESTART"
   fi
 
