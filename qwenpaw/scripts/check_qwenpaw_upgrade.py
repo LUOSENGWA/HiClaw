@@ -85,6 +85,33 @@ def _tail(text: str, lines: int = 3) -> str:
 # --------------------------------------------------------------------------- C1
 
 
+def _version_at_least(target: str, minimum: str) -> bool:
+    """True if ``target >= minimum``. Uses packaging (exact PEP440, pre-release
+    aware) when available; otherwise a minimal numeric comparator that strips the
+    pre-release suffix — sufficient for the min-version gate on minimal hosts that
+    lack packaging (the pre-flight must not require the build toolchain)."""
+    try:
+        from packaging.version import Version
+
+        return Version(target) >= Version(minimum)
+    except Exception:
+        pass
+
+    def _key(v: str) -> list[int]:
+        base = re.split(r"[a-zA-Z]+\d+", v, 1)[0]  # 2.2.2b4 -> 2.2.2
+        parts: list[int] = []
+        for piece in base.split("."):
+            m = re.match(r"(\d+)", piece)
+            parts.append(int(m.group(1)) if m else 0)
+        return parts
+
+    t, m = _key(target), _key(minimum)
+    n = max(len(t), len(m))
+    t += [0] * (n - len(t))
+    m += [0] * (n - len(m))
+    return t >= m
+
+
 def check_gate(qwenpaw_dir: Path, target: str) -> Check:
     source = qwenpaw_dir / GATE_SOURCE_REL
     text = _read(source)
@@ -100,12 +127,7 @@ def check_gate(qwenpaw_dir: Path, target: str) -> Check:
     line_no = text[: match.start()].count("\n") + 1
     # The wrapper gate is a minimum version (require_version means ">= found"),
     # so the target passes as long as it is at or above the gate.
-    try:
-        from packaging.version import Version
-
-        ok = Version(target) >= Version(found)
-    except Exception:
-        ok = found == target
+    ok = _version_at_least(target, found)
     if ok:
         return Check("C1", "version gate", STATUS_PASS,
                      evidence=(f'require_version("{found}") is a minimum gate; '
