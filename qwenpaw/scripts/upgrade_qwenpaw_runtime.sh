@@ -532,7 +532,7 @@ run_selftest() {
       case "$UG_VERSION_CMD" in *"/opt/venv/qwenpaw"*) printf 'pok' ;; *) printf 'pbad' ;; esac
       case "$UG_INSTALL_CMD" in *"--reinstall-package qwenpaw qwenpaw=={target}"*) printf 'uok' ;; *) printf 'ubad' ;; esac
       case "$UG_INSTALL_CMD" in *"--force-reinstall --no-deps qwenpaw=={target}"*) printf 'fok' ;; *) printf 'fbad' ;; esac
-      case "$UG_CHECKER_CMD" in *"--target {target}") printf 'cok' ;; *) printf 'cbad' ;; esac
+      case "$UG_CHECKER_CMD" in *"--target {target} --in-place") printf 'cok' ;; *) printf 'cbad' ;; esac
     } > "$d/asserts"
     exit 0
   ) > "$d/out.log" 2>&1
@@ -812,7 +812,7 @@ resolve_defaults() {
     fi
   fi
   if [ -n "$CHECKER" ] && [ "$SKIP_CHECK" -eq 0 ] && [ -z "$UG_CHECKER_CMD" ]; then
-    UG_CHECKER_CMD="python3 $CHECKER --target {target}"
+    UG_CHECKER_CMD="python3 $CHECKER --target {target} --in-place"
   fi
 }
 
