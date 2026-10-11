@@ -84,6 +84,7 @@ VERSION_ENDPOINT="http://127.0.0.1:8088/api/version"
 # ---------- environment hooks (caller values are kept; real defaults resolved in resolve_defaults) ----------
 UG_VERSION_CMD="${UG_VERSION_CMD:-}"
 UG_INSTALL_CMD="${UG_INSTALL_CMD:-}"
+UG_PATCH_CMD="${UG_PATCH_CMD:-}"
 UG_RESTART_CMD="${UG_RESTART_CMD:-}"
 UG_CHECKER_CMD="${UG_CHECKER_CMD:-}"
 UG_VENV="${UG_VENV:-}"
@@ -319,6 +320,21 @@ do_upgrade() {
   if ! run_install "$TARGET"; then
     err "install of $TARGET failed -> rolling back"
     do_rollback "$old"
+  fi
+
+  # 3b) apply compatibility patches to the freshly-installed runtime.
+  #      The in-place swap installs a pristine wheel, which does not carry the
+  #      driver-reload compat fix the 2.2.1 image bakes at build time; re-apply
+  #      it so the upgraded runtime keeps the fixed behavior. The patch is a
+  #      no-op when the target already has the fix integrated upstream.
+  if [ -n "$UG_PATCH_CMD" ]; then
+    pcmd="$(sub_target "$UG_PATCH_CMD" "$TARGET")"
+    log "compat patch: $pcmd"
+    if ! bash -c "$pcmd"; then
+      err "compat patch failed -> rolling back"
+      do_rollback "$old"
+    fi
+    log "compat patch done"
   fi
 
   # 4) restart (failure does not roll back directly; the health gate below decides)
@@ -766,6 +782,7 @@ resolve_defaults() {
     else
       [ -n "$UG_INSTALL_CMD" ] || UG_INSTALL_CMD="docker exec $CONTAINER sh -c 'if command -v uv >/dev/null 2>&1; then VIRTUAL_ENV=$UG_VENV uv pip install --reinstall-package qwenpaw qwenpaw=={target}; else $UG_VENV/bin/pip install --force-reinstall --no-deps qwenpaw=={target}; fi'"
     fi
+    [ -n "$UG_PATCH_CMD" ] || UG_PATCH_CMD="docker exec $CONTAINER sh -c '$UG_VENV/bin/python /opt/agentteams/scripts/patch-qwenpaw-driver-policy-reload.py'"
     [ -n "$UG_RESTART_CMD" ] || UG_RESTART_CMD="docker restart $CONTAINER"
     [ -n "$UG_ALIVE_CMD" ] || UG_ALIVE_CMD="docker inspect -f '{{.State.Running}}' $CONTAINER"
     # The rollback's `docker exec ... pip install` needs a running container;
@@ -778,6 +795,9 @@ resolve_defaults() {
     else
       [ -n "$UG_INSTALL_CMD" ] || UG_INSTALL_CMD="sh -c 'if command -v uv >/dev/null 2>&1; then VIRTUAL_ENV=$UG_VENV uv pip install --reinstall-package qwenpaw qwenpaw=={target}; else $UG_VENV/bin/pip install --force-reinstall --no-deps qwenpaw=={target}; fi'"
     fi
+    local _pd
+    _pd="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [ -n "$UG_PATCH_CMD" ] || UG_PATCH_CMD="$UG_VENV/bin/python $_pd/patch-qwenpaw-driver-policy-reload.py"
     [ -n "$UG_RESTART_CMD" ] || UG_RESTART_CMD="$DEFAULT_RESTART"
   fi
 

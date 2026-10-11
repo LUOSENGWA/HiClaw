@@ -98,13 +98,22 @@ def check_gate(qwenpaw_dir: Path, target: str) -> Check:
                      advice="verify the gate manually - it may have been parameterized already")
     found = match.group(1)
     line_no = text[: match.start()].count("\n") + 1
-    if found == target:
+    # The wrapper gate is a minimum version (require_version means ">= found"),
+    # so the target passes as long as it is at or above the gate.
+    try:
+        from packaging.version import Version
+
+        ok = Version(target) >= Version(found)
+    except Exception:
+        ok = found == target
+    if ok:
         return Check("C1", "version gate", STATUS_PASS,
-                     evidence=f'require_version("{found}") matches target ({GATE_SOURCE_REL}:{line_no})')
+                     evidence=(f'require_version("{found}") is a minimum gate; '
+                               f'target {target} satisfies it ({GATE_SOURCE_REL}:{line_no})'))
     return Check("C1", "version gate", STATUS_FAIL,
-                 evidence=f'gate expects "{found}" but target is "{target}" ({GATE_SOURCE_REL}:{line_no})',
-                 advice=("update the expected version in the wrapper, then re-run; "
-                         "the full bump still touches the pins reported by C2"))
+                 evidence=f'gate requires >= "{found}" but target is "{target}" ({GATE_SOURCE_REL}:{line_no})',
+                 advice=("the target is below the wrapper's minimum version; "
+                         "a full version bump still touches the pins reported by C2"))
 
 
 # --------------------------------------------------------------------------- C2
@@ -314,20 +323,10 @@ def check_patch(qwenpaw_dir: Path, target: str, wheel: Path | None,
         return Check("C3", "compat patch", STATUS_FAIL,
                      evidence=f"wheel version {wheel_version} != target {target}")
 
-    # Build-time patch contract: the script refuses to run for any other
-    # qwenpaw version, so a stale guard breaks the build regardless of what
-    # the target's manager.py looks like.
-    if guard is not None and guard != target:
-        return Check("C3", "compat patch", STATUS_FAIL,
-                     evidence=(f'patch guard expects "{guard}" but target is "{target}" — '
-                               f"the patch raises for every other version and cannot run as checked; "
-                               f"wheel {wheel.name}"),
-                     advice=(f"update the guard in {PATCH_SCRIPT_REL} when bumping to {target} and "
-                             "re-verify the old/new patterns; retire the patch script if the "
-                             "replacement block is already integrated upstream"))
-
-    # The patch slices manager.py between two method signatures and raises
-    # ValueError when either is missing — there is no whole-file fallback.
+    # Locate reload_driver first so an upstream-integrated fix can be detected
+    # before consulting the build-time patch's version guard. The patch slices
+    # manager.py between two method signatures and raises ValueError when
+    # either is missing — there is no whole-file fallback.
     start = manager_source.find("    async def reload_driver(")
     if start < 0:
         return Check("C3", "compat patch", STATUS_FAIL,
@@ -343,9 +342,23 @@ def check_patch(qwenpaw_dir: Path, target: str, wheel: Path | None,
     method = manager_source[start:end]
     note = f"wheel {wheel.name}"
 
+    # If the replacement block is already integrated upstream, the build-time
+    # patch is obsolete for this target regardless of its version guard.
     if new_block is not None and new_block in method:
         return Check("C3", "compat patch", STATUS_PASS,
                      evidence=f"replacement already present (patch integrated upstream). {note}")
+
+    # The patch is needed for this target, so its version guard must match:
+    # the build-time script refuses to run for any other qwenpaw version, so a
+    # stale guard breaks the build regardless of what the target looks like.
+    if guard is not None and guard != target:
+        return Check("C3", "compat patch", STATUS_FAIL,
+                     evidence=(f'patch guard expects "{guard}" but target is "{target}" — '
+                               f"the patch raises for every other version and cannot run as checked; "
+                               f"wheel {wheel.name}"),
+                     advice=(f"update the guard in {PATCH_SCRIPT_REL} when bumping to {target} and "
+                             "re-verify the old/new patterns; retire the patch script if the "
+                             "replacement block is already integrated upstream"))
     if PATCH_NEW_MARKER in method:
         if new_block is not None:
             return Check("C3", "compat patch", STATUS_FAIL,
@@ -435,6 +448,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--download", action="store_true", help="download the target wheel from PyPI (network)")
     parser.add_argument("--check-deps", action="store_true",
                         help="run `uv pip install --dry-run qwenpaw==<target>` (network)")
+    parser.add_argument("--in-place", action="store_true",
+                        help="in-place runtime upgrade: C2 image pins are informational (the image is not rebuilt)")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     args = parser.parse_args(argv)
 
@@ -460,6 +475,17 @@ def main(argv: list[str] | None = None) -> int:
         else:
             checks.append(Check("C4", "dependencies", STATUS_SKIP,
                                 evidence="not requested (--check-deps)"))
+
+    if args.in_place:
+        # In-place runtime upgrades do not rebuild the worker image, so the C2
+        # image pins are informational (the image keeps the previous pin); only
+        # a full image rebuild requires them to match the target.
+        for c in checks:
+            if c.id == "C2" and c.status == STATUS_FAIL:
+                c.status = STATUS_WARN
+                c.evidence = c.evidence + " [in-place: informational, image not rebuilt]"
+                c.advice = ("in-place upgrade keeps the current image; bump the pins above only "
+                            "for a full image rebuild")
 
     overall = STATUS_FAIL if any(check.status == STATUS_FAIL for check in checks) else STATUS_PASS
     exit_code = 1 if overall == STATUS_FAIL else 0

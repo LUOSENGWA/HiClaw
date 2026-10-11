@@ -71,11 +71,24 @@ class QwenPawApiClient:
             raise QwenPawApiError("QwenPaw API did not return a version")
         return version
 
-    def require_version(self, expected: str) -> None:
+    def require_version(self, minimum: str) -> None:
+        """Require the API to report a qwenpaw version >= ``minimum``.
+
+        A minimum (not exact) version gate: in-place runtime upgrades to a
+        newer qwenpaw must not be rejected by the wrapper. Compatibility for
+        a specific target is enforced by the pre-flight checker (S0), not here.
+        """
         actual = self.get_version()
-        if actual != expected:
+        try:
+            from packaging.version import Version
+
+            ok = Version(actual) >= Version(minimum)
+        except Exception:
+            # packaging unavailable or version unparseable: exact-match fallback.
+            ok = actual == minimum
+        if not ok:
             raise QwenPawApiError(
-                f"expected QwenPaw {expected}, API reported {actual}",
+                f"QwenPaw {actual} does not satisfy the required minimum {minimum}",
             )
 
     def require_agent_running(self, agent_id: str) -> None:
