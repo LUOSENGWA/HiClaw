@@ -550,6 +550,17 @@ func (h *CodingCliHandler) startInstall(w http.ResponseWriter, r *http.Request) 
 // string argument to npm, but belt-and-braces).
 var npmVersionPattern = regexp.MustCompile(`^([0-9][A-Za-z0-9.+-]*|\w+)$`)
 
+// runInstall installs/uninstalls the CLI inside the worker container via
+// `npm install/uninstall -g`. Persistence contract (joint-scenario note,
+// verified on the ARM worker image): the global npm payload lands in the
+// container's EPHEMERAL layer (the image layer at $npm prefix, e.g.
+// /usr/local/lib/node_modules) — NOT in the persistent agent home. A worker
+// recreation (image upgrade, a spec change such as an LLM-runtime parameter,
+// or any controller-driven container rebuild) wipes that layer, so the CLI
+// binary is lost even though the container "comes back". Operators must re-run
+// this install after a recreation; the settings surface is written
+// container-local too (no forced MinIO push), so auth may also need re-applying
+// — probe settings after a recreation and re-apply if the probe shows them gone.
 func (h *CodingCliHandler) runInstall(name string, eb codingCliExecer, spec codingCliSpec, taskID, action, version string) {
 	var cmd []string
 	if action == "uninstall" {
