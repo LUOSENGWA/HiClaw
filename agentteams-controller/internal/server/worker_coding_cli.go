@@ -161,7 +161,8 @@ type codingCliInstallTask struct {
 }
 
 // NewCodingCliHandler creates the handler with the default backend
-// resolution from the registry.
+// resolution from the registry: the auto-detected worker backend (docker in
+// embedded mode), matching how lifecycle_handler resolves its backend.
 func NewCodingCliHandler(c client.Client, namespace, kubeMode string, ac *audit.Client, reg *backend.Registry) *CodingCliHandler {
 	h := &CodingCliHandler{
 		client:     c,
@@ -170,10 +171,17 @@ func NewCodingCliHandler(c client.Client, namespace, kubeMode string, ac *audit.
 		audit:      ac,
 		tasks:      map[string]*codingCliInstallTask{},
 	}
-	h.execBackend = func(ctx context.Context, name string) (codingCliExecer, error) {
-		b, err := reg.GetWorkerBackend(ctx, name)
-		if err != nil {
-			return nil, err
+	// The worker name passed at call time is NOT a backend name — the
+	// backend is auto-detected. Treating the worker name as a backend name
+	// (GetWorkerBackend(ctx, name)) makes every request fail with
+	// "unknown worker backend: <worker-name>".
+	h.execBackend = func(ctx context.Context, _ string) (codingCliExecer, error) {
+		if reg == nil {
+			return nil, fmt.Errorf("no worker backend available")
+		}
+		b := reg.DetectWorkerBackend(ctx)
+		if b == nil {
+			return nil, fmt.Errorf("no worker backend available")
 		}
 		eb, ok := b.(codingCliExecer)
 		if !ok {

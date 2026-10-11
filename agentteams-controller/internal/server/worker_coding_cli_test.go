@@ -12,6 +12,7 @@ import (
 
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/audit"
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
+	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/backend"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/oss/ossfake"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -684,5 +685,64 @@ func TestCodingCli_WriteFileFailure_502(t *testing.T) {
 	h.putCliSettings(rec, adminCaller(codingCliRequest(http.MethodPut, "/api/v1/workers/daily-carol/coding-cli/qwen-code/settings", `{"a":1}`, "name", "daily-carol", "cli", "qwen-code")))
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status=%d want 502: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// wiringFakeBackend is a minimal WorkerBackend + codingCliExecer used to
+// exercise the PRODUCTION resolution closure built by NewCodingCliHandler
+// (the other tests replace h.execBackend, which left the real wiring
+// untested).
+type wiringFakeBackend struct{}
+
+func (wiringFakeBackend) Name() string                     { return "docker" }
+func (wiringFakeBackend) DeploymentMode() string           { return backend.DeployLocal }
+func (wiringFakeBackend) Available(context.Context) bool   { return true }
+func (wiringFakeBackend) NeedsCredentialInjection() bool   { return false }
+func (wiringFakeBackend) Create(context.Context, backend.CreateRequest) (*backend.WorkerResult, error) {
+	return nil, nil
+}
+func (wiringFakeBackend) Delete(context.Context, string) error  { return nil }
+func (wiringFakeBackend) Start(context.Context, string) error   { return nil }
+func (wiringFakeBackend) Stop(context.Context, string) error    { return nil }
+func (wiringFakeBackend) Status(context.Context, string) (*backend.WorkerResult, error) {
+	return nil, nil
+}
+func (wiringFakeBackend) Exec(context.Context, string, []string, time.Duration) (string, string, int, error) {
+	return "", "", 0, nil
+}
+func (wiringFakeBackend) WriteFile(context.Context, string, string, string) error { return nil }
+
+// TestCodingCliHandler_BackendWiring pins the production backend-resolution
+// closure from NewCodingCliHandler. The worker name passed to execBackend
+// must NOT be interpreted as a backend name — the backend is auto-detected
+// (embedded mode: docker). The old wiring called GetWorkerBackend(ctx,
+// workerName), so every live request 503'd with
+// "unknown worker backend: <worker-name>" (field-verified on the Pi stack,
+// 2026-10-11) while the unit tests stayed green because they all replace
+// h.execBackend with a stub.
+func TestCodingCliHandler_BackendWiring(t *testing.T) {
+	fb := wiringFakeBackend{}
+	reg := backend.NewRegistry([]backend.WorkerBackend{fb})
+	h := NewCodingCliHandler(nil, "default", "embedded", nil, reg)
+
+	got, err := h.execBackend(context.Background(), "pi-coder")
+	if err != nil {
+		t.Fatalf("execBackend(worker name) = error: %v — the worker name must not be treated as a backend name", err)
+	}
+	wb, ok := got.(backend.WorkerBackend)
+	if !ok {
+		t.Fatalf("resolved execer does not implement backend.WorkerBackend")
+	}
+	if wb.Name() != "docker" {
+		t.Fatalf("resolved backend = %q, want auto-detected docker backend", wb.Name())
+	}
+}
+
+// TestCodingCliHandler_BackendWiringNilRegistry guards the nil-registry path
+// (handler constructed without a registry): a clean error, not a panic.
+func TestCodingCliHandler_BackendWiringNilRegistry(t *testing.T) {
+	h := NewCodingCliHandler(nil, "default", "embedded", nil, nil)
+	if _, err := h.execBackend(context.Background(), "pi-coder"); err == nil {
+		t.Fatal("expected an error when the registry is nil, got nil")
 	}
 }
