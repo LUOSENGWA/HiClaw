@@ -120,9 +120,15 @@ and the auth settings survive:
 
 - `~/coding-cli-config.json` is in the delegating agent's own home → it survives.
 - The CLI binary (npm -g) is in the **image layer** → it does **not** survive.
-- `~/.qwen/settings.json` (auth) sits in the worker's agent home, but the install
-  surface writes it **container-local** (no forced MinIO push) → it MAY be lost on
-  a recreation. Do not assume it survives.
+- `~/.qwen/settings.json` (auth) sits in the worker's **agent home** — a persistent
+  host bind (embedded) / volume (k8s) that a recreation re-binds, so the file
+  **survives a same-worker recreation**. Field-verified 2026-10-11 on the Pi
+  embedded stack: after recreation the probe still reported
+  `auth.configured:true, method:settings` and a re-installed CLI ran without
+  re-applying auth. The caveat: the install surface does not force a MinIO push,
+  so a **fresh** home (new container identity, restored from object storage into
+  an empty home) starts without it — the settings probe is the arbiter either
+  way.
 
 Consequence: after any worker recreation, re-run the install endpoint
 (`POST /api/v1/workers/{name}/coding-cli/{cli}/install`) before delegating again,
@@ -131,6 +137,14 @@ endpoint. `run-coding-cli.sh`
 fails fast with an actionable re-install message (exit `125`) if the configured
 binary is missing on PATH, so a wiped install is self-diagnosing rather than a
 confusing mid-run "command not found".
+
+**Scope note — the managed install surface is worker-scoped.** The
+`/api/v1/workers/{name}/coding-cli/…` endpoints (install / settings / probe)
+manage CLIs **inside worker containers only**. When the delegating agent is a
+Manager or a team Leader, the CLI must already be present in *that* agent's own
+container (platform image or a manual `npm install -g` by the operator) — there
+is no managed install surface for non-worker agents yet (Phase 1 scope, tracked
+as a follow-up). Worker-side delegation via the endpoints above is unaffected.
 
 ## Step 1: First-Time Detection (before assigning a coding task)
 
