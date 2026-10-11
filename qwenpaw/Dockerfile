@@ -36,11 +36,17 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
         git \
         jq \
         libjemalloc2 \
-        nodejs \
-        npm \
         socat \
         tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 24 via NodeSource (same approach as openclaw-base).
+# The distro node (e.g. 20.x) crashes on 16K-page arm64 kernels
+# (`node: bad option: --max_old_space_size`) before the coding CLIs can run;
+# Node 24 LTS is 16K-page compatible.
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
 
 # jemalloc reduces Python memory fragmentation and matches the CoPaw worker base.
 RUN JEMALLOC=$(find /usr/lib -name 'libjemalloc.so.2' -print -quit) \
