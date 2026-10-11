@@ -19,9 +19,11 @@ Without structure, the dashboard derives presentation (thinking folds,
 tool-call cards, confirmation cards, run sentinels) from body-text
 heuristics. This protocol gives a runtime an **opt-in typed alternative**:
 attach a structured envelope under the message content key
-`org.agentteams.run`. Messages without the key — or with an envelope that
-yields no valid blocks — fall back to the existing heuristics, so a message
-is always rendered either as structured blocks or from its body. (An
+`org.agentteams.run`. A **v1** message without the key — or whose envelope
+yields zero valid blocks — falls back to the existing body-text heuristics,
+so a v1 message is always rendered either as structured blocks or from its
+body. A **legacy** envelope with no usable blocks does **not** fall back:
+the legacy parser yields an empty block list in that case (see §4.1). (An
 individual block that fails validation is skipped, not repaired — see §4.2.)
 Adoption is therefore safe to roll out incrementally, per runtime.
 
@@ -53,11 +55,14 @@ form is what the shipped parser tests exercise.
 | `error` | `kind: 'cancelled' \| 'failed' \| 'quiet'` (required); `title: string` (required) | run-closing sentinel; any other `kind` value rejects the block (§4.2) |
 
 **Normalized output shape** (what downstream consumers see — not wire
-input): each accepted block becomes `{ type, payload }`, where `payload` is
-the normalized object. For example, the flat v1 wire block
-`{ type: 'tool_call', tool_name: 'read_file', arguments: {}, status: 'running' }`
-is emitted as `{ type: 'tool_call', payload: { tool_name: 'read_file',
-arguments: {}, status: 'running' } }`.
+input): only `tool_call`, `confirmation`, and `error` blocks are wrapped as
+`{ type, payload }` with the normalized object in `payload`; a `text` block
+keeps its top-level `text` (plus `isStreaming`) and a `thinking` block keeps
+top-level `content` (plus `isStreaming`). For example, the flat v1 wire
+block `{ type: 'tool_call', tool_name: 'read_file', arguments: {},
+status: 'running' }` is emitted as `{ type: 'tool_call', payload:
+{ tool_name: 'read_file', arguments: {}, status: 'running' } }`, while the
+wire block `{ type: 'text', text: 'hi' }` stays a top-level `text` shape.
 
 **Legacy shape** (`version: "0"` / absent): lenient pass-through — a block's
 top-level `content`, `text`, `payload` (object, copied as-is), and `messages`
@@ -68,11 +73,17 @@ wire input.
 ## 4. Versioning & fallback semantics
 
 1. `resolveProtocolVersion`: `"1"` → v1; absent / `null` / `"0"` → legacy;
-   anything else → unknown. The parser returns `undefined` — which is the
-   **only** condition under which the caller falls back to the body-text
-   heuristics — when: the envelope is absent or not an object; the version is
-   unknown; `blocks` is not an array; or the envelope yields **zero** valid
-   blocks.
+   anything else → unknown. The parser returns `undefined` — the condition
+   under which the caller falls back to the body-text heuristics — when the
+   envelope is absent or not an object, the version is unknown, or `blocks`
+   is not an array. The zero-valid-block case is **version-specific**: the
+   **v1** parser returns `undefined` when no block survives validation, so a
+   v1 envelope with only invalid blocks also falls back to the body
+   heuristics. The **legacy** parser returns an empty array in that case
+   instead; the array is truthy, so the caller renders no blocks and does
+   **not** run the body heuristics — a legacy envelope whose `blocks` is
+   empty or contains only unknown types renders as no structured blocks,
+   not as a body fallback.
 2. v1 normalization: absent optional fields get safe defaults (e.g. `status`
    defaults to `running`); unknown fields are stripped so the payload stays
    serializable. A block missing a required field (a `confirmation` without a
