@@ -652,6 +652,119 @@ func TestCodingCli_LeaderReadOnly_403(t *testing.T) {
 	}
 }
 
+// Role matrix — the three delegator roles (Manager / Leader / Worker) plus
+// scoped humans pinned against the handler layer. The authorizer layer is
+// covered separately in internal/auth (ManagerAllowsEverything /
+// WorkerSelfOnly / WorkerCannotMutate / TeamLeaderOwnTeam); these pin the
+// handler-side team-scope behavior those roles reach after the middleware.
+
+// L2 humans scoped to a worker's team may read its coding-CLI surface.
+func TestCodingCli_HumanL2_SameTeam_Read200(t *testing.T) {
+	exec := &fakeExecBackend{fileWrites: map[string]string{}}
+	exec.respond = func(cmd []string) (string, string, int, error) {
+		return "", "cat: no such file", 1, nil
+	}
+	h := newTestCodingCliHandler(t, "embedded", exec, nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+	req := codingCliRequest(http.MethodGet, "/api/v1/workers/daily-carol/coding-cli/qwen-code/settings", "", "name", "daily-carol", "cli", "qwen-code")
+	human := withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "luo", Teams: []string{"team-a"}})
+	rec := httptest.NewRecorder()
+	h.getCliSettings(rec, human)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// L2 humans outside the worker's team see it as 404, not 403 (W8
+// anti-probing: a 403 would disclose the worker's existence).
+func TestCodingCli_HumanL2_CrossTeam_Read404(t *testing.T) {
+	exec := &fakeExecBackend{fileWrites: map[string]string{}}
+	exec.respond = func(cmd []string) (string, string, int, error) {
+		return "", "cat: no such file", 1, nil
+	}
+	h := newTestCodingCliHandler(t, "embedded", exec, nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+	req := codingCliRequest(http.MethodGet, "/api/v1/workers/daily-carol/coding-cli/qwen-code/settings", "", "name", "daily-carol", "cli", "qwen-code")
+	human := withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "outsider", Teams: []string{"team-b"}})
+	rec := httptest.NewRecorder()
+	h.getCliSettings(rec, human)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d want 404: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Cross-team writes take the same 404 anti-probing shape (never 403).
+func TestCodingCli_HumanL2_CrossTeam_Write404(t *testing.T) {
+	exec := &fakeExecBackend{fileWrites: map[string]string{}}
+	exec.respond = func(cmd []string) (string, string, int, error) {
+		return "", "", 1, nil
+	}
+	h := newTestCodingCliHandler(t, "embedded", exec, nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+	req := codingCliRequest(http.MethodPut, "/api/v1/workers/daily-carol/coding-cli/qwen-code/settings", `{"model":"gpt"}`, "name", "daily-carol", "cli", "qwen-code")
+	human := withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "outsider", Teams: []string{"team-b"}})
+	rec := httptest.NewRecorder()
+	h.putCliSettings(rec, human)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d want 404: %s", rec.Code, rec.Body.String())
+	}
+	if len(exec.fileWrites) != 0 {
+		t.Fatalf("cross-team write must not reach the backend: %v", exec.fileWrites)
+	}
+}
+
+// Team leaders are read-only: same-team reads pass (write 403 is pinned
+// above).
+func TestCodingCli_Leader_SameTeam_Read200(t *testing.T) {
+	exec := &fakeExecBackend{fileWrites: map[string]string{}}
+	exec.respond = func(cmd []string) (string, string, int, error) {
+		return "", "cat: no such file", 1, nil
+	}
+	h := newTestCodingCliHandler(t, "embedded", exec, nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+	req := codingCliRequest(http.MethodGet, "/api/v1/workers/daily-carol/coding-cli/qwen-code/settings", "", "name", "daily-carol", "cli", "qwen-code")
+	leader := withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleTeamLeader, Username: "alpha-lead", Team: "team-a"})
+	rec := httptest.NewRecorder()
+	h.getCliSettings(rec, leader)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// The manager service account is full access: read and write both pass at
+// the handler layer (it carries no team, so the team-scope gate skips it,
+// mirroring the authorizer's full-access grant).
+func TestCodingCli_Manager_FullAccess(t *testing.T) {
+	exec := &fakeExecBackend{fileWrites: map[string]string{}}
+	exec.respond = func(cmd []string) (string, string, int, error) {
+		if cmd[0] == "sh" {
+			switch {
+			case strings.Contains(cmd[2], "printf %s"):
+				return "/root", "", 0, nil // $HOME
+			case strings.Contains(cmd[2], "cat "):
+				return `{"a":1}`, "", 0, nil
+			}
+		}
+		return "", "", 1, nil
+	}
+	h := newTestCodingCliHandler(t, "embedded", exec, nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+	// Read
+	req := codingCliRequest(http.MethodGet, "/api/v1/workers/daily-carol/coding-cli/qwen-code/settings", "", "name", "daily-carol", "cli", "qwen-code")
+	mgr := withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleManager, Username: "manager"})
+	rec := httptest.NewRecorder()
+	h.getCliSettings(rec, mgr)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read status=%d want 200: %s", rec.Code, rec.Body.String())
+	}
+	// Write
+	wreq := codingCliRequest(http.MethodPut, "/api/v1/workers/daily-carol/coding-cli/qwen-code/settings", `{"b":2}`, "name", "daily-carol", "cli", "qwen-code")
+	wreq = withCaller(wreq, &authpkg.CallerIdentity{Role: authpkg.RoleManager, Username: "manager"})
+	rec = httptest.NewRecorder()
+	h.putCliSettings(rec, wreq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("write status=%d want 200: %s", rec.Code, rec.Body.String())
+	}
+	if _, ok := exec.written("/root/.qwen/settings.json"); !ok {
+		t.Fatalf("manager write did not reach the backend")
+	}
+}
+
 func TestCodingCli_UnknownCLI_400(t *testing.T) {
 	h := newTestCodingCliHandler(t, "embedded", nil, nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
 	rec := httptest.NewRecorder()
