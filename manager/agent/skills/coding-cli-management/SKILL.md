@@ -81,6 +81,7 @@ npm and the release assets cover Linux x64/arm64, macOS x64/arm64, and Windows. 
 **Unattended semantics — read before enabling.**
 - `qwen --yolo` automatically approves **all** tool calls — file edits and shell commands included, with no further prompts.
 - `opencode run --auto` auto-approves permissions, but **explicit deny rules are still enforced**.
+- `qodercli --yolo` bypasses prompts **only in a trusted directory**: in an untrusted workspace it silently falls back to `default` mode, where every would-ask operation is **auto-denied in headless** — the run degrades to read-only with no error. Org policy `security.disableYoloMode` disables `--yolo` entirely.
 - **Neither changing the working directory nor adding a timeout establishes a permission boundary.** The workspace and the timeout shape scope and duration only; the runner keeps every capability of the delegating agent's process.
 
 ---
@@ -163,7 +164,7 @@ echo '{"enabled":false,"cli":null,"confirmed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ
 Proceed with normal task assignment (Worker codes on their own).
 
 **If CLIs are available**, ask the admin via the primary channel or Matrix DM — **in the language the admin used**:
-> I found the following AI coding CLI tools available: [list]. Would you like to enable CLI delegation mode? Workers will generate coding prompts, and I'll use the CLI tool to make the code changes. Note: the CLI runs unattended — `qwen --yolo` auto-approves all tool calls, and `opencode --auto` still enforces explicit deny rules; the workspace and the timeout are not permission boundaries. On a local or shared machine, consider the sandbox tier for Qwen Code (`--sandbox`, Docker-backed, off by default) and turn/wall budgets; on OpenCode there is no native sandbox, so prefer an isolated execution environment or tight deny rules. Reply with the tool name (claude/gemini/qodercli/qwen/opencode) to enable, or 'no' to have workers code on their own.
+> I found the following AI coding CLI tools available: [list]. Would you like to enable CLI delegation mode? Workers will generate coding prompts, and I'll use the CLI tool to make the code changes. Note: the CLI runs unattended — `qwen --yolo` auto-approves all tool calls, `opencode --auto` still enforces explicit deny rules, and `qodercli --yolo` silently becomes read-only unless the workspace is trusted; the workspace and the timeout are not permission boundaries. On a local or shared machine, consider the sandbox tier for Qwen Code (`--sandbox`, Docker-backed, off by default) and turn/wall budgets; on OpenCode there is no native sandbox, so prefer an isolated execution environment or tight deny rules. Reply with the tool name (claude/gemini/qodercli/qwen/opencode) to enable, or 'no' to have workers code on their own.
 
 On admin reply:
 - Tool name (`claude` / `gemini` / `qodercli` / `qwen` / `opencode`):
