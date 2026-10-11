@@ -11,6 +11,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -365,6 +366,27 @@ class PreflightTests(unittest.TestCase):
         patch = check_by_id(payload, "C3")
         self.assertEqual(patch["status"], "FAIL")
         self.assertIn("--download failed", patch["evidence"])
+
+    def test_check_deps_unrunnable_fails(self):
+        # Maintainer gate detail (AgentTeams#1341 comment, 2026-10-09): an
+        # explicitly requested --check-deps stage that cannot run - missing
+        # tool (OSError) or timeout (TimeoutExpired) - must be
+        # upgrade-blocking, not a silent WARN with exit 0.
+        qwenpaw = build_repo(self.root)
+        for exc in (OSError("network disabled in tests"),
+                    subprocess.TimeoutExpired(cmd=["uv", "pip"], timeout=300)):
+            with unittest.mock.patch.object(self.module.subprocess, "run",
+                                            side_effect=exc):
+                code, payload = run_json(self.module, [
+                    "--target", "2.2.1", "--qwenpaw-dir", str(qwenpaw),
+                    "--check-deps",
+                ])
+            self.assertEqual(code, 1, f"exit code for {exc!r}")
+            self.assertEqual(payload["overall"], "FAIL")
+            deps = check_by_id(payload, "C4")
+            self.assertEqual(deps["status"], "FAIL")
+            self.assertIn("could not run", deps["evidence"])
+            self.assertIsNotNone(deps["advice"])
 
 
 if __name__ == "__main__":
