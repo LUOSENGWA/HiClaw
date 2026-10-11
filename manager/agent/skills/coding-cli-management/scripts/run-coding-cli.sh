@@ -51,6 +51,24 @@ if [ ! -d "$workspace" ]; then
     exit 1
 fi
 
+# Pre-flight: the configured CLI binary must be on PATH. If it is missing here
+# even though the config says delegation is enabled, the most common cause is a
+# worker RECREATION: the CLI is installed into the container's ephemeral layer
+# (npm install -g, i.e. the image layer at $npm prefix), which container
+# recreation wipes, while the auth config in the persistent agent home
+# (~/.qwen/settings.json) survives. Fail fast with an actionable message
+# instead of a confusing "command not found" deep inside the run.
+if ! command -v "$cli" >/dev/null 2>&1; then
+    echo "[run-coding-cli] ERROR: coding CLI '$cli' is configured but not on PATH." >&2
+    echo "[run-coding-cli] Usual cause: the worker was recreated and the CLI install" >&2
+    echo "[run-coding-cli] (npm -g, container ephemeral layer) was wiped. Re-run the install" >&2
+    echo "[run-coding-cli] endpoint (POST /api/v1/workers/{name}/coding-cli/$cli/install)," >&2
+    echo "[run-coding-cli] then retry. Auth settings are written container-local by that" >&2
+    echo "[run-coding-cli] surface and may not survive a recreation — probe settings and" >&2
+    echo "[run-coding-cli] re-apply via the settings endpoint if the probe shows them missing." >&2
+    exit 125
+fi
+
 # Governance flags are defined by the qwen runner; other runners have no
 # equivalent surface, so warn and ignore rather than fail the run.
 if [ "$cli" != "qwen" ] && { [ -n "$g_model" ] || [ -n "$g_allowed_tools" ] || [ -n "$g_allowed_mcp" ] || [ "$g_safe_mode" = "1" ] || [ "$g_bare" = "1" ] || [ -n "$g_json_file" ]; }; then

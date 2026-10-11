@@ -109,9 +109,33 @@ Note: the pre-existing claude/gemini cases already run skip-permissions-class fl
 
 ---
 
+## Persistence and re-install after worker recreation
+
+The CLI binary and its `npm install -g` payload live in the worker container's
+**ephemeral layer** (the image layer at `$npm prefix`, e.g. `/usr/local/lib/node_modules`) —
+**not** in the persistent agent home. A worker **recreation** (image upgrade, a spec
+change, or any controller-driven container rebuild, e.g. an LLM-runtime parameter
+change) wipes that layer, so the CLI disappears even though the delegation config
+and the auth settings survive:
+
+- `~/coding-cli-config.json` is in the delegating agent's own home → it survives.
+- The CLI binary (npm -g) is in the **image layer** → it does **not** survive.
+- `~/.qwen/settings.json` (auth) sits in the worker's agent home, but the install
+  surface writes it **container-local** (no forced MinIO push) → it MAY be lost on
+  a recreation. Do not assume it survives.
+
+Consequence: after any worker recreation, re-run the install endpoint
+(`POST /api/v1/workers/{name}/coding-cli/{cli}/install`) before delegating again,
+then **probe** the settings — if the auth is gone, re-apply it via the settings
+endpoint. `run-coding-cli.sh`
+fails fast with an actionable re-install message (exit `125`) if the configured
+binary is missing on PATH, so a wiped install is self-diagnosing rather than a
+confusing mid-run "command not found".
+
 ## Step 1: First-Time Detection (before assigning a coding task)
 
-Run when `~/coding-cli-config.json` does not exist:
+Run when `~/coding-cli-config.json` does not exist — **or after any worker
+recreation** (the detect step re-establishes what is actually on PATH):
 
 ```bash
 bash /opt/agentteams/agent/skills/coding-cli-management/scripts/detect-available-cli.sh

@@ -183,6 +183,31 @@ if [ ! -f "${json_out}" ]; then
     fail=1
 fi
 
+# --- case 7: CLI missing (recreation wiped the install) -> actionable error --
+# The recreation-wipe scenario: the CLI is configured (config says enabled) but
+# its npm -g install was wiped when the worker container was recreated, while
+# the auth config in the agent home survived. The pre-flight guard must fail
+# fast with an actionable re-install message (exit 125), not a confusing
+# mid-run "command not found". Run with a clean PATH that lacks the qwen stub
+# to simulate the wiped install.
+out="$(PATH="/usr/bin:/bin" \
+    QWEN_STUB_ARGS="${STUB_ARGS}" \
+    CODING_CLI_CONFIG="${TMP}/nonexistent.json" \
+    bash "${RUN_SCRIPT}" --cli qwen --workspace "${workspace}" --prompt-file "${prompt}" 2>&1)"
+rc=$?
+if [ "${rc}" -ne 125 ]; then
+    echo "FAIL case7: expected exit 125 when the CLI binary is missing (got ${rc}): ${out}"
+    fail=1
+fi
+if ! grep -q "not on PATH" <<<"${out}"; then
+    echo "FAIL case7: expected an actionable 'not on PATH' message (got: ${out})"
+    fail=1
+fi
+if ! grep -qi "install endpoint\|recreat" <<<"${out}"; then
+    echo "FAIL case7: expected an actionable re-install hint (got: ${out})"
+    fail=1
+fi
+
 if [ "${fail}" -eq 0 ]; then
     echo "PASS coding-cli run governance (jq=${HAS_JQ})"
     exit 0
