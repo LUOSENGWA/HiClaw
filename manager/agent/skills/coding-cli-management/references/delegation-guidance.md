@@ -82,7 +82,7 @@ host can actually *host* the toolchain before dispatching, not just that the fil
 
 | Scenario | Writes in worker | Build/verify in worker | Route |
 |---|---|---|---|
-| Web (Node / React / Vue) | yes | yes (Node 24 + npm 11 / pnpm) | closed in the worker |
+| Web (Node / React / Vue) | yes | yes (Node.js 22 on the current base — 24 LTS target pending the base-image bump — + npm/pnpm) | closed in the worker |
 | Python, stdlib-only | yes | yes (bare `python3` 3.12 — no pip, no third-party packages) | closed in the worker |
 | Python, third-party (requests / pandas / numpy …) | yes | no — no pip in the base image | code in the worker; verify on a host or build node that has the packages |
 | C / C++ | yes | yes (`gcc` / `g++` / `make`) | closed in the worker |
