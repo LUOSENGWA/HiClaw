@@ -270,6 +270,34 @@ run_case_g() {
     pass "${cli}.json_file (structured result written to the --json-file path and parses as JSON)"
 }
 
+# run_case_h <cli>: guard preflight — a .processing marker in the workspace
+# must hard-fail the run with exit 125 BEFORE the CLI is invoked. This is the
+# code-level enforcement of the SKILL's "check for processing marker" step:
+# prompt discipline alone is not a boundary (the 10-10 QC git-write incident
+# is the standing evidence). The stub prints a sentinel if it ever runs.
+run_case_h() {
+    local cli="$1" rc
+    cat > "${SANDBOX}/bin/${cli}" <<'GUARD_STUB'
+#!/bin/bash
+# Stub runner for verify-coding-cli.sh case (h): printing this means the guard failed.
+echo "GUARD_STUB_EXECUTED"
+exit 0
+GUARD_STUB
+    chmod +x "${SANDBOX}/bin/${cli}"
+    mkdir -p "${SANDBOX}/ws-h"
+    touch "${SANDBOX}/ws-h/.processing"
+    PATH="${SANDBOX}/bin:${PATH}" \
+        bash "${RUN_SCRIPT}" --cli "${cli}" --workspace "${SANDBOX}/ws-h" \
+            --prompt-file "${PROMPT_FILE}" \
+            > "${SANDBOX}/prompts/case-h.out" 2>&1
+    rc=$?
+    if [ "${rc}" = "125" ] && ! grep -q "GUARD_STUB_EXECUTED" "${SANDBOX}/prompts/case-h.out"; then
+        pass "${cli}.processing_guard (rc=125, CLI never invoked)"
+    else
+        fail "${cli}.processing_guard" "expected exit 125 with no CLI invocation, got rc=${rc}"
+    fi
+}
+
 # check_node_generation: environment-level check (runs once, not per-CLI). The npm
 # channel (qwen-code / opencode install) needs a Node in the OpenSSL 3.5 generation
 # to survive restrictive-network TLS-fingerprint filtering (see the SKILL "Node
@@ -318,6 +346,7 @@ for cli in qwen opencode; do
     fi
     run_case_b "${cli}"
     run_case_c "${cli}"
+    run_case_h "${cli}"
     if [ "${cli}" = "qwen" ]; then
         run_case_e "${cli}"
         if [ "${case_a_ok}" = "1" ]; then

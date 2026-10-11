@@ -68,6 +68,8 @@ fi
 
 If a `.processing` marker exists, wait for the delegating agent to complete their operation before sending your request.
 
+The same rule is **enforced in code**, not just recommended: `run-coding-cli.sh` hard-fails with exit 125 before invoking any CLI when the workspace carries a `.processing` marker (the delegating agent's runner-side mirror of this check). So even if this step is skipped, a colliding run is blocked at the script layer — but skipping it still wastes a round-trip, so check first.
+
 ### 3. Generate a High-Quality Prompt
 
 A good prompt includes:

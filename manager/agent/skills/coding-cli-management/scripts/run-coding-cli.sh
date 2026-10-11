@@ -51,6 +51,20 @@ if [ ! -d "$workspace" ]; then
     exit 1
 fi
 
+# Pre-flight guard: a .processing marker in the workspace means the
+# delegating agent is holding it (mirroring its files, reading results).
+# The SKILL tells the caller to check the marker and wait — that is prompt
+# discipline, and small models drop it (the 10-10 QC git-write incident is
+# the standing evidence that prompt constraints are not a boundary). Hard-
+# fail here, in code, before the CLI is invoked: exit 125 is the runner's
+# "blocked, retry later" contract (same code as the missing-CLI guard).
+if [ -f "${workspace}/.processing" ]; then
+    echo "[run-coding-cli] ERROR: ${workspace}/.processing exists — the delegating agent" >&2
+    echo "[run-coding-cli] is holding this workspace. Refusing to run; retry after it" >&2
+    echo "[run-coding-cli] removes the marker." >&2
+    exit 125
+fi
+
 # Pre-flight: the configured CLI binary must be on PATH. If it is missing here
 # even though the config says delegation is enabled, the most common cause is a
 # worker RECREATION: the CLI is installed into the container's ephemeral layer
