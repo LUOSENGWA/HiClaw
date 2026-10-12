@@ -248,10 +248,16 @@ cli=$(jq -r '.cli' ~/coding-cli-config.json)
 # --timeout is the wall-clock bound for the run. Delegated coding runs are
 # routinely hour-plus (field data), so size for the long tail, not the common
 # case. Keep the .processing marker TTL above (step 3) longer than this.
+# --task-dir is the marker's home (task root) and --processor names this run,
+# so the wrapper's .processing guard treats the delegating flow's OWN marker
+# (created in step 3, processor=manager) as a legitimate run — not a conflict.
+task_dir="/root/agentteams-fs/shared/tasks/${task_id}"
 bash /opt/agentteams/agent/skills/coding-cli-management/scripts/run-coding-cli.sh \
   --cli "$cli" \
   --workspace "$workspace" \
   --prompt-file "$prompt_file" \
+  --task-dir "$task_dir" \
+  --processor "manager" \
   --timeout 3600
 exit_code=$?
 
