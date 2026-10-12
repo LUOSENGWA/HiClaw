@@ -234,6 +234,17 @@ func (a *Authorizer) authorizeHuman(caller *CallerIdentity, req AuthzRequest) er
 		}
 		return deny(caller, req)
 
+	case "coding-runs":
+		// Coding-run transcript visibility (read-only, D12 路 A): L2 humans
+		// read the coding-run transcripts of teams in their accessibleTeams.
+		// Not rejected cross-team at the authorizer (a 403 would let a scoped
+		// caller probe which tasks exist); the handler (visibleTaskPrefixes +
+		// W4 404) is the real boundary, hiding out-of-scope runs as 404.
+		if req.Action == ActionGet || req.Action == ActionList {
+			return nil
+		}
+		return deny(caller, req)
+
 	default:
 		return deny(caller, req)
 	}
@@ -301,6 +312,16 @@ func (a *Authorizer) authorizeTeamLeader(caller *CallerIdentity, req AuthzReques
 		// TeamMatches (?team= mandatory, cross-team hidden as 404, W8
 		// anti-probing); unscoped reads are L1 only.
 		if req.Action == ActionGet {
+			return nil
+		}
+		return deny(caller, req)
+
+	case "coding-runs":
+		// Coding-run transcript visibility (read-only): team leaders read
+		// their own team's coding-run transcripts. Not rejected cross-team
+		// at the authorizer (W8 anti-probing); the handler (visibleTaskPrefixes
+		// + W4 404) hides cross-team runs as 404.
+		if req.Action == ActionGet || req.Action == ActionList {
 			return nil
 		}
 		return deny(caller, req)

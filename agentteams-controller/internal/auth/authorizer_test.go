@@ -585,3 +585,28 @@ func TestAuthorizer_HumanL3WriteDenied(t *testing.T) {
 		}
 	}
 }
+
+// TestAuthorizer_CodingRunsScoped pins the coding-run transcript visibility
+// boundary (GET /api/v1/coding-runs): L2 humans and team leaders READ (the
+// handler enforces the team-scope boundary and hides cross-team as 404 — W8
+// anti-probing); workers are denied (they run the CLIs, they don't read
+// transcripts through the API). This is what the handler's visibleTaskPrefixes
+// L2 logic depends on — without the "coding-runs" case here, L2 callers are
+// denied at the authorizer and never reach the handler.
+func TestAuthorizer_CodingRunsScoped(t *testing.T) {
+	az := NewAuthorizer()
+	for _, caller := range []*CallerIdentity{
+		{Role: RoleHuman, Username: "alice", Teams: []string{"market-team"}},
+		{Role: RoleTeamLeader, Username: "lead", Team: "market-team"},
+	} {
+		for _, a := range []Action{ActionGet, ActionList} {
+			if err := az.Authorize(caller, AuthzRequest{Action: a, ResourceKind: "coding-runs"}); err != nil {
+				t.Errorf("%s %s coding-runs should be allowed, got: %v", caller.Role, a, err)
+			}
+		}
+	}
+	if err := az.Authorize(&CallerIdentity{Role: RoleWorker, Username: "w", WorkerName: "w"},
+		AuthzRequest{Action: ActionGet, ResourceKind: "coding-runs"}); err == nil {
+		t.Errorf("worker should NOT be allowed to read coding-runs")
+	}
+}

@@ -152,6 +152,12 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	mux.Handle("GET /api/v1/projects/{id}/events", mw.RequireAuthz(authpkg.ActionGet, "project", projectNameFn)(http.HandlerFunc(projh.GetProjectEvents)))
 	mux.Handle("GET /api/v1/projects/{id}/history/{timestamp}", mw.RequireAuthz(authpkg.ActionGet, "project", projectNameFn)(http.HandlerFunc(projh.GetProjectHistorySnapshot)))
 
+	// --- Coding runs (read-only coding-CLI transcript visibility, D12 路 A;
+	// read from object storage, embedded + K8s both) ---
+	crh := NewCodingRunsHandler(deps.Client, deps.Namespace, deps.OSS)
+	mux.Handle("GET /api/v1/coding-runs", mw.RequireAuthz(authpkg.ActionGet, "coding-runs", nil)(http.HandlerFunc(crh.ListCodingRuns)))
+	mux.Handle("GET /api/v1/coding-runs/{taskID}/runs/{run}", mw.RequireAuthz(authpkg.ActionGet, "coding-runs", nil)(http.HandlerFunc(crh.GetCodingRun)))
+
 	// --- Worker checkpoints (execution timeline; proxy to the worker's qwenpaw app) ---
 	ckh := NewCheckpointHandler(deps.Client, deps.Namespace, deps.KubeMode, deps.ContainerPrefix)
 	mux.Handle("GET /api/v1/workers/{name}/checkpoints/{sub}", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(http.HandlerFunc(ckh.proxyCheckpoint)))
