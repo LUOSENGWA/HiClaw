@@ -8,7 +8,23 @@
 # lifecycle proposed in AgentTeams#1341 (end-to-end lifecycle comment,
 # 2026-10-11).
 #
-# Steps:
+# Phases (--phase, default full = the original single-process flow):
+#   full         S0 -> S3 -> S3b -> S4 -> S5 -> S6 in one process
+#   pre-restart  phase 1 of the two-phase model (the agentteams-upgrade
+#                plugin spawns it DETACHED so it survives the app kill):
+#                S0 full checks (C3 mandatory via --wheelhouse) -> S1 old
+#                version -> S3 install -> S3b patch -> write pending.json
+#                BEFORE the swap becomes visible -> S4 restart primitive ->
+#                exit 0. Completion is owned by phase 2 (state file).
+#   boot-check   phase 2 (entrypoint, before `exec qwenpaw-worker`; the app
+#                is not up yet): no pending.json -> no-op exit 0; venv
+#                version == target -> success + pending removed; otherwise
+#                reinstall old + re-apply patch = rolled_back. Always exits
+#                0 once handled (the container must boot; the result lives
+#                in the state file). --force-rollback skips the version
+#                check (host-side runbook).
+#
+# Steps (full phase):
 #   S0  pre-flight   external checker (default: the co-located
 #                    check_qwenpaw_upgrade.py); nonzero exit aborts before
 #                    anything is installed (exit 2)
@@ -53,11 +69,18 @@
 #
 # Exit codes: 0=ok  2=pre-flight/usage failure (nothing installed)
 #             3=rolled back  4=rollback failed (manual intervention needed)
+#             (boot-check: always 0 once handled; the result is in the state file)
 #
 # Usage:
 #   upgrade_qwenpaw_runtime.sh --target X.Y.Z [--checker PATH] [--skip-check]
 #       [--container NAME] [--venv PATH] [--uv PATH] [--restart-mode supervisorctl|kill]
 #       [--timeout 90] [--settle 65] [--record-file PATH] [--dry-run] [--selftest]
+#   # two-phase (agentteams-upgrade plugin / entrypoint):
+#   upgrade_qwenpaw_runtime.sh --target X.Y.Z --phase pre-restart \
+#       --job-id upg-... --state-file .../upgrade-<job-id>.json \
+#       --pending-file .../pending.json
+#   upgrade_qwenpaw_runtime.sh --phase boot-check --pending-file .../pending.json \
+#       --venv /opt/venv/qwenpaw [--force-rollback]
 #
 # Environment hooks (all overridable; --selftest stubs every external action):
 #   UG_VERSION_CMD   print the current version (raw "X.Y.Z" or the JSON
@@ -73,6 +96,8 @@
 #   UG_PRE_INSTALL_CMD pre-install hook (docker backend: starts a stopped
 #                    container, since the rollback's `docker exec ... pip
 #                    install` needs a running container; no-op in-container)
+#   UG_WHEELHOUSE    wheel cache dir for the pre-restart phase's mandatory
+#                    C3 gate (default $QWENPAW_WORKING_DIR/upgrade/wheelhouse)
 #
 # Red line: --selftest runs a fully stubbed battery and never touches a real
 # deployment; --dry-run prints the resolved commands without executing them.
@@ -106,6 +131,12 @@ RECORD_FILE=""
 DRY_RUN=0
 SELFTEST=0
 BACKEND="in-container"
+PHASE="full"
+JOB_ID=""
+STATE_FILE=""
+PENDING_FILE=""
+FORCE_ROLLBACK=0
+WHEELHOUSE_DIR=""
 
 log() { printf '[upgrade] %s\n' "$*"; }
 err() { printf '[upgrade] ERROR: %s\n' "$*" >&2; }
@@ -155,6 +186,85 @@ get_version() {
 # $1=command template  $2=version -> print with every {target} substituted
 sub_target() {
   printf '%s' "${1//\{target\}/$2}"
+}
+
+now_ts() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+# --- state file: single source of truth across container restarts ---------
+# write_state KEY=VALUE ... merges JSON values into $STATE_FILE (atomic
+# replace). A value is stored as JSON when parseable, else as a string.
+# No-op when STATE_FILE is empty (the full phase keeps its record.json
+# behaviour and is untouched).
+write_state() {
+  [ -n "$STATE_FILE" ] || return 0
+  [ $# -gt 0 ] || return 0
+  python3 - "$STATE_FILE" "$@" <<'PYEOF'
+import json, os, sys, tempfile
+path = sys.argv[1]
+data = {}
+if os.path.isfile(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        if isinstance(loaded, dict):
+            data = loaded
+    except Exception:
+        data = {}
+for arg in sys.argv[2:]:
+    if "=" not in arg:
+        continue
+    key, value = arg.split("=", 1)
+    try:
+        data[key] = json.loads(value)
+    except Exception:
+        data[key] = value
+directory = os.path.dirname(os.path.abspath(path))
+os.makedirs(directory, exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=".upgrade-", dir=directory)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+os.replace(tmp, path)
+PYEOF
+}
+
+# pending_get KEY -> print the value from $PENDING_FILE (empty when absent)
+pending_get() {
+  python3 - "$PENDING_FILE" "$1" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    value = data.get(sys.argv[2], "")
+    print("" if value is None else value)
+except Exception:
+    print("")
+PYEOF
+}
+
+# write_pending JOB_ID OLD TARGET VENV -> atomic pending.json
+write_pending() {
+  python3 - "$PENDING_FILE" "$1" "$2" "$3" "$4" <<'PYEOF'
+import datetime, json, os, sys, tempfile
+job_id, old, target, venv = sys.argv[2:6]
+data = {
+    "job_id": job_id,
+    "old": old,
+    "target": target,
+    "venv": venv,
+    "started_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}
+path = sys.argv[1]
+directory = os.path.dirname(os.path.abspath(path))
+os.makedirs(directory, exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=".pending-", dir=directory)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+os.replace(tmp, path)
+PYEOF
 }
 
 run_install() {
@@ -355,7 +465,198 @@ do_upgrade() {
 }
 
 # ============================================================================
-# --selftest: built-in stubbed battery (7 scenarios; every external command mocked via tmp-dir state files)
+# Two-phase execution (agentteams-upgrade plugin / entrypoint).
+# The full phase above is untouched; these reuse run_install / write_record
+# / do_rollback-style steps but NOT run_restart+health_gate (boot-check) or
+# S5 (pre-restart defers to phase 2).
+# ============================================================================
+
+# Phase 1 (spawned DETACHED by the plugin so it survives the app kill in S4):
+#   S0 full checks (C3 mandatory via --wheelhouse) -> S1 old version ->
+#   S3 install -> S3b patch -> write pending.json -> S4 restart -> exit 0.
+# Exits: 0 = restart issued (phase 2 owns completion); 2 = pre-checks failed;
+# 3 = rolled back; 4 = rollback itself failed.
+do_pre_restart() {
+  log "phase=pre-restart job=$JOB_ID target=$TARGET venv=$UG_VENV"
+
+  # 1) record the previous version (the app is still up in its old form)
+  local old
+  if ! old="$(get_version)"; then
+    err "could not read the current version (UG_VERSION_CMD failed or printed nothing)"
+    echo "SUMMARY: status=precheck_failed reason=old-version-unknown"
+    write_state state=precheck_failed finished_at="$(now_ts)"
+    exit 2
+  fi
+  log "previous version: $old"
+
+  # 2) compatibility checker (S0) - C3 mandatory (wheelhouse)
+  if [ -n "$CHECKER" ] && [ "$SKIP_CHECK" -eq 0 ]; then
+    ccmd="$(sub_target "$UG_CHECKER_CMD" "$TARGET")"
+    log "checker: $ccmd"
+    if ! bash -c "$ccmd"; then
+      err "checker refused the upgrade (nonzero exit) - aborted, nothing was installed"
+      echo "SUMMARY: status=precheck_failed reason=checker-failed"
+      write_state state=precheck_failed finished_at="$(now_ts)"
+      exit 2
+    fi
+    log "checker passed"
+  fi
+
+  # 3) install the target
+  if ! run_install "$TARGET"; then
+    err "install of $TARGET failed -> rolling back (no restart; app still runs the old code)"
+    do_pre_restart_rollback "$old" "install-failed"
+  fi
+  log "install of $TARGET done"
+
+  # 3b) re-apply the compat patch (idempotent)
+  if [ -n "$UG_PATCH_CMD" ]; then
+    pcmd="$(sub_target "$UG_PATCH_CMD" "$TARGET")"
+    log "compat patch: $pcmd"
+    if ! bash -c "$pcmd"; then
+      err "compat patch failed -> rolling back (no restart; app still runs the old code)"
+      do_pre_restart_rollback "$old" "patch-failed"
+    fi
+    log "compat patch done"
+  fi
+
+  # 4) write pending BEFORE the swap becomes visible to a new process
+  write_pending "$JOB_ID" "$old" "$TARGET" "$UG_VENV"
+  log "pending written: $PENDING_FILE (old=$old target=$TARGET)"
+  write_state state=running phase=boot-check job_id="$JOB_ID" target="$TARGET" current="$old" started_at="$(now_ts)"
+
+  # 5) restart primitive. After this point the container runtime brings the
+  #    container back up and the entrypoint runs phase 2 (boot-check).
+  log "S4: restart (mode=$RESTART_MODE)"
+  if ! run_restart; then
+    err "restart command failed; the container may still be running the old version"
+    echo "SUMMARY: status=precheck_failed reason=restart-failed"
+    write_state state=precheck_failed finished_at="$(now_ts)"
+    exit 2
+  fi
+  log "pre-restart complete: restart issued; boot-check owns completion (state: $STATE_FILE)"
+  echo "SUMMARY: status=ok phase=pre-restart old=$old target=$TARGET"
+  exit 0
+}
+
+# pre-restart rollback: reinstall old + re-apply patch, NO restart (the app
+# never died), then clean pending. Does not return (exits 3/4).
+do_pre_restart_rollback() {
+  local old="$1"
+  local reason="${2:-install-failed}"
+  log "ROLLBACK (pre-restart): restoring $old (reason: $reason; no restart - app unchanged)"
+  write_state state=rolled_back finished_at="$(now_ts)" note="rollback:$reason"
+  if ! run_install "$old"; then
+    fatal_rollback_failed
+    err "rollback failed: installing old version $old did not succeed"
+    echo "SUMMARY: status=rollback_failed old=$old target=$TARGET"
+    write_state state=rollback_failed
+    exit 4
+  fi
+  if [ -n "$UG_PATCH_CMD" ]; then
+    pcmd="$(sub_target "$UG_PATCH_CMD" "$old")"
+    if ! bash -c "$pcmd"; then
+      fatal_rollback_failed
+      err "rollback failed: compat patch re-apply failed for $old"
+      echo "SUMMARY: status=rollback_failed old=$old target=$TARGET"
+      write_state state=rollback_failed
+      exit 4
+    fi
+  fi
+  rm -f "$PENDING_FILE"
+  log "ROLLBACK (pre-restart): restored to $old"
+  echo "SUMMARY: status=rolled_back old=$old target=$TARGET reason=$reason"
+  exit 3
+}
+
+# Phase 2 (entrypoint, before `exec qwenpaw-worker`; the app is not up yet).
+# Always returns 0 once handled - the container MUST boot; the result lives
+# in the state file (success / rolled_back / rollback_failed).
+do_boot_check() {
+  log "phase=boot-check venv=$UG_VENV pending=$PENDING_FILE"
+
+  if [ ! -f "$PENDING_FILE" ]; then
+    log "boot-check: no pending upgrade ($PENDING_FILE missing), nothing to do"
+    return 0
+  fi
+
+  local pending_job pending_old pending_target
+  pending_job="$(pending_get job_id)"
+  pending_old="$(pending_get old)"
+  pending_target="$(pending_get target)"
+  [ -n "$TARGET" ] || TARGET="$pending_target"
+  [ -n "$JOB_ID" ] || JOB_ID="$pending_job"
+  if [ -z "$STATE_FILE" ] && [ -n "$JOB_ID" ]; then
+    # Derive the state file from the pending file's directory. The pending
+    # lives at $WORKING/upgrade/pending.json and the job state at
+    # $WORKING/upgrade/upgrade-<job>.json, so the state file is a sibling of
+    # the pending. More robust than relying on $QWENPAW_WORKING_DIR (the
+    # entrypoint sets it, but a standalone/manual boot-check may not).
+    STATE_FILE="$(dirname "$PENDING_FILE")/upgrade-$JOB_ID.json"
+  fi
+  log "boot-check: pending job=$JOB_ID old=$pending_old target=$TARGET"
+
+  if [ "$FORCE_ROLLBACK" = "1" ]; then
+    log "boot-check: --force-rollback: rolling back regardless of the venv version"
+    do_boot_check_rollback "$pending_old" "forced"
+    return 0
+  fi
+
+  local boot_version
+  boot_version="$(bash -c "$UG_VERSION_CMD" 2>/dev/null | tr -d '[:space:]')" || boot_version=""
+  if [ -z "$boot_version" ]; then
+    err "boot-check: could not read the venv version; assuming mismatch, rolling back"
+    do_boot_check_rollback "$pending_old" "version-unreadable"
+    return 0
+  fi
+  log "boot-check: venv reports qwenpaw==$boot_version (target $TARGET)"
+
+  if [ "$boot_version" = "$TARGET" ]; then
+    rm -f "$PENDING_FILE"
+    write_state state=success finished_at="$(now_ts)"
+    log "boot-check: SUCCESS - qwenpaw==$boot_version in place; pending removed"
+    echo "SUMMARY: status=ok phase=boot-check target=$TARGET"
+    return 0
+  fi
+
+  err "boot-check: version mismatch (expected $TARGET, venv has $boot_version); rolling back to $pending_old"
+  do_boot_check_rollback "$pending_old" "version-mismatch"
+  return 0
+}
+
+# boot-check rollback: reinstall old + re-apply patch, NO restart and NO
+# health gate (the app is not up; it cannot be verified before boot).
+# pending is KEPT on failure (manual retry via --force-rollback).
+do_boot_check_rollback() {
+  local old="$1"
+  local reason="${2:-version-mismatch}"
+  log "ROLLBACK (boot-check): restoring $old (reason: $reason; no restart - app not up yet)"
+  write_state state=rolled_back finished_at="$(now_ts)" note="rollback:$reason"
+  if ! run_install "$old"; then
+    fatal_rollback_failed
+    err "boot-check: FATAL restore failed; pending kept for manual retry (--force-rollback)"
+    echo "SUMMARY: status=rollback_failed old=$old target=$TARGET"
+    write_state state=rollback_failed
+    return 0
+  fi
+  if [ -n "$UG_PATCH_CMD" ]; then
+    pcmd="$(sub_target "$UG_PATCH_CMD" "$old")"
+    if ! bash -c "$pcmd"; then
+      fatal_rollback_failed
+      err "boot-check: FATAL compat patch re-apply failed; pending kept for manual retry"
+      echo "SUMMARY: status=rollback_failed old=$old target=$TARGET"
+      write_state state=rollback_failed
+      return 0
+    fi
+  fi
+  rm -f "$PENDING_FILE"
+  log "boot-check: rolled back to $old; pending removed; continuing startup"
+  echo "SUMMARY: status=rolled_back phase=boot-check old=$old target=$TARGET reason=$reason"
+  return 0
+}
+
+# ============================================================================
+# --selftest: built-in stubbed battery (11 scenarios; every external command mocked via tmp-dir state files)
 # ============================================================================
 
 SELFTEST_TOTAL_FAIL=0
@@ -398,7 +699,7 @@ run_selftest() {
   local tmp d rc
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/online_upgrade_v1.selftest.XXXXXX")" \
     || { err "cannot create temp dir"; return 1; }
-  log "selftest: starting (8 scenarios, all external commands stubbed; tmp dir: $tmp)"
+  log "selftest: starting (11 scenarios, all external commands stubbed; tmp dir: $tmp)"
   # Keep the default scenarios fast; T8 exercises the settle window explicitly.
   SETTLE=0
 
@@ -593,12 +894,93 @@ run_selftest() {
   st_grep "rolled back" "$d/out.log" "SUMMARY: status=rolledback old=2.2.1 target=2.2.2"
   st_end T8 "settle window catches delayed wrapper crash -> rollback"
 
+  # ============ T9 pre-restart happy path (two-phase, phase 1) ============
+  # Order must be: install(target) -> patch -> pending write -> restart;
+  # the state file ends with phase=boot-check.
+  d="$tmp/T9"; mkdir -p "$d"
+  printf '2.2.1' > "$d/version"
+  TARGET="2.2.2"; CHECKER=""; SKIP_CHECK=1; BACKEND="in-container"
+  RECORD_FILE=""
+  PHASE="pre-restart"; JOB_ID="upg-selftest-t9"
+  STATE_FILE="$d/state.json"; PENDING_FILE="$d/pending.json"
+  UG_VENV="$d/venv"
+  UG_VERSION_CMD="cat $d/version"
+  UG_INSTALL_CMD='printf %s {target} > '"$d"'/version'
+  UG_PATCH_CMD='echo patch-{target} >> '"$d"'/calls'
+  UG_RESTART_CMD='echo restart >> '"$d"'/calls'
+  ( do_pre_restart ) > "$d/out.log" 2>&1
+  rc=$?
+  SC_ID="T9"
+  st_begin T9 "pre-restart happy path (install -> patch -> pending -> restart)"
+  st_check "exit" "0" "$rc"
+  st_check "target installed" "2.2.2" "$(cat "$d/version" 2>/dev/null)"
+  if grep -q '"old": "2.2.1"' "$d/pending.json" 2>/dev/null \
+      && grep -q '"target": "2.2.2"' "$d/pending.json" 2>/dev/null \
+      && grep -q '"job_id": "upg-selftest-t9"' "$d/pending.json" 2>/dev/null; then
+    printf 'pok' > "$d/pchk"
+  else
+    printf 'pbad' > "$d/pchk"
+  fi
+  st_check "pending fields" "pok" "$(cat "$d/pchk" 2>/dev/null)"
+  if grep -q '"phase": "boot-check"' "$d/state.json" 2>/dev/null \
+      && grep -q '"state": "running"' "$d/state.json" 2>/dev/null; then
+    printf 'sok' > "$d/schk"
+  else
+    printf 'sbad' > "$d/schk"
+  fi
+  st_check "state phase=boot-check" "sok" "$(cat "$d/schk" 2>/dev/null)"
+  st_check "first call = patch" "patch-2.2.2" "$(head -n1 "$d/calls" 2>/dev/null | tr -d '[:space:]')"
+  st_check "last call = restart" "restart" "$(tail -n1 "$d/calls" 2>/dev/null | tr -d '[:space:]')"
+  st_grep "SUMMARY" "$d/out.log" "SUMMARY: status=ok phase=pre-restart old=2.2.1 target=2.2.2"
+  st_end T9 "pre-restart happy path"
+
+  # ============ T10 boot-check mismatch -> rollback (phase 2, no restart) ============
+  d="$tmp/T10"; mkdir -p "$d"
+  printf '2.2.1' > "$d/version"   # venv reports the OLD version: mismatch
+  PHASE="boot-check"; TARGET=""; CHECKER=""; SKIP_CHECK=1; BACKEND="in-container"
+  RECORD_FILE=""
+  PENDING_FILE="$d/pending.json"; STATE_FILE="$d/state.json"
+  UG_VENV="$d/venv"
+  printf '{"job_id": "upg-selftest-t10", "old": "2.2.1", "target": "2.2.2", "venv": "/fake/venv"}\n' > "$d/pending.json"
+  UG_VERSION_CMD="cat $d/version"
+  UG_INSTALL_CMD='printf %s {target} > '"$d"'/version'
+  UG_PATCH_CMD='echo patch >> '"$d"'/calls'
+  UG_RESTART_CMD='echo RESTART-CALLED >> '"$d"'/calls; exit 1'
+  ( do_boot_check ) > "$d/out.log" 2>&1
+  rc=$?
+  SC_ID="T10"
+  st_begin T10 "boot-check mismatch -> rollback (no restart)"
+  st_check "exit (boot-check always 0 once handled)" "0" "$rc"
+  st_check "version restored to old" "2.2.1" "$(cat "$d/version" 2>/dev/null)"
+  if [ -e "$d/pending.json" ]; then printf 'present' > "$d/eck"; else printf 'absent' > "$d/eck"; fi
+  st_check "pending removed after rollback" "absent" "$(cat "$d/eck" 2>/dev/null)"
+  if grep -q '"state": "rolled_back"' "$d/state.json" 2>/dev/null; then printf 'sok' > "$d/schk"; else printf 'sbad' > "$d/schk"; fi
+  st_check "state=rolled_back" "sok" "$(cat "$d/schk" 2>/dev/null)"
+  if grep -q 'RESTART-CALLED' "$d/calls" 2>/dev/null; then printf 'present' > "$d/rck"; else printf 'absent' > "$d/rck"; fi
+  st_check "restart never called" "absent" "$(cat "$d/rck" 2>/dev/null)"
+  st_grep "SUMMARY" "$d/out.log" "SUMMARY: status=rolled_back phase=boot-check old=2.2.1 target=2.2.2 reason=version-mismatch"
+  st_end T10 "boot-check mismatch -> rollback"
+
+  # ============ T11 boot-check no-op (no pending.json) ============
+  d="$tmp/T11"; mkdir -p "$d"
+  PHASE="boot-check"; TARGET=""; CHECKER=""; BACKEND="in-container"
+  PENDING_FILE="$d/pending.json"; STATE_FILE="$d/state.json"
+  UG_VENV="$d/venv"
+  UG_VERSION_CMD="true"; UG_INSTALL_CMD="true"; UG_RESTART_CMD="true"
+  ( do_boot_check ) > "$d/out.log" 2>&1
+  rc=$?
+  SC_ID="T11"
+  st_begin T11 "boot-check no-op (no pending.json)"
+  st_check "exit" "0" "$rc"
+  st_grep "nothing to do" "$d/out.log" "nothing to do"
+  st_end T11 "boot-check no-op"
+
   log "selftest: tmp dir kept at $tmp (not removed automatically)"
   if [ "$SELFTEST_TOTAL_FAIL" -eq 0 ]; then
-    echo "SELFTEST: 8/8 PASS"
+    echo "SELFTEST: 11/11 PASS"
     return 0
   fi
-  echo "SELFTEST: $SELFTEST_TOTAL_FAIL/8 scenarios FAIL"
+  echo "SELFTEST: $SELFTEST_TOTAL_FAIL/11 scenarios FAIL"
   return 1
 }
 
@@ -635,9 +1017,17 @@ Options:
                         must stay alive and version-stable for this long; it
                         catches a delayed wrapper crash the raw version
                         endpoint (served by the app subprocess) would not reveal
+  --phase PH            full (default, original flow) | pre-restart | boot-check
+  --job-id ID           job id (required for pre-restart; boot-check takes it
+                        from pending.json when omitted)
+  --state-file PATH     state file for pre-restart/boot-check (default
+                        $QWENPAW_WORKING_DIR/upgrade/upgrade-<job-id>.json)
+  --pending-file PATH   pending.json (default $QWENPAW_WORKING_DIR/upgrade/pending.json)
+  --force-rollback      boot-check only: roll back even if the version matches
   --record-file PATH    write a JSON version record after a successful upgrade
                         (verified, then recorded)
   --dry-run             print the resolved commands only; no install/restart/health gate
+                        (full phase only)
   --selftest            run the built-in stubbed battery (7 scenarios, no real actions)
   -h, --help            this help
 
@@ -684,6 +1074,23 @@ parse_args() {
         [ $# -ge 2 ] || { err "--restart-mode missing value"; exit 2; }
         RESTART_MODE="$2"; shift 2 ;;
       --restart-mode=*) RESTART_MODE="${1#*=}"; shift ;;
+      --phase)
+        [ $# -ge 2 ] || { err "--phase missing value"; exit 2; }
+        PHASE="$2"; shift 2 ;;
+      --phase=*)    PHASE="${1#*=}"; shift ;;
+      --job-id)
+        [ $# -ge 2 ] || { err "--job-id missing value"; exit 2; }
+        JOB_ID="$2"; shift 2 ;;
+      --job-id=*)   JOB_ID="${1#*=}"; shift ;;
+      --state-file)
+        [ $# -ge 2 ] || { err "--state-file missing value"; exit 2; }
+        STATE_FILE="$2"; shift 2 ;;
+      --state-file=*) STATE_FILE="${1#*=}"; shift ;;
+      --pending-file)
+        [ $# -ge 2 ] || { err "--pending-file missing value"; exit 2; }
+        PENDING_FILE="$2"; shift 2 ;;
+      --pending-file=*) PENDING_FILE="${1#*=}"; shift ;;
+      --force-rollback) FORCE_ROLLBACK=1; shift ;;
       --timeout)
         [ $# -ge 2 ] || { err "--timeout missing value"; exit 2; }
         TIMEOUT="$2"; shift 2 ;;
@@ -709,6 +1116,16 @@ main() {
     exit $?
   fi
 
+  # ---------- phase validation ----------
+  case "$PHASE" in
+    full|pre-restart|boot-check) ;;
+    *) err "invalid --phase '$PHASE' (expected: full | pre-restart | boot-check)"; exit 2 ;;
+  esac
+  if [ -n "$CONTAINER" ] && [ "$PHASE" != "full" ]; then
+    err "--container (docker backend) only supports --phase full; two-phase runs in-container"
+    exit 2
+  fi
+
   # ---------- backend mode ----------
   if [ -n "$CONTAINER" ]; then
     BACKEND="docker"
@@ -716,16 +1133,33 @@ main() {
       || { err "docker backend requires the docker CLI on the host"; exit 2; }
   fi
 
-  [ -n "$TARGET" ] || { err "--target is required"; usage; exit 2; }
+  # boot-check takes its target from pending.json; the other phases need it
+  if [ "$PHASE" != "boot-check" ]; then
+    [ -n "$TARGET" ] || { err "--target is required"; usage; exit 2; }
+  fi
+  if [ "$PHASE" = "pre-restart" ] && [ -z "$JOB_ID" ]; then
+    err "pre-restart phase requires --job-id (plus --state-file/--pending-file from the plugin)"
+    exit 2
+  fi
   case "$TIMEOUT" in
     ''|*[!0-9]*) err "--timeout must be a positive integer (got '$TIMEOUT')"; exit 2 ;;
   esac
   [ "$TIMEOUT" -ge 1 ] || { err "--timeout must be >= 1"; exit 2; }
 
+  # two-phase file defaults (the full phase ignores both)
+  [ -n "$PENDING_FILE" ] || PENDING_FILE="${QWENPAW_WORKING_DIR:-.}/upgrade/pending.json"
+  if [ -z "$STATE_FILE" ] && [ -n "$JOB_ID" ] && [ "$PHASE" != "full" ]; then
+    STATE_FILE="${QWENPAW_WORKING_DIR:-.}/upgrade/upgrade-$JOB_ID.json"
+  fi
+
   resolve_defaults
 
   # ---------- dry-run: print only, do not execute ----------
   if [ "$DRY_RUN" -eq 1 ]; then
+    if [ "$PHASE" != "full" ]; then
+      err "--dry-run is only supported for the full phase"
+      exit 2
+    fi
     log "dry-run: printing the resolved commands only (no install/restart/health gate)"
     if [ "$BACKEND" = "docker" ]; then
       log "  backend : docker (container=$CONTAINER)"
@@ -747,14 +1181,31 @@ main() {
     exit 0
   fi
 
-  do_upgrade
+  case "$PHASE" in
+    full)        do_upgrade ;;
+    pre-restart) do_pre_restart ;;
+    boot-check)  do_boot_check ;;
+  esac
 }
 
 # Default resolution (env hooks win); shared by main and selftest
 resolve_defaults() {
+  if [ -z "$WHEELHOUSE_DIR" ]; then
+    WHEELHOUSE_DIR="${UG_WHEELHOUSE:-${QWENPAW_WORKING_DIR:-.}/upgrade/wheelhouse}"
+  fi
   case "$RESTART_MODE" in
     supervisorctl) DEFAULT_RESTART="supervisorctl restart app" ;;
-    kill)          DEFAULT_RESTART='pkill -9 -f "qwenpaw app"' ;;
+    # The worker is two processes: the qwenpaw-worker wrapper (PID 1) blocks on
+    # the qwenpaw app child (the 8088 server). Killing the app makes the
+    # wrapper's wait() return and the wrapper exits, so the container stops and
+    # the runtime (restart policy / K8s) restarts it -> entrypoint runs the
+    # boot-check (phase 2). The slim image has no ps/pkill, so scan /proc. The
+    # cmdline is NUL-separated, so "qwenpaw" and "app" are separate fields —
+    # convert NULs to spaces first, then match the server's distinctive
+    # "qwenpaw app --host" (the wrapper's cmdline is "qwenpaw-worker", no
+    # "app --host"). Exclude $$ so this shell (which carries the pattern in its
+    # own cmdline) is not killed.
+    kill)          DEFAULT_RESTART='for d in /proc/[0-9]*; do [ -r "$d/cmdline" ] || continue; p=$(basename "$d"); [ "$p" = "$$" ] && continue; c=$(tr "\0" " " < "$d/cmdline" 2>/dev/null); case "$c" in *"qwenpaw app --host"*) kill -9 "$p" 2>/dev/null; break;; esac; done' ;;
     *)             err "invalid --restart-mode: '$RESTART_MODE' (expected supervisorctl | kill)"; exit 2 ;;
   esac
 
@@ -789,7 +1240,14 @@ resolve_defaults() {
     # after a wrapper crash the container is stopped, so start it first.
     [ -n "$UG_PRE_INSTALL_CMD" ] || UG_PRE_INSTALL_CMD='if [ "$(docker inspect -f "{{.State.Running}}" '"$CONTAINER"' 2>/dev/null)" != "true" ]; then echo "[upgrade] pre-install: container not running, starting it"; docker start '"$CONTAINER"'; fi'
   else
-    [ -n "$UG_VERSION_CMD" ] || UG_VERSION_CMD="curl -fsS $VERSION_ENDPOINT || $UG_VENV/bin/qwenpaw --version"
+    if [ "$PHASE" = "boot-check" ]; then
+      # The app is not up yet at boot-check time (this runs before
+      # `exec qwenpaw-worker`): read the version from the venv metadata
+      # directly instead of probing the live API.
+      [ -n "$UG_VERSION_CMD" ] || UG_VERSION_CMD="$UG_VENV/bin/python -c 'import importlib.metadata as m; print(m.version(\"qwenpaw\"))'"
+    else
+      [ -n "$UG_VERSION_CMD" ] || UG_VERSION_CMD="curl -fsS $VERSION_ENDPOINT || $UG_VENV/bin/qwenpaw --version"
+    fi
     if [ -n "$UG_UV" ]; then
       [ -n "$UG_INSTALL_CMD" ] || UG_INSTALL_CMD="VIRTUAL_ENV=$UG_VENV $UG_UV pip install --reinstall-package qwenpaw qwenpaw=={target}"
     else
@@ -812,7 +1270,14 @@ resolve_defaults() {
     fi
   fi
   if [ -n "$CHECKER" ] && [ "$SKIP_CHECK" -eq 0 ] && [ -z "$UG_CHECKER_CMD" ]; then
-    UG_CHECKER_CMD="python3 $CHECKER --target {target} --in-place"
+    if [ "$PHASE" = "pre-restart" ]; then
+      # venv python (the system python has no qwenpaw_worker) and the
+      # wheelhouse: C3 is MANDATORY in pre-restart (a missing wheel is a FAIL,
+      # and the app cannot download after the restart).
+      UG_CHECKER_CMD="$UG_VENV/bin/python $CHECKER --target {target} --in-place --wheelhouse $WHEELHOUSE_DIR"
+    else
+      UG_CHECKER_CMD="python3 $CHECKER --target {target} --in-place"
+    fi
   fi
 }
 

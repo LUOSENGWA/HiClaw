@@ -100,10 +100,12 @@ RUN mkdir -p /opt/agentteams/plugins
 COPY dist/adapters/qwenpaw/teamharness-qwenpaw.zip /opt/agentteams/plugins/teamharness-qwenpaw.zip
 COPY dist/adapters/qwenpaw/workerflow-qwenpaw.zip /opt/agentteams/plugins/workerflow-qwenpaw.zip
 COPY plugins/agentteams-matrix-channel/ /opt/agentteams/plugins/agentteams-matrix-channel/
+COPY plugins/agentteams-upgrade/ /opt/agentteams/plugins/agentteams-upgrade/
 COPY qwenpaw/scripts/install-builtin-qwenpaw-plugins.py /tmp/install-builtin-qwenpaw-plugins.py
 RUN /opt/venv/qwenpaw/bin/python /tmp/install-builtin-qwenpaw-plugins.py \
         --working-dir /opt/agentteams/qwenpaw-builtin \
         /opt/agentteams/plugins/agentteams-matrix-channel \
+        /opt/agentteams/plugins/agentteams-upgrade \
         /opt/agentteams/plugins/teamharness-qwenpaw.zip \
         /opt/agentteams/plugins/workerflow-qwenpaw.zip \
     && rm -f /tmp/install-builtin-qwenpaw-plugins.py
@@ -125,6 +127,11 @@ RUN chmod +x /opt/agentteams/scripts/lib/mc-wrapper.sh && \
 # orchestrator re-applies it after an S3 package swap (the pristine wheel does
 # not carry the fix). The build-time run below applies it for the 2.2.1 image.
 COPY qwenpaw/scripts/patch-qwenpaw-driver-policy-reload.py /opt/agentteams/scripts/patch-qwenpaw-driver-policy-reload.py
+# In-place runtime upgrade: two-phase orchestrator + checker CLI, kept next to
+# the patch script so the orchestrator's `$(dirname $0)` resolution finds both
+# the patch (re-applied after an S3 package swap) and the checker.
+COPY --chmod=755 qwenpaw/scripts/upgrade_qwenpaw_runtime.sh /opt/agentteams/scripts/upgrade_qwenpaw_runtime.sh
+COPY --chmod=755 qwenpaw/scripts/check_qwenpaw_upgrade.py /opt/agentteams/scripts/check_qwenpaw_upgrade.py
 COPY qwenpaw/tests/check_driver_policy_reload.py /tmp/check_driver_policy_reload.py
 RUN /opt/venv/qwenpaw/bin/python /opt/agentteams/scripts/patch-qwenpaw-driver-policy-reload.py && \
     /opt/venv/qwenpaw/bin/python /tmp/check_driver_policy_reload.py && \

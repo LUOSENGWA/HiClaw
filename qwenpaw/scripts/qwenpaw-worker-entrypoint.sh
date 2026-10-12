@@ -118,4 +118,23 @@ log "  QwenPaw working dir: ${QWENPAW_WORKING_DIR}"
 log "  QwenPaw venv: ${VENV}"
 log "  Console port: ${CONSOLE_PORT}"
 
+# In-place runtime upgrade, phase 2 (design doc §4.8): phase 1 (pre-restart)
+# kills the app to restart it after the package swap, leaving pending.json
+# when it succeeded. Verify the installed version before exec'ing the app:
+# target reached -> success; otherwise reinstall the old version (rollback).
+# boot-check always exits 0 once handled (result lands in the job state
+# file), and an unexpected non-zero exit must never block startup.
+PENDING_UPGRADE="${QWENPAW_WORKING_DIR}/upgrade/pending.json"
+if [ -f "${PENDING_UPGRADE}" ] && [ -f /opt/agentteams/scripts/upgrade_qwenpaw_runtime.sh ]; then
+    log "Pending in-place upgrade found: running boot-check before startup..."
+    if bash /opt/agentteams/scripts/upgrade_qwenpaw_runtime.sh \
+            --phase boot-check \
+            --venv "${VENV}" \
+            --pending-file "${PENDING_UPGRADE}"; then
+        log "Upgrade boot-check completed"
+    else
+        log "WARNING: upgrade boot-check exited $?; continuing startup"
+    fi
+fi
+
 exec "${VENV}/bin/qwenpaw-worker" "${CMD_ARGS[@]}"
