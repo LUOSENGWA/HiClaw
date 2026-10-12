@@ -814,6 +814,12 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install the checker's version-parsing dependency
+        # The pre-flight checker imports `packaging` (version comparison); a
+        # bare setup-python runner does not ship it, so install it before the
+        # offline suite runs.
+        run: python3 -m pip install --quiet packaging
+
       - name: Run the offline pre-flight suite
         run: python3 qwenpaw/tests/test_check_qwenpaw_upgrade.py
 
