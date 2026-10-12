@@ -1326,3 +1326,60 @@ func (f *fakeTeamMatrix) seedOwnedRoom(roomID, uid string) {
 	f.roomCreators[roomID] = uid
 	f.members[roomID] = append(f.members[roomID], matrix.RoomMember{UserID: uid, Membership: "join"})
 }
+
+// IsUserInRoom is the membership guard behind the #1079 force-leave flood fix.
+// It reuses observedRoomMembership (homeserver-admin token, counts "join"
+// only) and — on a lookup error — conservatively reports true so the removal
+// path stays reachable instead of stranding an unwanted member.
+func TestIsUserInRoom_MembershipGuard(t *testing.T) {
+	ctx := context.Background()
+	room := "!room-dev:matrix.local"
+	manager := "@manager:matrix.local"
+
+	newProv := func(f *fakeTeamMatrix) *Provisioner {
+		return NewProvisioner(ProvisionerConfig{
+			Matrix:   f,
+			Creds:    fakeCredentialStore{},
+			OSSAdmin: &fakeStorageAdmin{},
+		})
+	}
+
+	// Manager present (join) → true.
+	t.Run("present", func(t *testing.T) {
+		f := newFakeTeamMatrix()
+		f.members[room] = []matrix.RoomMember{{UserID: manager, Membership: "join"}}
+		got, err := newProv(f).IsUserInRoom(ctx, room, manager)
+		if err != nil {
+			t.Fatalf("IsUserInRoom: %v", err)
+		}
+		if !got {
+			t.Errorf("Manager in room (join) → want true, got false")
+		}
+	})
+
+	// Manager absent (only another member joined) → false.
+	t.Run("absent", func(t *testing.T) {
+		f := newFakeTeamMatrix()
+		f.members[room] = []matrix.RoomMember{{UserID: "@alice:matrix.local", Membership: "join"}}
+		got, err := newProv(f).IsUserInRoom(ctx, room, manager)
+		if err != nil {
+			t.Fatalf("IsUserInRoom: %v", err)
+		}
+		if got {
+			t.Errorf("Manager not in room → want false, got true")
+		}
+	})
+
+	// Lookup error → conservative true (removal path stays reachable).
+	t.Run("lookup_error_conservative_true", func(t *testing.T) {
+		f := newFakeTeamMatrix()
+		f.listErrs[room] = errors.New("homeserver unavailable")
+		got, err := newProv(f).IsUserInRoom(ctx, room, manager)
+		if err == nil {
+			t.Fatalf("want lookup error propagated, got nil")
+		}
+		if !got {
+			t.Errorf("lookup error → want conservative true, got false")
+		}
+	})
+}

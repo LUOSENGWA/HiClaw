@@ -81,6 +81,14 @@ type WorkerProvisioner interface {
 	// ForceLeaveRoom removes a user whose room power level prevents a normal
 	// admin kick.
 	ForceLeaveRoom(ctx context.Context, userID, roomID string) error
+
+	// IsUserInRoom reports whether userID is currently a member of roomID,
+	// queried with the homeserver-admin token (authoritative regardless of
+	// the caller's own membership). Reconcile paths guard a ForceLeaveRoom
+	// with it so the removal is skipped when already satisfied — re-firing a
+	// fire-and-forget force-leave every reconcile floods the admin room
+	// (#1079).
+	IsUserInRoom(ctx context.Context, roomID, userID string) (bool, error)
 	MatrixAppServiceEnabled() bool
 }
 

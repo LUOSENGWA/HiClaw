@@ -370,6 +370,64 @@ func TestReconcileManagerAccessRemovesManagerFromTeamWorkerRoom(t *testing.T) {
 	}
 }
 
+// #1079: the Manager is not supposed to be in a team worker's personal room, so
+// in the steady state it is already out. The reconcile must then skip the
+// force-leave entirely — re-firing a fire-and-forget force-leave on every
+// reconcile is what floods the admin room.
+func TestReconcileManagerAccessSkipsForceLeaveWhenManagerAbsent(t *testing.T) {
+	ctx := context.Background()
+	worker := &v1beta1.Worker{
+		ObjectMeta: metav1.ObjectMeta{Name: "dev", Namespace: "default"},
+		Status:     v1beta1.WorkerStatus{RoomID: "!room-dev:matrix.local"},
+	}
+	team := &v1beta1.Team{
+		ObjectMeta: metav1.ObjectMeta{Name: "team-a", Namespace: "default"},
+		Spec: v1beta1.TeamSpec{WorkerMembers: []v1beta1.TeamWorkerRef{
+			{Name: "lead", Role: RoleTeamLeader.String()},
+			{Name: "dev", Role: RoleTeamWorker.String()},
+		}},
+	}
+	rig := newWorkerRig(t, worker.DeepCopy(), team.DeepCopy())
+	rig.r.ManagerConfig, _ = newTestManagerConfig(t)
+	rig.provisioner.IsUserInRoomFn = func(context.Context, string, string) (bool, error) {
+		return false, nil // Manager already out of the room (steady state)
+	}
+
+	rig.r.reconcileManagerAccess(ctx, worker, MemberContext{RuntimeName: "dev"}, &MemberState{})
+
+	if got := rig.provisioner.Calls.ForceLeaveRoom; len(got) != 0 {
+		t.Fatalf("ForceLeaveRoom calls=%+v, want none (Manager absent, #1079 guard)", got)
+	}
+}
+
+// #1079: when the Manager is actually in the worker's personal room, the
+// reconcile still removes it (the guard only skips the already-satisfied case).
+func TestReconcileManagerAccessForceLeavesWhenManagerPresent(t *testing.T) {
+	ctx := context.Background()
+	worker := &v1beta1.Worker{
+		ObjectMeta: metav1.ObjectMeta{Name: "dev", Namespace: "default"},
+		Status:     v1beta1.WorkerStatus{RoomID: "!room-dev:matrix.local"},
+	}
+	team := &v1beta1.Team{
+		ObjectMeta: metav1.ObjectMeta{Name: "team-a", Namespace: "default"},
+		Spec: v1beta1.TeamSpec{WorkerMembers: []v1beta1.TeamWorkerRef{
+			{Name: "lead", Role: RoleTeamLeader.String()},
+			{Name: "dev", Role: RoleTeamWorker.String()},
+		}},
+	}
+	rig := newWorkerRig(t, worker.DeepCopy(), team.DeepCopy())
+	rig.r.ManagerConfig, _ = newTestManagerConfig(t)
+	rig.provisioner.IsUserInRoomFn = func(context.Context, string, string) (bool, error) {
+		return true, nil // Manager is in the room — removal still happens
+	}
+
+	rig.r.reconcileManagerAccess(ctx, worker, MemberContext{RuntimeName: "dev"}, &MemberState{})
+
+	if got := rig.provisioner.Calls.ForceLeaveRoom; len(got) != 1 {
+		t.Fatalf("ForceLeaveRoom calls=%+v, want Manager removed (Manager present)", got)
+	}
+}
+
 func testWorkerDepsVolumes() []v1beta1.WorkerVolumeSpec {
 	return []v1beta1.WorkerVolumeSpec{{
 		Name: "agentteams-prod-001",

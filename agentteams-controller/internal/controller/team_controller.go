@@ -472,13 +472,20 @@ func (r *TeamReconciler) reconcileTeam(ctx context.Context, t *v1beta1.Team, pat
 		for _, rm := range members {
 			if rm.ref.Name != leaderRef.Name {
 				if rm.worker.Status.RoomID != "" {
-					if err := r.Provisioner.ForceLeaveRoom(
-						ctx,
-						managerMatrixID,
-						rm.worker.Status.RoomID,
-					); err != nil {
-						return r.failTeam(ctx, t, patchBase,
-							fmt.Sprintf("remove Manager from Worker %q personal room: %v", rm.ref.Name, err))
+					// #1079: skip the force-leave when the Manager is already out of
+					// the worker's personal room (the steady state) — re-firing a
+					// fire-and-forget force-leave on every team reconcile floods the
+					// admin room. IsUserInRoom reports true on a lookup error,
+					// keeping the removal (and this failTeam on a real error) reachable.
+					if inRoom, _ := r.Provisioner.IsUserInRoom(ctx, rm.worker.Status.RoomID, managerMatrixID); inRoom {
+						if err := r.Provisioner.ForceLeaveRoom(
+							ctx,
+							managerMatrixID,
+							rm.worker.Status.RoomID,
+						); err != nil {
+							return r.failTeam(ctx, t, patchBase,
+								fmt.Sprintf("remove Manager from Worker %q personal room: %v", rm.ref.Name, err))
+						}
 					}
 				}
 				if err := r.ManagerConfig.UpdateManagerGroupAllowFrom(r.ManagerConfig.MatrixUserID(rm.runtimeName), false); err != nil {

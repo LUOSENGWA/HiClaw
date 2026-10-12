@@ -493,12 +493,21 @@ func (r *WorkerReconciler) reconcileManagerAccess(ctx context.Context, w *v1beta
 		// TeamReconciler owns Team-scoped Manager access and channel policies.
 		if role != RoleTeamLeader {
 			if w.Status.RoomID != "" {
-				if err := r.Provisioner.ForceLeaveRoom(
-					ctx,
-					r.ManagerConfig.MatrixUserID("manager"),
-					w.Status.RoomID,
-				); err != nil {
-					logger.Error(err, "failed to remove Manager from Team worker personal room (non-fatal)", "worker", w.Name, "roomID", w.Status.RoomID)
+				// #1079: skip the force-leave when the Manager is already out of
+				// the worker's personal room (the steady state). ForceLeaveRoom is
+				// fire-and-forget, so re-firing it on every worker reconcile floods
+				// the admin room; IsUserInRoom is queried with the homeserver-admin
+				// token so it is authoritative, and reports true on a lookup error
+				// to keep the removal reachable.
+				managerMatrixID := r.ManagerConfig.MatrixUserID("manager")
+				if inRoom, _ := r.Provisioner.IsUserInRoom(ctx, w.Status.RoomID, managerMatrixID); inRoom {
+					if err := r.Provisioner.ForceLeaveRoom(
+						ctx,
+						managerMatrixID,
+						w.Status.RoomID,
+					); err != nil {
+						logger.Error(err, "failed to remove Manager from Team worker personal room (non-fatal)", "worker", w.Name, "roomID", w.Status.RoomID)
+					}
 				}
 			}
 			if err := r.ManagerConfig.UpdateManagerGroupAllowFrom(r.ManagerConfig.MatrixUserID(runtimeName), false); err != nil {
