@@ -127,6 +127,19 @@ func (r *WorkerReconciler) applyLlmStreamTimeoutsHot(ctx context.Context, w *v1b
 			log.FromContext(ctx).Error(err, "LLM stream timeout hot-apply failed, will retry on next reconcile", "worker", w.Name, "first", first, "idle", idle)
 			return
 		}
+		// Reset the keys the previous annotation applied that are no longer
+		// set (partial clearing). Without this, clearing one side while the
+		// other stays configured leaves the stale override in the running
+		// process and drops ownership of it — the annotation would claim only
+		// the survivor while the runtime still holds the cleared value.
+		for _, key := range appliedLlmStreamEnvKeys(applied) {
+			if _, stillSet := payload[key]; !stillSet {
+				if err := resetWorkerEnv(ctx, baseURL, key); err != nil {
+					log.FromContext(ctx).Error(err, "LLM stream timeout partial-clear reset failed, will retry on next reconcile", "worker", w.Name, "key", key)
+					return
+				}
+			}
+		}
 	}
 
 	base := w.DeepCopy()

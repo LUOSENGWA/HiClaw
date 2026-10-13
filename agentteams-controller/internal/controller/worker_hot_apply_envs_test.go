@@ -306,3 +306,122 @@ func TestApplyLlmStreamTimeoutsHotSkips(t *testing.T) {
 		t.Fatalf("skipped cases made %d requests, want 0 (%+v)", len(*reqs), *reqs)
 	}
 }
+
+// T7: partial clearing — clearing one key while the other stays configured
+// (resolved now "-:120") must PATCH the surviving key AND reset the cleared
+// one, so the stale override is not left in the runtime. Regression for the
+// case the upstream maintainer reproduced with the actual reconciler: an
+// applied annotation 300:120 followed by first="" idle="120" issued only
+// PATCH {idle:120} and stored "-:120" without ever POSTing a first-content
+// reset, leaving the old first override in the process and dropping ownership
+// of it.
+func TestApplyLlmStreamTimeoutsHotPartialClearFirst(t *testing.T) {
+	srv, reqs := newEnvsRecordingServer(t, http.StatusOK)
+	w := newEnvsTestWorker(map[string]string{annotationLlmStreamTimeoutsApplied: "300:120"})
+	r, key := newEnvsTestReconciler(t, srv.URL, w)
+
+	r.applyLlmStreamTimeoutsHot(context.Background(), w,
+		v1beta1.WorkerSpec{Runtime: "qwenpaw", LlmStreamIdleTimeout: "120"},
+		MemberContext{}, &MemberState{ContainerState: "running"})
+
+	var sawPatchIdle, sawResetFirst bool
+	for _, req := range *reqs {
+		switch {
+		case req.method == http.MethodPatch && req.path == "/api/envs":
+			if p := envsPayload(t, req.body); p[envLlmStreamIdleTimeout] == "120" {
+				sawPatchIdle = true
+			}
+		case req.method == http.MethodPost && req.path == "/api/envs/"+envLlmStreamFirstContentTimeout+"/reset":
+			sawResetFirst = true
+		}
+	}
+	if !sawPatchIdle {
+		t.Fatalf("missing PATCH idle=120 (surviving key): %+v", *reqs)
+	}
+	if !sawResetFirst {
+		t.Fatalf("partial clear must POST a first-content reset (stale override left in runtime): %+v", *reqs)
+	}
+	var stored v1beta1.Worker
+	if err := r.Client.Get(context.Background(), key, &stored); err != nil {
+		t.Fatalf("get worker: %v", err)
+	}
+	if got := stored.Annotations[annotationLlmStreamTimeoutsApplied]; got != "-:120" {
+		t.Fatalf("annotation = %q, want %q", got, "-:120")
+	}
+}
+
+// T8: partial clearing in the other direction — clearing idle while first
+// stays (resolved now "300:-") must PATCH first and reset idle.
+func TestApplyLlmStreamTimeoutsHotPartialClearIdle(t *testing.T) {
+	srv, reqs := newEnvsRecordingServer(t, http.StatusOK)
+	w := newEnvsTestWorker(map[string]string{annotationLlmStreamTimeoutsApplied: "300:120"})
+	r, key := newEnvsTestReconciler(t, srv.URL, w)
+
+	r.applyLlmStreamTimeoutsHot(context.Background(), w,
+		v1beta1.WorkerSpec{Runtime: "qwenpaw", LlmStreamFirstContentTimeout: "300"},
+		MemberContext{}, &MemberState{ContainerState: "running"})
+
+	var sawPatchFirst, sawResetIdle bool
+	for _, req := range *reqs {
+		switch {
+		case req.method == http.MethodPatch && req.path == "/api/envs":
+			if p := envsPayload(t, req.body); p[envLlmStreamFirstContentTimeout] == "300" {
+				sawPatchFirst = true
+			}
+		case req.method == http.MethodPost && req.path == "/api/envs/"+envLlmStreamIdleTimeout+"/reset":
+			sawResetIdle = true
+		}
+	}
+	if !sawPatchFirst {
+		t.Fatalf("missing PATCH first=300 (surviving key): %+v", *reqs)
+	}
+	if !sawResetIdle {
+		t.Fatalf("partial clear must POST an idle reset (stale override left in runtime): %+v", *reqs)
+	}
+	var stored v1beta1.Worker
+	if err := r.Client.Get(context.Background(), key, &stored); err != nil {
+		t.Fatalf("get worker: %v", err)
+	}
+	if got := stored.Annotations[annotationLlmStreamTimeoutsApplied]; got != "300:-" {
+		t.Fatalf("annotation = %q, want %q", got, "300:-")
+	}
+}
+
+// T9: partial-clearing failure/retry — when the surviving-key PATCH succeeds
+// but the cleared-key reset fails (500), the annotation must NOT be updated,
+// so the next reconcile retries the reset and the runtime never loses
+// ownership of an override it still holds.
+func TestApplyLlmStreamTimeoutsHotPartialClearResetFails(t *testing.T) {
+	// Sequenced server: first dial (PATCH) 200, then 500 (reset fails).
+	statuses := []int{http.StatusOK, http.StatusInternalServerError}
+	n := 0
+	reqs := &[]envsRequest{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		*reqs = append(*reqs, envsRequest{method: r.Method, path: r.URL.Path, body: string(b)})
+		st := statuses[n]
+		if n < len(statuses) {
+			n++
+		}
+		w.WriteHeader(st)
+	}))
+	t.Cleanup(srv.Close)
+
+	w := newEnvsTestWorker(map[string]string{annotationLlmStreamTimeoutsApplied: "300:120"})
+	r, key := newEnvsTestReconciler(t, srv.URL, w)
+
+	r.applyLlmStreamTimeoutsHot(context.Background(), w,
+		v1beta1.WorkerSpec{Runtime: "qwenpaw", LlmStreamIdleTimeout: "120"},
+		MemberContext{}, &MemberState{ContainerState: "running"})
+
+	if len(*reqs) != 2 {
+		t.Fatalf("requests = %d, want 2 (PATCH surviving key then reset cleared key): %+v", len(*reqs), *reqs)
+	}
+	var stored v1beta1.Worker
+	if err := r.Client.Get(context.Background(), key, &stored); err != nil {
+		t.Fatalf("get worker: %v", err)
+	}
+	if got := stored.Annotations[annotationLlmStreamTimeoutsApplied]; got != "300:120" {
+		t.Fatalf("annotation = %q after failed reset, want unchanged %q (retry on next reconcile)", got, "300:120")
+	}
+}
