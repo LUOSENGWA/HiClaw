@@ -172,6 +172,9 @@ func (h *CodingRunsHandler) ListCodingRuns(w http.ResponseWriter, r *http.Reques
 				break
 			}
 		}
+		if len(runs) >= codingRunsListCap {
+			break
+		}
 	}
 	httputil.WriteJSON(w, http.StatusOK, runs)
 }

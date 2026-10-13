@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -199,5 +200,36 @@ func TestGetCodingRun_NotFound(t *testing.T) {
 	rec := getRun(h, "t1", "run-20260101-000000.log", &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("missing run status = %d, want 404", rec.Code)
+	}
+}
+
+// TestListCodingRuns_CapIsGlobalAcrossTeams pins the list cap as GLOBAL across
+// the caller's visible prefixes, not per-prefix. Regression for the case the
+// upstream maintainer reproduced: two teams with codingRunsListCap runs each
+// returned 201 because the inner file/task loops broke at the cap but the
+// outer visible-prefix loop kept going into the next team's prefix. The break
+// must stop the outer traversal as well.
+func TestListCodingRuns_CapIsGlobalAcrossTeams(t *testing.T) {
+	store := ossfake.NewMemory()
+	// Two teams, each with exactly codingRunsListCap runs (one per task).
+	for i := 0; i < codingRunsListCap; i++ {
+		putRun(store, fmt.Sprintf("teams/alpha-team/shared/tasks/a%03d/workspace/coding-cli-logs/run-20261012-120000.log", i), "alpha")
+		putRun(store, fmt.Sprintf("teams/beta-team/shared/tasks/b%03d/workspace/coding-cli-logs/run-20261012-120000.log", i), "beta")
+	}
+	h := newCodingRunsTestHandler(t, store, team("alpha-team"), team("beta-team"))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/coding-runs", nil)
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ListCodingRuns(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var runs []codingRun
+	if err := json.Unmarshal(rec.Body.Bytes(), &runs); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(runs) != codingRunsListCap {
+		t.Fatalf("len(runs) = %d, want global cap %d (outer prefix loop must stop once the cap is reached)", len(runs), codingRunsListCap)
 	}
 }
