@@ -230,7 +230,9 @@ fi
 # 3. Create processing marker (TTL in minutes; must outlive the longest
 #    in-flight run or a second actor can enter the workspace mid-run —
 #    75 = 60-min run + sync/review slack)
-bash /opt/agentteams/agent/skills/task-coordination/scripts/create-processing-marker.sh "$task_id" "manager" 75
+# Generate a fresh ID for this operation; never reuse an ID from another marker.
+run_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+bash /opt/agentteams/agent/skills/task-coordination/scripts/create-processing-marker.sh "$task_id" "manager" 75 "$run_id"
 
 # 4. Save prompt to file
 timestamp=$(date +%Y%m%d-%H%M%S)
@@ -248,9 +250,8 @@ cli=$(jq -r '.cli' ~/coding-cli-config.json)
 # --timeout is the wall-clock bound for the run. Delegated coding runs are
 # routinely hour-plus (field data), so size for the long tail, not the common
 # case. Keep the .processing marker TTL above (step 3) longer than this.
-# --task-dir is the marker's home (task root) and --processor names this run,
-# so the wrapper's .processing guard treats the delegating flow's OWN marker
-# (created in step 3, processor=manager) as a legitimate run — not a conflict.
+# --task-dir locates your marker. Pass the same processor and unique run ID
+# used in step 3 so the wrapper can identify your own operation.
 task_dir="/root/agentteams-fs/shared/tasks/${task_id}"
 bash /opt/agentteams/agent/skills/coding-cli-management/scripts/run-coding-cli.sh \
   --cli "$cli" \
@@ -258,11 +259,12 @@ bash /opt/agentteams/agent/skills/coding-cli-management/scripts/run-coding-cli.s
   --prompt-file "$prompt_file" \
   --task-dir "$task_dir" \
   --processor "manager" \
+  --run-id "$run_id" \
   --timeout 3600
 exit_code=$?
 
 # 7. Remove processing marker
-bash /opt/agentteams/agent/skills/task-coordination/scripts/remove-processing-marker.sh "$task_id"
+bash /opt/agentteams/agent/skills/task-coordination/scripts/remove-processing-marker.sh "$task_id" "$run_id"
 
 # 8. On success (exit 0): push changes to MinIO
 if [ "$exit_code" -eq 0 ]; then

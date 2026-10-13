@@ -40,6 +40,7 @@ on:
       - 'manager/agent/skills/project-management/**'
       - 'manager/agent/skills/coding-cli-management/**'
       - 'manager/agent/worker-skills/coding-cli/**'
+      - 'manager/agent/skills/task-coordination/**'
       - 'tests/check-coding-cli-qoder-pat-processing.sh'
       - 'manager/scripts/init/start-manager-agent.sh'
       - 'manager/tests/test-manager-startup-recovery.sh'

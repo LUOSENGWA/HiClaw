@@ -59,14 +59,14 @@ out=$(HOME="$work/home" PATH="$work/bin:$PATH" bash "${DETECT}")
 task_root="$work/task-1"; ws="$task_root/workspace"; mkdir -p "$ws"
 prompt="$work/p.txt"; echo "do x" > "$prompt"
 fut() { date -u -d '+15 minutes' +%Y-%m-%dT%H:%M:%SZ; }
-mk_marker() { printf '{"processor":"%s","started_at":"%s","expires_at":"%s"}' "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" > "$task_root/.processing"; }
-run_cli() { ( PATH="$work/bin:$PATH" bash "${RUN}" --cli qodercli --workspace "$ws" --prompt-file "$prompt" "$@" >/dev/null 2>&1; echo $? ); }
+mk_marker() { jq -n --arg processor "$1" --arg expires "$2" --arg run_id "${3:-}" '{processor:$processor, expires_at:$expires, run_id:$run_id}' > "$task_root/.processing"; }
+run_cli() { ( set +e; PATH="$work/bin:$PATH" bash "${RUN}" --cli qodercli --workspace "$ws" --prompt-file "$prompt" "$@" >"$work/run.out" 2>&1; echo $? ); }
 
 # A. conflicting processor -> blocked (125)
 mk_marker alice "$(fut)"; got=$(run_cli --task-dir "$task_root" --processor bob)
 [ "$got" = "125" ] || { echo "FAIL: conflicting processor must be blocked (got $got, want 125)" >&2; exit 1; }
-# B. delegating flow's own marker (manager == manager) -> allowed (0)
-mk_marker manager "$(fut)"; got=$(run_cli --task-dir "$task_root" --processor manager)
+# B. your processor AND unique run ID match -> allowed (0)
+mk_marker manager "$(fut)" run-a; got=$(run_cli --task-dir "$task_root" --processor manager --run-id run-a)
 [ "$got" = "0" ] || { echo "FAIL: delegating flow's own marker must be allowed (got $got, want 0)" >&2; exit 1; }
 # C. undeclared caller with a marker present -> blocked (125)
 mk_marker manager "$(fut)"; got=$(run_cli --task-dir "$task_root")
@@ -77,5 +77,52 @@ mk_marker alice "2020-01-01T00:00:00Z"; got=$(run_cli --task-dir "$task_root" --
 # E. default task root (dirname of workspace) + conflicting marker -> blocked (125)
 mk_marker alice "$(fut)"; got=$(run_cli --processor bob)
 [ "$got" = "125" ] || { echo "FAIL: default task root (dirname workspace) must be honored (got $got, want 125)" >&2; exit 1; }
+
+# F. the same processor's DIFFERENT run must not inherit ownership
+mk_marker manager "$(fut)" run-a
+got=$(run_cli --task-dir "$task_root" --processor manager --run-id run-b)
+[ "$got" = "125" ] || { echo "FAIL: same processor with a different run ID must be blocked (got $got)" >&2; exit 1; }
+! grep -q 'Finished with exit code' "$work/run.out" || { echo "FAIL: conflicting run invoked the CLI" >&2; exit 1; }
+
+# G. a matching processor without its run ID is not the owner
+got=$(run_cli --task-dir "$task_root" --processor manager)
+[ "$got" = "125" ] || { echo "FAIL: an undeclared run must be blocked (got $got)" >&2; exit 1; }
+
+# H. a run ID does not permit impersonating another processor
+got=$(run_cli --task-dir "$task_root" --processor other --run-id run-a)
+[ "$got" = "125" ] || { echo "FAIL: a different processor must be blocked even with the run ID (got $got)" >&2; exit 1; }
+
+# I. legacy markers without run IDs cannot prove ownership
+printf '{"processor":"manager","expires_at":"%s"}' "$(fut)" > "$task_root/.processing"
+got=$(run_cli --task-dir "$task_root" --processor manager --run-id run-a)
+[ "$got" = "125" ] || { echo "FAIL: active legacy marker must be respected (got $got)" >&2; exit 1; }
+
+# J. no marker still permits old callers without ownership arguments
+rm -f "$task_root/.processing"
+got=$(run_cli)
+[ "$got" = "0" ] || { echo "FAIL: marker-free legacy call should work (got $got)" >&2; exit 1; }
+
+# Exercise the actual marker scripts with only their fixed filesystem root
+# redirected into the fixture; no production logic is replaced.
+mkdir -p "$work/shared/tasks"
+for script in create-processing-marker remove-processing-marker; do
+    sed "s|/root/agentteams-fs/shared/tasks/|$work/shared/tasks/|g" \
+        "$ROOT_DIR/manager/agent/skills/task-coordination/scripts/$script.sh" > "$work/$script.sh"
+done
+bash "$work/create-processing-marker.sh" ownership-test manager 15 run-a >/dev/null
+marker="$work/shared/tasks/ownership-test/.processing"
+[ "$(jq -r '.run_id' "$marker")" = run-a ] || { echo "FAIL: marker creator lost the run ID" >&2; exit 1; }
+mkdir -p "$work/shared/tasks/ownership-test/workspace"
+got=$(run_cli --workspace "$work/shared/tasks/ownership-test/workspace" \
+    --task-dir "$work/shared/tasks/ownership-test" --processor manager --run-id run-a)
+[ "$got" = 0 ] || { echo "FAIL: wrapper rejected the actual creator's marker (got $got)" >&2; exit 1; }
+got=$( (set +e; bash "$work/remove-processing-marker.sh" ownership-test run-b >/dev/null 2>&1; echo $?) )
+[ "$got" != 0 ] && [ -f "$marker" ] || { echo "FAIL: different run removed the marker" >&2; exit 1; }
+bash "$work/remove-processing-marker.sh" ownership-test run-a >/dev/null
+[ ! -f "$marker" ] || { echo "FAIL: owner could not remove its marker" >&2; exit 1; }
+bash "$work/create-processing-marker.sh" ownership-test manager 15 >/dev/null
+jq -e 'has("run_id") | not' "$marker" >/dev/null || { echo "FAIL: legacy marker format changed" >&2; exit 1; }
+bash "$work/remove-processing-marker.sh" ownership-test >/dev/null
+[ ! -f "$marker" ] || { echo "FAIL: legacy marker removal broke" >&2; exit 1; }
 
 echo "PASS: coding-cli Qoder PAT/QODER_CONFIG_DIR detection + .processing task-root ownership guard"

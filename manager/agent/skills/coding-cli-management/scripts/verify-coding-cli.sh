@@ -274,7 +274,7 @@ run_case_g() {
 # ROOT (create-processing-marker.sh), and the guard checks the task root with
 # ownership semantics. A marker held by ANOTHER processor must hard-fail the
 # run with exit 125 BEFORE the CLI is invoked; the delegating flow's OWN marker
-# (processor=manager, created before invoking the wrapper) must be ALLOWED so
+# (processor=manager and a matching unique run ID) must be ALLOWED so
 # that legitimate run stays possible. This is the code-level enforcement of the
 # SKILL's "check for processing marker" step: prompt discipline alone is not a
 # boundary (the 10-10 QC git-write incident is the standing evidence). The stub
@@ -309,10 +309,11 @@ GUARD_STUB
     fi
 
     # (h2) the delegating flow's OWN marker (processor=manager) -> allowed, CLI runs
-    printf '{"processor":"manager","started_at":"%s","expires_at":"%s"}' "${now}" "${fut}" > "${task_root}/.processing"
+    printf '{"processor":"manager","run_id":"verify-run","started_at":"%s","expires_at":"%s"}' "${now}" "${fut}" > "${task_root}/.processing"
     PATH="${SANDBOX}/bin:${PATH}" \
         bash "${RUN_SCRIPT}" --cli "${cli}" --workspace "${ws}" \
             --prompt-file "${PROMPT_FILE}" --task-dir "${task_root}" --processor "manager" \
+            --run-id "verify-run" \
             > "${SANDBOX}/prompts/case-h2.out" 2>&1
     rc=$?
     rm -f "${task_root}/.processing"
