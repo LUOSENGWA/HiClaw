@@ -118,23 +118,53 @@ log "  QwenPaw working dir: ${QWENPAW_WORKING_DIR}"
 log "  QwenPaw venv: ${VENV}"
 log "  Console port: ${CONSOLE_PORT}"
 
-# In-place runtime upgrade, phase 2 (design doc §4.8): phase 1 (pre-restart)
-# kills the app to restart it after the package swap, leaving pending.json
-# when it succeeded. Verify the installed version before exec'ing the app:
-# target reached -> success; otherwise reinstall the old version (rollback).
-# boot-check always exits 0 once handled (result lands in the job state
-# file), and an unexpected non-zero exit must never block startup.
+# In-place runtime upgrade (two-phase + post-start health gate, design doc
+# §4.8). Phase 1 (pre-restart) swaps the package and restarts the container,
+# leaving pending.json on success. Phase 2 (boot-check, below, before boot)
+# verifies the installed venv version: match -> pending RETAINED (the app is
+# not up yet, so this is only a pre-check); mismatch -> boot-check rolls back
+# to the old version. The post-start gate (after the app is up) is the real
+# arbiter: it verifies the running app serves the target version and stays
+# alive, removing pending on success and rolling back on failure — so a
+# package that installed fine but whose app fails to start is recovered
+# automatically. Both phases always exit 0 once handled (result in the job
+# state file); an unexpected non-zero exit must never block startup.
+UPGRADE_SH=/opt/agentteams/scripts/upgrade_qwenpaw_runtime.sh
 PENDING_UPGRADE="${QWENPAW_WORKING_DIR}/upgrade/pending.json"
-if [ -f "${PENDING_UPGRADE}" ] && [ -f /opt/agentteams/scripts/upgrade_qwenpaw_runtime.sh ]; then
+POST_START=0
+if [ -f "${PENDING_UPGRADE}" ] && [ -f "${UPGRADE_SH}" ]; then
     log "Pending in-place upgrade found: running boot-check before startup..."
-    if bash /opt/agentteams/scripts/upgrade_qwenpaw_runtime.sh \
-            --phase boot-check \
-            --venv "${VENV}" \
-            --pending-file "${PENDING_UPGRADE}"; then
+    if bash "${UPGRADE_SH}" --phase boot-check --venv "${VENV}" --pending-file "${PENDING_UPGRADE}"; then
         log "Upgrade boot-check completed"
+        # boot-check retained the pending file (venv matched the target), so
+        # the running app still has to be verified before the upgrade counts
+        # as a success.
+        if [ -f "${PENDING_UPGRADE}" ]; then
+            POST_START=1
+        fi
     else
         log "WARNING: upgrade boot-check exited $?; continuing startup"
     fi
 fi
 
-exec "${VENV}/bin/qwenpaw-worker" "${CMD_ARGS[@]}"
+# No pending upgrade left to verify: normal foreground start.
+if [ "${POST_START}" -ne 1 ]; then
+    exec "${VENV}/bin/qwenpaw-worker" "${CMD_ARGS[@]}"
+fi
+
+# Post-start verification: start the app in the background, run the health
+# gate (version/readiness/settle), then either keep the new runtime
+# (foreground) or let the orchestrator roll back (it reinstalls the old
+# version and restarts, which replaces our background process).
+log "Starting qwenpaw-worker in the background for post-start upgrade verification..."
+"${VENV}/bin/qwenpaw-worker" "${CMD_ARGS[@]}" &
+APP_PID=$!
+if bash "${UPGRADE_SH}" --phase post-start --venv "${VENV}" --pending-file "${PENDING_UPGRADE}"; then
+    log "Post-start verification passed; keeping the new runtime."
+    wait "${APP_PID}"
+else
+    log "Post-start verification failed; the orchestrator has rolled back."
+    kill "${APP_PID}" 2>/dev/null || true
+    wait "${APP_PID}" 2>/dev/null || true
+    exit 1
+fi

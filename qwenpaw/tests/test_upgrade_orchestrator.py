@@ -52,7 +52,7 @@ def test_orchestrator_selftest_all_green():
     assert "SELFTEST: 11/11 PASS" in proc.stdout
 
 
-def test_boot_check_success_removes_pending(tmp_path):
+def test_boot_check_success_retains_pending_for_post_start(tmp_path):
     d = tmp_path
     (d / "version").write_text("2.2.2\n")  # venv already reports the target
     pending = d / "pending.json"
@@ -70,11 +70,78 @@ def test_boot_check_success_removes_pending(tmp_path):
         env=_stub_env(d),
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "SUMMARY: status=ok phase=boot-check target=2.2.2" in proc.stdout
+    assert "SUMMARY: status=boot-check-passed phase=boot-check target=2.2.2" in proc.stdout
+    # The app is not up yet at boot-check time: pending is RETAINED and the
+    # state is the intermediate boot-check-passed (not success), so the
+    # entrypoint's post-start health gate remains the arbiter and a package
+    # that installed fine but whose app fails to start still rolls back.
+    assert pending.exists()
+    data = json.loads(state.read_text())
+    assert data["state"] == "boot-check-passed"
+
+
+def test_post_start_success_removes_pending(tmp_path):
+    d = tmp_path
+    (d / "version").write_text("2.2.2\n")  # running app serves the target
+    pending = d / "pending.json"
+    pending.write_text(json.dumps({
+        "job_id": "upg-20261012-000000-abcd",
+        "old": "2.2.1",
+        "target": "2.2.2",
+        "venv": str(d / "venv"),
+    }))
+    state = d / "state.json"
+    proc = run_bash(
+        f"bash {SCRIPT} --phase post-start --venv {d}/venv "
+        f"--pending-file {pending} --state-file {state} --timeout 5 --settle 0",
+        env=_stub_env(d, UG_ALIVE_CMD="echo running"),
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "SUMMARY: status=ok phase=post-start target=2.2.2" in proc.stdout
     assert not pending.exists()
     data = json.loads(state.read_text())
     assert data["state"] == "success"
-    assert data["finished_at"]
+
+
+def test_post_start_fail_rolls_back(tmp_path):
+    d = tmp_path
+    (d / "version").write_text("2.2.2\n")
+    calls = d / "calls"
+    pending = d / "pending.json"
+    pending.write_text(json.dumps({
+        "job_id": "upg-20261012-000000-ffff",
+        "old": "2.2.1",
+        "target": "2.2.2",
+        "venv": str(d / "venv"),
+    }))
+    state = d / "state.json"
+    env = _stub_env(
+        d,
+        # App failed to start: the version probe (which in-container hits the
+        # running app's /api/version, not pip show) cannot read a version, so
+        # the health gate times out. This is the shiyiyue scenario — a
+        # correctly installed package (venv reports the target at boot-check)
+        # whose app then fails to come up.
+        UG_VERSION_CMD="exit 1",
+        UG_ALIVE_CMD="echo not-alive",
+        UG_INSTALL_CMD=f'echo install-{{target}} >> {calls}; true',
+        UG_PATCH_CMD=f'echo patch-{{target}} >> {calls}; true',
+        UG_RESTART_CMD=f'echo restart >> {calls}; true',
+    )
+    proc = run_bash(
+        f"bash {SCRIPT} --phase post-start --venv {d}/venv "
+        f"--pending-file {pending} --state-file {state} --timeout 2 --settle 0",
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "SUMMARY: status=rolled_back phase=post-start" in proc.stdout
+    got = calls.read_text().splitlines()
+    assert "install-2.2.1" in got  # rollback reinstalled the old version
+    assert "patch-2.2.1" in got
+    assert "restart" in got        # post-start rollback restarts (app was up)
+    assert not pending.exists()
+    data = json.loads(state.read_text())
+    assert data["state"] == "rolled_back"
 
 
 def test_pre_restart_install_fail_rolls_back_without_restart(tmp_path):

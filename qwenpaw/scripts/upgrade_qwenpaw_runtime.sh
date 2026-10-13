@@ -612,10 +612,16 @@ do_boot_check() {
   log "boot-check: venv reports qwenpaw==$boot_version (target $TARGET)"
 
   if [ "$boot_version" = "$TARGET" ]; then
-    rm -f "$PENDING_FILE"
-    write_state state=success finished_at="$(now_ts)"
-    log "boot-check: SUCCESS - qwenpaw==$boot_version in place; pending removed"
-    echo "SUMMARY: status=ok phase=boot-check target=$TARGET"
+    # venv version matches the target, but the app is not up yet: boot-check
+    # runs before `exec qwenpaw-worker`. Do NOT remove pending or record
+    # success here — a correctly installed package whose app then fails to
+    # start would lose its recovery marker and any automatic health-triggered
+    # rollback. Retain pending and mark the intermediate state; the
+    # entrypoint's post-start health gate (version/readiness/settle) is the
+    # arbiter and rolls back on startup failure.
+    write_state state=boot-check-passed finished_at="" note="awaiting post-start health gate"
+    log "boot-check: venv version matches target; pending RETAINED for post-start health gate"
+    echo "SUMMARY: status=boot-check-passed phase=boot-check target=$TARGET"
     return 0
   fi
 
@@ -652,6 +658,77 @@ do_boot_check_rollback() {
   rm -f "$PENDING_FILE"
   log "boot-check: rolled back to $old; pending removed; continuing startup"
   echo "SUMMARY: status=rolled_back phase=boot-check old=$old target=$TARGET reason=$reason"
+  return 0
+}
+
+# Post-start health gate (run by the entrypoint AFTER `qwenpaw-worker` is up).
+# boot-check verified the installed venv version before boot; this verifies the
+# RUNNING app actually serves the target version and stays alive (settle
+# window). On success it removes pending and records success; on failure it
+# rolls back (reinstall old + patch + restart) so a correctly installed
+# package whose app then fails to start is recovered automatically instead of
+# being stranded without a recovery marker or an automatic rollback.
+do_post_start() {
+  log "phase=post-start venv=$UG_VENV pending=$PENDING_FILE"
+  if [ ! -f "$PENDING_FILE" ]; then
+    log "post-start: no pending upgrade ($PENDING_FILE missing), nothing to do"
+    return 0
+  fi
+  local pending_target pending_old
+  pending_target="$(pending_get target)"
+  pending_old="$(pending_get old)"
+  [ -n "$TARGET" ] || TARGET="$pending_target"
+  log "post-start: health gate for the running app, target=$TARGET"
+  if health_gate "$TARGET" "$TIMEOUT" "$SETTLE"; then
+    rm -f "$PENDING_FILE"
+    write_state state=success finished_at="$(now_ts)"
+    log "post-start: SUCCESS - health gate passed; pending removed"
+    echo "SUMMARY: status=ok phase=post-start target=$TARGET"
+    return 0
+  fi
+  err "post-start: health gate failed (want=$TARGET); rolling back to $pending_old"
+  do_post_start_rollback "$pending_old" "post-start-health-failed"
+  return 0
+}
+
+# post-start rollback: the app is up (possibly serving the new version), so
+# restoring the old version needs a restart to take effect. pending is KEPT on
+# failure (manual retry via --force-rollback).
+do_post_start_rollback() {
+  local old="$1"
+  local reason="${2:-post-start-health-failed}"
+  log "ROLLBACK (post-start): restoring $old (reason: $reason)"
+  write_state state=rolled_back finished_at="$(now_ts)" note="rollback:$reason"
+  if ! run_install "$old"; then
+    fatal_rollback_failed
+    err "post-start: FATAL restore failed; pending kept for manual retry (--force-rollback)"
+    echo "SUMMARY: status=rollback_failed old=$old target=$TARGET"
+    write_state state=rollback_failed
+    return 0
+  fi
+  if [ -n "$UG_PATCH_CMD" ]; then
+    pcmd="$(sub_target "$UG_PATCH_CMD" "$old")"
+    if ! bash -c "$pcmd"; then
+      fatal_rollback_failed
+      err "post-start: FATAL compat patch re-apply failed; pending kept for manual retry"
+      echo "SUMMARY: status=rollback_failed old=$old target=$TARGET"
+      write_state state=rollback_failed
+      return 0
+    fi
+  fi
+  if [ -n "$UG_RESTART_CMD" ]; then
+    rcmd="$(sub_target "$UG_RESTART_CMD" "$old")"
+    if ! bash -c "$rcmd"; then
+      fatal_rollback_failed
+      err "post-start: FATAL restart after rollback failed; pending kept for manual retry"
+      echo "SUMMARY: status=rollback_failed old=$old target=$TARGET"
+      write_state state=rollback_failed
+      return 0
+    fi
+  fi
+  rm -f "$PENDING_FILE"
+  log "post-start: rolled back to $old; pending removed"
+  echo "SUMMARY: status=rolled_back phase=post-start old=$old target=$TARGET reason=$reason"
   return 0
 }
 
@@ -1118,8 +1195,8 @@ main() {
 
   # ---------- phase validation ----------
   case "$PHASE" in
-    full|pre-restart|boot-check) ;;
-    *) err "invalid --phase '$PHASE' (expected: full | pre-restart | boot-check)"; exit 2 ;;
+    full|pre-restart|boot-check|post-start) ;;
+    *) err "invalid --phase '$PHASE' (expected: full | pre-restart | boot-check | post-start)"; exit 2 ;;
   esac
   if [ -n "$CONTAINER" ] && [ "$PHASE" != "full" ]; then
     err "--container (docker backend) only supports --phase full; two-phase runs in-container"
@@ -1133,8 +1210,9 @@ main() {
       || { err "docker backend requires the docker CLI on the host"; exit 2; }
   fi
 
-  # boot-check takes its target from pending.json; the other phases need it
-  if [ "$PHASE" != "boot-check" ]; then
+  # boot-check and post-start take their target from pending.json; the other
+  # phases need it
+  if [ "$PHASE" != "boot-check" ] && [ "$PHASE" != "post-start" ]; then
     [ -n "$TARGET" ] || { err "--target is required"; usage; exit 2; }
   fi
   if [ "$PHASE" = "pre-restart" ] && [ -z "$JOB_ID" ]; then
@@ -1185,6 +1263,7 @@ main() {
     full)        do_upgrade ;;
     pre-restart) do_pre_restart ;;
     boot-check)  do_boot_check ;;
+    post-start)  do_post_start ;;
   esac
 }
 
