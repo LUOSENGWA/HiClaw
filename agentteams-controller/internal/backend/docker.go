@@ -399,12 +399,17 @@ func (d *DockerBackend) execContainer(ctx context.Context, containerName string,
 
 // Exec implements WorkerExecBackend: runs a command in the worker
 // container and captures stdout/stderr and the exit code. Synchronous;
-// bounded by timeout.
+// bounded by a GNU timeout process inside the container (included in managed
+// Worker images). KILL targets the process group: TERM can leave an ignoring
+// child alive when its parent exits first. The HTTP deadline leaves time for
+// Docker to report completion before callers release installation busy state.
 func (d *DockerBackend) Exec(ctx context.Context, name string, command []string, timeout time.Duration) (string, string, int, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	seconds := strconv.FormatFloat(timeout.Seconds(), 'f', 9, 64) + "s"
+	command = append([]string{"timeout", "--signal=KILL", "--", seconds}, command...)
+	ctx, cancel := context.WithTimeout(ctx, timeout+2*time.Second)
 	defer cancel()
 	containerName := d.containerPrefix + name
 
@@ -484,6 +489,11 @@ func (d *DockerBackend) Exec(ctx context.Context, name string, command []string,
 	}
 	if inspected.Running {
 		return stdout, stderr, 0, fmt.Errorf("docker exec still running")
+	}
+	if inspected.ExitCode == 137 {
+		// Preserve the old timeout error contract: settings callers must not
+		// interpret an interrupted read as an absent file and overwrite it.
+		return stdout, stderr, inspected.ExitCode, fmt.Errorf("worker command timed out or was killed (exit 137)")
 	}
 	return stdout, stderr, inspected.ExitCode, nil
 }

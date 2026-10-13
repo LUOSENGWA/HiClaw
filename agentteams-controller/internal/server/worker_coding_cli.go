@@ -163,6 +163,8 @@ type CodingCliHandler struct {
 	tasks      map[string]*codingCliInstallTask
 	taskSeq    int
 	lastPrune  time.Time
+	// Protected by tasksMu; each entry covers the whole settings read/merge/write.
+	settingsBusy map[string]bool
 }
 
 type codingCliInstallTask struct {
@@ -446,6 +448,24 @@ func (h *CodingCliHandler) putCliSettings(w http.ResponseWriter, r *http.Request
 		httputil.WriteError(w, http.StatusBadRequest, "request body must be a JSON object: "+err.Error())
 		return
 	}
+
+	key := name + "/" + spec.ID
+	h.tasksMu.Lock()
+	if h.settingsBusy[key] {
+		h.tasksMu.Unlock()
+		httputil.WriteError(w, http.StatusConflict, "settings update already running; retry from the latest settings")
+		return
+	}
+	if h.settingsBusy == nil {
+		h.settingsBusy = make(map[string]bool)
+	}
+	h.settingsBusy[key] = true
+	h.tasksMu.Unlock()
+	defer func() {
+		h.tasksMu.Lock()
+		delete(h.settingsBusy, key)
+		h.tasksMu.Unlock()
+	}()
 
 	// Read current (may be absent) first: the "***" sentinel needs it to
 	// verify there is an existing value to keep.
@@ -810,10 +830,14 @@ func redactCodingCliNode(node interface{}) interface{} {
 }
 
 // isCodingCliCredentialKey reports whether a JSON key holds secret
-// material in coding-CLI settings. Mirrors the worker-side
-// CREDENTIAL_KEY_PATTERNS so the two redaction layers stay in sync.
+// material in coding-CLI settings. Includes the worker-side
+// CREDENTIAL_KEY_PATTERNS and authentication headers used by OpenCode.
 func isCodingCliCredentialKey(key string) bool {
 	k := strings.ToLower(key)
+	switch k {
+	case "authorization", "proxy-authorization", "cookie", "set-cookie":
+		return true
+	}
 	for _, p := range []string{"api_key", "apikey", "api-key", "token", "secret", "password", "access_key"} {
 		if strings.Contains(k, p) {
 			return true

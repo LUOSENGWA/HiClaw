@@ -361,8 +361,9 @@ type AuthTokenProjector interface {
 //
 // It powers the coding-CLI management surface (version probe, settings
 // read/write, CLI install), which must work for ANY worker runtime without
-// worker-side cooperation — the worker container only needs the CLI binary
-// and npm to exist, no worker-side router or image change.
+// worker-side cooperation — the worker container needs the CLI binary,
+// npm and GNU timeout (coreutils, included in managed Worker images), but
+// no worker-side router or image change.
 type WorkerExecBackend interface {
 	// Exec runs a command in the worker container and captures its
 	// output. Synchronous, bounded by timeout. The command runs as the
