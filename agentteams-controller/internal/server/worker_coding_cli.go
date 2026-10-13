@@ -354,12 +354,21 @@ func (h *CodingCliHandler) probeCLIAuth(ctx context.Context, eb codingCliExecer,
 			return map[string]interface{}{"configured": true, "method": "auth-file"}
 		}
 	}
-	// Settings dot-paths (qwen security.auth.apiKey).
+	// Settings credentials: Qwen's fixed path and OpenCode's provider API keys.
 	if _, _, exit, err := eb.Exec(ctx, name, []string{"sh", "-c", "test -f " + spec.SettingsPath}, codingCliExecTimeout); err == nil && exit == 0 {
 		out, _, cexit, cerr := eb.Exec(ctx, name, []string{"sh", "-c", "cat " + spec.SettingsPath}, codingCliExecTimeout)
 		if cerr == nil && cexit == 0 {
 			var doc map[string]interface{}
 			if json.Unmarshal([]byte(out), &doc) == nil {
+				if spec.ID == "opencode" {
+					providers, _ := doc["provider"].(map[string]interface{})
+					for _, value := range providers {
+						provider, _ := value.(map[string]interface{})
+						if key, ok := codingCliDotGet(provider, "options.apiKey").(string); ok && key != "" {
+							return map[string]interface{}{"configured": true, "method": "settings"}
+						}
+					}
+				}
 				for _, dp := range spec.AuthDotPaths {
 					if v := codingCliDotGet(doc, dp); v != nil {
 						if s, isStr := v.(string); !isStr || s != "" {
@@ -764,7 +773,7 @@ func codingCliSentinelsAt(current, incoming map[string]interface{}, prefix strin
 		switch vv := v.(type) {
 		case string:
 			if vv == "***" {
-				cur := codingCliDotGet(current, path)
+				cur := current[k]
 				if cur == nil {
 					return fmt.Errorf("sentinel \"***\" at %q has no existing value to keep", path)
 				}
@@ -775,7 +784,8 @@ func codingCliSentinelsAt(current, incoming map[string]interface{}, prefix strin
 				delete(incoming, k)
 			}
 		case map[string]interface{}:
-			if err := codingCliSentinelsAt(current, vv, path); err != nil {
+			child, _ := current[k].(map[string]interface{})
+			if err := codingCliSentinelsAt(child, vv, path); err != nil {
 				return err
 			}
 		}

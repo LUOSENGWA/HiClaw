@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -161,5 +162,117 @@ func TestCodingCliSettingsReadTimeoutDoesNotOverwrite(t *testing.T) {
 	}
 	if got, _ := exec.written(path); got != `{"keep":true}` {
 		t.Fatalf("timeout overwrote existing settings: %s", got)
+	}
+}
+
+func TestCodingCliOpenCodeSettingsAuthRoundTrip(t *testing.T) {
+	const path = "/root/.config/opencode/opencode.json"
+	exec := &fakeExecBackend{fileWrites: map[string]string{path: `{}`}}
+	exec.respond = func(cmd []string) (string, string, int, error) {
+		if cmd[0] == "opencode" {
+			return "1.19.0", "", 0, nil
+		}
+		if cmd[0] == "sh" {
+			switch {
+			case strings.Contains(cmd[2], "printf %s"):
+				return "/root", "", 0, nil
+			case strings.Contains(cmd[2], "test -f ~/.config/opencode/opencode.json"):
+				return "", "", 0, nil
+			case strings.Contains(cmd[2], "cat ~/.config/opencode/opencode.json"):
+				data, _ := exec.written(path)
+				return data, "", 0, nil
+			}
+		}
+		return "", "absent", 1, nil
+	}
+	h := newTestCodingCliHandler(t, "embedded", exec, nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+	rec := httptest.NewRecorder()
+	h.putCliSettings(rec, adminCaller(codingCliRequest(http.MethodPut, "/settings", `{"provider":{"team.gateway":{"options":{"apiKey":"synthetic-provider-key","baseURL":"https://example.invalid/v1"}}}}`, "name", "daily-carol", "cli", "opencode")))
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "synthetic-provider-key") {
+		t.Fatalf("PUT status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	h.listCLIs(rec, adminCaller(codingCliRequest(http.MethodGet, "/coding-cli", "", "name", "daily-carol")))
+	doc := decodeJSON(t, rec.Body.String())
+	oc := doc["opencode"].(map[string]interface{})
+	auth := oc["auth"].(map[string]interface{})
+	if oc["installed"] != true || auth["configured"] != true || auth["method"] != "settings" {
+		t.Fatalf("settings API key was not detected: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "synthetic-provider-key") {
+		t.Fatal("probe exposed the synthetic credential")
+	}
+}
+
+func TestCodingCliOpenCodeSettingsAuthPresence(t *testing.T) {
+	for _, tc := range []struct {
+		name, settings string
+		configured     bool
+	}{
+		{"empty-key", `{"provider":{"custom":{"options":{"apiKey":""}}}}`, false},
+		{"base-url-only", `{"provider":{"custom":{"options":{"baseURL":"https://example.invalid"}}}}`, false},
+		{"unrelated-key", `{"apiKey":"synthetic-metadata"}`, false},
+		{"multiple-providers", `{"provider":{"first":{"options":{}},"second.provider":{"options":{"apiKey":"synthetic-key"}}}}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec := &fakeExecBackend{}
+			exec.respond = func(cmd []string) (string, string, int, error) {
+				if strings.Contains(cmd[2], "test -f") {
+					return "", "", 0, nil
+				}
+				if strings.Contains(cmd[2], "cat ") {
+					return tc.settings, "", 0, nil
+				}
+				return "", "absent", 1, nil
+			}
+			h := newTestCodingCliHandler(t, "embedded", exec, nil)
+			spec, _ := codingCliSpecByID("opencode")
+			auth := h.probeCLIAuth(context.Background(), exec, "daily-carol", spec)
+			if auth["configured"] != tc.configured {
+				t.Fatalf("auth=%v, want configured=%v", auth, tc.configured)
+			}
+		})
+	}
+}
+
+func TestCodingCliDottedKeysKeepExistingSecret(t *testing.T) {
+	for _, tc := range []struct {
+		name, current string
+		status        int
+	}{
+		{"existing-literal-key", `{"provider":{"team.gateway":{"options":{"apiKey":"synthetic-existing"}}}}`, http.StatusOK},
+		{"nested-key-is-not-literal-key", `{"provider":{"team":{"gateway":{"options":{"apiKey":"synthetic-unrelated"}}}}}`, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec := &fakeExecBackend{fileWrites: map[string]string{}}
+			exec.respond = func(cmd []string) (string, string, int, error) {
+				if strings.Contains(cmd[2], "cat ") {
+					return tc.current, "", 0, nil
+				}
+				return "/root", "", 0, nil
+			}
+			h := newTestCodingCliHandler(t, "embedded", exec, nil, checkpointTeamWithWorkers("team-a", "daily-carol")...)
+			rec := httptest.NewRecorder()
+			h.putCliSettings(rec, adminCaller(codingCliRequest(http.MethodPut, "/settings", `{"provider":{"team.gateway":{"options":{"apiKey":"***","baseURL":"https://example.invalid/v1"}}}}`, "name", "daily-carol", "cli", "opencode")))
+			if rec.Code != tc.status {
+				t.Fatalf("status=%d want=%d body=%s", rec.Code, tc.status, rec.Body.String())
+			}
+			if tc.status != http.StatusOK {
+				if len(exec.fileWrites) != 0 {
+					t.Fatal("invalid sentinel wrote settings")
+				}
+				return
+			}
+			written, _ := exec.written("/root/.config/opencode/opencode.json")
+			doc := decodeJSON(t, written)
+			provider := doc["provider"].(map[string]interface{})["team.gateway"].(map[string]interface{})
+			options := provider["options"].(map[string]interface{})
+			if options["apiKey"] != "synthetic-existing" || options["baseURL"] != "https://example.invalid/v1" {
+				t.Fatalf("existing credential was not preserved: %s", written)
+			}
+			if strings.Contains(rec.Body.String(), "synthetic-existing") {
+				t.Fatal("PUT exposed the synthetic credential")
+			}
+		})
 	}
 }
