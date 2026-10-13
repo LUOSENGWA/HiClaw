@@ -5,7 +5,10 @@
 #
 # A CLI is "available" when its binary is on PATH AND at least one
 # config/auth surface exists:
-#   claude/gemini/qodercli : $HOME/.claude / $HOME/.gemini / $HOME/.qoder directory
+#   claude/gemini          : $HOME/.claude / $HOME/.gemini directory
+#   qodercli               : $QODER_CONFIG_DIR (default $HOME/.qoder) directory,
+#                            OR a non-empty QODER_PERSONAL_ACCESS_TOKEN (PAT)
+#                            env var — presence = configured, not verified
 #   qwen                   : $HOME/.qwen directory, OR env-based auth
 #   opencode                : $HOME/.config/opencode directory,
 #                             $HOME/.local/share/opencode/auth.json file
@@ -31,6 +34,9 @@
 #   opencode (per opencode.ai/docs/providers):
 #     OPENAI_API_KEY, ANTHROPIC_API_KEY, OPENROUTER_API_KEY,
 #     GEMINI_API_KEY, XAI_API_KEY
+# (qodercli's QODER_PERSONAL_ACCESS_TOKEN is checked separately as a non-empty
+#  -n test — not a names-only check — so an empty PAT is not "configured"; see
+#  the qodercli case below.)
 #
 # `details` records which surface(s) matched: config_source.dir,
 # config_source.share_file (opencode auth.json), config_source.env (array of
@@ -78,7 +84,22 @@ for cli in claude gemini qodercli qwen opencode; do
     case "$cli" in
         claude)   [ -d "$HOME/.claude" ]  && { config_ok=true; cfg_dir=true; } ;;
         gemini)   [ -d "$HOME/.gemini" ]  && { config_ok=true; cfg_dir=true; } ;;
-        qodercli) [ -d "$HOME/.qoder" ]   && { config_ok=true; cfg_dir=true; } ;;
+        qodercli)
+            # Qoder: config dir honors Qoder's QODER_CONFIG_DIR (default
+            # ~/.qoder); a NON-EMPTY QODER_PERSONAL_ACCESS_TOKEN is env-based
+            # PAT auth — an empty or unset value is NOT configured
+            # (docs.qoder.com/cli/authentication). Test -n on the variable
+            # directly (its value is never read into output) rather than
+            # env_names_set, which only tests the variable name and would treat
+            # an empty PAT as set. Matches the Worker-env flow (#1306) where the
+            # PAT is injected into the executing Worker without interactive login.
+            qoder_cfg_dir="${QODER_CONFIG_DIR:-$HOME/.qoder}"
+            [ -d "$qoder_cfg_dir" ] && { config_ok=true; cfg_dir=true; }
+            if [ -n "${QODER_PERSONAL_ACCESS_TOKEN:-}" ]; then
+                config_ok=true
+                env_found="QODER_PERSONAL_ACCESS_TOKEN"
+            fi
+            ;;
         qwen)
             [ -d "$HOME/.qwen" ] && { config_ok=true; cfg_dir=true; }
             env_found="$(env_names_set "$QWEN_ENV_NAMES")"

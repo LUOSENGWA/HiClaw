@@ -70,7 +70,7 @@ fi
 
 If a `.processing` marker exists, wait for the delegating agent to complete their operation before sending your request.
 
-The same rule is **enforced in code**, not just recommended: `run-coding-cli.sh` hard-fails with exit 125 before invoking any CLI when the workspace carries a `.processing` marker (the delegating agent's runner-side mirror of this check). So even if this step is skipped, a colliding run is blocked at the script layer — but skipping it still wastes a round-trip, so check first.
+The same marker check is **enforced in code**: `run-coding-cli.sh` exits 125 before invoking a CLI when the **task root** (`--task-dir`, default the workspace's parent) has an active marker that does not match both the caller's `--processor` and non-empty `--run-id`. Your delegating agent creates a fresh run ID with its marker and passes that same ID to the wrapper and marker removal script. A shared name such as `manager` alone does not establish ownership. Active legacy markers without run IDs block execution; expired markers are ignored. Keep checking the marker before sending your request, and do not reuse another operation's run ID. This check does not replace atomic scheduling or provide a permission boundary.
 
 ### 3. Generate a High-Quality Prompt
 

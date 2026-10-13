@@ -2,6 +2,7 @@
 # Execute an AI coding CLI tool in a given workspace
 # Usage: run-coding-cli.sh --cli <tool> --workspace <dir> --prompt-file <file> [--timeout <secs>]
 #        [--model <name>] [--allowed-tools <csv>] [--allowed-mcp <csv>] [--safe-mode] [--bare] [--json-file <path>]
+#        [--task-dir <dir>] [--processor <name>] [--run-id <id>]
 # (governance flags apply to the qwen runner; other runners warn and ignore them)
 
 set -e
@@ -19,6 +20,13 @@ g_allowed_mcp=""
 g_safe_mode=0
 g_bare=0
 g_json_file=""
+# .processing guard: task root (where the marker lives — see task-coordination
+# create/check/remove-processing-marker.sh) and this run's processor identity.
+# Ownership requires both the processor name and the unique run ID used when
+# creating your marker. A shared processor name alone cannot identify your run.
+g_task_dir=""
+g_processor=""
+g_run_id=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -32,6 +40,9 @@ while [[ $# -gt 0 ]]; do
         --safe-mode)   g_safe_mode=1;      shift ;;
         --bare)        g_bare=1;           shift ;;
         --json-file)   g_json_file="$2";   shift 2 ;;
+        --task-dir)    g_task_dir="$2";    shift 2 ;;
+        --processor)   g_processor="$2";   shift 2 ;;
+        --run-id)      g_run_id="$2";      shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -51,18 +62,37 @@ if [ ! -d "$workspace" ]; then
     exit 1
 fi
 
-# Pre-flight guard: a .processing marker in the workspace means the
-# delegating agent is holding it (mirroring its files, reading results).
-# The SKILL tells the caller to check the marker and wait — that is prompt
-# discipline, and small models drop it (the 10-10 QC git-write incident is
-# the standing evidence that prompt constraints are not a boundary). Hard-
-# fail here, in code, before the CLI is invoked: exit 125 is the runner's
-# "blocked, retry later" contract (same code as the missing-CLI guard).
-if [ -f "${workspace}/.processing" ]; then
-    echo "[run-coding-cli] ERROR: ${workspace}/.processing exists — the delegating agent" >&2
-    echo "[run-coding-cli] is holding this workspace. Refusing to run; retry after it" >&2
-    echo "[run-coding-cli] removes the marker." >&2
-    exit 125
+# Pre-flight guard: a .processing marker at the TASK ROOT means another
+# operation holds the task. The marker lives at <task-root>/.processing (see
+# task-coordination create/check/remove-processing-marker.sh) — NOT in the
+# workspace (the workspace is <task-root>/workspace), so we must check the
+# task root. You can pass through your own marker only when BOTH the processor
+# and its non-empty run ID match. Active legacy markers without run IDs also
+# block execution. An expired marker is ignored (matches check-processing-marker.sh
+# TTL). Prompt discipline drops (small models skip the SKILL's check — the
+# 10-10 QC git-write incident is the standing evidence), so this hard-fails in
+# code before the CLI is invoked: exit 125 is the "blocked, retry later"
+# contract (same code as the missing-CLI guard).
+task_dir="${g_task_dir:-$(dirname "$workspace")}"
+marker_file="${task_dir}/.processing"
+if [ -f "$marker_file" ]; then
+    marker_processor=$(jq -r '.processor // "unknown"' "$marker_file" 2>/dev/null || echo "unknown")
+    marker_run_id=$(jq -r '.run_id // empty' "$marker_file" 2>/dev/null || true)
+    marker_expires=$(jq -r '.expires_at // empty' "$marker_file" 2>/dev/null || true)
+    marker_expired=false
+    if [ -n "$marker_expires" ]; then
+        if exp_epoch=$(date -d "$marker_expires" +%s 2>/dev/null); then
+            [ "$(date -u +%s)" -ge "$exp_epoch" ] && marker_expired=true
+        fi
+    fi
+    if ! $marker_expired && { [ -z "$g_processor" ] || [ "$marker_processor" != "$g_processor" ] || [ -z "$g_run_id" ] || [ "$marker_run_id" != "$g_run_id" ]; }; then
+        echo "[run-coding-cli] ERROR: ${marker_file} is held by '${marker_processor}'" >&2
+        echo "[run-coding-cli] and does not match this run's ownership — a conflicting" >&2
+        echo "[run-coding-cli] operation is in progress. Refusing to run; retry after the holder" >&2
+        echo "[run-coding-cli] removes the marker or it expires." >&2
+        exit 125
+    fi
+    # Expired marker, or matching processor AND run ID -> proceed.
 fi
 
 # Pre-flight: the configured CLI binary must be on PATH. If it is missing here

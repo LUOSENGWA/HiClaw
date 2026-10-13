@@ -270,11 +270,15 @@ run_case_g() {
     pass "${cli}.json_file (structured result written to the --json-file path and parses as JSON)"
 }
 
-# run_case_h <cli>: guard preflight — a .processing marker in the workspace
-# must hard-fail the run with exit 125 BEFORE the CLI is invoked. This is the
-# code-level enforcement of the SKILL's "check for processing marker" step:
-# prompt discipline alone is not a boundary (the 10-10 QC git-write incident
-# is the standing evidence). The stub prints a sentinel if it ever runs.
+# run_case_h <cli>: guard preflight — the .processing marker lives at the TASK
+# ROOT (create-processing-marker.sh), and the guard checks the task root with
+# ownership semantics. A marker held by ANOTHER processor must hard-fail the
+# run with exit 125 BEFORE the CLI is invoked; the delegating flow's OWN marker
+# (processor=manager and a matching unique run ID) must be ALLOWED so
+# that legitimate run stays possible. This is the code-level enforcement of the
+# SKILL's "check for processing marker" step: prompt discipline alone is not a
+# boundary (the 10-10 QC git-write incident is the standing evidence). The stub
+# prints a sentinel if it runs when it should not.
 run_case_h() {
     local cli="$1" rc
     cat > "${SANDBOX}/bin/${cli}" <<'GUARD_STUB'
@@ -284,17 +288,39 @@ echo "GUARD_STUB_EXECUTED"
 exit 0
 GUARD_STUB
     chmod +x "${SANDBOX}/bin/${cli}"
-    mkdir -p "${SANDBOX}/ws-h"
-    touch "${SANDBOX}/ws-h/.processing"
+    local ws="${SANDBOX}/ws-h" task_root="${SANDBOX}/task-h" now fut
+    mkdir -p "${ws}" "${task_root}"
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    fut="$(date -u -d '+15 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+
+    # (h1) marker held by ANOTHER processor -> blocked 125, CLI never invoked
+    printf '{"processor":"other-actor","started_at":"%s","expires_at":"%s"}' "${now}" "${fut}" > "${task_root}/.processing"
     PATH="${SANDBOX}/bin:${PATH}" \
-        bash "${RUN_SCRIPT}" --cli "${cli}" --workspace "${SANDBOX}/ws-h" \
-            --prompt-file "${PROMPT_FILE}" \
+        bash "${RUN_SCRIPT}" --cli "${cli}" --workspace "${ws}" \
+            --prompt-file "${PROMPT_FILE}" --task-dir "${task_root}" --processor "manager" \
             > "${SANDBOX}/prompts/case-h.out" 2>&1
     rc=$?
     if [ "${rc}" = "125" ] && ! grep -q "GUARD_STUB_EXECUTED" "${SANDBOX}/prompts/case-h.out"; then
-        pass "${cli}.processing_guard (rc=125, CLI never invoked)"
+        : # conflict correctly blocked
     else
-        fail "${cli}.processing_guard" "expected exit 125 with no CLI invocation, got rc=${rc}"
+        fail "${cli}.processing_guard.conflict" "expected exit 125 with no CLI invocation, got rc=${rc}"
+        rm -f "${task_root}/.processing"
+        return 0
+    fi
+
+    # (h2) the delegating flow's OWN marker (processor=manager) -> allowed, CLI runs
+    printf '{"processor":"manager","run_id":"verify-run","started_at":"%s","expires_at":"%s"}' "${now}" "${fut}" > "${task_root}/.processing"
+    PATH="${SANDBOX}/bin:${PATH}" \
+        bash "${RUN_SCRIPT}" --cli "${cli}" --workspace "${ws}" \
+            --prompt-file "${PROMPT_FILE}" --task-dir "${task_root}" --processor "manager" \
+            --run-id "verify-run" \
+            > "${SANDBOX}/prompts/case-h2.out" 2>&1
+    rc=$?
+    rm -f "${task_root}/.processing"
+    if [ "${rc}" = "0" ] && grep -q "GUARD_STUB_EXECUTED" "${SANDBOX}/prompts/case-h2.out"; then
+        pass "${cli}.processing_guard (conflict blocked rc=125; own marker allowed rc=0)"
+    else
+        fail "${cli}.processing_guard.own" "expected the delegating flow's own marker to allow the run (got rc=${rc})"
     fi
 }
 
