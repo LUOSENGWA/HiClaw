@@ -391,6 +391,33 @@ func codingCliDotGet(doc map[string]interface{}, dotPath string) interface{} {
 
 // --- settings ------------------------------------------------------------
 
+// readCliSettings returns the path used for this read so a subsequent write
+// targets the same file. Qoder resolves its config directory inside the Worker;
+// pass the resulting path as an argument so shell characters stay literal.
+func (h *CodingCliHandler) readCliSettings(ctx context.Context, eb codingCliExecer, name string, spec codingCliSpec) (contents, filePath string, exitCode int, err error) {
+	filePath = spec.SettingsPath
+	cmd := []string{"sh", "-c", "cat " + filePath}
+	if spec.ID == "qoder" {
+		filePath, _, exitCode, err = eb.Exec(ctx, name, []string{"sh", "-c", `dir="${QODER_CONFIG_DIR:-$HOME/.qoder}"
+case "$dir" in /*) ;; *) dir="$PWD/$dir" ;; esac
+printf '%s/settings.json' "${dir%/}"`}, codingCliExecTimeout)
+		if err != nil {
+			return
+		}
+		if exitCode != 0 {
+			err = fmt.Errorf("resolve Qoder settings path: exec exit %d", exitCode)
+			return
+		}
+		if !strings.HasPrefix(filePath, "/") {
+			err = fmt.Errorf("worker Qoder settings path is not absolute")
+			return
+		}
+		cmd = []string{"cat", "--", filePath}
+	}
+	contents, _, exitCode, err = eb.Exec(ctx, name, cmd, codingCliExecTimeout)
+	return
+}
+
 func (h *CodingCliHandler) getCliSettings(w http.ResponseWriter, r *http.Request) {
 	spec, ok := requireKnownCLI(w, r.PathValue("cli"))
 	if !ok {
@@ -401,7 +428,7 @@ func (h *CodingCliHandler) getCliSettings(w http.ResponseWriter, r *http.Request
 		return
 	}
 	name := r.PathValue("name")
-	out, _, exit, err := eb.Exec(r.Context(), name, []string{"sh", "-c", "cat " + spec.SettingsPath}, codingCliExecTimeout)
+	out, filePath, exit, err := h.readCliSettings(r.Context(), eb, name, spec)
 	if err != nil {
 		httputil.WriteError(w, http.StatusBadGateway, "worker exec failed: "+err.Error())
 		return
@@ -410,7 +437,7 @@ func (h *CodingCliHandler) getCliSettings(w http.ResponseWriter, r *http.Request
 		// Settings file absent — report an empty (not error) state so the
 		// frontend can offer "create from defaults".
 		writeCodingCliJSON(w, http.StatusOK, map[string]interface{}{
-			"cli": spec.ID, "path": spec.SettingsPath, "exists": false, "settings": map[string]interface{}{},
+			"cli": spec.ID, "path": filePath, "exists": false, "settings": map[string]interface{}{},
 		})
 		return
 	}
@@ -420,7 +447,7 @@ func (h *CodingCliHandler) getCliSettings(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeCodingCliJSON(w, http.StatusOK, redactCodingCliSecrets(map[string]interface{}{
-		"cli": spec.ID, "path": spec.SettingsPath, "exists": true, "settings": settings,
+		"cli": spec.ID, "path": filePath, "exists": true, "settings": settings,
 	}))
 }
 
@@ -469,7 +496,7 @@ func (h *CodingCliHandler) putCliSettings(w http.ResponseWriter, r *http.Request
 
 	// Read current (may be absent) first: the "***" sentinel needs it to
 	// verify there is an existing value to keep.
-	out, _, exit, err := eb.Exec(r.Context(), name, []string{"sh", "-c", "cat " + spec.SettingsPath}, codingCliExecTimeout)
+	out, filePath, exit, err := h.readCliSettings(r.Context(), eb, name, spec)
 	if err != nil {
 		httputil.WriteError(w, http.StatusBadGateway, "worker exec failed: "+err.Error())
 		return
@@ -490,17 +517,21 @@ func (h *CodingCliHandler) putCliSettings(w http.ResponseWriter, r *http.Request
 		return
 	}
 	merged := codingCliDeepMerge(current, incoming)
-	home, err := h.workerHome(r.Context(), eb, name)
-	if err != nil {
-		httputil.WriteError(w, http.StatusBadGateway, "resolve worker home: "+err.Error())
-		return
+	writePath := filePath
+	if spec.ID != "qoder" {
+		home, err := h.workerHome(r.Context(), eb, name)
+		if err != nil {
+			httputil.WriteError(w, http.StatusBadGateway, "resolve worker home: "+err.Error())
+			return
+		}
+		writePath = strings.ReplaceAll(filePath, "~", home)
 	}
 	mergedJSON, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, "encode settings: "+err.Error())
 		return
 	}
-	if err := eb.WriteFile(r.Context(), name, strings.ReplaceAll(spec.SettingsPath, "~", home), string(mergedJSON)); err != nil {
+	if err := eb.WriteFile(r.Context(), name, writePath, string(mergedJSON)); err != nil {
 		httputil.WriteError(w, http.StatusBadGateway, "write settings into worker: "+err.Error())
 		return
 	}
@@ -508,7 +539,7 @@ func (h *CodingCliHandler) putCliSettings(w http.ResponseWriter, r *http.Request
 	log.FromContext(r.Context()).Info("worker coding-cli settings updated",
 		"worker", name, "cli", spec.ID, "actor", authzActor(caller))
 	writeCodingCliJSON(w, http.StatusOK, redactCodingCliSecrets(map[string]interface{}{
-		"cli": spec.ID, "path": spec.SettingsPath, "exists": true, "settings": merged,
+		"cli": spec.ID, "path": filePath, "exists": true, "settings": merged,
 	}))
 }
 
