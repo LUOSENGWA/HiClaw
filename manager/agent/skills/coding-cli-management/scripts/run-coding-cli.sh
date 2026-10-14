@@ -2,6 +2,7 @@
 # Execute an AI coding CLI tool in a given workspace
 # Usage: run-coding-cli.sh --cli <tool> --workspace <dir> --prompt-file <file> [--timeout <secs>]
 #        [--model <name>] [--allowed-tools <csv>] [--allowed-mcp <csv>] [--safe-mode] [--bare] [--json-file <path>]
+#        [--approval-mode <tier>] [--max-wall-time <val>]
 #        [--task-dir <dir>] [--processor <name>] [--run-id <id>]
 # (governance flags apply to the qwen runner; other runners warn and ignore them)
 
@@ -20,6 +21,11 @@ g_allowed_mcp=""
 g_safe_mode=0
 g_bare=0
 g_json_file=""
+# Execution boundary (qwen only): approval tier (plan/default/auto-edit/auto/
+# yolo) and native wall budget (qwen formats: 90/30s/5m/1h/1.5h). Both resolve
+# per-run flag > config (approval_mode / max_wall_time) > default (yolo / unset).
+g_approval_mode=""
+g_max_wall_time=""
 # .processing guard: task root (where the marker lives — see task-coordination
 # create/check/remove-processing-marker.sh) and this run's processor identity.
 # Ownership requires both the processor name and the unique run ID used when
@@ -40,6 +46,8 @@ while [[ $# -gt 0 ]]; do
         --safe-mode)   g_safe_mode=1;      shift ;;
         --bare)        g_bare=1;           shift ;;
         --json-file)   g_json_file="$2";   shift 2 ;;
+        --approval-mode) g_approval_mode="$2"; shift 2 ;;
+        --max-wall-time) g_max_wall_time="$2"; shift 2 ;;
         --task-dir)    g_task_dir="$2";    shift 2 ;;
         --processor)   g_processor="$2";   shift 2 ;;
         --run-id)      g_run_id="$2";      shift 2 ;;
@@ -115,8 +123,8 @@ fi
 
 # Governance flags are defined by the qwen runner; other runners have no
 # equivalent surface, so warn and ignore rather than fail the run.
-if [ "$cli" != "qwen" ] && { [ -n "$g_model" ] || [ -n "$g_allowed_tools" ] || [ -n "$g_allowed_mcp" ] || [ "$g_safe_mode" = "1" ] || [ "$g_bare" = "1" ] || [ -n "$g_json_file" ]; }; then
-    echo "[run-coding-cli] note: governance flags (--model/--allowed-tools/--allowed-mcp/--safe-mode/--bare/--json-file) are qwen-specific and were ignored for cli=$cli" >&2
+if [ "$cli" != "qwen" ] && { [ -n "$g_model" ] || [ -n "$g_allowed_tools" ] || [ -n "$g_allowed_mcp" ] || [ "$g_safe_mode" = "1" ] || [ "$g_bare" = "1" ] || [ -n "$g_json_file" ] || [ -n "$g_approval_mode" ] || [ -n "$g_max_wall_time" ]; }; then
+    echo "[run-coding-cli] note: governance flags (--model/--allowed-tools/--allowed-mcp/--safe-mode/--bare/--json-file/--approval-mode/--max-wall-time) are qwen-specific and were ignored for cli=$cli" >&2
 fi
 
 # Save output to log file in the workspace's coding-cli-logs directory
@@ -130,16 +138,20 @@ log_file="$log_dir/run-${timestamp}.log"
 echo "[run-coding-cli] cli=$cli workspace=$workspace prompt_file=$prompt_file timeout=${timeout_secs}s" | tee "$log_file"
 echo "[run-coding-cli] Log: $log_file"
 
-# Optional per-runner budget fields from the delegating agent's config
-# (default ~/coding-cli-config.json, override with CODING_CLI_CONFIG for
-# tests). Only the qwen case consumes them today; absent/0/false -> no
+# Optional per-runner budget/boundary fields from the delegating agent's
+# config (default ~/coding-cli-config.json, override with CODING_CLI_CONFIG
+# for tests). Only the qwen case consumes them today; absent/0/false -> no
 # extra flags.
 config_file="${CODING_CLI_CONFIG:-${HOME}/coding-cli-config.json}"
 max_session_turns=""
 sandbox_setting=""
+approval_mode_setting=""
+max_wall_time_setting=""
 if command -v jq >/dev/null 2>&1 && [ -f "${config_file}" ]; then
     max_session_turns=$(jq -r '.max_session_turns // empty' "${config_file}" 2>/dev/null || true)
     sandbox_setting=$(jq -r '.sandbox // empty' "${config_file}" 2>/dev/null || true)
+    approval_mode_setting=$(jq -r '.approval_mode // empty' "${config_file}" 2>/dev/null || true)
+    max_wall_time_setting=$(jq -r '.max_wall_time // empty' "${config_file}" 2>/dev/null || true)
 fi
 
 cd "$workspace"
@@ -163,11 +175,48 @@ case "$cli" in
         # qwen has no workspace flag (verified through qwen 0.25.0); its workspace is the
         # process cwd, so pin the run to $workspace explicitly.
         cd "$workspace"
+        # Execution boundary (see SKILL.md "Execution boundary"): approval
+        # tier and native wall budget, each resolving per-run flag > config
+        # field > default. Defaults are byte-compatible with the pre-boundary
+        # wrapper (yolo, no wall flag), so an unchanged caller gets an
+        # identical qwen argv. Only yolo and plan are usable in a
+        # non-interactive one-shot run — default/auto-edit/auto route
+        # would-ask calls to an approver that is never present headless, so
+        # the run would stall; they are deliberately not a default here.
+        approval_mode="${g_approval_mode:-${approval_mode_setting}}"
+        if [ -z "${approval_mode}" ]; then
+            approval_mode="yolo"
+        fi
+        case "${approval_mode}" in
+            plan|default|auto-edit|auto|yolo) ;;
+            *)
+                echo "[run-coding-cli] ERROR: invalid approval mode '${approval_mode}'" >&2
+                if [ -n "${g_approval_mode}" ]; then
+                    echo "[run-coding-cli] source: --approval-mode" >&2
+                else
+                    echo "[run-coding-cli] source: approval_mode in ${config_file}" >&2
+                fi
+                echo "[run-coding-cli] Valid values: plan, default, auto-edit, auto, yolo" >&2
+                exit 1
+                ;;
+        esac
+        max_wall_time="${g_max_wall_time:-${max_wall_time_setting}}"
         # Optional budget flags from the config (see "Config File" in
         # SKILL.md): max_session_turns -> --max-session-turns N (absent/0
         # = omit); sandbox: true -> --sandbox (Docker-backed, requires
         # docker at the execution site). No other runner consumes these.
-        qwen_args=(--yolo)
+        qwen_args=()
+        if [ "${approval_mode}" = "yolo" ]; then
+            qwen_args+=(--yolo)
+        else
+            qwen_args+=(--approval-mode "${approval_mode}")
+        fi
+        # Native wall budget (qwen value formats: 90/30s/5m/1h/1.5h); an
+        # over-budget qwen run aborts with exit 55. The outer --timeout above
+        # remains the hard backstop for every runner.
+        if [ -n "${max_wall_time}" ]; then
+            qwen_args+=(--max-wall-time "${max_wall_time}")
+        fi
         if [ -n "${max_session_turns}" ] && [ "${max_session_turns}" != "0" ]; then
             qwen_args+=(--max-session-turns "${max_session_turns}")
         fi
@@ -179,6 +228,8 @@ case "$cli" in
         # --allowed-tools <csv> tool allowlist (code-level permission boundary)
         # --allowed-mcp <csv>   MCP server allowlist (scenario isolation)
         # --safe-mode / --bare  clean / minimal config loading
+        # (--approval-mode / --max-wall-time are resolved above — they carry
+        #  config-backed defaults, so they are not plain passthroughs.)
         if [ -n "${g_model}" ]; then
             qwen_args+=(-m "${g_model}")
         fi
@@ -212,6 +263,10 @@ case "$cli" in
         if [ -n "${max_session_turns}" ] && [ "${max_session_turns}" != "0" ]; then ungoverned=0; fi
         if [ "${sandbox_setting}" = "true" ]; then ungoverned=0; fi
         if [ -n "${g_allowed_tools}" ]; then ungoverned=0; fi
+        # The read-only `plan` tier is governance in its own right: a plan run
+        # neither mutates files nor executes tools, so the unattended run is
+        # bounded even without a turn/sandbox/allowlist budget.
+        if [ "${approval_mode}" = "plan" ]; then ungoverned=0; fi
         if [ "$ungoverned" = "1" ]; then
             echo "[run-coding-cli] WARNING: unattended qwen run is UNGOVERNED (no turn budget, no --sandbox, no tool allowlist) — bounded only by the ${timeout_secs}s wall-clock timeout. Tighten via ${config_file} (max_session_turns/sandbox) or --allowed-tools." | tee -a "$log_file"
         fi

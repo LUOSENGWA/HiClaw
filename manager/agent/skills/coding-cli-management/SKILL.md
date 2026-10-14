@@ -26,12 +26,25 @@ Path: `~/coding-cli-config.json` — this is the **delegating agent's own** conf
 | `false`   | any   | Admin declined; use normal task flow |
 | `true`    | `"claude"` / `"gemini"` / `"qodercli"` / `"qwen"` / `"opencode"` | Active — use this CLI |
 
-Optional budget fields (consumed by `run-coding-cli.sh` for `qwen` only — the other runners have no equivalent and ignore them):
+Optional budget / execution-boundary fields (consumed by `run-coding-cli.sh` for `qwen` only — the other runners have no equivalent and ignore them):
 
 | Field | Type / default | Meaning |
 |-------|----------------|---------|
 | `max_session_turns` | integer, default absent / `0` (flag not passed) | Caps the qwen run at N model turns (`--max-session-turns <N>`); a run that reaches the cap terminates at the budget |
 | `sandbox` | boolean, default `false` | Adds `--sandbox` (Docker-backed) to the qwen run. Requires docker at the execution site — leave off where docker is unavailable (as in many agent containers) |
+| `approval_mode` | string, default `yolo` | Approval tier for the qwen run: `yolo` → `--yolo` (the default, byte-identical to the pre-boundary wrapper); `plan` / `default` / `auto-edit` / `auto` → `--approval-mode <tier>`. In a non-interactive one-shot run only `yolo` and `plan` actually work — the ask tiers stall (see Execution boundary below). An invalid value fails the run with the valid values listed; there is no silent fallback |
+| `max_wall_time` | string, default absent (flag not passed) | Native qwen wall budget → `--max-wall-time <val>` (qwen value formats: `90` / `30s` / `5m` / `1h` / `1.5h`); qwen aborts an over-budget run with exit code 55. The wrapper's `--timeout` remains the hard backstop for all runners |
+
+Config example (tight one-shot boundary — read-only plan + 30-minute native wall budget):
+
+```json
+{
+  "enabled": true,
+  "cli": "qwen",
+  "approval_mode": "plan",
+  "max_wall_time": "30m"
+}
+```
 
 The config path can be overridden with the `CODING_CLI_CONFIG` environment variable (the verify script uses this for its turn-budget case).
 
@@ -44,8 +57,10 @@ The config path can be overridden with the `CODING_CLI_CONFIG` environment varia
 | `--allowed-mcp <csv>` | `--allowed-mcp-server-names` | MCP server allowlist — scenario isolation (e.g. only this task's toolchain MCP) |
 | `--safe-mode` | `--safe-mode` | disable all customizations (hooks, extensions, skills, MCP, QWEN.md) — clean-environment runs |
 | `--bare` | `--bare` | minimal mode |
+| `--approval-mode <tier>` | `--yolo` / `--approval-mode <tier>` | execution-boundary tier for the qwen run (`plan` / `default` / `auto-edit` / `auto` / `yolo`). Precedence: per-run flag > config `approval_mode` > `yolo` default. An invalid tier fails the run with the valid values listed (no fallback) |
+| `--max-wall-time <val>` | `--max-wall-time <val>` | native qwen wall budget (value formats `90` / `30s` / `5m` / `1h` / `1.5h`); an over-budget run aborts with exit code 55. Precedence: per-run flag > config `max_wall_time` > unset (flag not passed) |
 
-Use the runner's own init frame (`-o json` prints a `tools` array and `permission_mode`) to size an allowlist from the actual capability list rather than from memory. All five were field-verified on qwen 0.25.0 (safe-mode banner, emptied MCP list, per-run model override observed in one run).
+Use the runner's own init frame (`-o json` prints a `tools` array and `permission_mode`) to size an allowlist from the actual capability list rather than from memory. The five governance flags were field-verified on qwen 0.25.0 (safe-mode banner, emptied MCP list, per-run model override observed in one run). `--approval-mode` / `--max-wall-time` were field-verified on qwen 0.25.1 (one-shot plan-tier read boundary, and the native exit-55 wall-budget path observed end to end through this wrapper), and the wrapper's arg assembly for all seven is covered by `manager/tests/test-run-coding-cli-exec-boundary.sh`.
 
 **Updates.** Re-run the npm install command to upgrade in place, or use the runner's built-in `qwen update` self-update command (see `qwen update --help` for its channel behavior). Either way, re-run `verify-coding-cli.sh` afterwards (upgrade discipline above).
 
@@ -102,9 +117,11 @@ When deciding whether to enable CLI delegation, assess at least:
 
 Mitigations, in three tiers:
 
-1. **Approval tiers (native).** Qwen Code: `--approval-mode` levels (plan / default / auto-edit / auto / yolo); lower tiers keep prompts on destructive shell and outbound calls. OpenCode: permission rules with `allow` / `ask` / `deny` actions, including command-prefix granularity (e.g. deny `rm ` while allowing `git ` / `npm `); `opencode agent create` can produce a scoped agent whose frontmatter denies everything not allowed.
+1. **Approval tiers (native).** Qwen Code: `--approval-mode` levels (plan / default / auto-edit / auto / yolo); lower tiers keep prompts on destructive shell and outbound calls. Configurable from this wrapper: `run-coding-cli.sh --approval-mode <tier>` per run, or `approval_mode` in the config (per-run wins; default `yolo`, so an unchanged caller gets a byte-identical qwen argv). **One-shot usability boundary:** a non-interactive run has no approver, so only two tiers are usable there — `yolo` (approve everything, the default) and `plan` (the genuinely usable read-only tier: the run produces a plan and does not execute; field-verified on qwen 0.25.1 — and note the read scope stays pinned to the run's workspace: non-interactive reads of files outside `--workspace` are declined by the permission policy rather than prompted, so the prompt must reference workspace-relative paths or place inputs inside the workspace). `default` / `auto-edit` / `auto` route would-ask calls to an approver that never answers headless, so the run stalls; they are documented for interactive or supervised use and are deliberately **not** a wrapper default. The `plan` tier also satisfies the wrapper's UNGOVERNED detection: a read-only run is treated as governed even without a turn budget, sandbox, or tool allowlist. OpenCode: permission rules with `allow` / `ask` / `deny` actions, including command-prefix granularity (e.g. deny `rm ` while allowing `git ` / `npm `); `opencode agent create` can produce a scoped agent whose frontmatter denies everything not allowed.
 2. **Native sandbox (opt-in).** Qwen Code ships a Docker-backed sandbox (`--sandbox` / `QWEN_SANDBOX=1`) that runs shell/write/edit tools inside a sandbox image — **it is NOT auto-enabled by `--yolo`**; an un-sandboxed yolo run prints a warning to stderr, which lands in the run log. It requires docker at the execution site; where there is none (as in many agent containers) the flag must stay off. OpenCode has no native sandbox — its boundary is tier 1 plus tier 3.
 3. **Isolated execution environment (the baseline for skip-permissions-class flags).** Industry practice (Anthropic's own guidance for `--dangerously-skip-permissions`, and public incident reports from unsandboxed auto runs) is to run such sessions only in isolated environments — a dedicated container/VM/ephemeral runner — with budgets (`--max-session-turns` / wall time) so a stuck run cannot burn the host. In that case the delegating agent's ambient credentials and sockets should not be mounted into the environment at all.
+
+Both budget levers are configurable from this wrapper: the turn cap via `max_session_turns` (Config File above), and the wall budget via `max_wall_time` in the config or `--max-wall-time <val>` per run (qwen value formats `90` / `30s` / `5m` / `1h` / `1.5h`). qwen enforces the wall budget natively and aborts an over-budget run with **exit code 55**; the wrapper's outer `--timeout` (default 3600 s) remains the hard backstop for every runner, while the native budget is a tighter, runner-aware bound for qwen.
 
 No new approval subsystem is introduced by this skill.
 
