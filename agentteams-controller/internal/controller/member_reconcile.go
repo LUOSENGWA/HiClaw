@@ -970,18 +970,40 @@ func buildMemberWorkerEnv(ctx context.Context, d MemberDeps, m MemberContext, pr
 // registry value type used for validation (mirrors qwenpaw envs/registry.py;
 // when a key is ever promoted to hot_runtime, the hot-apply table in
 // worker_hot_apply_envs.go is the extension point — see that file's docs).
+// get/set expose the WorkerSpec field behind each key so the effective
+// value (worker over team default) is computed in one place, feeding both
+// the container env projection (resolveLlmTuningEnv) and the
+// container-recreation hash (hashSpecWithLlmTuningDefaults).
 var llmTuningEnvSpecs = []struct {
 	envKey   string
 	valueTyp string // "integer" | "float"
+	get      func(v1beta1.WorkerSpec) string
+	set      func(*v1beta1.WorkerSpec, string)
 }{
-	{"QWENPAW_LLM_MAX_RETRIES", "integer"},
-	{"QWENPAW_LLM_BACKOFF_BASE", "float"},
-	{"QWENPAW_LLM_BACKOFF_CAP", "float"},
-	{"QWENPAW_LLM_MAX_CONCURRENT", "integer"},
-	{"QWENPAW_LLM_MAX_QPM", "integer"},
-	{"QWENPAW_LLM_RATE_LIMIT_PAUSE", "float"},
-	{"QWENPAW_LLM_RATE_LIMIT_JITTER", "float"},
-	{"QWENPAW_LLM_ACQUIRE_TIMEOUT", "float"},
+	{"QWENPAW_LLM_MAX_RETRIES", "integer",
+		func(s v1beta1.WorkerSpec) string { return s.LlmMaxRetries },
+		func(s *v1beta1.WorkerSpec, v string) { s.LlmMaxRetries = v }},
+	{"QWENPAW_LLM_BACKOFF_BASE", "float",
+		func(s v1beta1.WorkerSpec) string { return s.LlmBackoffBase },
+		func(s *v1beta1.WorkerSpec, v string) { s.LlmBackoffBase = v }},
+	{"QWENPAW_LLM_BACKOFF_CAP", "float",
+		func(s v1beta1.WorkerSpec) string { return s.LlmBackoffCap },
+		func(s *v1beta1.WorkerSpec, v string) { s.LlmBackoffCap = v }},
+	{"QWENPAW_LLM_MAX_CONCURRENT", "integer",
+		func(s v1beta1.WorkerSpec) string { return s.LlmMaxConcurrent },
+		func(s *v1beta1.WorkerSpec, v string) { s.LlmMaxConcurrent = v }},
+	{"QWENPAW_LLM_MAX_QPM", "integer",
+		func(s v1beta1.WorkerSpec) string { return s.LlmMaxQpm },
+		func(s *v1beta1.WorkerSpec, v string) { s.LlmMaxQpm = v }},
+	{"QWENPAW_LLM_RATE_LIMIT_PAUSE", "float",
+		func(s v1beta1.WorkerSpec) string { return s.LlmRateLimitPause },
+		func(s *v1beta1.WorkerSpec, v string) { s.LlmRateLimitPause = v }},
+	{"QWENPAW_LLM_RATE_LIMIT_JITTER", "float",
+		func(s v1beta1.WorkerSpec) string { return s.LlmRateLimitJitter },
+		func(s *v1beta1.WorkerSpec, v string) { s.LlmRateLimitJitter = v }},
+	{"QWENPAW_LLM_ACQUIRE_TIMEOUT", "float",
+		func(s v1beta1.WorkerSpec) string { return s.LlmAcquireTimeout },
+		func(s *v1beta1.WorkerSpec, v string) { s.LlmAcquireTimeout = v }},
 }
 
 // resolveLlmTuningEnv computes the effective startup-only LLM env for the
@@ -992,19 +1014,9 @@ var llmTuningEnvSpecs = []struct {
 func resolveLlmTuningEnv(m MemberContext, logger interface {
 	Info(msg string, keysAndValues ...interface{})
 }) map[string]string {
-	workerVals := map[string]string{
-		"QWENPAW_LLM_MAX_RETRIES":       m.Spec.LlmMaxRetries,
-		"QWENPAW_LLM_BACKOFF_BASE":      m.Spec.LlmBackoffBase,
-		"QWENPAW_LLM_BACKOFF_CAP":       m.Spec.LlmBackoffCap,
-		"QWENPAW_LLM_MAX_CONCURRENT":    m.Spec.LlmMaxConcurrent,
-		"QWENPAW_LLM_MAX_QPM":           m.Spec.LlmMaxQpm,
-		"QWENPAW_LLM_RATE_LIMIT_PAUSE":  m.Spec.LlmRateLimitPause,
-		"QWENPAW_LLM_RATE_LIMIT_JITTER": m.Spec.LlmRateLimitJitter,
-		"QWENPAW_LLM_ACQUIRE_TIMEOUT":   m.Spec.LlmAcquireTimeout,
-	}
 	out := map[string]string{}
 	for _, spec := range llmTuningEnvSpecs {
-		val := workerVals[spec.envKey]
+		val := spec.get(m.Spec)
 		if val == "" {
 			val = m.TeamLlmTuning[spec.envKey]
 		}

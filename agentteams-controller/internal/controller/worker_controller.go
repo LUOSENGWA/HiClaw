@@ -217,7 +217,19 @@ func (r *WorkerReconciler) reconcileNormal(ctx context.Context, w *v1beta1.Worke
 	if err := validateWorkerDeploymentTargetImmutable(w, effectiveSpec); err != nil {
 		return reconcile.Result{}, err
 	}
-	mctx := r.workerMemberContextWithSpec(w, effectiveSpec, resourceSpec, updateStrategy)
+	// Team-wide startup-only LLM tuning defaults (read-time merge), same
+	// gating pattern: only when at least one worker value is unset (the
+	// check keeps the List call rare). Resolved before the container
+	// context is built so both consumers see the same effective values:
+	// the pod spec hash (recreate trigger, merged into the spec before
+	// hashing) and the container env projection (mctx.TeamLlmTuning via
+	// resolveLlmTuningEnv).
+	var teamLlmTuning map[string]string
+	if w.Annotations[v1beta1.AnnotationWorkerTeamName] != "" &&
+		!allLlmTuningSet(w.Spec) {
+		teamLlmTuning = r.owningTeamLlmTuning(ctx, w)
+	}
+	mctx := r.workerMemberContextWithSpec(w, effectiveSpec, resourceSpec, updateStrategy, teamLlmTuning)
 	mctx.TeamName, err = r.workerTeamName(ctx, w)
 	if err != nil {
 		return reconcile.Result{}, err
@@ -253,13 +265,6 @@ func (r *WorkerReconciler) reconcileNormal(ctx context.Context, w *v1beta1.Worke
 	if w.Annotations[v1beta1.AnnotationWorkerTeamName] != "" &&
 		(w.Spec.LlmStreamFirstContentTimeout == "" || w.Spec.LlmStreamIdleTimeout == "") {
 		configContext.TeamLlmStreamFirstContentTimeout, configContext.TeamLlmStreamIdleTimeout = r.owningTeamLlmStreamTimeouts(ctx, w)
-	}
-	// Team-wide startup-only LLM tuning defaults (read-time merge), same
-	// gating pattern: only when at least one worker value is unset (the
-	// check keeps the List call rare).
-	if w.Annotations[v1beta1.AnnotationWorkerTeamName] != "" &&
-		!allLlmTuningSet(w.Spec) {
-		configContext.TeamLlmTuning = r.owningTeamLlmTuning(ctx, w)
 	}
 
 	if mctx.DeployMode == v1beta1.DeployModeEdge {
@@ -567,7 +572,7 @@ func (r *WorkerReconciler) reconcileDelete(ctx context.Context, w *v1beta1.Worke
 		return reconcile.Result{}, err
 	}
 	effectiveSpec = workerSpecWithAppliedDeploymentTarget(effectiveSpec, w.Status)
-	mctx := r.workerMemberContextWithSpec(w, effectiveSpec, resourceSpec, updateStrategy)
+	mctx := r.workerMemberContextWithSpec(w, effectiveSpec, resourceSpec, updateStrategy, nil)
 
 	_ = ReconcileMemberDelete(ctx, deps, mctx)
 
@@ -761,10 +766,15 @@ func mergeBackendResourceRequirements(defaults, override *backend.ResourceRequir
 // deliberately come last so anything the user writes that collides (e.g.
 // `agentteams.io/controller`) is silently overridden rather than rejected.
 func (r *WorkerReconciler) workerMemberContext(w *v1beta1.Worker) MemberContext {
-	return r.workerMemberContextWithSpec(w, w.Spec, nil, "")
+	return r.workerMemberContextWithSpec(w, w.Spec, nil, "", nil)
 }
 
-func (r *WorkerReconciler) workerMemberContextWithSpec(w *v1beta1.Worker, spec v1beta1.WorkerSpec, resourceSpec *v1beta1.AgentResourceRequirements, updateStrategy string) MemberContext {
+// teamLlmTuning is the owning team's startup-only LLM tuning defaults
+// (QWENPAW_LLM_* env keys), resolved by the caller. It feeds two consumers
+// with the same effective values: the pod spec hash (merged in, so a change
+// recreates the container) and the container env projection (via
+// MemberContext.TeamLlmTuning / resolveLlmTuningEnv).
+func (r *WorkerReconciler) workerMemberContextWithSpec(w *v1beta1.Worker, spec v1beta1.WorkerSpec, resourceSpec *v1beta1.AgentResourceRequirements, updateStrategy string, teamLlmTuning map[string]string) MemberContext {
 	runtimeName := spec.EffectiveWorkerName(w.Name)
 	effectiveRuntime := backend.ResolveRuntime(spec.Runtime, r.DefaultRuntime)
 	backendRuntime := spec.GetBackendRuntime()
@@ -772,7 +782,7 @@ func (r *WorkerReconciler) workerMemberContextWithSpec(w *v1beta1.Worker, spec v
 		backendRuntime = r.DefaultBackendRuntime
 	}
 	hashSpec := workerSpecWithEffectiveBackendRuntimeForHash(spec, backendRuntime)
-	appliedSpecHash := hashAppliedWorkerSpecForRuntimeAndResources(hashSpec, effectiveRuntime, resourceSpec)
+	appliedSpecHash := hashAppliedWorkerSpecForRuntimeAndResources(hashSpecWithLlmTuningDefaults(hashSpec, teamLlmTuning), effectiveRuntime, resourceSpec)
 	// Only pod-affecting fields trigger recreation. A Worker without a recorded
 	// spec hash follows the normal create path and records it after success.
 	specChanged := w.Status.SpecHash != "" && w.Status.SpecHash != appliedSpecHash
@@ -797,6 +807,7 @@ func (r *WorkerReconciler) workerMemberContextWithSpec(w *v1beta1.Worker, spec v
 		Namespace:          w.Namespace,
 		Role:               RoleStandalone,
 		Spec:               spec,
+		TeamLlmTuning:      teamLlmTuning,
 		Generation:         w.Generation,
 		ObservedGeneration: w.Status.ObservedGeneration,
 		PodLabels: mergeLabels(
@@ -1047,6 +1058,27 @@ func workerSpecWithEffectiveBackendRuntimeForHash(spec v1beta1.WorkerSpec, backe
 	return spec
 }
 
+// hashSpecWithLlmTuningDefaults returns spec with the startup-only LLM
+// tuning fields set to their effective values (worker explicit value over
+// team default, per key). The result is fed to the container-recreation
+// hash so it covers exactly the values resolveLlmTuningEnv projects into
+// the container env — a change to either side recreates the container.
+// An empty teamLlmTuning leaves the spec untouched (no copy).
+func hashSpecWithLlmTuningDefaults(spec v1beta1.WorkerSpec, teamLlmTuning map[string]string) v1beta1.WorkerSpec {
+	if len(teamLlmTuning) == 0 {
+		return spec
+	}
+	for _, k := range llmTuningEnvSpecs {
+		if k.get(spec) != "" {
+			continue
+		}
+		if v := teamLlmTuning[k.envKey]; v != "" {
+			k.set(&spec, v)
+		}
+	}
+	return spec
+}
+
 func hashMemberRuntimePodSpec(spec v1beta1.WorkerSpec) string {
 	return hashMemberRuntimePodSpecWithResources(spec, nil)
 }
@@ -1064,21 +1096,43 @@ func hashMemberRuntimePodSpecWithResources(spec v1beta1.WorkerSpec, resources *v
 		Labels           map[string]string                  `json:"labels,omitempty"`
 		Volumes          []v1beta1.WorkerVolumeSpec         `json:"volumes,omitempty"`
 		Mounts           []v1beta1.WorkerMountSpec          `json:"mounts,omitempty"`
-		WorkerDepsLayout string                             `json:"workerDepsLayout,omitempty"`
+		// Effective startup-only LLM tuning (worker value over team
+		// default, merged by the caller before hashing). These are
+		// projected into the container env, so any change must recreate
+		// the container. The two hot stream-timeout fields are
+		// deliberately absent: they are hot-applied via the QwenPaw envs
+		// API without a restart.
+		LlmMaxRetries      string `json:"llmMaxRetries,omitempty"`
+		LlmBackoffBase     string `json:"llmBackoffBase,omitempty"`
+		LlmBackoffCap      string `json:"llmBackoffCap,omitempty"`
+		LlmMaxConcurrent   string `json:"llmMaxConcurrent,omitempty"`
+		LlmMaxQpm          string `json:"llmMaxQpm,omitempty"`
+		LlmRateLimitPause  string `json:"llmRateLimitPause,omitempty"`
+		LlmRateLimitJitter string `json:"llmRateLimitJitter,omitempty"`
+		LlmAcquireTimeout  string `json:"llmAcquireTimeout,omitempty"`
+		WorkerDepsLayout   string `json:"workerDepsLayout,omitempty"`
 	}
 	payload := memberRuntimePodSpec{
-		Runtime:          spec.Runtime,
-		Image:            spec.Image,
-		WorkerName:       spec.WorkerName,
-		ContainerManaged: spec.ContainerManaged,
-		DeployMode:       spec.DeployMode,
-		BackendRuntime:   spec.BackendRuntime,
-		Resources:        resources,
-		Env:              spec.Env,
-		Labels:           spec.Labels,
-		Volumes:          spec.Volumes,
-		Mounts:           spec.Mounts,
-		WorkerDepsLayout: workerDepsLayoutHashVersion(spec),
+		Runtime:            spec.Runtime,
+		Image:              spec.Image,
+		WorkerName:         spec.WorkerName,
+		ContainerManaged:   spec.ContainerManaged,
+		DeployMode:         spec.DeployMode,
+		BackendRuntime:     spec.BackendRuntime,
+		Resources:          resources,
+		Env:                spec.Env,
+		Labels:             spec.Labels,
+		Volumes:            spec.Volumes,
+		Mounts:             spec.Mounts,
+		LlmMaxRetries:      spec.LlmMaxRetries,
+		LlmBackoffBase:     spec.LlmBackoffBase,
+		LlmBackoffCap:      spec.LlmBackoffCap,
+		LlmMaxConcurrent:   spec.LlmMaxConcurrent,
+		LlmMaxQpm:          spec.LlmMaxQpm,
+		LlmRateLimitPause:  spec.LlmRateLimitPause,
+		LlmRateLimitJitter: spec.LlmRateLimitJitter,
+		LlmAcquireTimeout:  spec.LlmAcquireTimeout,
+		WorkerDepsLayout:   workerDepsLayoutHashVersion(spec),
 	}
 	buf, err := json.Marshal(payload)
 	if err != nil {
