@@ -127,8 +127,17 @@ log "  Console port: ${CONSOLE_PORT}"
 # arbiter: it verifies the running app serves the target version and stays
 # alive, removing pending on success and rolling back on failure — so a
 # package that installed fine but whose app fails to start is recovered
-# automatically. Both phases always exit 0 once handled (result in the job
-# state file); an unexpected non-zero exit must never block startup.
+# automatically. boot-check always exits 0 once handled (the container MUST
+# boot; the result lives in the job state file). The post-start exit code is
+# the VERDICT (this worker image has no supervisor, so the rollback's
+# restart primitive is kill, not supervisorctl):
+#   0 = verification passed -> keep the new runtime (foreground)
+#   3 = recovered -> the rollback restored the old runtime; relaunch the
+#       worker in the foreground against it (kill mode verifies at the next
+#       boot's wrapper version gate)
+#   other (4 = FATAL: verification AND its rollback failed, pending kept) ->
+#       never read as "keep the new runtime": stop the app and exit
+#       non-zero so the container supervisor surfaces the failure.
 UPGRADE_SH=/opt/agentteams/scripts/upgrade_qwenpaw_runtime.sh
 PENDING_UPGRADE="${QWENPAW_WORKING_DIR}/upgrade/pending.json"
 POST_START=0
@@ -153,18 +162,33 @@ if [ "${POST_START}" -ne 1 ]; then
 fi
 
 # Post-start verification: start the app in the background, run the health
-# gate (version/readiness/settle), then either keep the new runtime
-# (foreground) or let the orchestrator roll back (it reinstalls the old
-# version and restarts, which replaces our background process).
+# gate (version/readiness/settle), then branch on the orchestrator's exit
+# code (the verdict — see the two-phase block above).
 log "Starting qwenpaw-worker in the background for post-start upgrade verification..."
 "${VENV}/bin/qwenpaw-worker" "${CMD_ARGS[@]}" &
 APP_PID=$!
-if bash "${UPGRADE_SH}" --phase post-start --venv "${VENV}" --pending-file "${PENDING_UPGRADE}"; then
-    log "Post-start verification passed; keeping the new runtime."
-    wait "${APP_PID}"
-else
-    log "Post-start verification failed; the orchestrator has rolled back."
-    kill "${APP_PID}" 2>/dev/null || true
-    wait "${APP_PID}" 2>/dev/null || true
-    exit 1
-fi
+POST_START_RC=0
+bash "${UPGRADE_SH}" --phase post-start --venv "${VENV}" \
+    --pending-file "${PENDING_UPGRADE}" --restart-mode kill || POST_START_RC=$?
+case "${POST_START_RC}" in
+    0)
+        log "Post-start verification passed; keeping the new runtime."
+        wait "${APP_PID}"
+        ;;
+    3)
+        # The rollback restored the old runtime (kill mode: the app child is
+        # already dead and the wrapper exited with it; the next boot's
+        # version gate is the final verifier). Serve the old runtime from
+        # here, in the foreground.
+        log "Post-start recovered to the old runtime; relaunching the worker in the foreground."
+        kill "${APP_PID}" 2>/dev/null || true
+        wait "${APP_PID}" 2>/dev/null || true
+        exec "${VENV}/bin/qwenpaw-worker" "${CMD_ARGS[@]}"
+        ;;
+    *)
+        log "FATAL: post-start verification and its rollback failed (rc=${POST_START_RC}); manual intervention required."
+        kill "${APP_PID}" 2>/dev/null || true
+        wait "${APP_PID}" 2>/dev/null || true
+        exit 1
+        ;;
+esac

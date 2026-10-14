@@ -177,6 +177,72 @@ def test_run_501_docker_mode_reserved(tmp_path, monkeypatch):
     assert "docker" in _body(resp)["error"]
 
 
+def test_active_job_returns_intermediate_states(tmp_path, monkeypatch):
+    """P1-1: between boot-check-passed and the post-start verdict the job is
+    still in flight — active_job() must keep reporting it (409 source)."""
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(tmp_path))
+    from qwenpaw_worker.upgrade import runner
+
+    up = tmp_path / "upgrade"
+    up.mkdir()
+    job = "upg-20261014-000000-cccc"
+    (up / f"upgrade-{job}.json").write_text(json.dumps({
+        "job_id": job,
+        "state": "boot-check-passed",  # post-start health gate running
+        "started_at": "2026-10-14T00:00:00Z",
+    }))
+    active = runner.active_job()
+    assert active is not None
+    assert active["job_id"] == job
+
+
+def test_active_job_ignores_terminal_states(tmp_path, monkeypatch):
+    """P1-1 regression: once a job reaches a terminal state it frees the
+    mutex again, even when several terminal jobs are on disk."""
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(tmp_path))
+    from qwenpaw_worker.upgrade import runner
+
+    up = tmp_path / "upgrade"
+    up.mkdir()
+    for job, state in {
+        "upg-20260101-000000-succ": "success",
+        "upg-20260102-000000-roll": "rolled_back",
+        "upg-20260103-000000-rfal": "rollback_failed",
+        "upg-20260104-000000-pref": "precheck_failed",
+    }.items():
+        (up / f"upgrade-{job}.json").write_text(json.dumps({
+            "job_id": job,
+            "state": state,
+            "started_at": "2026-01-01T00:00:00Z",
+        }))
+    assert runner.active_job() is None
+
+
+def test_run_409_during_post_start_verification(tmp_path, monkeypatch):
+    """P1-1 (shiyiyue case): a second /run while the first job is inside its
+    post-start health gate must be rejected with 409 (the whole two-phase
+    window is the mutex, not just the pre-restart process lifetime)."""
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(tmp_path))
+    from qwenpaw_worker.upgrade import runner, versions
+
+    monkeypatch.setattr(versions, "current_version",
+                        lambda: ("2.2.1", "importlib.metadata"))
+    up = tmp_path / "upgrade"
+    up.mkdir()
+    job = "upg-20261014-000000-dddd"
+    (up / f"upgrade-{job}.json").write_text(json.dumps({
+        "job_id": job,
+        "state": "boot-check-passed",
+        "started_at": "2026-10-14T00:00:00Z",
+    }))
+
+    routes, _ = _register()
+    body = runner.UpgradeRunBody(version="2.2.2", skip_check=True)
+    resp = _call(routes["/run"].endpoint, body=body)
+    assert resp.status_code == 409
+    assert _body(resp) == {"error": "upgrade_in_progress", "job_id": job}
+
+
 def test_check_endpoint_delegates_to_run_check(tmp_path, monkeypatch):
     monkeypatch.setenv("QWENPAW_WORKING_DIR", str(tmp_path))
     from qwenpaw_worker.upgrade import checker

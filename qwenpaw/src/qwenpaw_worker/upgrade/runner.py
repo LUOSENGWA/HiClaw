@@ -74,7 +74,7 @@ class JobState:
     """The on-disk state file record (subset that endpoints surface)."""
 
     job_id: str
-    state: str = "running"  # running|success|rolled_back|rollback_failed|precheck_failed
+    state: str = "running"  # running|boot-check-passed|success|rolled_back|rollback_failed|precheck_failed
     exit_code: Optional[int] = None
     current: str = ""
     target: str = ""
@@ -151,13 +151,23 @@ def _write_state(job_id: str, data: dict) -> None:
     os.replace(str(tmp), str(_state_path(job_id)))
 
 
+# States a job leaves behind forever. Everything else on disk (running,
+# boot-check-passed, ...) is still in flight: the two-phase window runs
+# across a container restart, so the mutex must cover boot-check and the
+# post-start health gate, not just the pre-restart process lifetime.
+_TERMINAL_STATES = frozenset(
+    {"success", "rolled_back", "rollback_failed", "precheck_failed"})
+
+
 def active_job() -> Optional[dict]:
-    """The newest state file still ``running`` (a live pid is not required —
-    the orchestrator exits 0 after S4 while the app is restarting, and the
-    phase-2 boot-check owns completion)."""
+    """The newest job that has not reached a terminal state (a live pid is
+    not required — the orchestrator exits 0 after S4 while the app is
+    restarting, and the phase-2 boot-check / post-start gate own completion).
+    ``boot-check-passed`` is deliberately NON-terminal: during the post-start
+    health gate the upgrade is still in flight and a second /run must 409."""
     best: Optional[tuple[str, dict]] = None
     for record in _iter_jobs():
-        if record.get("state") != "running":
+        if record.get("state") in _TERMINAL_STATES:
             continue
         key = (record.get("started_at") or "", record.get("job_id") or "")
         if best is None or key > (best[0], best[1]):

@@ -18,11 +18,25 @@
 #                exit 0. Completion is owned by phase 2 (state file).
 #   boot-check   phase 2 (entrypoint, before `exec qwenpaw-worker`; the app
 #                is not up yet): no pending.json -> no-op exit 0; venv
-#                version == target -> success + pending removed; otherwise
-#                reinstall old + re-apply patch = rolled_back. Always exits
-#                0 once handled (the container must boot; the result lives
-#                in the state file). --force-rollback skips the version
-#                check (host-side runbook).
+#                version == target -> intermediate state boot-check-passed,
+#                pending RETAINED (the app is not up yet, so this is only a
+#                pre-check); otherwise reinstall old + re-apply patch =
+#                rolled_back. Always exits 0 once handled (the container
+#                must boot; the result lives in the state file).
+#                --force-rollback skips the version check (host-side
+#                runbook).
+#   post-start   phase 3 (entrypoint, AFTER the app is up): the real
+#                arbiter — health gate on the running app (version /
+#                readiness / settle window). Pass -> pending removed, state
+#                success, exit 0 (keep the new runtime). Fail -> rollback
+#                (reinstall old + patch + restart) and verify the recovery:
+#                supervisorctl mode re-verifies the restored runtime
+#                in-process; kill mode (worker images have no supervisor)
+#                delegates verification to the next boot's wrapper version
+#                gate. exit 3 = recovered, exit 4 = FATAL rollback failure
+#                (pending kept, manual intervention). The entrypoint passes
+#                only --pending-file; the job context (job id + state file)
+#                is recovered from pending.json.
 #
 # Steps (full phase):
 #   S0  pre-flight   external checker (default: the co-located
@@ -69,7 +83,9 @@
 #
 # Exit codes: 0=ok  2=pre-flight/usage failure (nothing installed)
 #             3=rolled back  4=rollback failed (manual intervention needed)
-#             (boot-check: always 0 once handled; the result is in the state file)
+#             (boot-check: always 0 once handled; the result is in the
+#              state file; post-start: 0=success / 3=recovered /
+#              4=rollback failed — the entrypoint branches on this verdict)
 #
 # Usage:
 #   upgrade_qwenpaw_runtime.sh --target X.Y.Z [--checker PATH] [--skip-check]
@@ -81,6 +97,8 @@
 #       --pending-file .../pending.json
 #   upgrade_qwenpaw_runtime.sh --phase boot-check --pending-file .../pending.json \
 #       --venv /opt/venv/qwenpaw [--force-rollback]
+#   upgrade_qwenpaw_runtime.sh --phase post-start --pending-file .../pending.json \
+#       --venv /opt/venv/qwenpaw --restart-mode kill
 #
 # Environment hooks (all overridable; --selftest stubs every external action):
 #   UG_VERSION_CMD   print the current version (raw "X.Y.Z" or the JSON
@@ -244,16 +262,39 @@ except Exception:
 PYEOF
 }
 
-# write_pending JOB_ID OLD TARGET VENV -> atomic pending.json
+# Recover the job context from pending.json (JOB_ID + STATE_FILE). The
+# entrypoint invokes the phase-2 phases with ONLY --venv and --pending-file,
+# so without this their write_state calls no-op (STATE_FILE empty) and the
+# job is stranded at its last written state (boot-check-passed) — the state
+# file is the single source of truth and must close to a terminal state.
+# STATE_FILE resolution: explicit pending field (written by pre-restart) >
+# sibling convention (pending and the job state live in the same
+# $WORKING/upgrade dir; also covers pending files written before the
+# state_file field existed).
+resolve_pending_context() {
+  [ -n "$JOB_ID" ] || JOB_ID="$(pending_get job_id)"
+  if [ -z "$STATE_FILE" ] && [ -n "$JOB_ID" ]; then
+    STATE_FILE="$(pending_get state_file)"
+  fi
+  if [ -z "$STATE_FILE" ] && [ -n "$JOB_ID" ]; then
+    STATE_FILE="$(dirname "$PENDING_FILE")/upgrade-$JOB_ID.json"
+  fi
+}
+
+# write_pending JOB_ID OLD TARGET VENV [STATE_FILE] -> atomic pending.json.
+# state_file travels in pending so the entrypoint-style phase-2 calls
+# (--pending-file only, no --job-id/--state-file) can close the job state
+# instead of no-op'ing write_state.
 write_pending() {
-  python3 - "$PENDING_FILE" "$1" "$2" "$3" "$4" <<'PYEOF'
+  python3 - "$PENDING_FILE" "$1" "$2" "$3" "$4" "${5:-}" <<'PYEOF'
 import datetime, json, os, sys, tempfile
-job_id, old, target, venv = sys.argv[2:6]
+job_id, old, target, venv, state_file = sys.argv[2:7]
 data = {
     "job_id": job_id,
     "old": old,
     "target": target,
     "venv": venv,
+    "state_file": state_file,
     "started_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }
 path = sys.argv[1]
@@ -521,7 +562,7 @@ do_pre_restart() {
   fi
 
   # 4) write pending BEFORE the swap becomes visible to a new process
-  write_pending "$JOB_ID" "$old" "$TARGET" "$UG_VENV"
+  write_pending "$JOB_ID" "$old" "$TARGET" "$UG_VENV" "$STATE_FILE"
   log "pending written: $PENDING_FILE (old=$old target=$TARGET)"
   write_state state=running phase=boot-check job_id="$JOB_ID" target="$TARGET" current="$old" started_at="$(now_ts)"
 
@@ -580,20 +621,11 @@ do_boot_check() {
     return 0
   fi
 
-  local pending_job pending_old pending_target
-  pending_job="$(pending_get job_id)"
+  local pending_old pending_target
   pending_old="$(pending_get old)"
   pending_target="$(pending_get target)"
   [ -n "$TARGET" ] || TARGET="$pending_target"
-  [ -n "$JOB_ID" ] || JOB_ID="$pending_job"
-  if [ -z "$STATE_FILE" ] && [ -n "$JOB_ID" ]; then
-    # Derive the state file from the pending file's directory. The pending
-    # lives at $WORKING/upgrade/pending.json and the job state at
-    # $WORKING/upgrade/upgrade-<job>.json, so the state file is a sibling of
-    # the pending. More robust than relying on $QWENPAW_WORKING_DIR (the
-    # entrypoint sets it, but a standalone/manual boot-check may not).
-    STATE_FILE="$(dirname "$PENDING_FILE")/upgrade-$JOB_ID.json"
-  fi
+  resolve_pending_context
   log "boot-check: pending job=$JOB_ID old=$pending_old target=$TARGET"
 
   if [ "$FORCE_ROLLBACK" = "1" ]; then
@@ -678,62 +710,91 @@ do_post_start() {
   pending_target="$(pending_get target)"
   pending_old="$(pending_get old)"
   [ -n "$TARGET" ] || TARGET="$pending_target"
-  log "post-start: health gate for the running app, target=$TARGET"
+  # The entrypoint calls us with --pending-file only: recover the job context
+  # so the verdict below actually lands in the job's state file (previously
+  # STATE_FILE stayed empty -> write_state no-op -> job stuck at
+  # boot-check-passed, which also left the 409 mutex disengaged).
+  resolve_pending_context
+  log "post-start: job=$JOB_ID health gate for the running app, target=$TARGET"
   if health_gate "$TARGET" "$TIMEOUT" "$SETTLE"; then
     rm -f "$PENDING_FILE"
-    write_state state=success finished_at="$(now_ts)"
+    write_state state=success phase=post-start finished_at="$(now_ts)"
     log "post-start: SUCCESS - health gate passed; pending removed"
     echo "SUMMARY: status=ok phase=post-start target=$TARGET"
     return 0
   fi
   err "post-start: health gate failed (want=$TARGET); rolling back to $pending_old"
+  # does not return: exit 3 (recovered) or 4 (rollback failed) — never 0,
+  # which the entrypoint would read as "keep the new runtime"
   do_post_start_rollback "$pending_old" "post-start-health-failed"
-  return 0
 }
 
 # post-start rollback: the app is up (possibly serving the new version), so
-# restoring the old version needs a restart to take effect. pending is KEPT on
-# failure (manual retry via --force-rollback).
+# restoring the old version needs a restart to take effect. It does NOT
+# return 0: the entrypoint branches on the exit code, and 0 means "keep the
+# NEW runtime". Outcomes:
+#   3 = recovered: old runtime restored AND verified (supervisorctl mode
+#       re-verifies in-process; kill mode delegates to the next boot's
+#       wrapper version gate) -> pending removed, job rolled_back
+#   4 = FATAL: the rollback itself failed (install/patch/restart, or the
+#       restored runtime failed its own health gate) -> pending KEPT for
+#       manual retry, job rollback_failed, loud banner
 do_post_start_rollback() {
   local old="$1"
   local reason="${2:-post-start-health-failed}"
-  log "ROLLBACK (post-start): restoring $old (reason: $reason)"
+  log "ROLLBACK (post-start): restoring $old (reason: $reason, restart mode=$RESTART_MODE)"
   write_state state=rolled_back finished_at="$(now_ts)" note="rollback:$reason"
   if ! run_install "$old"; then
     fatal_rollback_failed
     err "post-start: FATAL restore failed; pending kept for manual retry (--force-rollback)"
-    echo "SUMMARY: status=rollback_failed old=$old target=$TARGET"
+    echo "SUMMARY: status=rollback_failed phase=post-start old=$old target=$TARGET reason=$reason"
     write_state state=rollback_failed
-    return 0
+    exit 4
   fi
   if [ -n "$UG_PATCH_CMD" ]; then
     pcmd="$(sub_target "$UG_PATCH_CMD" "$old")"
     if ! bash -c "$pcmd"; then
       fatal_rollback_failed
       err "post-start: FATAL compat patch re-apply failed; pending kept for manual retry"
-      echo "SUMMARY: status=rollback_failed old=$old target=$TARGET"
+      echo "SUMMARY: status=rollback_failed phase=post-start old=$old target=$TARGET reason=$reason"
       write_state state=rollback_failed
-      return 0
+      exit 4
     fi
   fi
-  if [ -n "$UG_RESTART_CMD" ]; then
-    rcmd="$(sub_target "$UG_RESTART_CMD" "$old")"
-    if ! bash -c "$rcmd"; then
-      fatal_rollback_failed
-      err "post-start: FATAL restart after rollback failed; pending kept for manual retry"
-      echo "SUMMARY: status=rollback_failed old=$old target=$TARGET"
-      write_state state=rollback_failed
-      return 0
-    fi
+  # The restart must be the primitive that exists in THIS image: the worker
+  # image has no supervisor (PID1 is the qwenpaw-worker wrapper), so its mode
+  # is kill (the entrypoint passes --restart-mode kill); supervisorctl mode
+  # is for the QwenPaw runtime image that ships supervisord.
+  if ! run_restart; then
+    fatal_rollback_failed
+    err "post-start: FATAL restart after rollback failed (mode=$RESTART_MODE); pending kept for manual retry"
+    echo "SUMMARY: status=rollback_failed phase=post-start old=$old target=$TARGET reason=$reason"
+    write_state state=rollback_failed
+    exit 4
+  fi
+  if [ "$RESTART_MODE" = "kill" ]; then
+    # kill mode stops the app child and the wrapper exits with it: there is
+    # no in-process way to verify the restored runtime here (the app is dead
+    # and the entrypoint is about to relaunch it / the container is about to
+    # restart). Verification is delegated to the next boot's wrapper version
+    # gate (qwenpaw_worker._wait_for_qwenpaw_api, 60s deadline).
+    log "post-start: kill-mode restart issued; recovery verification delegated to the next boot's version gate"
+  elif ! health_gate "$old" "$TIMEOUT" "$SETTLE"; then
+    fatal_rollback_failed
+    err "post-start: FATAL restored runtime failed its health gate (want='$old'); pending kept for manual retry"
+    echo "SUMMARY: status=rollback_failed phase=post-start old=$old target=$TARGET reason=$reason"
+    write_state state=rollback_failed
+    exit 4
   fi
   rm -f "$PENDING_FILE"
-  log "post-start: rolled back to $old; pending removed"
-  echo "SUMMARY: status=rolled_back phase=post-start old=$old target=$TARGET reason=$reason"
-  return 0
+  write_state state=rolled_back phase=post-start finished_at="$(now_ts)"
+  log "post-start: RECOVERED to $old (restart mode=$RESTART_MODE); pending removed"
+  echo "SUMMARY: status=recovered phase=post-start old=$old target=$TARGET reason=$reason"
+  exit 3
 }
 
 # ============================================================================
-# --selftest: built-in stubbed battery (11 scenarios; every external command mocked via tmp-dir state files)
+# --selftest: built-in stubbed battery (15 scenarios; every external command mocked via tmp-dir state files)
 # ============================================================================
 
 SELFTEST_TOTAL_FAIL=0
@@ -776,7 +837,7 @@ run_selftest() {
   local tmp d rc
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/online_upgrade_v1.selftest.XXXXXX")" \
     || { err "cannot create temp dir"; return 1; }
-  log "selftest: starting (11 scenarios, all external commands stubbed; tmp dir: $tmp)"
+  log "selftest: starting (15 scenarios, all external commands stubbed; tmp dir: $tmp)"
   # Keep the default scenarios fast; T8 exercises the settle window explicitly.
   SETTLE=0
 
@@ -1052,12 +1113,158 @@ run_selftest() {
   st_grep "nothing to do" "$d/out.log" "nothing to do"
   st_end T11 "boot-check no-op"
 
+  # ============ T12 two-phase full chain, entrypoint-style phase 2 (P1-1) ============
+  # The entrypoint invokes boot-check/post-start with ONLY --venv and
+  # --pending-file, so the job context must travel in pending.json (state_file)
+  # and be recovered: the job state must close to success (not be stranded at
+  # boot-check-passed) and the 409 mutex stays engaged for the whole window.
+  d="$tmp/T12"; mkdir -p "$d/upgrade"
+  printf '2.2.1' > "$d/version"
+  JOB="upg-selftest-t12"
+  S12="$d/upgrade/upgrade-$JOB.json"; P12="$d/upgrade/pending.json"
+  TARGET="2.2.2"; CHECKER=""; SKIP_CHECK=1; BACKEND="in-container"
+  RECORD_FILE=""
+  PHASE="pre-restart"; JOB_ID="$JOB"
+  STATE_FILE="$S12"; PENDING_FILE="$P12"
+  UG_VENV="$d/venv"; RESTART_MODE="supervisorctl"
+  UG_CHECKER_CMD=""
+  UG_VERSION_CMD="cat $d/version"
+  UG_INSTALL_CMD='printf %s {target} > '"$d"'/version'
+  UG_PATCH_CMD='echo patch-{target} >> '"$d"'/calls'
+  UG_RESTART_CMD='echo restart >> '"$d"'/calls'
+  ( do_pre_restart ) > "$d/out1.log" 2>&1
+  rc1=$?
+  cp "$P12" "$d/pending-snap.json" 2>/dev/null
+  # Phase 2 (boot-check): entrypoint-style — no --job-id/--state-file
+  PHASE="boot-check"; TARGET=""; JOB_ID=""; STATE_FILE=""
+  ( do_boot_check ) > "$d/out2.log" 2>&1
+  rc2=$?
+  cp "$S12" "$d/state-after-bootcheck.json" 2>/dev/null
+  # Phase 3 (post-start): entrypoint-style — no --job-id/--state-file
+  PHASE="post-start"; TARGET=""; JOB_ID=""; STATE_FILE=""
+  TIMEOUT=5; SETTLE=0
+  ( do_post_start ) > "$d/out3.log" 2>&1
+  rc3=$?
+  SC_ID="T12"
+  st_begin T12 "two-phase chain: pre-restart -> boot-check -> post-start (entrypoint-style phase 2)"
+  st_check "pre-restart exit" "0" "$rc1"
+  st_check "boot-check exit" "0" "$rc2"
+  st_check "post-start exit" "0" "$rc3"
+  st_check "target installed" "2.2.2" "$(cat "$d/version" 2>/dev/null)"
+  st_grep "pending carries job_id" "$d/pending-snap.json" '"job_id": "upg-selftest-t12"'
+  st_grep "pending carries state_file" "$d/pending-snap.json" '"state_file": "'"$S12"'"'
+  st_grep "boot-check parked intermediate state" "$d/state-after-bootcheck.json" '"state": "boot-check-passed"'
+  if [ -e "$P12" ]; then printf 'present' > "$d/eck"; else printf 'absent' > "$d/eck"; fi
+  st_check "pending removed after success" "absent" "$(cat "$d/eck" 2>/dev/null)"
+  st_grep "job closed to success" "$S12" '"state": "success"'
+  st_grep "job closed in post-start" "$S12" '"phase": "post-start"'
+  st_end T12 "two-phase chain (state closes to success from pending alone)"
+
+  # ============ T13 post-start health fail -> rollback -> recovered (P1-2) ============
+  # supervisorctl mode re-verifies the restored old runtime IN-PROCESS after
+  # the rollback restart: the recovery only counts when that gate passes.
+  d="$tmp/T13"; mkdir -p "$d/upgrade"
+  printf '2.2.1' > "$d/version"   # app dead/stale: the target gate cannot pass
+  JOB="upg-selftest-t13"
+  S13="$d/upgrade/upgrade-$JOB.json"; P13="$d/upgrade/pending.json"
+  printf '{"job_id": "%s", "state": "boot-check-passed", "target": "2.2.2", "started_at": "2026-01-01T00:00:00Z"}\n' "$JOB" > "$S13"
+  printf '{"job_id": "%s", "old": "2.2.1", "target": "2.2.2", "venv": "/fake/venv", "state_file": "%s"}\n' "$JOB" "$S13" > "$P13"
+  PHASE="post-start"; TARGET=""; JOB_ID=""; STATE_FILE=""; PENDING_FILE="$P13"
+  CHECKER=""; SKIP_CHECK=1; BACKEND="in-container"; RECORD_FILE=""
+  UG_VENV="$d/venv"; RESTART_MODE="supervisorctl"
+  TIMEOUT=5; SETTLE=0
+  UG_VERSION_CMD="cat $d/version"
+  UG_INSTALL_CMD='echo install-{target} >> '"$d"'/calls; printf %s {target} > '"$d"'/version'
+  UG_PATCH_CMD='echo patch-{target} >> '"$d"'/calls'
+  UG_RESTART_CMD='echo restart >> '"$d"'/calls'
+  ( do_post_start ) > "$d/out.log" 2>&1
+  rc=$?
+  SC_ID="T13"
+  st_begin T13 "post-start health fail -> rollback -> recovered (in-process re-verify)"
+  st_check "exit (recovered = 3)" "3" "$rc"
+  st_check "version restored to old" "2.2.1" "$(cat "$d/version" 2>/dev/null)"
+  st_grep "rollback installed old" "$d/calls" "install-2.2.1"
+  st_grep "rollback patched old" "$d/calls" "patch-2.2.1"
+  st_grep "rollback restarted" "$d/calls" "restart"
+  if [ -e "$P13" ]; then printf 'present' > "$d/eck"; else printf 'absent' > "$d/eck"; fi
+  st_check "pending removed after recovery" "absent" "$(cat "$d/eck" 2>/dev/null)"
+  st_grep "job rolled_back" "$S13" '"state": "rolled_back"'
+  st_grep "job closed in post-start" "$S13" '"phase": "post-start"'
+  st_grep "SUMMARY recovered" "$d/out.log" "SUMMARY: status=recovered phase=post-start old=2.2.1 target=2.2.2 reason=post-start-health-failed"
+  st_end T13 "post-start rollback recovered (exit 3, verified)"
+
+  # ============ T14 post-start rollback restart primitive absent (P1-2) ============
+  # The worker image has no supervisor: supervisorctl is not there. A rollback
+  # whose restart fails is a FAILED recovery -> loud FATAL + exit 4 (never 0,
+  # which the entrypoint would read as "keep the new runtime"), job
+  # rollback_failed, pending kept for manual retry.
+  d="$tmp/T14"; mkdir -p "$d/upgrade"
+  printf '2.2.1' > "$d/version"
+  JOB="upg-selftest-t14"
+  S14="$d/upgrade/upgrade-$JOB.json"; P14="$d/upgrade/pending.json"
+  printf '{"job_id": "%s", "state": "boot-check-passed", "target": "2.2.2", "started_at": "2026-01-01T00:00:00Z"}\n' "$JOB" > "$S14"
+  printf '{"job_id": "%s", "old": "2.2.1", "target": "2.2.2", "venv": "/fake/venv", "state_file": "%s"}\n' "$JOB" "$S14" > "$P14"
+  PHASE="post-start"; TARGET=""; JOB_ID=""; STATE_FILE=""; PENDING_FILE="$P14"
+  CHECKER=""; SKIP_CHECK=1; BACKEND="in-container"; RECORD_FILE=""
+  UG_VENV="$d/venv"; RESTART_MODE="supervisorctl"   # the worker image does not have it
+  TIMEOUT=3; SETTLE=0
+  UG_VERSION_CMD="cat $d/version"
+  UG_INSTALL_CMD='echo install-{target} >> '"$d"'/calls; true'
+  UG_PATCH_CMD='echo patch-{target} >> '"$d"'/calls'
+  UG_RESTART_CMD='echo RESTART-ATTEMPTED >> '"$d"'/calls; exit 1'
+  ( do_post_start ) > "$d/out.log" 2>&1
+  rc=$?
+  SC_ID="T14"
+  st_begin T14 "post-start rollback restart primitive absent (worker image) -> FATAL"
+  st_check "exit (rollback failed = 4)" "4" "$rc"
+  st_grep "FATAL banner" "$d/out.log" "FATAL: ROLLBACK FAILED"
+  st_grep "restart was attempted" "$d/calls" "RESTART-ATTEMPTED"
+  st_check "not silently recovered" "2.2.1" "$(cat "$d/version" 2>/dev/null)"
+  if [ -e "$P14" ]; then printf 'present' > "$d/eck"; else printf 'absent' > "$d/eck"; fi
+  st_check "pending kept for manual retry" "present" "$(cat "$d/eck" 2>/dev/null)"
+  st_grep "job rollback_failed" "$S14" '"state": "rollback_failed"'
+  st_end T14 "post-start rollback failure is FATAL (exit 4, pending kept)"
+
+  # ============ T15 post-start rollback in kill mode (P1-2, worker default) ============
+  # Worker images restart by killing the app child: the wrapper exits with it,
+  # so the restored runtime CANNOT be re-verified in-process. Recovery is
+  # still reported (exit 3, job rolled_back, pending removed); verification is
+  # delegated to the next boot's wrapper version gate.
+  d="$tmp/T15"; mkdir -p "$d/upgrade"
+  printf '2.2.1' > "$d/version"
+  JOB="upg-selftest-t15"
+  S15="$d/upgrade/upgrade-$JOB.json"; P15="$d/upgrade/pending.json"
+  printf '{"job_id": "%s", "state": "boot-check-passed", "target": "2.2.2", "started_at": "2026-01-01T00:00:00Z"}\n' "$JOB" > "$S15"
+  printf '{"job_id": "%s", "old": "2.2.1", "target": "2.2.2", "venv": "/fake/venv", "state_file": "%s"}\n' "$JOB" "$S15" > "$P15"
+  PHASE="post-start"; TARGET=""; JOB_ID=""; STATE_FILE=""; PENDING_FILE="$P15"
+  CHECKER=""; SKIP_CHECK=1; BACKEND="in-container"; RECORD_FILE=""
+  UG_VENV="$d/venv"; RESTART_MODE="kill"
+  TIMEOUT=3; SETTLE=0
+  UG_VERSION_CMD="cat $d/version"
+  UG_INSTALL_CMD='echo install-{target} >> '"$d"'/calls; printf %s {target} > '"$d"'/version'
+  UG_PATCH_CMD='echo patch-{target} >> '"$d"'/calls'
+  UG_RESTART_CMD='echo restart-kill >> '"$d"'/calls'
+  ( do_post_start ) > "$d/out.log" 2>&1
+  rc=$?
+  SC_ID="T15"
+  st_begin T15 "post-start rollback in kill mode (worker image, no supervisor)"
+  st_check "exit (recovered in kill mode = 3)" "3" "$rc"
+  st_check "version restored to old" "2.2.1" "$(cat "$d/version" 2>/dev/null)"
+  st_grep "rollback installed old" "$d/calls" "install-2.2.1"
+  st_grep "kill restart primitive used" "$d/calls" "restart-kill"
+  st_grep "verification delegated to next boot" "$d/out.log" "recovery verification delegated to the next boot"
+  if [ -e "$P15" ]; then printf 'present' > "$d/eck"; else printf 'absent' > "$d/eck"; fi
+  st_check "pending removed after recovery" "absent" "$(cat "$d/eck" 2>/dev/null)"
+  st_grep "job rolled_back" "$S15" '"state": "rolled_back"'
+  st_grep "job closed in post-start" "$S15" '"phase": "post-start"'
+  st_end T15 "post-start kill-mode rollback recovered (exit 3, delegated verify)"
+
   log "selftest: tmp dir kept at $tmp (not removed automatically)"
   if [ "$SELFTEST_TOTAL_FAIL" -eq 0 ]; then
-    echo "SELFTEST: 11/11 PASS"
+    echo "SELFTEST: 15/15 PASS"
     return 0
   fi
-  echo "SELFTEST: $SELFTEST_TOTAL_FAIL/11 scenarios FAIL"
+  echo "SELFTEST: $SELFTEST_TOTAL_FAIL/15 scenarios FAIL"
   return 1
 }
 
@@ -1095,17 +1302,20 @@ Options:
                         catches a delayed wrapper crash the raw version
                         endpoint (served by the app subprocess) would not reveal
   --phase PH            full (default, original flow) | pre-restart | boot-check
-  --job-id ID           job id (required for pre-restart; boot-check takes it
-                        from pending.json when omitted)
-  --state-file PATH     state file for pre-restart/boot-check (default
-                        $QWENPAW_WORKING_DIR/upgrade/upgrade-<job-id>.json)
+                        | post-start
+  --job-id ID           job id (required for pre-restart; boot-check/post-start
+                        take it from pending.json when omitted)
+  --state-file PATH     state file for pre-restart (boot-check/post-start
+                        recover it from the pending.json state_file field, else
+                        by the sibling convention: pending.json and
+                        upgrade-<job-id>.json live in the same dir)
   --pending-file PATH   pending.json (default $QWENPAW_WORKING_DIR/upgrade/pending.json)
   --force-rollback      boot-check only: roll back even if the version matches
   --record-file PATH    write a JSON version record after a successful upgrade
                         (verified, then recorded)
   --dry-run             print the resolved commands only; no install/restart/health gate
                         (full phase only)
-  --selftest            run the built-in stubbed battery (7 scenarios, no real actions)
+  --selftest            run the built-in stubbed battery (15 scenarios, no real actions)
   -h, --help            this help
 
 Environment hooks (all overridable; selftest relies on this mechanism):
@@ -1113,9 +1323,12 @@ Environment hooks (all overridable; selftest relies on this mechanism):
   UG_VENV (default /app/venv, /opt/venv/qwenpaw with --container) / UG_UV (uv path;
   when unset the install command auto-detects uv and falls back to venv pip)
 
-Exit codes:
-  0 upgraded   2 pre-flight/usage failure (nothing installed)   3 rolled back
-  4 rollback failed (manual intervention needed)
+Exit codes (full/pre-restart phases):
+  0 upgraded   2 pre-flight/usage failure (nothing installed)
+  3 rolled back   4 rollback failed (manual intervention needed)
+Exit codes (post-start phase, consumed by the entrypoint as the verdict):
+  0 verification passed, keep the new runtime   3 recovered to the old runtime
+  4 verification AND its rollback failed (manual intervention needed)
 EOF
 }
 
