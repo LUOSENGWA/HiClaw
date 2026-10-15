@@ -1723,3 +1723,87 @@ func TestWorkerLlmTuningAPIRoundTrip(t *testing.T) {
 		t.Fatalf("clear persisted maxRetries=%q acquireTimeout=%q, want empty/180", w.Spec.LlmMaxRetries, w.Spec.LlmAcquireTimeout)
 	}
 }
+
+// --- write-path reference validation: the API server, not the lagging cache ---
+//
+// The manager scopes its Worker/Team/Human informer caches with an
+// agentteams.io/controller label selector, and a cache only holds an object
+// after a watch round-trip. One `agt apply` creates a Worker and then the Team
+// naming it, so a cache-backed existence check can miss a Worker the API
+// server has already accepted — the QwenPaw/Hermes shard's "referenced Worker
+// ... does not exist" 400 (test-19-human-and-team-admin). The validators read
+// references through the direct API reader and re-apply the scope themselves.
+
+func workerWithController(name, controller string) *v1beta1.Worker {
+	labels := map[string]string{}
+	if controller != "" {
+		labels[v1beta1.LabelController] = controller
+	}
+	return &v1beta1.Worker{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: labels},
+		Spec:       v1beta1.WorkerSpec{Model: "qwen3.5-plus"},
+	}
+}
+
+const twoMemberTeamBody = `{"name":"alpha-team","workerMembers":[` +
+	`{"name":"alpha-lead","role":"team_leader"},{"name":"alpha-dev","role":"worker"}]}`
+
+func postTeam(t *testing.T, handler *ResourceHandler, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/teams", bytes.NewReader([]byte(body)))
+	rec := httptest.NewRecorder()
+	handler.CreateTeam(rec, req)
+	return rec
+}
+
+func TestCreateTeamSeesWorkerTheCacheHasNotObservedYet(t *testing.T) {
+	scheme := newServerTestScheme(t)
+	// The informer cache is still empty (the Worker was created moments ago)…
+	cached := fake.NewClientBuilder().WithScheme(scheme).Build()
+	// …while the API server, which answered 201 to that create, already has it.
+	direct := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(
+		workerWithController("alpha-lead", ""), workerWithController("alpha-dev", ""),
+	).Build()
+	handler := NewResourceHandler(cached, "default", nil, "", nil).WithAPIReader(direct)
+
+	rec := postTeam(t, handler, twoMemberTeamBody)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("Team create = %d %s, want 201: a Worker the API server has must not read as missing", rec.Code, rec.Body.String())
+	}
+	var team v1beta1.Team
+	if err := cached.Get(context.Background(), client.ObjectKey{Name: "alpha-team", Namespace: "default"}, &team); err != nil {
+		t.Fatalf("get team: %v", err)
+	}
+}
+
+func TestCreateTeamStillRejectsAWorkerMissingEverywhere(t *testing.T) {
+	scheme := newServerTestScheme(t)
+	build := func() client.Client {
+		return fake.NewClientBuilder().WithScheme(scheme).
+			WithRuntimeObjects(workerWithController("alpha-lead", "")).Build()
+	}
+	handler := NewResourceHandler(build(), "default", nil, "", nil).WithAPIReader(build())
+
+	rec := postTeam(t, handler, twoMemberTeamBody)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "referenced Worker alpha-dev does not exist") {
+		t.Fatalf("Team create = %d %s, want 400 naming the missing Worker", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateTeamRejectsAWorkerOwnedByAnotherControllerInstance(t *testing.T) {
+	scheme := newServerTestScheme(t)
+	// In incluster mode the caches are label-scoped, so another instance's
+	// Worker is invisible to a cached read; the direct read must keep it
+	// invisible rather than accepting a reference this instance cannot manage.
+	cached := fake.NewClientBuilder().WithScheme(scheme).Build()
+	direct := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(
+		workerWithController("alpha-lead", "ctl-a"),
+		workerWithController("alpha-dev", "other-ctl"),
+	).Build()
+	handler := NewResourceHandler(cached, "default", nil, "ctl-a", nil).WithAPIReader(direct)
+
+	rec := postTeam(t, handler, twoMemberTeamBody)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "referenced Worker alpha-dev does not exist") {
+		t.Fatalf("Team create = %d %s, want 400 for the out-of-scope Worker", rec.Code, rec.Body.String())
+	}
+}

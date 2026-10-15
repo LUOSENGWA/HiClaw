@@ -51,6 +51,15 @@ type ResourceHandler struct {
 	// Empty string means no enforcement (embedded mode).
 	controllerName string
 
+	// apiReader reads CRs straight from the API server rather than the
+	// informer cache. Write-path reference validation must use it: an
+	// `agt apply` can create a Worker and then the Team naming it in
+	// immediate succession, and the cache — label-scoped and populated by a
+	// watch round-trip — may not hold the new Worker yet, which would fail
+	// the Team with "referenced Worker ... does not exist". Nil falls back to
+	// the cached client (embedded mode / tests).
+	apiReader client.Reader
+
 	// audit records sensitive-surface events (#1220 §8); nil disables the
 	// durable layer (tests).
 	audit *audit.Client
@@ -77,6 +86,38 @@ func NewResourceHandler(c client.Client, namespace string, b *backend.Registry, 
 func (h *ResourceHandler) WithOSS(store oss.StorageClient) *ResourceHandler {
 	h.oss = store
 	return h
+}
+
+// WithAPIReader attaches the direct (uncached) reader the write-path
+// reference validators use — see the apiReader field. Returns the receiver
+// for chaining; nil keeps the cached client.
+func (h *ResourceHandler) WithAPIReader(reader client.Reader) *ResourceHandler {
+	h.apiReader = reader
+	return h
+}
+
+// referenceReader is the read path for references validated while writing:
+// the API server (authoritative for a create the same request chain just
+// completed) rather than the lagging informer cache.
+func (h *ResourceHandler) referenceReader() client.Reader {
+	if h.apiReader != nil {
+		return h.apiReader
+	}
+	return h.client
+}
+
+// referenceOutOfScope reports whether a reference read through the DIRECT
+// reader must still count as missing. The informer caches are built with an
+// agentteams.io/controller=<controllerName> selector (incluster mode), so a
+// cached read cannot see another controller instance's object; the direct
+// reader bypasses that selector, so the scope is re-applied here. Only the
+// direct path needs the guard — a cached read already carries the selector —
+// and embedded mode (empty controllerName) has no scope at all.
+func (h *ResourceHandler) referenceOutOfScope(labels map[string]string) bool {
+	if h.apiReader == nil || h.controllerName == "" {
+		return false
+	}
+	return labels[v1beta1.LabelController] != h.controllerName
 }
 
 // stampControllerLabel force-writes the controller ownership label on meta.
@@ -1007,11 +1048,14 @@ var errDanglingReference = errors.New("dangling reference")
 func (h *ResourceHandler) validateHumanReferences(ctx context.Context, teams *[]string, workers *[]string) error {
 	if teams != nil {
 		var teamList v1beta1.TeamList
-		if err := h.client.List(ctx, &teamList, client.InNamespace(h.namespace)); err != nil {
+		if err := h.referenceReader().List(ctx, &teamList, client.InNamespace(h.namespace)); err != nil {
 			return fmt.Errorf("list teams: %w", err)
 		}
 		existing := make(map[string]struct{}, len(teamList.Items))
 		for i := range teamList.Items {
+			if h.referenceOutOfScope(teamList.Items[i].Labels) {
+				continue
+			}
 			existing[teamList.Items[i].Name] = struct{}{}
 		}
 		var missing []string
@@ -1034,12 +1078,15 @@ func (h *ResourceHandler) validateHumanReferences(ctx context.Context, teams *[]
 				continue
 			}
 			var worker v1beta1.Worker
-			if err := h.client.Get(ctx, client.ObjectKey{Name: wn, Namespace: h.namespace}, &worker); err != nil {
+			if err := h.referenceReader().Get(ctx, client.ObjectKey{Name: wn, Namespace: h.namespace}, &worker); err != nil {
 				if apierrors.IsNotFound(err) {
 					missing = append(missing, wn)
 					continue
 				}
 				return fmt.Errorf("get worker %s: %w", wn, err)
+			}
+			if h.referenceOutOfScope(worker.Labels) {
+				missing = append(missing, wn)
 			}
 		}
 		if len(missing) > 0 {
@@ -1630,11 +1677,14 @@ func (h *ResourceHandler) validateTeamWorkerMembers(ctx context.Context, teamNam
 		}
 
 		var worker v1beta1.Worker
-		if err := h.client.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: h.namespace}, &worker); err != nil {
+		if err := h.referenceReader().Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: h.namespace}, &worker); err != nil {
 			if apierrors.IsNotFound(err) {
 				return fmt.Errorf("referenced Worker %s does not exist", ref.Name)
 			}
 			return fmt.Errorf("get referenced Worker %s: %w", ref.Name, err)
+		}
+		if h.referenceOutOfScope(worker.Labels) {
+			return fmt.Errorf("referenced Worker %s does not exist", ref.Name)
 		}
 	}
 	if leaders != 1 {
@@ -1642,12 +1692,12 @@ func (h *ResourceHandler) validateTeamWorkerMembers(ctx context.Context, teamNam
 	}
 
 	var teams v1beta1.TeamList
-	if err := h.client.List(ctx, &teams, client.InNamespace(h.namespace)); err != nil {
+	if err := h.referenceReader().List(ctx, &teams, client.InNamespace(h.namespace)); err != nil {
 		return fmt.Errorf("list Teams: %w", err)
 	}
 	for i := range teams.Items {
 		team := &teams.Items[i]
-		if team.Name == teamName {
+		if team.Name == teamName || h.referenceOutOfScope(team.Labels) {
 			continue
 		}
 		for _, ref := range team.Spec.WorkerMembers {

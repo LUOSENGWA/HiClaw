@@ -654,6 +654,7 @@ func (a *App) initReconcilers(_ context.Context) error {
 func (a *App) initHTTPServer(_ context.Context) error {
 	a.httpServer = server.NewHTTPServer(a.cfg.HTTPAddr, server.ServerDeps{
 		Client:          a.mgr.GetClient(),
+		APIReader:       a.mgr.GetAPIReader(),
 		Backend:         a.registry,
 		Gateway:         a.gateway,
 		OSS:             a.oss,

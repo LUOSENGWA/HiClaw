@@ -23,21 +23,25 @@ import (
 type ServerDeps struct {
 	WorkerEnvBuilder *service.WorkerEnvBuilder
 	Client           client.Client
-	Backend          *backend.Registry
-	Gateway          gateway.Client
-	OSS              oss.StorageClient
-	STS              *credentials.STSService
-	AuthMw           *authpkg.Middleware
-	KubeMode         string
-	Namespace        string
-	ControllerName   string               // AGENTTEAMS_CONTROLLER_NAME; empty in embedded mode
-	SocketPath       string               // Docker proxy (embedded only)
-	SkillScanner     *skillscan.Client    // shared skill content scan (upload ① + assign ②)
-	ContainerPrefix  string               // effective worker container prefix (config.ContainerPrefix); embedded-only address resolution
-	ResourcePrefix   string               // resource name prefix ("" = agentteams-); manager container name derivation for skillscan
-	MatrixConfig     matrix.Config        // for AppService rotation endpoint
-	MatrixClient     matrix.Client        // for project intervention notifications (SendMessageAsAdmin); nil to skip
-	Provisioner      *service.Provisioner // for Matrix token refresh
+	// APIReader reads CRs straight from the API server (uncached). Write-path
+	// reference validation uses it so a reference created moments earlier in
+	// the same request chain is visible; nil falls back to Client.
+	APIReader       client.Reader
+	Backend         *backend.Registry
+	Gateway         gateway.Client
+	OSS             oss.StorageClient
+	STS             *credentials.STSService
+	AuthMw          *authpkg.Middleware
+	KubeMode        string
+	Namespace       string
+	ControllerName  string               // AGENTTEAMS_CONTROLLER_NAME; empty in embedded mode
+	SocketPath      string               // Docker proxy (embedded only)
+	SkillScanner    *skillscan.Client    // shared skill content scan (upload ① + assign ②)
+	ContainerPrefix string               // effective worker container prefix (config.ContainerPrefix); embedded-only address resolution
+	ResourcePrefix  string               // resource name prefix ("" = agentteams-); manager container name derivation for skillscan
+	MatrixConfig    matrix.Config        // for AppService rotation endpoint
+	MatrixClient    matrix.Client        // for project intervention notifications (SendMessageAsAdmin); nil to skip
+	Provisioner     *service.Provisioner // for Matrix token refresh
 
 	GatewayURL           string
 	DefaultWorkerRuntime string // install-time default for Worker create requests
@@ -78,7 +82,7 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	// One shared audit client: resource mutations (human updates, capability
 	// changes) and approval OFF transitions append to the same durable trail.
 	auditClient := audit.NewClient(deps.OSS)
-	rh := NewResourceHandler(deps.Client, deps.Namespace, deps.Backend, deps.ControllerName, auditClient).WithOSS(deps.OSS)
+	rh := NewResourceHandler(deps.Client, deps.Namespace, deps.Backend, deps.ControllerName, auditClient).WithOSS(deps.OSS).WithAPIReader(deps.APIReader)
 	rh.workerEnvBuilder = deps.WorkerEnvBuilder
 	rh.defaultWorkerRuntime = deps.DefaultWorkerRuntime
 	rh.defaultWorkerModel = deps.DefaultModel
