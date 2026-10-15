@@ -17,14 +17,24 @@
 #                    (single-lined first 200 chars).
 #   2. timeout     — the stub outlives --timeout: status=timeout, exit_code=124.
 #   3. blocked     — a conflicting .processing marker: status=blocked,
-#                    reason=marker-conflict, exit_code=125, log_bytes omitted
-#                    (no log was written), and the CLI never ran.
+#                    reason=marker-conflict, exit_code=125, the CLI never ran —
+#                    AND a diagnostic transcript exists that explains the
+#                    block (the read API enumerates transcripts, so an
+#                    index-only attempt would be invisible).
 #   4. cli-missing — the CLI binary is not on PATH: status=blocked,
-#                    reason=cli-missing, exit_code=125.
+#                    reason=cli-missing, exit_code=125, same transcript
+#                    requirement.
 #   5. worker-omit — no --worker: the worker key is absent (empty values are
 #                    omitted, aligned with the API's omitempty contract); the
 #                    200-character prompt-summary truncation is pinned here.
 #   6. append-only — two runs in one workspace -> two lines, one per run.
+#   7. bad-approval — an invalid approval tier: status=failed,
+#                    reason=invalid-approval-mode, and a transcript that names
+#                    the refusal (every post-validation exit explains itself).
+#   8. non-UTC TZ  — with a non-UTC container clock the record's started_at is
+#                    still a real UTC instant (`date -u`), never the local
+#                    stamp dressed as UTC.
+#   9. invariant   — sweep: every recorded run names an existing transcript.
 #
 # jq + python3 are required (the assertions read the JSONL; the wrapper builds
 # each line with python3) — SKIP when either is absent, per the check-suite
@@ -85,6 +95,30 @@ assert_jq() { # $1 label, $2 json text, $3 jq predicate (true = pass)
 }
 
 field() { jq -r "$2" <<<"$1" 2>/dev/null; }
+
+# assert_transcript <label> <workspace> <jsonl line> [diagnostic needle]
+# The recorded run must name an existing transcript, the transcript must carry
+# the run header, and (given a needle) the diagnostic that explains the
+# outcome. The read API enumerates transcripts, so an index line without one
+# is exactly the review's gap: mirrored but invisible.
+assert_transcript() {
+    local label="$1" ws="$2" line="$3" needle="${4:-}"
+    local run_name tpath
+    run_name="$(field "${line}" '.run')"
+    tpath="${ws}/coding-cli-logs/${run_name}"
+    if [ -z "${run_name}" ] || [ ! -f "${tpath}" ]; then
+        echo "FAIL ${label}: the index line must name an existing transcript (run='${run_name}')"
+        fail=1
+        return
+    fi
+    grep -qF "[run-coding-cli] cli=" "${tpath}" \
+        || { echo "FAIL ${label}: transcript is missing the run header (${tpath})"; fail=1; }
+    if [ -n "${needle}" ] && ! grep -qF "${needle}" "${tpath}"; then
+        echo "FAIL ${label}: transcript does not explain the outcome ('${needle}' absent from ${tpath})"
+        fail=1
+    fi
+    assert_jq "${label} log_bytes > 0" "${line}" '.log_bytes > 0'
+}
 
 run_cli() { # $1 = workspace, $2 = prompt file, $@ = extra wrapper flags
     local ws="$1" pf="$2"; shift 2
@@ -147,7 +181,10 @@ assert_eq "case3 status" "$(field "${line}" '.status')" "blocked"
 assert_eq "case3 reason" "$(field "${line}" '.reason')" "marker-conflict"
 assert_eq "case3 exit_code" "$(field "${line}" '.exit_code')" "125"
 assert_jq "case3 run name shape" "${line}" '.run | test("^run-[0-9]{8}-[0-9]{6}[.]log$")'
-assert_jq "case3 log_bytes omitted (no log written)" "${line}" 'has("log_bytes") | not'
+# The attempt must leave a READABLE transcript, not just an index line: the
+# read API enumerates transcripts, so an index-only attempt never reaches the
+# list or detail (review finding).
+assert_transcript "case3" "${ws3}" "${line}" "is held by"
 
 # --- case 4: cli-missing — the binary is not on PATH -------------------------
 ws4="${TMP}/ws4"; mkdir -p "${ws4}"
@@ -159,6 +196,7 @@ line="$(last_line "${ws4}")"
 assert_eq "case4 status" "$(field "${line}" '.status')" "blocked"
 assert_eq "case4 reason" "$(field "${line}" '.reason')" "cli-missing"
 assert_eq "case4 exit_code" "$(field "${line}" '.exit_code')" "125"
+assert_transcript "case4" "${ws4}" "${line}" "not on PATH"
 
 # --- case 5: no --worker -> the worker key is omitted; summary truncates -----
 ws5="${TMP}/ws5"; mkdir -p "${ws5}"
@@ -180,6 +218,52 @@ assert_eq "case6 line count" "$(wc -l < "$(jsonl_of "${ws6}")" | tr -d ' ')" "2"
 assert_eq "case6 line1 status" "$(field "$(sed -n 1p "$(jsonl_of "${ws6}")")" '.status')" "ok"
 assert_eq "case6 line1 worker" "$(field "$(sed -n 1p "$(jsonl_of "${ws6}")")" '.worker')" "w1"
 assert_eq "case6 line2 worker" "$(field "$(sed -n 2p "$(jsonl_of "${ws6}")")" '.worker')" "w2"
+
+# --- case 7: invalid approval tier -> failed + a self-explaining transcript --
+ws7="${TMP}/ws7"; mkdir -p "${ws7}"
+out="$(run_cli "${ws7}" "${prompt}" --approval-mode bogus)"
+assert_eq "case7 exit" "$?" "1"
+line="$(last_line "${ws7}")"
+assert_eq "case7 status" "$(field "${line}" '.status')" "failed"
+assert_eq "case7 reason" "$(field "${line}" '.reason')" "invalid-approval-mode"
+assert_eq "case7 exit_code" "$(field "${line}" '.exit_code')" "1"
+assert_transcript "case7" "${ws7}" "${line}" "invalid approval mode"
+
+# --- case 8: non-UTC container — the record's instant is still UTC -----------
+# The wrapper names transcripts with the CONTAINER's local clock, so a
+# filename is not a UTC instant. The record's started_at must come from
+# `date -u` — the reader is never handed a local stamp dressed as UTC.
+ws8="${TMP}/ws8"; mkdir -p "${ws8}"
+utc_hour_before="$(date -u +%H)"
+out="$(TZ=Asia/Shanghai run_cli "${ws8}" "${prompt}")"
+assert_eq "case8 exit" "$?" "0"
+utc_hour_after="$(date -u +%H)"
+line="$(last_line "${ws8}")"
+assert_jq "case8 started_at is UTC" "${line}" '.started_at | test("Z$")'
+if [ "${utc_hour_before}" != "$(TZ=Asia/Shanghai date +%H)" ]; then
+    started_hour="$(field "${line}" '.started_at' | cut -c12-13)"
+    case "${started_hour}" in
+        "${utc_hour_before}"|"${utc_hour_after}") ;;
+        *)
+            echo "FAIL case8: started_at hour '${started_hour}' is the container's local clock, not UTC (${utc_hour_before}/${utc_hour_after})"
+            fail=1
+            ;;
+    esac
+else
+    echo "SKIP case8 local-vs-UTC hour comparison (TZ data not honored here)"
+fi
+
+# --- case 9: invariant — every recorded run names an existing transcript -----
+# The class-level guard for the review finding: regardless of outcome, a
+# runs.jsonl line implies a transcript the read API can enumerate.
+for ws in "${ws1}" "${ws2}" "${ws3}" "${ws4}" "${ws5}" "${ws6}" "${ws7}" "${ws8}"; do
+    idx="$(jsonl_of "${ws}")"
+    [ -f "${idx}" ] || continue
+    while IFS= read -r rec; do
+        [ -n "${rec}" ] || continue
+        assert_transcript "case9 $(basename "${ws}")" "${ws}" "${rec}"
+    done < "${idx}"
+done
 
 if [ "${fail}" -eq 0 ]; then
     echo "PASS coding-cli runs metadata (runs.jsonl outcome records)"

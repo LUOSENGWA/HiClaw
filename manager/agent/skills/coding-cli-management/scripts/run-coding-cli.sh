@@ -75,19 +75,41 @@ if [ ! -d "$workspace" ]; then
     exit 1
 fi
 
-# ── Run record (runs.jsonl) ─────────────────────────────────────────────────
-# Outcome metadata for the coding-runs read path: one appended JSON line per
-# run, covering EVERY exit path from here on (ok / timeout / blocked /
-# failed), so a failed or blocked run is as diagnosable from storage as a
-# successful one. This is also where the run's log path is fixed — before the
-# pre-flight guards below, so a blocked run still records which run it was.
+# ── The run's artifacts: one transcript + one record ────────────────────────
+# The run is identified from here on: it owns a transcript (the log the CLI
+# tees into, or the diagnostic prose when a pre-flight guard refuses the run)
+# and one appended runs.jsonl line naming that transcript. EVERY exit path
+# below finalizes both. The read API enumerates transcripts, so an outcome
+# recorded in the index without a transcript would be invisible — a blocked
+# attempt must leave a readable artifact, not just metadata.
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-timestamp=$(date +%Y%m%d-%H%M%S)
 log_dir="$workspace/coding-cli-logs"
 mkdir -p "$log_dir"
-run_name="run-${timestamp}.log"
-log_file="$log_dir/${run_name}"
 runs_jsonl="$log_dir/runs.jsonl"
+
+# claim_transcript fixes this run's transcript path, creating the file
+# exclusively (noclobber) so a transcript from the same wall-clock second is
+# never clobbered — the run that holds the task is exactly the one a blocked
+# attempt collides with. A taken name steps one second forward.
+claim_transcript() {
+    local epoch
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    run_name="run-${timestamp}.log"
+    log_file="$log_dir/${run_name}"
+    while ! ( set -C; : > "$log_file" ) 2>/dev/null; do
+        epoch=$(( $(date +%s) + 1 ))
+        timestamp=$(date -d "@${epoch}" +%Y%m%d-%H%M%S)
+        run_name="run-${timestamp}.log"
+        log_file="$log_dir/${run_name}"
+    done
+}
+claim_transcript
+
+# Open the transcript with the run metadata header so the log itself records
+# which workspace/prompt/timeout this run used — for every exit path below,
+# a blocked attempt included.
+echo "[run-coding-cli] cli=$cli workspace=$workspace prompt_file=$prompt_file timeout=${timeout_secs}s" | tee -a "$log_file"
+echo "[run-coding-cli] Log: $log_file"
 
 # The script's exit code -> the recorded status (the two-guard 125s are
 # "blocked, retry later"; 124 is the outer timeout; anything else failed).
@@ -98,6 +120,22 @@ status_of_exit() {
         125) echo "blocked" ;;
         *)   echo "failed" ;;
     esac
+}
+
+# fail_run <status> <reason> <exit_code> <message line>...
+# Finalize a refusing/failing exit: the diagnostic lands in the transcript AND
+# on stderr (so the run explains itself both in storage and to the caller),
+# then the record is appended and the script exits with that code.
+fail_run() {
+    local rec_status="$1" rec_reason="$2" rec_exit="$3"
+    shift 3
+    local line
+    for line in "$@"; do
+        # Best-effort: the run's exit code must not depend on the log write.
+        echo "$line" | tee -a "$log_file" >&2 || true
+    done
+    append_run_record "$rec_status" "$rec_reason" "$rec_exit"
+    exit "$rec_exit"
 }
 
 # append_run_record <status> <reason> <exit_code>
@@ -174,12 +212,11 @@ if [ -f "$marker_file" ]; then
         fi
     fi
     if ! $marker_expired && { [ -z "$g_processor" ] || [ "$marker_processor" != "$g_processor" ] || [ -z "$g_run_id" ] || [ "$marker_run_id" != "$g_run_id" ]; }; then
-        echo "[run-coding-cli] ERROR: ${marker_file} is held by '${marker_processor}'" >&2
-        echo "[run-coding-cli] and does not match this run's ownership — a conflicting" >&2
-        echo "[run-coding-cli] operation is in progress. Refusing to run; retry after the holder" >&2
-        echo "[run-coding-cli] removes the marker or it expires." >&2
-        append_run_record blocked marker-conflict 125
-        exit 125
+        fail_run blocked marker-conflict 125 \
+            "[run-coding-cli] ERROR: ${marker_file} is held by '${marker_processor}'" \
+            "[run-coding-cli] and does not match this run's ownership — a conflicting" \
+            "[run-coding-cli] operation is in progress. Refusing to run; retry after the holder" \
+            "[run-coding-cli] removes the marker or it expires."
     fi
     # Expired marker, or matching processor AND run ID -> proceed.
 fi
@@ -192,15 +229,14 @@ fi
 # (~/.qwen/settings.json) survives. Fail fast with an actionable message
 # instead of a confusing "command not found" deep inside the run.
 if ! command -v "$cli" >/dev/null 2>&1; then
-    echo "[run-coding-cli] ERROR: coding CLI '$cli' is configured but not on PATH." >&2
-    echo "[run-coding-cli] Usual cause: the worker was recreated and the CLI install" >&2
-    echo "[run-coding-cli] (npm -g, container ephemeral layer) was wiped. Re-run the install" >&2
-    echo "[run-coding-cli] endpoint (POST /api/v1/workers/{name}/coding-cli/$cli/install)," >&2
-    echo "[run-coding-cli] then retry. Auth settings are written container-local by that" >&2
-    echo "[run-coding-cli] surface and may not survive a recreation — probe settings and" >&2
-    echo "[run-coding-cli] re-apply via the settings endpoint if the probe shows them missing." >&2
-    append_run_record blocked cli-missing 125
-    exit 125
+    fail_run blocked cli-missing 125 \
+        "[run-coding-cli] ERROR: coding CLI '$cli' is configured but not on PATH." \
+        "[run-coding-cli] Usual cause: the worker was recreated and the CLI install" \
+        "[run-coding-cli] (npm -g, container ephemeral layer) was wiped. Re-run the install" \
+        "[run-coding-cli] endpoint (POST /api/v1/workers/{name}/coding-cli/$cli/install)," \
+        "[run-coding-cli] then retry. Auth settings are written container-local by that" \
+        "[run-coding-cli] surface and may not survive a recreation — probe settings and" \
+        "[run-coding-cli] re-apply via the settings endpoint if the probe shows them missing."
 fi
 
 # Governance flags are defined by the qwen runner; other runners have no
@@ -208,11 +244,6 @@ fi
 if [ "$cli" != "qwen" ] && { [ -n "$g_model" ] || [ -n "$g_allowed_tools" ] || [ -n "$g_allowed_mcp" ] || [ "$g_safe_mode" = "1" ] || [ "$g_bare" = "1" ] || [ -n "$g_json_file" ] || [ -n "$g_approval_mode" ] || [ -n "$g_max_wall_time" ]; }; then
     echo "[run-coding-cli] note: governance flags (--model/--allowed-tools/--allowed-mcp/--safe-mode/--bare/--json-file/--approval-mode/--max-wall-time) are qwen-specific and were ignored for cli=$cli" >&2
 fi
-
-# Write the run metadata header to the log (and stdout) so the log file itself
-# records which workspace/prompt/timeout this run used.
-echo "[run-coding-cli] cli=$cli workspace=$workspace prompt_file=$prompt_file timeout=${timeout_secs}s" | tee "$log_file"
-echo "[run-coding-cli] Log: $log_file"
 
 # Optional per-runner budget/boundary fields from the delegating agent's
 # config (default ~/coding-cli-config.json, override with CODING_CLI_CONFIG
@@ -266,15 +297,15 @@ case "$cli" in
         case "${approval_mode}" in
             plan|default|auto-edit|auto|yolo) ;;
             *)
-                echo "[run-coding-cli] ERROR: invalid approval mode '${approval_mode}'" >&2
                 if [ -n "${g_approval_mode}" ]; then
-                    echo "[run-coding-cli] source: --approval-mode" >&2
+                    approval_source="[run-coding-cli] source: --approval-mode"
                 else
-                    echo "[run-coding-cli] source: approval_mode in ${config_file}" >&2
+                    approval_source="[run-coding-cli] source: approval_mode in ${config_file}"
                 fi
-                echo "[run-coding-cli] Valid values: plan, default, auto-edit, auto, yolo" >&2
-                append_run_record failed invalid-approval-mode 1
-                exit 1
+                fail_run failed invalid-approval-mode 1 \
+                    "[run-coding-cli] ERROR: invalid approval mode '${approval_mode}'" \
+                    "${approval_source}" \
+                    "[run-coding-cli] Valid values: plan, default, auto-edit, auto, yolo"
                 ;;
         esac
         max_wall_time="${g_max_wall_time:-${max_wall_time_setting}}"
@@ -358,9 +389,8 @@ case "$cli" in
         exit_code=${PIPESTATUS[0]}
         ;;
     *)
-        echo "Unknown CLI tool: $cli. Supported: claude, gemini, qodercli, qwen, opencode" >&2 | tee -a "$log_file"
-        append_run_record failed unknown-cli 1
-        exit 1
+        fail_run failed unknown-cli 1 \
+            "Unknown CLI tool: $cli. Supported: claude, gemini, qodercli, qwen, opencode"
         ;;
 esac
 

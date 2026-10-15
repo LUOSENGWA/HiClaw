@@ -34,6 +34,15 @@ unchanged, and a run with no `runs.jsonl` record (every run recorded before
 v2) degrades to the v1 fields rather than failing. The list never reads a log
 body — one index read per task, not N per run.
 
+**Every recorded outcome is readable.** A transcript is the unit this API
+enumerates and serves, so the writer never records an outcome without one: a
+**blocked attempt** (a conflicting `.processing` marker, or a CLI missing from
+PATH) leaves a transcript carrying the refusal diagnostic — the attempt shows
+up in the list as `status: blocked` with its reason, and the detail serves the
+diagnostic text like any other run. Index-only records (metadata with no
+transcript object) are not expected from the wrapper and would stay invisible
+here; that is why the writer's contract is "one index line ⇔ one transcript".
+
 ## Routes
 
 | Route | Storage read | Returns |
@@ -59,9 +68,12 @@ body — one index read per task, not N per run.
 
 - **Source**: the task's `…/coding-cli-logs/runs.jsonl`, mapped by run name
   (one extra `GetObject` per task directory — never a per-run log read).
-- **Fallback**: with no record, the item keeps the v1 fields and derives
-  `started_at` from the run filename (`run-YYYYMMDD-HHMMSS.log`); an
-  implausible timestamp is dropped rather than fabricated.
+- **No fabricated timestamps**: `started_at` / `ended_at` come from the record
+  only, where the wrapper writes UTC (`date -u`). The run **filename** is a
+  container-LOCAL wall-clock stamp (`date +%Y%m%d-%H%M%S`) whose timezone is
+  unknowable from the controller, so a record-less run reports **no**
+  `started_at` rather than a local time asserted as UTC. (Do not add a
+  filename fallback: it is wrong by the container's UTC offset.)
 - **Tolerance**: a missing `runs.jsonl`, a bad line, or a line without a run
   name is skipped — a malformed index never fails the list.
 - `runner` (the run's own container identity) is deliberately **not** in the
@@ -73,7 +85,7 @@ body — one index read per task, not N per run.
 {
   "task_id": "t1", "run": "run-20261015-101500.log", "team": "alpha-team",
   "meta": { "cli": "qwen", "worker": "sysdev-coder", "runner": "sysdev-lead",
-            "status": "ok", "exit_code": 0, "timeout_secs": 3600,
+            "status": "ok", "reason": "", "exit_code": 0, "timeout_secs": 3600,
             "started_at": "…", "ended_at": "…", "log_bytes": 12345,
             "prompt_file": "…", "prompt_sha256": "…" },
   "input":  { "prompt_summary": "…first 200 chars…", "prompt_sha256": "…",
@@ -84,6 +96,11 @@ body — one index read per task, not N per run.
 
 - `output.transcript` is the same bytes the default route returns verbatim; the
   envelope adds no timestamp or wrapper of its own.
+- `meta.reason` is the record's machine-readable outcome qualifier — it names
+  the refusal on the blocked paths (`marker-conflict`, `cli-missing`) and the
+  other write-side reason codes, and is absent when the outcome needs none. A
+  consumer can render `status` + the transcript for the human, and `reason` for
+  the machine.
 - `input.prompt` is read from `…/{taskID}/coding-prompts/{basename}` — the
   prompt lives *beside* the workspace, and is only readable because the mirror
   rule below pushes it on every outcome. The basename comes from the record's
@@ -167,12 +184,17 @@ enriches from:
  "prompt_sha256":"…","prompt_summary":"…"}
 ```
 
-- **Appended on every exit path from argument validation onwards** — ok,
-  timeout (124), blocked-by-marker / blocked-missing-CLI (125), invalid
-  approval mode / unknown CLI / runner failure — so a run that never produced
-  a result still records why. Argument-validation failures (missing
-  `--cli` / missing prompt / missing workspace) are not runs and append
-  nothing. Empty values are omitted, matching the API's `omitempty` contract.
+- **One transcript per record, on every exit path from argument validation
+  onwards** — ok, timeout (124), blocked-by-marker / blocked-missing-CLI
+  (125), invalid approval mode / unknown CLI / runner failure. Each of those
+  owns a `run-….log`: it is created up front (exclusively — a same-second
+  transcript is never clobbered; a taken name steps one second forward) and
+  finalized with the diagnostic that explains the outcome, which a refusing
+  exit writes to the transcript **and** stderr before appending the record.
+  `log_bytes` is that transcript's size, so it is present for every recorded
+  run. Argument-validation failures (missing `--cli` / missing prompt /
+  missing workspace) are not runs: no record, no transcript. Empty values are
+  omitted, matching the API's `omitempty` contract.
 - **`status` is the script's exit code mapped**: `0 → ok`, `124 → timeout`,
   `125 → blocked`, anything else `failed`. `reason` disambiguates the blocked
   paths (`marker-conflict`, `cli-missing`) and is empty otherwise.
@@ -260,9 +282,16 @@ curl -s "http://127.0.0.1:8090/api/v1/coding-runs/../etc/runs/run-20261012-12000
     `TestListCodingRuns_CapIsGlobalAcrossTeams` (the 200 cap stays global)
   - list enrichment (v2): `TestListCodingRuns_EnrichedFromRunsJSONL` (fields
     pass-through, `exit_code: 0` shown, second run degrading),
-    `TestListCodingRuns_MissingRunsJSONLFallsBackToFilename` (filename-derived
-    `started_at`, metadata keys omitted on the wire),
+    `TestListCodingRuns_LocalFilenameIsNotReadAsUTC` (a container-local
+    filename must not produce a `Z` instant — no fabricated start),
     `TestListCodingRuns_MalformedRunsJSONLIsTolerated`
+  - blocked attempts: `TestBlockedAttemptVisibleToListAndDetail` (listed as
+    `status=blocked` with `reason`, transcript readable verbatim), and
+    `TestBlockedAttempts_EndToEnd_WriterStorageAPI` — the writer→storage→API
+    regression: it runs the real `run-coding-cli.sh` through both blocked
+    reasons, mirrors `coding-cli-logs/` + `coding-prompts/` into the fake
+    store, and asserts the attempt is visible in the list and readable in the
+    detail (skips when the shell toolchain is unavailable)
   - detail: `TestGetCodingRun_AdminReadsByteTransparent` (default
     `text/plain`, byte-identical),
     `TestGetCodingRun_L2OwnTeam`, `TestGetCodingRun_L2OtherTeam` (W4 404),
@@ -277,8 +306,14 @@ curl -s "http://127.0.0.1:8090/api/v1/coding-runs/../etc/runs/run-20261012-12000
   the authorizer boundary: L2 human + team leader `get`/`list` allowed (so the
   handler scope runs), worker denied.
 - `tests/check-coding-cli-runs-metadata.sh` — the write side, over a stub CLI:
-  the ok / timeout / blocked-marker / blocked-missing-CLI paths each append
-  exactly one `runs.jsonl` line with the right `status` / `reason` /
-  `exit_code`, `--worker` and `AGENTTEAMS_WORKER_NAME` land as
-  `worker` / `runner`, empty values are omitted, and runs append
-  (one line per run). Wired into `.github/workflows/helm-lint.yml`.
+  - ok / timeout / bad-approval / both blocked reasons each append exactly one
+    `runs.jsonl` line with the right `status` / `reason` / `exit_code`;
+  - each of those leaves a **transcript that names the run and explains the
+    outcome** (the blocked ones carry the refusal diagnostic) — the review
+    regression for "recorded but invisible";
+  - a closing invariant sweep asserts **every** recorded run names an existing
+    transcript, whatever the outcome;
+  - `--worker` and `AGENTTEAMS_WORKER_NAME` land as `worker` / `runner`, empty
+    values are omitted, runs append (one line per run), and a non-UTC
+    container (`TZ=Asia/Shanghai`) still records `started_at` in UTC.
+  Wired into `.github/workflows/helm-lint.yml`.

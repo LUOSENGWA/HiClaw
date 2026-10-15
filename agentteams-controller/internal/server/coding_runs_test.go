@@ -3,11 +3,17 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
+	"time"
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
@@ -192,25 +198,30 @@ func TestListCodingRuns_EnrichedFromRunsJSONL(t *testing.T) {
 	if enriched.EndedAt != "2026-10-12T12:00:00Z" || enriched.LogBytes == nil || *enriched.LogBytes != 42 {
 		t.Fatalf("ended_at/log_bytes = %q/%v, want the record's values", enriched.EndedAt, enriched.LogBytes)
 	}
-	// The run without a record degrades to base fields + filename fallback.
+	// The run without a record degrades to the base fields only: no metadata,
+	// and no invented timestamp (the filename's timezone is unknowable — see
+	// TestListCodingRuns_LocalFilenameIsNotReadAsUTC).
 	fallback := runs[1]
 	if fallback.Run != "run-20261012-130000.log" {
 		t.Fatalf("runs[1] = %+v, want the unrecorded run", fallback)
 	}
 	if fallback.Cli != "" || fallback.Worker != "" || fallback.Status != "" ||
-		fallback.ExitCode != nil || fallback.EndedAt != "" || fallback.LogBytes != nil {
-		t.Fatalf("fallback run must not carry record metadata: %+v", fallback)
-	}
-	if fallback.StartedAt != "2026-10-12T13:00:00Z" {
-		t.Fatalf("fallback started_at = %q, want filename-derived 2026-10-12T13:00:00Z", fallback.StartedAt)
+		fallback.ExitCode != nil || fallback.EndedAt != "" || fallback.LogBytes != nil ||
+		fallback.StartedAt != "" {
+		t.Fatalf("fallback run must not carry record metadata or a fabricated start: %+v", fallback)
 	}
 }
 
-func TestListCodingRuns_MissingRunsJSONLFallsBackToFilename(t *testing.T) {
-	// No runs.jsonl at all (an older wrapper version): base fields plus the
-	// filename-derived started_at, and nothing else.
+func TestListCodingRuns_LocalFilenameIsNotReadAsUTC(t *testing.T) {
+	// run-coding-cli.sh names transcripts with the CONTAINER clock
+	// (`date +%Y%m%d-%H%M%S`), so the filename is a LOCAL wall-clock stamp,
+	// not a UTC instant — a "2026-10-15 23:00" name from an Asia/Shanghai
+	// container is 15:00Z. Without a runs.jsonl record the container's zone is
+	// unknowable, so started_at must stay absent rather than assert a
+	// fabricated UTC instant (review finding: do not reinterpret legacy local
+	// filenames using the controller's timezone).
 	store := ossfake.NewMemory()
-	putRun(store, teamRunKey, "alpha t1 run")
+	putRun(store, "teams/alpha-team/shared/tasks/t1/workspace/coding-cli-logs/run-20261015-230000.log", "legacy local-time run")
 	h := newCodingRunsTestHandler(t, store, team("alpha-team"))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/coding-runs", nil)
@@ -218,23 +229,82 @@ func TestListCodingRuns_MissingRunsJSONLFallsBackToFilename(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ListCodingRuns(rec, req)
 
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
 	var runs []codingRun
-	_ = json.Unmarshal(rec.Body.Bytes(), &runs)
+	if err := json.Unmarshal(rec.Body.Bytes(), &runs); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
 	if len(runs) != 1 {
 		t.Fatalf("runs = %d, want 1: %+v", len(runs), runs)
 	}
-	if runs[0].StartedAt != "2026-10-12T12:00:00Z" {
-		t.Fatalf("started_at = %q, want filename-derived 2026-10-12T12:00:00Z", runs[0].StartedAt)
+	if runs[0].StartedAt != "" {
+		t.Fatalf("started_at = %q, want empty: a local filename must not be asserted as UTC", runs[0].StartedAt)
 	}
 	// Unknown metadata keys are omitted from the wire (omitempty contract).
 	var rawList []map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &rawList); err != nil {
 		t.Fatalf("decode raw list: %v", err)
 	}
-	for _, key := range []string{"cli", "worker", "status", "exit_code", "ended_at", "log_bytes"} {
+	for _, key := range []string{"cli", "worker", "status", "exit_code", "started_at", "ended_at", "log_bytes"} {
 		if _, ok := rawList[0][key]; ok {
 			t.Fatalf("key %q must be omitted when unknown, got: %v", key, rawList[0])
 		}
+	}
+}
+
+// ── blocked attempts (review: recorded but must also be readable) ───────────
+
+// A blocked attempt (the pre-flight guards refuse to run the CLI) is a
+// first-class record, not an index-only ghost: the writer leaves a diagnostic
+// transcript beside its index line, so the read API sees it like any other
+// run — on the list and in the detail. Regression for the review finding that
+// these attempts were mirrored but invisible (no transcript object).
+func TestBlockedAttemptVisibleToListAndDetail(t *testing.T) {
+	const diagnostic = "[run-coding-cli] cli=qwen workspace=… timeout=3600s\n" +
+		"[run-coding-cli] ERROR: …/.processing is held by 'alice'\n" +
+		"[run-coding-cli] removes the marker or it expires.\n"
+	store := ossfake.NewMemory()
+	putRun(store, teamRunKey, diagnostic) // teamRunKey is t1/run-20261012-120000.log
+	putRun(store, runsJSONLKey, `{"v":1,"run":"run-20261012-120000.log","cli":"qwen","worker":"sysdev-coder","status":"blocked","reason":"marker-conflict","exit_code":125,"timeout_secs":3600,"started_at":"2026-10-12T11:59:58Z","ended_at":"2026-10-12T11:59:58Z","log_bytes":214,"prompt_file":"/root/agentteams-fs/shared/tasks/t1/coding-prompts/20261012-120000.txt","prompt_sha256":"abc123sha","prompt_summary":"do the thing"}`)
+	h := newCodingRunsTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/coding-runs", nil)
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ListCodingRuns(rec, req)
+	var runs []codingRun
+	if err := json.Unmarshal(rec.Body.Bytes(), &runs); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(runs) != 1 || runs[0].Status != "blocked" || runs[0].ExitCode == nil || *runs[0].ExitCode != 125 {
+		t.Fatalf("blocked attempt must be listed with status=blocked exit_code=125: %+v", runs)
+	}
+	if runs[0].LogBytes == nil || *runs[0].LogBytes != 214 {
+		t.Fatalf("blocked attempt log_bytes = %v, want the transcript size 214", runs[0].LogBytes)
+	}
+
+	// Detail: the default text route serves the diagnostic transcript…
+	recText := getRun(h, "t1", "run-20261012-120000.log", &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	if recText.Code != http.StatusOK || !strings.Contains(recText.Body.String(), "is held by") {
+		t.Fatalf("blocked detail (text) = %d %q, want the diagnostic transcript", recText.Code, recText.Body.String())
+	}
+	// …and the JSON envelope names the outcome plus the machine-readable
+	// reason, with the transcript still carried verbatim.
+	recJSON := getRunJSON(h, "t1", "run-20261012-120000.log", &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	if recJSON.Code != http.StatusOK {
+		t.Fatalf("blocked detail (json) status = %d: %s", recJSON.Code, recJSON.Body.String())
+	}
+	var d codingRunDetail
+	if err := json.Unmarshal(recJSON.Body.Bytes(), &d); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if d.Meta.Status != "blocked" || d.Meta.Reason != "marker-conflict" || d.Meta.ExitCode == nil || *d.Meta.ExitCode != 125 {
+		t.Fatalf("blocked meta = %+v, want status/reason/exit_code", d.Meta)
+	}
+	if !strings.Contains(d.Output.Transcript, "is held by") || d.Output.Transcript != diagnostic {
+		t.Fatalf("blocked output.transcript = %q, want the diagnostic verbatim", d.Output.Transcript)
 	}
 }
 
@@ -515,5 +585,153 @@ func TestListCodingRuns_CapIsGlobalAcrossTeams(t *testing.T) {
 	}
 	if len(runs) != codingRunsListCap {
 		t.Fatalf("len(runs) = %d, want global cap %d (outer prefix loop must stop once the cap is reached)", len(runs), codingRunsListCap)
+	}
+}
+
+// ── writer → storage → API: the blocked attempts, end to end ────────────────
+
+// codingRunsWrapperRelPath is the coding-cli wrapper, relative to this
+// package's directory (agentteams-controller/internal/server).
+const codingRunsWrapperRelPath = "../../../manager/agent/skills/coding-cli-management/scripts/run-coding-cli.sh"
+
+// TestBlockedAttempts_EndToEnd_WriterStorageAPI drives the REAL writer through
+// both blocked exits (125: a conflicting .processing marker, and a CLI absent
+// from PATH), mirrors what the skill mirrors into the in-memory store, and
+// then reads the API. Regression for the review finding: a blocked attempt
+// used to append only its runs.jsonl line — no transcript object — so mirroring
+// the directory left it absent from the list and unreadable in detail. The
+// writer's contract is now "one index line ⇔ one transcript".
+func TestBlockedAttempts_EndToEnd_WriterStorageAPI(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("the coding-cli wrapper is a POSIX shell script")
+	}
+	for _, bin := range []string{"bash", "python3", "date", "sha256sum", "sed", "tr", "head", "wc", "mkdir"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("end-to-end writer regression needs %s on PATH", bin)
+		}
+	}
+	wrapper, err := filepath.Abs(codingRunsWrapperRelPath)
+	if err != nil {
+		t.Fatalf("resolve the wrapper path: %v", err)
+	}
+	if _, err := os.Stat(wrapper); err != nil {
+		t.Skipf("wrapper not found at %s (controller tree checked out without the manager tree?)", wrapper)
+	}
+	// A bogus CLI name keeps the missing-CLI guard deterministic even on a host
+	// that has a real qwen installed (the marker guard fires first anyway).
+	const cliName = "no-such-coding-cli-for-test"
+	const promptBody = "fix the parser\nplease be careful"
+	const taskPrefix = "teams/alpha-team/shared/tasks/t1/"
+
+	for _, tc := range []struct {
+		name       string
+		reason     string
+		diagnostic string // a phrase the blocked transcript must carry
+	}{
+		{"marker-conflict", "marker-conflict", "is held by"},
+		{"cli-missing", "cli-missing", "not on PATH"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			taskDir := t.TempDir()
+			workspace := filepath.Join(taskDir, "workspace")
+			promptDir := filepath.Join(taskDir, "coding-prompts")
+			for _, d := range []string{workspace, promptDir} {
+				if err := os.MkdirAll(d, 0o755); err != nil {
+					t.Fatalf("mkdir %s: %v", d, err)
+				}
+			}
+			prompt := filepath.Join(promptDir, "20261015-101500.txt")
+			if err := os.WriteFile(prompt, []byte(promptBody), 0o644); err != nil {
+				t.Fatalf("write prompt: %v", err)
+			}
+			args := []string{wrapper, "--cli", cliName, "--workspace", workspace, "--prompt-file", prompt}
+			if tc.reason == "marker-conflict" {
+				marker := fmt.Sprintf(`{"processor":"alice","expires_at":%q}`,
+					time.Now().UTC().Add(15*time.Minute).Format("2006-01-02T15:04:05Z"))
+				if err := os.WriteFile(filepath.Join(taskDir, ".processing"), []byte(marker), 0o644); err != nil {
+					t.Fatalf("write marker: %v", err)
+				}
+				args = append(args, "--task-dir", taskDir, "--processor", "bob")
+			}
+			cmd := exec.Command("bash", args...)
+			cmd.Env = append(os.Environ(),
+				"AGENTTEAMS_WORKER_NAME=sysdev-lead",
+				"CODING_CLI_CONFIG="+filepath.Join(t.TempDir(), "no-such-config.json"),
+			)
+			out, err := cmd.CombinedOutput()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 125 {
+				t.Fatalf("wrapper exit = %v, want 125 (blocked); output:\n%s", err, out)
+			}
+
+			logsDir := filepath.Join(workspace, "coding-cli-logs")
+			// Mirror what the skill mirrors (coding-cli-logs/ + coding-prompts/)
+			// — the storage leg of the regression.
+			store := ossfake.NewMemory()
+			mirror := func(dir, prefix string) {
+				items, err := os.ReadDir(dir)
+				if err != nil {
+					t.Fatalf("read %s: %v", dir, err)
+				}
+				for _, it := range items {
+					if it.IsDir() {
+						continue
+					}
+					data, err := os.ReadFile(filepath.Join(dir, it.Name()))
+					if err != nil {
+						t.Fatalf("read %s: %v", it.Name(), err)
+					}
+					if err := store.PutObject(context.Background(), prefix+it.Name(), data); err != nil {
+						t.Fatalf("put %s: %v", it.Name(), err)
+					}
+				}
+			}
+			mirror(logsDir, taskPrefix+"workspace/coding-cli-logs/")
+			mirror(promptDir, taskPrefix+"coding-prompts/")
+
+			h := newCodingRunsTestHandler(t, store, team("alpha-team"))
+			admin := &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"}
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/coding-runs", nil)
+			req = withCaller(req, admin)
+			rec := httptest.NewRecorder()
+			h.ListCodingRuns(rec, req)
+
+			var runs []codingRun
+			if err := json.Unmarshal(rec.Body.Bytes(), &runs); err != nil {
+				t.Fatalf("decode list: %v", err)
+			}
+			if len(runs) != 1 {
+				t.Fatalf("list = %+v, want the blocked attempt visible after the mirror (its transcript must exist)", runs)
+			}
+			got := runs[0]
+			if got.Status != "blocked" || got.ExitCode == nil || *got.ExitCode != 125 {
+				t.Fatalf("list item = %+v, want status=blocked exit_code=125", got)
+			}
+			if got.StartedAt == "" || !strings.HasSuffix(got.StartedAt, "Z") {
+				t.Fatalf("started_at = %q, want the record's UTC instant", got.StartedAt)
+			}
+			if got.LogBytes == nil || *got.LogBytes == 0 {
+				t.Fatalf("log_bytes = %v, want the diagnostic transcript's size", got.LogBytes)
+			}
+
+			recText := getRun(h, "t1", got.Run, admin)
+			if recText.Code != http.StatusOK || !strings.Contains(recText.Body.String(), tc.diagnostic) {
+				t.Fatalf("detail (text) = %d %q, want a transcript containing %q", recText.Code, recText.Body.String(), tc.diagnostic)
+			}
+			recJSON := getRunJSON(h, "t1", got.Run, admin)
+			var d codingRunDetail
+			if err := json.Unmarshal(recJSON.Body.Bytes(), &d); err != nil {
+				t.Fatalf("decode detail: %v", err)
+			}
+			if d.Meta.Status != "blocked" || d.Meta.Reason != tc.reason {
+				t.Fatalf("meta = %+v, want status=blocked reason=%s", d.Meta, tc.reason)
+			}
+			if !strings.Contains(d.Output.Transcript, tc.diagnostic) {
+				t.Fatalf("output.transcript = %q, want the diagnostic containing %q", d.Output.Transcript, tc.diagnostic)
+			}
+			if !d.Input.PromptAvailable || d.Input.Prompt != promptBody {
+				t.Fatalf("input = %+v, want the mirrored prompt available", d.Input)
+			}
+		})
 	}
 }

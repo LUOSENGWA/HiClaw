@@ -38,7 +38,6 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"time"
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
@@ -132,8 +131,7 @@ func visibleTaskPrefixes(all []string, caller *authpkg.CallerIdentity, crToEffec
 // codingRun is one run transcript entry in the list response. The base
 // fields (task_id / run / team) are v1; the metadata fields are additive
 // (v2) and omitted when the task's runs.jsonl has no record for the run
-// (older wrapper versions, or a pre-flight failure that left no record) —
-// started_at alone falls back to the run filename's timestamp.
+// (older wrapper versions, or a pre-flight failure that left no record).
 type codingRun struct {
 	TaskID    string `json:"task_id"`
 	Run       string `json:"run"`
@@ -193,26 +191,12 @@ func parseRunsIndex(data []byte) map[string]*codingRunRecord {
 	return out
 }
 
-// startedAtFromRunName derives a run's start time from its transcript
-// filename (run-YYYYMMDD-HHMMSS.log) — the fallback when the task has no
-// runs.jsonl record for the run. It returns "" for an implausible timestamp
-// (e.g. month 13), so a fallback never fabricates a time.
-func startedAtFromRunName(run string) string {
-	const prefix, suffix = "run-", ".log"
-	if !strings.HasPrefix(run, prefix) || !strings.HasSuffix(run, suffix) {
-		return ""
-	}
-	parts := strings.SplitN(strings.TrimSuffix(strings.TrimPrefix(run, prefix), suffix), "-", 2)
-	if len(parts) != 2 || len(parts[0]) != 8 || len(parts[1]) != 6 {
-		return ""
-	}
-	stamped := parts[0][:4] + "-" + parts[0][4:6] + "-" + parts[0][6:8] + "T" +
-		parts[1][:2] + ":" + parts[1][2:4] + ":" + parts[1][4:6] + "Z"
-	if _, err := time.Parse(time.RFC3339, stamped); err != nil {
-		return ""
-	}
-	return stamped
-}
+// Note on started_at: the wrapper names transcripts with the CONTAINER's local
+// wall clock (`date +%Y%m%d-%H%M%S`), so a run filename is not a UTC instant
+// and its timezone is unknowable from the controller. The API therefore only
+// reports started_at when the run's record carries it (the wrapper writes UTC
+// via `date -u`); it never reinterprets a legacy filename under a UTC
+// assumption. Unknown time is omitted, not fabricated.
 
 // GET /api/v1/coding-runs
 //
@@ -268,9 +252,6 @@ func (h *CodingRunsHandler) ListCodingRuns(w http.ResponseWriter, r *http.Reques
 					entry.EndedAt = rec.EndedAt
 					entry.LogBytes = rec.LogBytes
 				}
-				if entry.StartedAt == "" {
-					entry.StartedAt = startedAtFromRunName(f)
-				}
 				runs = append(runs, entry)
 				if len(runs) >= codingRunsListCap {
 					break
@@ -305,6 +286,7 @@ type codingRunMeta struct {
 	Worker       string `json:"worker,omitempty"`
 	Runner       string `json:"runner,omitempty"`
 	Status       string `json:"status,omitempty"`
+	Reason       string `json:"reason,omitempty"`
 	ExitCode     *int   `json:"exit_code,omitempty"`
 	TimeoutSecs  *int   `json:"timeout_secs,omitempty"`
 	StartedAt    string `json:"started_at,omitempty"`
@@ -402,6 +384,7 @@ func (h *CodingRunsHandler) writeRunDetailJSON(w http.ResponseWriter, r *http.Re
 			Worker:       rec.Worker,
 			Runner:       rec.Runner,
 			Status:       rec.Status,
+			Reason:       rec.Reason,
 			ExitCode:     rec.ExitCode,
 			TimeoutSecs:  rec.TimeoutSecs,
 			StartedAt:    rec.StartedAt,
