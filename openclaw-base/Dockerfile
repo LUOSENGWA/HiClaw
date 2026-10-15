@@ -103,6 +103,7 @@ RUN git init /opt/openclaw && \
         exit 1; \
     fi && \
     echo "==> Native addon present: ${MSC_DIR}/${MSC_FILE} ($(stat -c%s ${MSC_DIR}/${MSC_FILE}) bytes)" && \
+    node -e "require('${MSC_DIR}/${MSC_FILE}'); console.log('==> matrix-sdk-crypto LOAD OK (NAPI/ABI verified) on Node ' + process.version)" && \
     chmod +x /opt/openclaw/openclaw.mjs && \
     ln -sf /opt/openclaw/openclaw.mjs /usr/local/bin/openclaw && \
     echo "==> Linked openclaw CLI to /usr/local/bin/openclaw" && \
