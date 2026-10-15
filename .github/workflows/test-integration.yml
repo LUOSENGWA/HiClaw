@@ -830,12 +830,19 @@ jobs:
 
   qwenpaw-runtime-upgrade:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Every step below carries its own wall-clock bound, so a stall fails AT
+    # that step (exit 124, step named in the log) instead of silently consuming
+    # the job budget: the previous shape had no per-step bound, so a cancelled
+    # run left nothing to point at. The repo-side work measures ~35 s
+    # (selftest) and ~75 s (the 41-test battery) — a healthy run is ~2-3 min;
+    # the job budget covers the three step bounds (150+210+270 = 630 s) plus
+    # checkout / setup-python overhead.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - name: Run the in-place upgrade battery (stubbed selftest)
-        run: bash qwenpaw/scripts/upgrade_qwenpaw_runtime.sh --selftest
+        run: timeout 150 bash qwenpaw/scripts/upgrade_qwenpaw_runtime.sh --selftest
 
       - uses: actions/setup-python@v5
         with:
@@ -843,13 +850,17 @@ jobs:
 
       - name: Install the upgrade test-suite dependencies
         # The plugin tests load the real plugin module (fastapi/pydantic);
-        # the version tests use packaging for PEP440 comparison.
-        run: python3 -m pip install --quiet pytest packaging fastapi pydantic
+        # the version tests use packaging for PEP440 comparison. Bounded, with
+        # retries, so a registry hiccup surfaces here rather than stalling the
+        # whole job.
+        run: timeout 210 python3 -m pip install --quiet --timeout 20 --retries 2 pytest packaging fastapi pydantic
 
       - name: Run the upgrade pytest battery (orchestrator / versions / plugin / entrypoint)
         # Fully stubbed: fake orchestrator hooks, fake worker, no network.
+        # -v names every test as it starts, so a stall points at the test it is
+        # stuck in; --durations surfaces anything unexpectedly slow.
         run: >
-          python3 -m pytest -q
+          timeout 270 python3 -m pytest -v --durations=10
           qwenpaw/tests/test_upgrade_orchestrator.py
           qwenpaw/tests/test_upgrade_versions.py
           qwenpaw/tests/test_upgrade_plugin.py
