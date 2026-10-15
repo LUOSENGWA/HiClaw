@@ -40,7 +40,9 @@
 #                    it would spin outside the CLI timeout).
 #  10. collision   — a same-second transcript is never clobbered: the claim
 #                    steps to a free name and both transcripts survive.
-#  11. invariant   — sweep: every recorded run names an existing transcript.
+#  11. bad-stamp   — a clock that cannot produce run-YYYYMMDD-HHMMSS.log
+#                    refuses the run (an unenumerable name would be invisible).
+#  12. invariant   — sweep: every recorded run names an existing transcript.
 #
 # jq + python3 are required (the assertions read the JSONL; the wrapper builds
 # each line with python3) — SKIP when either is absent, per the check-suite
@@ -333,7 +335,43 @@ assert_eq "case10 stepped to a free name" "$(field "${line}" '.run')" "run-${sta
 assert_eq "case10 live transcript not clobbered" "$(cat "${sentinel}")" "live run transcript — must survive"
 assert_transcript "case10" "${ws10}" "${line}"
 
-# --- case 11: invariant — every recorded run names an existing transcript -----
+# --- case 11: a clock that cannot name a transcript refuses the run ----------
+# The read API only enumerates run-<YYYYMMDD>-<HHMMSS>.log. A candidate outside
+# that shape (a broken clock/date) must refuse the run rather than claim a name
+# no reader can enumerate.
+ws11="${TMP}/ws11"; mkdir -p "${ws11}/coding-cli-logs"
+stub_bad_dir="${TMP}/bin-bad-date"; mkdir -p "${stub_bad_dir}"
+cat > "${stub_bad_dir}/date" <<'STUB'
+#!/bin/bash
+case "$*" in
+    *"+%s")                 echo "1786000000"; exit 0 ;;
+    *"-d @"*)               echo "not-a-stamp"; exit 0 ;;
+    *"+%Y%m%d-%H%M%S")      exec /usr/bin/date -d "@1786000000" +%Y%m%d-%H%M%S ;;
+    *"+%Y-%m-%dT%H:%M:%SZ") echo "2026-11-10T10:14:59Z"; exit 0 ;;
+esac
+/usr/bin/date "$@"
+STUB
+chmod +x "${stub_bad_dir}/date"
+stamp_collide="$(PATH="${stub_bad_dir}:${PATH}" date +%Y%m%d-%H%M%S)"
+printf 'live run transcript — must survive\n' > "${ws11}/coding-cli-logs/run-${stamp_collide}.log"
+rm -f "${STUB_ARGS}"
+out="$(PATH="${stub_bad_dir}:${STUB_BIN}:${PATH}" QWEN_STUB_ARGS="${STUB_ARGS}" \
+    CODING_CLI_CONFIG="${TMP}/nonexistent.json" AGENTTEAMS_WORKER_NAME="runner-1" \
+    timeout 10 bash "${RUN_SCRIPT}" --cli qwen --workspace "${ws11}" --prompt-file "${prompt}" 2>&1)"
+rc=$?
+if [ "${rc}" -eq 0 ] || [ "${rc}" -eq 124 ]; then
+    echo "FAIL case11: an unusable transcript name must refuse promptly (got ${rc}): ${out}"
+    fail=1
+fi
+grep -qF "unusable run transcript name" <<<"${out}" \
+    || { echo "FAIL case11: expected a diagnostic naming the unusable transcript (got: ${out})"; fail=1; }
+[ ! -f "${STUB_ARGS}" ] \
+    || { echo "FAIL case11: the CLI must not be invoked when no transcript name can be claimed"; fail=1; }
+[ ! -f "$(jsonl_of "${ws11}")" ] \
+    || { echo "FAIL case11: no record may be written without an enumerable transcript"; fail=1; }
+assert_eq "case11 no stray transcript" "$(ls "${ws11}/coding-cli-logs" | wc -l | tr -d ' ')" "1"
+
+# --- case 12: invariant — every recorded run names an existing transcript -----
 # The class-level guard for the review finding: regardless of outcome, a
 # runs.jsonl line implies a transcript the read API can enumerate.
 for ws in "${ws1}" "${ws2}" "${ws3}" "${ws4}" "${ws5}" "${ws6}" "${ws7}" "${ws8}" "${ws10}"; do

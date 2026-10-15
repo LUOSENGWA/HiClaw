@@ -202,9 +202,12 @@ enriches from:
   or unwritable `coding-cli-logs/`, a full disk, an uncreatable directory)
   refuses the run at once with a visible diagnostic instead of retrying: a
   retry there would sit before the pre-flight guards and outside the CLI
-  `--timeout`, so nothing could bound it. Such a refusal writes no record (the
-  directory cannot hold one) — like the argument-validation class, the run
-  simply does not exist.
+  `--timeout`, so nothing could bound it. A candidate outside the enumerated
+  `run-YYYYMMDD-HHMMSS.log` shape (a clock/date that cannot produce one) is
+  refused the same way — claiming it would leave a transcript no reader could
+  enumerate. Such refusals write no record (the directory cannot hold one, and
+  a record without a transcript would break the one-to-one invariant) — like
+  the argument-validation class, the run simply does not exist.
 - **`status` is the script's exit code mapped**: `0 → ok`, `124 → timeout`,
   `125 → blocked`, anything else `failed`. `reason` disambiguates the blocked
   paths (`marker-conflict`, `cli-missing`) and is empty otherwise.
@@ -328,6 +331,8 @@ curl -s "http://127.0.0.1:8090/api/v1/coding-runs/../etc/runs/run-20261012-12000
     `timeout`, so a regression back to retrying shows up as a failure and not
     as a hang), and a same-second collision leaves the live transcript
     byte-identical while the claim steps to a free name;
+  - a clock that cannot produce the enumerated `run-YYYYMMDD-HHMMSS.log` shape
+    refuses the run instead of claiming a name no reader can enumerate;
   - `--worker` and `AGENTTEAMS_WORKER_NAME` land as `worker` / `runner`, empty
     values are omitted, runs append (one line **and** one transcript per run),
     and a non-UTC container (`TZ=Asia/Shanghai`) still records `started_at` in

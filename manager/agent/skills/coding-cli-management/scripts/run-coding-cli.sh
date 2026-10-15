@@ -104,10 +104,19 @@ runs_jsonl="$log_dir/runs.jsonl"
 claim_transcript() {
     local epoch attempts=0
     epoch=$(date +%s)
+    timestamp=$(date +%Y%m%d-%H%M%S)
     while true; do
-        timestamp=$(date -d "@${epoch}" +%Y%m%d-%H%M%S)
         run_name="run-${timestamp}.log"
         log_file="$log_dir/${run_name}"
+        # The read API only enumerates run-YYYYMMDD-HHMMSS.log, so never claim
+        # a name outside that shape: a clock/date that cannot produce one would
+        # otherwise leave a transcript no reader (and no index lookup) can see.
+        if [[ ! "${run_name}" =~ ^run-[0-9]{8}-[0-9]{6}\.log$ ]]; then
+            echo "[run-coding-cli] ERROR: unusable run transcript name '${run_name}' — the clock/date" >&2
+            echo "[run-coding-cli] produced a stamp that run-YYYYMMDD-HHMMSS.log cannot match, so no" >&2
+            echo "[run-coding-cli] reader could enumerate it. No run was started." >&2
+            exit 1
+        fi
         if ( set -C; : > "$log_file" ) 2>/dev/null; then
             return 0
         fi
@@ -125,6 +134,7 @@ claim_transcript() {
             exit 1
         fi
         epoch=$(( epoch + 1 ))
+        timestamp=$(date -d "@${epoch}" +%Y%m%d-%H%M%S)
     done
 }
 claim_transcript
