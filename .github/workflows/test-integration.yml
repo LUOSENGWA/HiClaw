@@ -836,3 +836,21 @@ jobs:
 
       - name: Run the in-place upgrade battery (stubbed selftest)
         run: bash qwenpaw/scripts/upgrade_qwenpaw_runtime.sh --selftest
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install the upgrade test-suite dependencies
+        # The plugin tests load the real plugin module (fastapi/pydantic);
+        # the version tests use packaging for PEP440 comparison.
+        run: python3 -m pip install --quiet pytest packaging fastapi pydantic
+
+      - name: Run the upgrade pytest battery (orchestrator / versions / plugin / entrypoint)
+        # Fully stubbed: fake orchestrator hooks, fake worker, no network.
+        run: >
+          python3 -m pytest -q
+          qwenpaw/tests/test_upgrade_orchestrator.py
+          qwenpaw/tests/test_upgrade_versions.py
+          qwenpaw/tests/test_upgrade_plugin.py
+          qwenpaw/tests/test_upgrade_entrypoint.py

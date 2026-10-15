@@ -12,7 +12,11 @@
 
 set -e
 
-source /opt/agentteams/scripts/lib/agentteams-env.sh
+# AGENTTEAMS_ENV_LIB lets tests (and image variants) point the bootstrap at a
+# different copy; the default is the image path and production behavior is
+# unchanged.
+ENV_LIB="${AGENTTEAMS_ENV_LIB:-/opt/agentteams/scripts/lib/agentteams-env.sh}"
+source "${ENV_LIB}"
 
 WORKER_NAME="${AGENTTEAMS_WORKER_NAME:?AGENTTEAMS_WORKER_NAME is required}"
 WORKER_CR_NAME="${AGENTTEAMS_WORKER_CR_NAME:-${WORKER_NAME}}"
@@ -96,7 +100,9 @@ EOF
     export LOONGSUITE_PYTHON_SITE_BOOTSTRAP_LOG_SUCCESS=false
 fi
 
-VENV="/opt/venv/qwenpaw"
+# AGENTTEAMS_QWENPAW_VENV lets tests point the runtime at a stub venv; the
+# default is the image path.
+VENV="${AGENTTEAMS_QWENPAW_VENV:-/opt/venv/qwenpaw}"
 
 CMD_ARGS=(
     --name "${WORKER_NAME}"
@@ -122,23 +128,32 @@ log "  Console port: ${CONSOLE_PORT}"
 # §4.8). Phase 1 (pre-restart) swaps the package and restarts the container,
 # leaving pending.json on success. Phase 2 (boot-check, below, before boot)
 # verifies the installed venv version: match -> pending RETAINED (the app is
-# not up yet, so this is only a pre-check); mismatch -> boot-check rolls back
-# to the old version. The post-start gate (after the app is up) is the real
-# arbiter: it verifies the running app serves the target version and stays
-# alive, removing pending on success and rolling back on failure — so a
-# package that installed fine but whose app fails to start is recovered
+# not up yet, so this is only a pre-check); mismatch -> boot-check restores
+# the old version and DEFERS (the job goes to the non-terminal state
+# `recovering`, pending kept with expect=old — the app is not up yet, so the
+# restored runtime cannot be verified here). The post-start gate (after the
+# app is up) is the real arbiter: it verifies the RUNNING app serves the
+# expected version (the target on a success path; the OLD version when
+# pending.json carries expect=old) and stays alive (settle window), and only
+# a PASSED gate finalizes the job (success / rolled_back, pending removed) —
+# so a package that installed fine but whose app fails to start is recovered
 # automatically. boot-check always exits 0 once handled (the container MUST
 # boot; the result lives in the job state file). The post-start exit code is
 # the VERDICT (this worker image has no supervisor, so the rollback's
 # restart primitive is kill, not supervisorctl):
-#   0 = verification passed -> keep the new runtime (foreground)
-#   3 = recovered -> the rollback restored the old runtime; relaunch the
-#       worker in the foreground against it (kill mode verifies at the next
-#       boot's wrapper version gate)
-#   other (4 = FATAL: verification AND its rollback failed, pending kept) ->
-#       never read as "keep the new runtime": stop the app and exit
+#   0 = the CURRENT runtime passed its verification gate -> keep it
+#       (the new version on a success path; the restored OLD version when
+#       expect=old — the recovery is verified and the job is rolled_back)
+#   3 = restore done, UNVERIFIED (kill mode): the app child is dead and the
+#       wrapper exited with it — this entrypoint must relaunch the OLD
+#       runtime and re-run the post-start gate, whose expect=old branch
+#       performs the verification and finalizes the job
+#   other (4 = FATAL: the restore and/or its verification failed, pending
+#       kept) -> never read as "keep the new runtime": stop the app and exit
 #       non-zero so the container supervisor surfaces the failure.
-UPGRADE_SH=/opt/agentteams/scripts/upgrade_qwenpaw_runtime.sh
+# AGENTTEAMS_UPGRADE_SCRIPT lets tests point the orchestrator at a repo copy;
+# the default is the image path (same convention as the runner plugin).
+UPGRADE_SH="${AGENTTEAMS_UPGRADE_SCRIPT:-/opt/agentteams/scripts/upgrade_qwenpaw_runtime.sh}"
 PENDING_UPGRADE="${QWENPAW_WORKING_DIR}/upgrade/pending.json"
 POST_START=0
 if [ -f "${PENDING_UPGRADE}" ] && [ -f "${UPGRADE_SH}" ]; then
@@ -172,18 +187,38 @@ bash "${UPGRADE_SH}" --phase post-start --venv "${VENV}" \
     --pending-file "${PENDING_UPGRADE}" --restart-mode kill || POST_START_RC=$?
 case "${POST_START_RC}" in
     0)
-        log "Post-start verification passed; keeping the new runtime."
+        # The current runtime passed its verification gate: the new version
+        # on a success path, or the restored OLD version when pending.json
+        # carried expect=old (the recovery is verified, job rolled_back).
+        log "Post-start verification passed; keeping the current runtime (new on success, restored old on recovery)."
         wait "${APP_PID}"
         ;;
     3)
-        # The rollback restored the old runtime (kill mode: the app child is
-        # already dead and the wrapper exited with it; the next boot's
-        # version gate is the final verifier). Serve the old runtime from
-        # here, in the foreground.
-        log "Post-start recovered to the old runtime; relaunching the worker in the foreground."
+        # UNVERIFIED handoff (kill mode): the restore actions succeeded, but
+        # the app child is dead and the wrapper exited with it — the restored
+        # runtime has NOT been verified and the job is still `recovering`.
+        # Relaunch the OLD runtime and re-run the post-start gate against it
+        # (its expect=old branch performs the readiness+settle verification
+        # and finalizes rolled_back). With expect=old set, that second run
+        # can only exit 0 (verified) or 4 (verification failed) — never 3
+        # again, so there is no relaunch loop.
+        log "Post-start restore done (unverified); relaunching the old runtime and re-verifying..."
         kill "${APP_PID}" 2>/dev/null || true
         wait "${APP_PID}" 2>/dev/null || true
-        exec "${VENV}/bin/qwenpaw-worker" "${CMD_ARGS[@]}"
+        "${VENV}/bin/qwenpaw-worker" "${CMD_ARGS[@]}" &
+        APP_PID=$!
+        POST_START_RC=0
+        bash "${UPGRADE_SH}" --phase post-start --venv "${VENV}" \
+            --pending-file "${PENDING_UPGRADE}" --restart-mode kill || POST_START_RC=$?
+        if [ "${POST_START_RC}" -eq 0 ]; then
+            log "Restored runtime verified; serving the old runtime."
+            wait "${APP_PID}"
+        else
+            log "FATAL: recovery verification failed (rc=${POST_START_RC}); manual intervention required."
+            kill "${APP_PID}" 2>/dev/null || true
+            wait "${APP_PID}" 2>/dev/null || true
+            exit 1
+        fi
         ;;
     *)
         log "FATAL: post-start verification and its rollback failed (rc=${POST_START_RC}); manual intervention required."

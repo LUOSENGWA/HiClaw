@@ -74,7 +74,12 @@ class JobState:
     """The on-disk state file record (subset that endpoints surface)."""
 
     job_id: str
-    state: str = "running"  # running|boot-check-passed|success|rolled_back|rollback_failed|precheck_failed
+    # running|boot-check-passed|recovering|success|rolled_back|rollback_failed|precheck_failed
+    # `recovering` is the NON-terminal rollback-recovery state: it stays on
+    # disk (pending.json kept, expect=old) until the restored OLD runtime
+    # passes its readiness+settle verification, which alone finalizes
+    # rolled_back + pending removal.
+    state: str = "running"
     exit_code: Optional[int] = None
     current: str = ""
     target: str = ""
@@ -152,9 +157,13 @@ def _write_state(job_id: str, data: dict) -> None:
 
 
 # States a job leaves behind forever. Everything else on disk (running,
-# boot-check-passed, ...) is still in flight: the two-phase window runs
-# across a container restart, so the mutex must cover boot-check and the
-# post-start health gate, not just the pre-restart process lifetime.
+# boot-check-passed, recovering, ...) is still in flight: the two-phase
+# window runs across a container restart, so the mutex must cover boot-check
+# and the post-start health gate, not just the pre-restart process lifetime.
+# `recovering` is likewise NON-terminal: a rollback whose restored OLD
+# runtime has not yet passed its readiness+settle verification keeps the
+# single-upgrade mutex engaged; only a PASSED verification finalizes
+# rolled_back (and removes pending.json).
 _TERMINAL_STATES = frozenset(
     {"success", "rolled_back", "rollback_failed", "precheck_failed"})
 
@@ -163,8 +172,9 @@ def active_job() -> Optional[dict]:
     """The newest job that has not reached a terminal state (a live pid is
     not required — the orchestrator exits 0 after S4 while the app is
     restarting, and the phase-2 boot-check / post-start gate own completion).
-    ``boot-check-passed`` is deliberately NON-terminal: during the post-start
-    health gate the upgrade is still in flight and a second /run must 409."""
+    ``boot-check-passed`` and ``recovering`` are deliberately NON-terminal:
+    during the post-start health gate — success or rollback verification —
+    the job is still in flight and a second /run must 409."""
     best: Optional[tuple[str, dict]] = None
     for record in _iter_jobs():
         if record.get("state") in _TERMINAL_STATES:

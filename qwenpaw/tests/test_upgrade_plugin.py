@@ -178,8 +178,9 @@ def test_run_501_docker_mode_reserved(tmp_path, monkeypatch):
 
 
 def test_active_job_returns_intermediate_states(tmp_path, monkeypatch):
-    """P1-1: between boot-check-passed and the post-start verdict the job is
-    still in flight — active_job() must keep reporting it (409 source)."""
+    """P1-1 / round 3: between boot-check-passed and the post-start verdict —
+    and through the whole `recovering` rollback-recovery window — the job is
+    still in flight; active_job() must keep reporting it (409 source)."""
     monkeypatch.setenv("QWENPAW_WORKING_DIR", str(tmp_path))
     from qwenpaw_worker.upgrade import runner
 
@@ -191,9 +192,16 @@ def test_active_job_returns_intermediate_states(tmp_path, monkeypatch):
         "state": "boot-check-passed",  # post-start health gate running
         "started_at": "2026-10-14T00:00:00Z",
     }))
+    job2 = "upg-20261015-000000-cccc"
+    (up / f"upgrade-{job2}.json").write_text(json.dumps({
+        "job_id": job2,
+        "state": "recovering",  # rollback verification in flight
+        "started_at": "2026-10-15T00:00:00Z",
+    }))
     active = runner.active_job()
     assert active is not None
-    assert active["job_id"] == job
+    # both are non-terminal; the newest in-flight job is the mutex holder
+    assert active["job_id"] == job2
 
 
 def test_active_job_ignores_terminal_states(tmp_path, monkeypatch):
@@ -234,6 +242,32 @@ def test_run_409_during_post_start_verification(tmp_path, monkeypatch):
         "job_id": job,
         "state": "boot-check-passed",
         "started_at": "2026-10-14T00:00:00Z",
+    }))
+
+    routes, _ = _register()
+    body = runner.UpgradeRunBody(version="2.2.2", skip_check=True)
+    resp = _call(routes["/run"].endpoint, body=body)
+    assert resp.status_code == 409
+    assert _body(resp) == {"error": "upgrade_in_progress", "job_id": job}
+
+
+def test_run_409_during_recovering_verification(tmp_path, monkeypatch):
+    """Round 3: a second /run while a job is in `recovering` (the restored
+    old runtime has not yet passed its readiness+settle verification) must be
+    rejected with 409 — the mutex covers the whole recovery window, not just
+    the pre-restart process lifetime."""
+    monkeypatch.setenv("QWENPAW_WORKING_DIR", str(tmp_path))
+    from qwenpaw_worker.upgrade import runner, versions
+
+    monkeypatch.setattr(versions, "current_version",
+                        lambda: ("2.2.1", "importlib.metadata"))
+    up = tmp_path / "upgrade"
+    up.mkdir()
+    job = "upg-20261015-000000-eeee"
+    (up / f"upgrade-{job}.json").write_text(json.dumps({
+        "job_id": job,
+        "state": "recovering",
+        "started_at": "2026-10-15T00:00:00Z",
     }))
 
     routes, _ = _register()

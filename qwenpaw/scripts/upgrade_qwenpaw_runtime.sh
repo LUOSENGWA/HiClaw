@@ -20,23 +20,39 @@
 #                is not up yet): no pending.json -> no-op exit 0; venv
 #                version == target -> intermediate state boot-check-passed,
 #                pending RETAINED (the app is not up yet, so this is only a
-#                pre-check); otherwise reinstall old + re-apply patch =
-#                rolled_back. Always exits 0 once handled (the container
-#                must boot; the result lives in the state file).
+#                pre-check); otherwise reinstall old + re-apply patch, keep
+#                pending with `expect=old` and park the job in the
+#                NON-TERMINAL state `recovering` — the restored runtime
+#                cannot be verified before boot, so the entrypoint's
+#                post-start gate verifies the OLD version and only then
+#                finalizes rolled_back. Crash-loop guard: if pending already
+#                carries expect=old and the venv already holds the old
+#                version, the reinstall is skipped (no pip in a crash
+#                loop). Always exits 0 once handled (the container must
+#                boot; the result lives in the state file).
 #                --force-rollback skips the version check (host-side
 #                runbook).
 #   post-start   phase 3 (entrypoint, AFTER the app is up): the real
 #                arbiter — health gate on the running app (version /
 #                readiness / settle window). Pass -> pending removed, state
 #                success, exit 0 (keep the new runtime). Fail -> rollback
-#                (reinstall old + patch + restart) and verify the recovery:
-#                supervisorctl mode re-verifies the restored runtime
-#                in-process; kill mode (worker images have no supervisor)
-#                delegates verification to the next boot's wrapper version
-#                gate. exit 3 = recovered, exit 4 = FATAL rollback failure
-#                (pending kept, manual intervention). The entrypoint passes
-#                only --pending-file; the job context (job id + state file)
-#                is recovered from pending.json.
+#                (reinstall old + patch + restart): the job goes to the
+#                NON-TERMINAL state `recovering` (the upgrade mutex stays
+#                engaged) and only a PASSED verification of the restored
+#                runtime finalizes it — supervisorctl mode re-verifies
+#                in-process (rolled_back + pending removed, exit 3); kill
+#                mode (worker images have no supervisor) keeps pending with
+#                `expect=old` and exits 3 as a HANDOFF: the entrypoint
+#                relaunches the old runtime and re-enters post-start, where
+#                the `expect=old` branch health-gates the OLD version and
+#                finalizes rolled_back (exit 0) or fails with
+#                rollback_failed + pending kept (exit 4).
+#                exit 0 = verified (keep the current runtime); 3 = restore
+#                done, verification pending / in-process verified;
+#                4 = FATAL restore/verification failure (pending kept,
+#                manual intervention). The entrypoint passes only
+#                --pending-file; the job context (job id + state file) is
+#                recovered from pending.json.
 #
 # Steps (full phase):
 #   S0  pre-flight   external checker (default: the co-located
@@ -84,8 +100,11 @@
 # Exit codes: 0=ok  2=pre-flight/usage failure (nothing installed)
 #             3=rolled back  4=rollback failed (manual intervention needed)
 #             (boot-check: always 0 once handled; the result is in the
-#              state file; post-start: 0=success / 3=recovered /
-#              4=rollback failed — the entrypoint branches on this verdict)
+#              state file; post-start: 0=verified, keep the current runtime
+#              / 3=restore done, awaiting relaunch+verification (kill mode)
+#              or already in-process verified (supervisorctl)
+#              / 4=restore and/or its verification failed — the entrypoint
+#              branches on this verdict)
 #
 # Usage:
 #   upgrade_qwenpaw_runtime.sh --target X.Y.Z [--checker PATH] [--skip-check]
@@ -116,6 +135,11 @@
 #                    install` needs a running container; no-op in-container)
 #   UG_WHEELHOUSE    wheel cache dir for the pre-restart phase's mandatory
 #                    C3 gate (default $QWENPAW_WORKING_DIR/upgrade/wheelhouse)
+#   UG_TIMEOUT       health-gate timeout seconds (default 90); the entrypoint
+#                    path passes no --timeout, so this env is the test/ops
+#                    knob for that call
+#   UG_SETTLE        settle window seconds (default 65; 0 disables); same
+#                    test/ops role as UG_TIMEOUT
 #
 # Red line: --selftest runs a fully stubbed battery and never touches a real
 # deployment; --dry-run prints the resolved commands without executing them.
@@ -142,8 +166,10 @@ SKIP_CHECK=0
 CONTAINER=""
 VENV=""
 RESTART_MODE="supervisorctl"
-TIMEOUT=90
-SETTLE=65
+# UG_TIMEOUT / UG_SETTLE are env-level defaults (same family as
+# UG_SETTLE_POLL): explicit --timeout/--settle flags still win in parse_args.
+TIMEOUT="${UG_TIMEOUT:-90}"
+SETTLE="${UG_SETTLE:-65}"
 SETTLE_POLL="${UG_SETTLE_POLL:-5}"
 RECORD_FILE=""
 DRY_RUN=0
@@ -259,6 +285,36 @@ try:
     print("" if value is None else value)
 except Exception:
     print("")
+PYEOF
+}
+
+# pending_set KEY VALUE -> merge one JSON value into $PENDING_FILE (atomic
+# replace). The rollback paths use it to add expect=old without rewriting
+# the whole pending record (job_id/old/target/venv/state_file stay intact).
+pending_set() {
+  python3 - "$PENDING_FILE" "$1" "$2" <<'PYEOF'
+import json, os, sys, tempfile
+path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
+data = {}
+if os.path.isfile(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        if isinstance(loaded, dict):
+            data = loaded
+    except Exception:
+        data = {}
+try:
+    data[key] = json.loads(value)
+except Exception:
+    data[key] = value
+directory = os.path.dirname(os.path.abspath(path))
+os.makedirs(directory, exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=".pending-", dir=directory)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+os.replace(tmp, path)
 PYEOF
 }
 
@@ -581,12 +637,16 @@ do_pre_restart() {
 }
 
 # pre-restart rollback: reinstall old + re-apply patch, NO restart (the app
-# never died), then clean pending. Does not return (exits 3/4).
+# never died), then finalize. Does not return (exits 3/4).
+# State rule: the job is NON-terminal (recovering) while the restore actions
+# run; rolled_back is written only AFTER they all succeed, together with the
+# pending removal (the running app is the old code — it never died — so no
+# further verification is needed).
 do_pre_restart_rollback() {
   local old="$1"
   local reason="${2:-install-failed}"
   log "ROLLBACK (pre-restart): restoring $old (reason: $reason; no restart - app unchanged)"
-  write_state state=rolled_back finished_at="$(now_ts)" note="rollback:$reason"
+  write_state state=recovering note="rollback:$reason"
   if ! run_install "$old"; then
     fatal_rollback_failed
     err "rollback failed: installing old version $old did not succeed"
@@ -604,7 +664,9 @@ do_pre_restart_rollback() {
       exit 4
     fi
   fi
+  # restore actions done: finalize here (the app is the old code, unaffected)
   rm -f "$PENDING_FILE"
+  write_state state=rolled_back finished_at="$(now_ts)"
   log "ROLLBACK (pre-restart): restored to $old"
   echo "SUMMARY: status=rolled_back old=$old target=$TARGET reason=$reason"
   exit 3
@@ -657,6 +719,18 @@ do_boot_check() {
     return 0
   fi
 
+  # Crash-loop guard (I3): a previous boot-check rollback already restored
+  # the old version and left expect=old. If the venv still holds it, do NOT
+  # reinstall again (a crash loop would pip on every boot); keep pending and
+  # let the entrypoint's post-start gate verify the restored runtime. Any
+  # half-installed state (version unreadable or different) falls through to
+  # the full rollback retry below.
+  if [ "$(pending_get expect)" = "old" ] && [ "$boot_version" = "$pending_old" ]; then
+    log "boot-check: already restored (expect=old, venv=$boot_version); retaining pending for post-start verification"
+    echo "SUMMARY: status=recovering phase=boot-check old=$pending_old target=$TARGET reason=already-restored"
+    return 0
+  fi
+
   err "boot-check: version mismatch (expected $TARGET, venv has $boot_version); rolling back to $pending_old"
   do_boot_check_rollback "$pending_old" "version-mismatch"
   return 0
@@ -664,12 +738,16 @@ do_boot_check() {
 
 # boot-check rollback: reinstall old + re-apply patch, NO restart and NO
 # health gate (the app is not up; it cannot be verified before boot).
-# pending is KEPT on failure (manual retry via --force-rollback).
+# DEFERRED verification: the job goes to the non-terminal state `recovering`
+# and pending is KEPT with expect=old — the entrypoint boots the app and its
+# post-start gate verifies the OLD version (readiness + settle), finalizing
+# rolled_back + pending removal only when that passes. pending is also kept
+# on restore failure (manual retry via --force-rollback).
 do_boot_check_rollback() {
   local old="$1"
   local reason="${2:-version-mismatch}"
   log "ROLLBACK (boot-check): restoring $old (reason: $reason; no restart - app not up yet)"
-  write_state state=rolled_back finished_at="$(now_ts)" note="rollback:$reason"
+  write_state state=recovering note="rollback:$reason"
   if ! run_install "$old"; then
     fatal_rollback_failed
     err "boot-check: FATAL restore failed; pending kept for manual retry (--force-rollback)"
@@ -687,9 +765,9 @@ do_boot_check_rollback() {
       return 0
     fi
   fi
-  rm -f "$PENDING_FILE"
-  log "boot-check: rolled back to $old; pending removed; continuing startup"
-  echo "SUMMARY: status=rolled_back phase=boot-check old=$old target=$TARGET reason=$reason"
+  pending_set expect old
+  log "boot-check: restored to $old; pending retained for post-start verification of the restored runtime"
+  echo "SUMMARY: status=recovering phase=boot-check old=$old target=$TARGET reason=$reason"
   return 0
 }
 
@@ -715,6 +793,27 @@ do_post_start() {
   # STATE_FILE stayed empty -> write_state no-op -> job stuck at
   # boot-check-passed, which also left the 409 mutex disengaged).
   resolve_pending_context
+  # RECOVERY verification (expect=old, set by the kill-mode post-start
+  # rollback and the boot-check rollback): the running app is expected to be
+  # the OLD version. The job is still `recovering` (non-terminal, mutex
+  # engaged); only a passed readiness+settle gate finalizes rolled_back and
+  # removes pending. A failed verification is rollback_failed with pending
+  # KEPT — it must never read as a successful recovery.
+  if [ "$(pending_get expect)" = "old" ]; then
+    log "post-start: job=$JOB_ID recovery verification, health gate for the restored runtime, want=$pending_old"
+    if health_gate "$pending_old" "$TIMEOUT" "$SETTLE"; then
+      rm -f "$PENDING_FILE"
+      write_state state=rolled_back phase=post-start finished_at="$(now_ts)"
+      log "post-start: RECOVERY VERIFIED - restored runtime healthy; pending removed"
+      echo "SUMMARY: status=recovered phase=post-start old=$pending_old target=$TARGET"
+      return 0
+    fi
+    fatal_rollback_failed
+    err "post-start: FATAL recovery verification failed (want='$pending_old'); pending kept for manual retry"
+    echo "SUMMARY: status=rollback_failed phase=post-start old=$pending_old target=$TARGET reason=restore-verification-failed"
+    write_state state=rollback_failed
+    exit 4
+  fi
   log "post-start: job=$JOB_ID health gate for the running app, target=$TARGET"
   if health_gate "$TARGET" "$TIMEOUT" "$SETTLE"; then
     rm -f "$PENDING_FILE"
@@ -732,18 +831,23 @@ do_post_start() {
 # post-start rollback: the app is up (possibly serving the new version), so
 # restoring the old version needs a restart to take effect. It does NOT
 # return 0: the entrypoint branches on the exit code, and 0 means "keep the
-# NEW runtime". Outcomes:
-#   3 = recovered: old runtime restored AND verified (supervisorctl mode
-#       re-verifies in-process; kill mode delegates to the next boot's
-#       wrapper version gate) -> pending removed, job rolled_back
-#   4 = FATAL: the rollback itself failed (install/patch/restart, or the
-#       restored runtime failed its own health gate) -> pending KEPT for
-#       manual retry, job rollback_failed, loud banner
+# CURRENT runtime". State rule: the job is NON-terminal (recovering) while
+# the restore actions run; rolled_back is written only by the path that
+# actually verified the restored runtime. Outcomes:
+#   3 = supervisorctl: old runtime restored AND in-process verified
+#       (readiness + settle) -> pending removed, job rolled_back
+#   3 = kill: restore done but UNVERIFIED (the app child is dead and the
+#       entrypoint owns the relaunch) -> pending kept with expect=old, job
+#       recovering; the entrypoint relaunches the old runtime and re-enters
+#       post-start, whose expect=old branch performs the verification
+#   4 = FATAL: the restore failed (install/patch/restart, or in
+#       supervisorctl mode the restored runtime failed its own health gate)
+#       -> pending KEPT for manual retry, job rollback_failed, loud banner
 do_post_start_rollback() {
   local old="$1"
   local reason="${2:-post-start-health-failed}"
   log "ROLLBACK (post-start): restoring $old (reason: $reason, restart mode=$RESTART_MODE)"
-  write_state state=rolled_back finished_at="$(now_ts)" note="rollback:$reason"
+  write_state state=recovering note="rollback:$reason"
   if ! run_install "$old"; then
     fatal_rollback_failed
     err "post-start: FATAL restore failed; pending kept for manual retry (--force-rollback)"
@@ -773,12 +877,17 @@ do_post_start_rollback() {
     exit 4
   fi
   if [ "$RESTART_MODE" = "kill" ]; then
-    # kill mode stops the app child and the wrapper exits with it: there is
-    # no in-process way to verify the restored runtime here (the app is dead
-    # and the entrypoint is about to relaunch it / the container is about to
-    # restart). Verification is delegated to the next boot's wrapper version
-    # gate (qwenpaw_worker._wait_for_qwenpaw_api, 60s deadline).
-    log "post-start: kill-mode restart issued; recovery verification delegated to the next boot's version gate"
+    # kill mode stops the app child and the wrapper exits with it: the
+    # restored runtime CANNOT be verified in-process (the app is dead).
+    # Hand off to the entrypoint: keep the recovery in flight (recovering,
+    # mutex engaged) with pending(expect=old); the entrypoint relaunches the
+    # old runtime and re-enters post-start, where the expect=old branch
+    # verifies it (readiness + settle) and only then finalizes rolled_back.
+    # This exit 3 is therefore a handoff, NOT a verdict.
+    pending_set expect old
+    log "post-start: kill-mode restore done; relaunch + verification by the entrypoint"
+    echo "SUMMARY: status=recovering phase=post-start old=$old target=$TARGET reason=$reason"
+    exit 3
   elif ! health_gate "$old" "$TIMEOUT" "$SETTLE"; then
     fatal_rollback_failed
     err "post-start: FATAL restored runtime failed its health gate (want='$old'); pending kept for manual retry"
@@ -786,6 +895,8 @@ do_post_start_rollback() {
     write_state state=rollback_failed
     exit 4
   fi
+  # supervisorctl: the restored runtime passed its in-process health gate —
+  # the recovery is verified, finalize here.
   rm -f "$PENDING_FILE"
   write_state state=rolled_back phase=post-start finished_at="$(now_ts)"
   log "post-start: RECOVERED to $old (restart mode=$RESTART_MODE); pending removed"
@@ -794,7 +905,7 @@ do_post_start_rollback() {
 }
 
 # ============================================================================
-# --selftest: built-in stubbed battery (15 scenarios; every external command mocked via tmp-dir state files)
+# --selftest: built-in stubbed battery (19 scenarios; every external command mocked via tmp-dir state files)
 # ============================================================================
 
 SELFTEST_TOTAL_FAIL=0
@@ -837,7 +948,7 @@ run_selftest() {
   local tmp d rc
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/online_upgrade_v1.selftest.XXXXXX")" \
     || { err "cannot create temp dir"; return 1; }
-  log "selftest: starting (15 scenarios, all external commands stubbed; tmp dir: $tmp)"
+  log "selftest: starting (19 scenarios, all external commands stubbed; tmp dir: $tmp)"
   # Keep the default scenarios fast; T8 exercises the settle window explicitly.
   SETTLE=0
 
@@ -1072,7 +1183,12 @@ run_selftest() {
   st_grep "SUMMARY" "$d/out.log" "SUMMARY: status=ok phase=pre-restart old=2.2.1 target=2.2.2"
   st_end T9 "pre-restart happy path"
 
-  # ============ T10 boot-check mismatch -> rollback (phase 2, no restart) ============
+  # ============ T10 boot-check mismatch -> rollback DEFERS to post-start ============
+  # Round 3: the boot-check rollback restores the old version but CANNOT verify
+  # it (the app is not up yet): the job goes to the non-terminal state
+  # `recovering`, pending is KEPT with expect=old, and the exit is 0 so the
+  # entrypoint proceeds to boot the app — its post-start gate (expect=old
+  # branch) performs the verification and finalizes rolled_back.
   d="$tmp/T10"; mkdir -p "$d"
   printf '2.2.1' > "$d/version"   # venv reports the OLD version: mismatch
   PHASE="boot-check"; TARGET=""; CHECKER=""; SKIP_CHECK=1; BACKEND="in-container"
@@ -1087,17 +1203,18 @@ run_selftest() {
   ( do_boot_check ) > "$d/out.log" 2>&1
   rc=$?
   SC_ID="T10"
-  st_begin T10 "boot-check mismatch -> rollback (no restart)"
+  st_begin T10 "boot-check mismatch -> rollback (deferred, no restart)"
   st_check "exit (boot-check always 0 once handled)" "0" "$rc"
   st_check "version restored to old" "2.2.1" "$(cat "$d/version" 2>/dev/null)"
   if [ -e "$d/pending.json" ]; then printf 'present' > "$d/eck"; else printf 'absent' > "$d/eck"; fi
-  st_check "pending removed after rollback" "absent" "$(cat "$d/eck" 2>/dev/null)"
-  if grep -q '"state": "rolled_back"' "$d/state.json" 2>/dev/null; then printf 'sok' > "$d/schk"; else printf 'sbad' > "$d/schk"; fi
-  st_check "state=rolled_back" "sok" "$(cat "$d/schk" 2>/dev/null)"
+  st_check "pending RETAINED for post-start verification" "present" "$(cat "$d/eck" 2>/dev/null)"
+  st_grep "pending marks expect=old" "$d/pending.json" '"expect": "old"'
+  if grep -q '"state": "recovering"' "$d/state.json" 2>/dev/null; then printf 'sok' > "$d/schk"; else printf 'sbad' > "$d/schk"; fi
+  st_check "state=recovering (non-terminal)" "sok" "$(cat "$d/schk" 2>/dev/null)"
   if grep -q 'RESTART-CALLED' "$d/calls" 2>/dev/null; then printf 'present' > "$d/rck"; else printf 'absent' > "$d/rck"; fi
-  st_check "restart never called" "absent" "$(cat "$d/rck" 2>/dev/null)"
-  st_grep "SUMMARY" "$d/out.log" "SUMMARY: status=rolled_back phase=boot-check old=2.2.1 target=2.2.2 reason=version-mismatch"
-  st_end T10 "boot-check mismatch -> rollback"
+  st_check "restart never called (app not up yet)" "absent" "$(cat "$d/rck" 2>/dev/null)"
+  st_grep "SUMMARY recovering" "$d/out.log" "SUMMARY: status=recovering phase=boot-check old=2.2.1 target=2.2.2 reason=version-mismatch"
+  st_end T10 "boot-check mismatch -> rollback defers (recovering, expect=old)"
 
   # ============ T11 boot-check no-op (no pending.json) ============
   d="$tmp/T11"; mkdir -p "$d"
@@ -1225,11 +1342,12 @@ run_selftest() {
   st_grep "job rollback_failed" "$S14" '"state": "rollback_failed"'
   st_end T14 "post-start rollback failure is FATAL (exit 4, pending kept)"
 
-  # ============ T15 post-start rollback in kill mode (P1-2, worker default) ============
+  # ============ T15 post-start rollback in kill mode: UNVERIFIED HANDOFF (round 3) ============
   # Worker images restart by killing the app child: the wrapper exits with it,
-  # so the restored runtime CANNOT be re-verified in-process. Recovery is
-  # still reported (exit 3, job rolled_back, pending removed); verification is
-  # delegated to the next boot's wrapper version gate.
+  # so the restored runtime CANNOT be re-verified in-process. The recovery
+  # therefore STAYS in flight: exit 3 is a handoff to the entrypoint (NOT a
+  # verdict), pending is KEPT with expect=old, and the job is left in the
+  # non-terminal state `recovering` (409 mutex engaged).
   d="$tmp/T15"; mkdir -p "$d/upgrade"
   printf '2.2.1' > "$d/version"
   JOB="upg-selftest-t15"
@@ -1247,24 +1365,145 @@ run_selftest() {
   ( do_post_start ) > "$d/out.log" 2>&1
   rc=$?
   SC_ID="T15"
-  st_begin T15 "post-start rollback in kill mode (worker image, no supervisor)"
-  st_check "exit (recovered in kill mode = 3)" "3" "$rc"
+  st_begin T15 "post-start rollback in kill mode (worker image): unverified handoff"
+  st_check "exit (handoff to entrypoint = 3)" "3" "$rc"
   st_check "version restored to old" "2.2.1" "$(cat "$d/version" 2>/dev/null)"
   st_grep "rollback installed old" "$d/calls" "install-2.2.1"
   st_grep "kill restart primitive used" "$d/calls" "restart-kill"
-  st_grep "verification delegated to next boot" "$d/out.log" "recovery verification delegated to the next boot"
+  st_grep "handoff logged" "$d/out.log" "relaunch + verification by the entrypoint"
   if [ -e "$P15" ]; then printf 'present' > "$d/eck"; else printf 'absent' > "$d/eck"; fi
-  st_check "pending removed after recovery" "absent" "$(cat "$d/eck" 2>/dev/null)"
-  st_grep "job rolled_back" "$S15" '"state": "rolled_back"'
+  st_check "pending RETAINED for verification" "present" "$(cat "$d/eck" 2>/dev/null)"
+  st_grep "pending marks expect=old" "$P15" '"expect": "old"'
+  st_grep "job still recovering (non-terminal)" "$S15" '"state": "recovering"'
+  st_grep "SUMMARY recovering handoff" "$d/out.log" "SUMMARY: status=recovering phase=post-start old=2.2.1 target=2.2.2 reason=post-start-health-failed"
+  st_end T15 "kill-mode rollback handoff (exit 3, recovering, pending kept)"
+
+  # ============ T16 entrypoint re-entry: expect=old verifies the restored runtime ============
+  # Same dir as T15: the entrypoint relaunched the old runtime (the version
+  # file already reads 2.2.1) and re-ran post-start entrypoint-style. The
+  # expect=old branch must verify it (readiness + settle) and ONLY THEN
+  # finalize: pending removed, job rolled_back with finished_at set.
+  d="$tmp/T15"
+  PHASE="post-start"; TARGET=""; JOB_ID=""; STATE_FILE=""; PENDING_FILE="$P15"
+  CHECKER=""; SKIP_CHECK=1; BACKEND="in-container"; RECORD_FILE=""
+  UG_VENV="$d/venv"; RESTART_MODE="kill"
+  TIMEOUT=3; SETTLE=0
+  UG_VERSION_CMD="cat $d/version"   # the relaunched old runtime serves 2.2.1
+  ( do_post_start ) > "$d/out16.log" 2>&1
+  rc=$?
+  SC_ID="T16"
+  st_begin T16 "post-start re-entry (expect=old) verifies the restored runtime"
+  st_check "exit (recovery verified = 0)" "0" "$rc"
+  if [ -e "$P15" ]; then printf 'present' > "$d/eck"; else printf 'absent' > "$d/eck"; fi
+  st_check "pending removed after verification" "absent" "$(cat "$d/eck" 2>/dev/null)"
+  st_grep "job rolled_back after verification" "$S15" '"state": "rolled_back"'
   st_grep "job closed in post-start" "$S15" '"phase": "post-start"'
-  st_end T15 "post-start kill-mode rollback recovered (exit 3, delegated verify)"
+  if grep -q '"finished_at": ""' "$S15" 2>/dev/null || grep -q '"finished_at": null' "$S15" 2>/dev/null; then
+    printf 'empty' > "$d/eck"
+  elif grep -q '"finished_at"' "$S15" 2>/dev/null; then
+    printf 'set' > "$d/eck"
+  else
+    printf 'missing' > "$d/eck"
+  fi
+  st_check "finished_at set on finalization" "set" "$(cat "$d/eck" 2>/dev/null)"
+  st_grep "SUMMARY recovered" "$d/out16.log" "SUMMARY: status=recovered phase=post-start old=2.2.1 target=2.2.2"
+  st_end T16 "recovery verification finalizes rolled_back (exit 0, pending removed)"
+
+  # ============ T17 recovery verification failure -> FATAL (never rolled_back) ============
+  # Re-entry with expect=old but the relaunched runtime is still broken (the
+  # version probe keeps failing): the verification must FAIL LOUDLY — exit 4,
+  # FATAL banner, pending KEPT, job rollback_failed. Never rolled_back.
+  d="$tmp/T17"; mkdir -p "$d/upgrade"
+  JOB="upg-selftest-t17"
+  S17="$d/upgrade/upgrade-$JOB.json"; P17="$d/upgrade/pending.json"
+  printf '{"job_id": "%s", "state": "recovering", "target": "2.2.2", "started_at": "2026-01-01T00:00:00Z"}\n' "$JOB" > "$S17"
+  printf '{"job_id": "%s", "old": "2.2.1", "target": "2.2.2", "venv": "/fake/venv", "state_file": "%s", "expect": "old"}\n' "$JOB" "$S17" > "$P17"
+  PHASE="post-start"; TARGET=""; JOB_ID=""; STATE_FILE=""; PENDING_FILE="$P17"
+  CHECKER=""; SKIP_CHECK=1; BACKEND="in-container"; RECORD_FILE=""
+  UG_VENV="$d/venv"; RESTART_MODE="kill"
+  TIMEOUT=3; SETTLE=0
+  UG_VERSION_CMD="exit 1"   # the relaunched runtime is still broken
+  ( do_post_start ) > "$d/out.log" 2>&1
+  rc=$?
+  SC_ID="T17"
+  st_begin T17 "recovery verification failure (expect=old, probe dead) -> FATAL"
+  st_check "exit (verification failed = 4)" "4" "$rc"
+  st_grep "FATAL banner" "$d/out.log" "FATAL: ROLLBACK FAILED"
+  if [ -e "$P17" ]; then printf 'present' > "$d/eck"; else printf 'absent' > "$d/eck"; fi
+  st_check "pending kept for manual retry" "present" "$(cat "$d/eck" 2>/dev/null)"
+  st_grep "job rollback_failed" "$S17" '"state": "rollback_failed"'
+  st_grep "SUMMARY rollback_failed" "$d/out.log" "SUMMARY: status=rollback_failed phase=post-start old=2.2.1 target=2.2.2 reason=restore-verification-failed"
+  st_end T17 "recovery verification failure is FATAL (exit 4, pending kept)"
+
+  # ============ T18 boot-check guard: expect=old with venv already restored (I3) ============
+  # Reboot mid-recovery: pending(expect=old) is present and the venv already
+  # reports the old version. The boot-check mismatch path must NOT reinstall
+  # again (a crash loop would pip on every boot) — it defers to post-start and
+  # returns 0 so the entrypoint proceeds to boot the app.
+  d="$tmp/T18"; mkdir -p "$d/upgrade"
+  printf '2.2.1' > "$d/version"   # the venv already reports the old version
+  JOB="upg-selftest-t18"
+  S18="$d/upgrade/upgrade-$JOB.json"; P18="$d/upgrade/pending.json"
+  printf '{"job_id": "%s", "state": "recovering", "target": "2.2.2", "started_at": "2026-01-01T00:00:00Z"}\n' "$JOB" > "$S18"
+  printf '{"job_id": "%s", "old": "2.2.1", "target": "2.2.2", "venv": "/fake/venv", "state_file": "%s", "expect": "old"}\n' "$JOB" "$S18" > "$P18"
+  PHASE="boot-check"; TARGET=""; JOB_ID=""; STATE_FILE=""; PENDING_FILE="$P18"
+  CHECKER=""; SKIP_CHECK=1; BACKEND="in-container"; RECORD_FILE=""
+  UG_VENV="$d/venv"; RESTART_MODE="kill"
+  UG_VERSION_CMD="cat $d/version"
+  UG_INSTALL_CMD='echo install-{target} >> '"$d"'/calls; true'
+  UG_PATCH_CMD='echo patch-{target} >> '"$d"'/calls; true'
+  ( do_boot_check ) > "$d/out.log" 2>&1
+  rc=$?
+  SC_ID="T18"
+  st_begin T18 "boot-check guard: expect=old + venv==old (no reinstall, defer)"
+  st_check "exit (defer to post-start = 0)" "0" "$rc"
+  if [ -e "$d/calls" ]; then printf 'called' > "$d/eck"; else printf 'uncalled' > "$d/eck"; fi
+  st_check "install NOT called (crash-loop guard)" "uncalled" "$(cat "$d/eck" 2>/dev/null)"
+  if [ -e "$P18" ]; then printf 'present' > "$d/eck"; else printf 'absent' > "$d/eck"; fi
+  st_check "pending retained" "present" "$(cat "$d/eck" 2>/dev/null)"
+  st_grep "job still recovering (non-terminal)" "$S18" '"state": "recovering"'
+  st_grep "SUMMARY recovering" "$d/out.log" "SUMMARY: status=recovering phase=boot-check old=2.2.1 target=2.2.2 reason=already-restored"
+  st_end T18 "boot-check guard defers (no reinstall, pending kept)"
+
+  # ============ T19 boot-check mismatch -> rollback defers to post-start ============
+  # Fresh reboot right after a crash: pending is present (no expect yet) and
+  # the target install never completed, so the venv still reports the OLD
+  # version (mismatch against the target). boot-check must (re)install/patch
+  # the old version and then DEFER: state recovering, pending kept with
+  # expect=old, exit 0 — verification happens in post-start once the app is up.
+  d="$tmp/T19"; mkdir -p "$d/upgrade"
+  printf '2.2.1' > "$d/version"   # the venv still reports the old version (install failed)
+  JOB="upg-selftest-t19"
+  S19="$d/upgrade/upgrade-$JOB.json"; P19="$d/upgrade/pending.json"
+  printf '{"job_id": "%s", "state": "boot-check-passed", "target": "2.2.2", "started_at": "2026-01-01T00:00:00Z"}\n' "$JOB" > "$S19"
+  printf '{"job_id": "%s", "old": "2.2.1", "target": "2.2.2", "venv": "/fake/venv", "state_file": "%s"}\n' "$JOB" "$S19" > "$P19"
+  PHASE="boot-check"; TARGET=""; JOB_ID=""; STATE_FILE=""; PENDING_FILE="$P19"
+  CHECKER=""; SKIP_CHECK=1; BACKEND="in-container"; RECORD_FILE=""
+  UG_VENV="$d/venv"; RESTART_MODE="kill"
+  UG_VERSION_CMD="cat $d/version"
+  UG_INSTALL_CMD='echo install-{target} >> '"$d"'/calls; printf %s {target} > '"$d"'/version'
+  UG_PATCH_CMD='echo patch-{target} >> '"$d"'/calls'
+  ( do_boot_check ) > "$d/out.log" 2>&1
+  rc=$?
+  SC_ID="T19"
+  st_begin T19 "boot-check mismatch rollback defers to post-start (expect=old)"
+  st_check "exit (defer = 0)" "0" "$rc"
+  st_check "version restored to old" "2.2.1" "$(cat "$d/version" 2>/dev/null)"
+  st_grep "rollback installed old" "$d/calls" "install-2.2.1"
+  st_grep "rollback patched old" "$d/calls" "patch-2.2.1"
+  if [ -e "$P19" ]; then printf 'present' > "$d/eck"; else printf 'absent' > "$d/eck"; fi
+  st_check "pending retained" "present" "$(cat "$d/eck" 2>/dev/null)"
+  st_grep "pending marks expect=old" "$P19" '"expect": "old"'
+  st_grep "job recovering (non-terminal)" "$S19" '"state": "recovering"'
+  st_grep "SUMMARY recovering" "$d/out.log" "SUMMARY: status=recovering phase=boot-check old=2.2.1 target=2.2.2 reason=version-mismatch"
+  st_end T19 "boot-check rollback defers (recovering, expect=old, pending kept)"
 
   log "selftest: tmp dir kept at $tmp (not removed automatically)"
   if [ "$SELFTEST_TOTAL_FAIL" -eq 0 ]; then
-    echo "SELFTEST: 15/15 PASS"
+    echo "SELFTEST: 19/19 PASS"
     return 0
   fi
-  echo "SELFTEST: $SELFTEST_TOTAL_FAIL/15 scenarios FAIL"
+  echo "SELFTEST: $SELFTEST_TOTAL_FAIL/19 scenarios FAIL"
   return 1
 }
 
@@ -1303,6 +1542,11 @@ Options:
                         endpoint (served by the app subprocess) would not reveal
   --phase PH            full (default, original flow) | pre-restart | boot-check
                         | post-start
+                        (rollback deferral: boot-check/post-start leave the job in
+                        the NON-terminal state `recovering` with pending.json kept —
+                        expect=old in pending.json marks that the next post-start
+                        must verify the RESTORED OLD runtime before finalizing
+                        rolled_back)
   --job-id ID           job id (required for pre-restart; boot-check/post-start
                         take it from pending.json when omitted)
   --state-file PATH     state file for pre-restart (boot-check/post-start
@@ -1315,20 +1559,30 @@ Options:
                         (verified, then recorded)
   --dry-run             print the resolved commands only; no install/restart/health gate
                         (full phase only)
-  --selftest            run the built-in stubbed battery (15 scenarios, no real actions)
+  --selftest            run the built-in stubbed battery (19 scenarios, no real actions)
   -h, --help            this help
 
 Environment hooks (all overridable; selftest relies on this mechanism):
-  UG_VERSION_CMD / UG_INSTALL_CMD({target}) / UG_RESTART_CMD / UG_CHECKER_CMD({target})
+  UG_VERSION_CMD / UG_INSTALL_CMD({target}) / UG_PATCH_CMD({target}) /
+  UG_RESTART_CMD / UG_CHECKER_CMD({target}) / UG_ALIVE_CMD
   UG_VENV (default /app/venv, /opt/venv/qwenpaw with --container) / UG_UV (uv path;
   when unset the install command auto-detects uv and falls back to venv pip)
+  UG_TIMEOUT (health-gate timeout seconds, default 90) / UG_SETTLE (settle window
+  seconds, default 65; 0 disables) / UG_SETTLE_POLL (settle poll interval, default 5)
+  — env-level defaults; explicit --timeout/--settle flags still win
 
 Exit codes (full/pre-restart phases):
   0 upgraded   2 pre-flight/usage failure (nothing installed)
   3 rolled back   4 rollback failed (manual intervention needed)
 Exit codes (post-start phase, consumed by the entrypoint as the verdict):
-  0 verification passed, keep the new runtime   3 recovered to the old runtime
-  4 verification AND its rollback failed (manual intervention needed)
+  0 the CURRENT runtime passed its verification gate — keep it
+    (the new version on a success path; the restored OLD version when
+    pending.json carries expect=old)
+  3 restore done: kill mode = UNVERIFIED handoff (the entrypoint must relaunch
+    the old runtime and re-run post-start, whose expect=old branch performs
+    the verification); supervisorctl mode = restored runtime verified in-process
+  4 restore and/or verification FAILED (manual intervention needed; the job is
+    rollback_failed and pending.json is kept — never reads as a recovery)
 EOF
 }
 

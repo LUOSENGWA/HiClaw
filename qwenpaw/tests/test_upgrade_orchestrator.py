@@ -1,6 +1,6 @@
 """Orchestrator contract tests for ``upgrade_qwenpaw_runtime.sh``.
 
-The heavy path matrix lives in the script's own ``--selftest`` (15
+The heavy path matrix lives in the script's own ``--selftest`` (19
 scenarios, fully stubbed); this file re-runs that gate as a pytest test
 and adds targeted two-phase scenarios the selftest does not cover:
 boot-check SUCCESS (version == target) and the pre-restart install-fail
@@ -49,7 +49,7 @@ def test_orchestrator_selftest_all_green():
         timeout=600,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "SELFTEST: 15/15 PASS" in proc.stdout
+    assert "SELFTEST: 19/19 PASS" in proc.stdout
 
 
 def test_boot_check_success_retains_pending_for_post_start(tmp_path):
@@ -389,12 +389,15 @@ def test_post_start_rollback_recovered_exit_code(tmp_path):
     assert data["state"] == "rolled_back"
 
 
-def test_post_start_rollback_kill_mode_no_supervisor(tmp_path):
-    """P1-2: worker images restart by killing the app child (the UG hook
+def test_post_start_rollback_kill_mode_unverified_handoff(tmp_path):
+    """Round 3: worker images restart by killing the app child (the UG hook
     stubs the primitive here — never a real /proc kill). Kill mode cannot
-    re-verify in-process (the wrapper exits with the app child), so recovery
-    verification is delegated to the next boot's wrapper version gate:
-    exit 3, job rolled_back, pending removed, and no supervisorctl involved."""
+    re-verify in-process (the wrapper exits with the app child), so the
+    recovery STAYS in flight instead of being declared done: exit 3 is a
+    handoff to the entrypoint, the job is the NON-terminal `recovering`
+    (409 mutex engaged), and pending.json is KEPT with expect=old so the
+    entrypoint's re-verified post-start (expect=old branch) finalizes it.
+    No supervisorctl involved."""
     d = tmp_path
     (d / "version").write_text("2.2.1\n")
     calls = d / "calls"
@@ -414,8 +417,190 @@ def test_post_start_rollback_kill_mode_no_supervisor(tmp_path):
     assert proc.returncode == 3, proc.stdout + proc.stderr
     assert "supervisorctl" not in proc.stdout + proc.stderr
     got = calls.read_text().splitlines()
-    assert "install-2.2.1" in got
+    assert "install-2.2.1" in got   # the restore actions ran
     assert "restart" in got
-    assert not pending.exists()
+    # The recovery is NOT verified: nothing may read as done.
+    assert pending.exists()         # retained for the verification
+    pdata = json.loads(pending.read_text())
+    assert pdata["expect"] == "old" # the next post-start verifies the OLD runtime
+    data = json.loads(state.read_text())
+    assert data["state"] == "recovering"  # non-terminal -> mutex engaged
+    assert "SUMMARY: status=recovering phase=post-start old=2.2.1 target=2.2.2" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# Round 3 (#1364 review): rolled_back + pending removal are SUBORDINATE to
+# the restored runtime passing readiness+settle verification; the whole
+# recovery stays non-terminal (`recovering`, mutex engaged) until then.
+# ---------------------------------------------------------------------------
+
+def test_post_start_kill_mode_recovery_verifies_old_runtime(tmp_path):
+    """T16: the entrypoint re-entry. After the kill-mode handoff (expect=old
+    in pending, job recovering), the entrypoint relaunched the OLD runtime
+    and re-ran post-start entrypoint-style. The expect=old branch verifies
+    it (readiness + settle) and only then finalizes: exit 0, pending REMOVED,
+    job rolled_back with finished_at set."""
+    d = tmp_path
+    (d / "version").write_text("2.2.1\n")  # the relaunched old runtime serves it
+    calls = d / "calls"
+    pending, state = _seed_two_phase_context(d, "upg-20261014-000000-iiii")
+    env = _stub_env(
+        d,
+        UG_VERSION_CMD=f"cat {d}/version",
+        UG_INSTALL_CMD=f'echo install-{{target}} >> {calls}; printf %s {{target}} > {d}/version',
+        UG_PATCH_CMD=f'echo patch-{{target}} >> {calls}; true',
+        UG_RESTART_CMD=f'echo restart >> {calls}; true',
+    )
+    # 1st run: target gate fails (version stuck at old) -> kill-mode rollback
+    proc1 = run_bash(
+        f"bash {SCRIPT} --phase post-start --venv {d}/venv "
+        f"--restart-mode kill --pending-file {pending} --timeout 3 --settle 0",
+        env=env,
+    )
+    assert proc1.returncode == 3, proc1.stdout + proc1.stderr
+    # 2nd run: entrypoint-style re-entry against the relaunched old runtime
+    proc2 = run_bash(
+        f"bash {SCRIPT} --phase post-start --venv {d}/venv "
+        f"--restart-mode kill --pending-file {pending} --timeout 3 --settle 0",
+        env=env,
+    )
+    assert proc2.returncode == 0, proc2.stdout + proc2.stderr
+    assert "SUMMARY: status=recovered phase=post-start old=2.2.1 target=2.2.2" in proc2.stdout
+    assert not pending.exists()  # removed only AFTER verification passed
     data = json.loads(state.read_text())
     assert data["state"] == "rolled_back"
+    assert data["phase"] == "post-start"
+    assert data.get("finished_at")  # finalization stamped finished_at
+
+
+def test_post_start_recovery_verification_failure(tmp_path):
+    """T17: re-entry with expect=old but the relaunched runtime is STILL
+    broken (version probe dead): the verification fails LOUDLY — exit 4,
+    FATAL banner, pending KEPT, job rollback_failed. Never rolled_back."""
+    d = tmp_path
+    up = d / "upgrade"
+    up.mkdir()
+    job = "upg-20261014-000000-jjjj"
+    state = up / f"upgrade-{job}.json"
+    state.write_text(json.dumps({
+        "job_id": job,
+        "state": "recovering",
+        "target": "2.2.2",
+        "started_at": "2026-10-14T00:00:00Z",
+    }))
+    pending = up / "pending.json"
+    pending.write_text(json.dumps({
+        "job_id": job,
+        "old": "2.2.1",
+        "target": "2.2.2",
+        "venv": str(d / "venv"),
+        "state_file": str(state),
+        "expect": "old",
+    }))
+    proc = run_bash(
+        f"bash {SCRIPT} --phase post-start --venv {d}/venv "
+        f"--restart-mode kill --pending-file {pending} --timeout 2 --settle 0",
+        env=_stub_env(d, UG_VERSION_CMD="exit 1"),  # still broken
+    )
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert "FATAL: ROLLBACK FAILED" in proc.stdout + proc.stderr
+    assert "reason=restore-verification-failed" in proc.stdout
+    assert pending.exists()  # kept for manual retry
+    data = json.loads(state.read_text())
+    assert data["state"] == "rollback_failed"
+
+
+def test_boot_check_rollback_defers_to_post_start(tmp_path):
+    """T19: fresh reboot after a crash — the target install never completed,
+    so the venv still reports the OLD version (mismatch). boot-check restores
+    the old version and DEFERS (the app is not up yet, it cannot be verified
+    here): exit 0 (the container MUST boot), state recovering (non-terminal),
+    pending KEPT with expect=old — verification happens in post-start."""
+    d = tmp_path
+    (d / "version").write_text("2.2.1\n")  # install failed: venv holds the old version
+    calls = d / "calls"
+    up = d / "upgrade"
+    up.mkdir()
+    job = "upg-20261014-000000-kkkk"
+    state = up / f"upgrade-{job}.json"
+    state.write_text(json.dumps({
+        "job_id": job,
+        "state": "boot-check-passed",
+        "target": "2.2.2",
+        "started_at": "2026-10-14T00:00:00Z",
+    }))
+    pending = up / "pending.json"
+    pending.write_text(json.dumps({
+        "job_id": job,
+        "old": "2.2.1",
+        "target": "2.2.2",
+        "venv": str(d / "venv"),
+        "state_file": str(state),
+    }))
+    env = _stub_env(
+        d,
+        UG_VERSION_CMD=f"cat {d}/version",
+        UG_INSTALL_CMD=f'echo install-{{target}} >> {calls}; printf %s {{target}} > {d}/version',
+        UG_PATCH_CMD=f'echo patch-{{target}} >> {calls}; true',
+    )
+    proc = run_bash(
+        f"bash {SCRIPT} --phase boot-check --venv {d}/venv "
+        f"--pending-file {pending} --state-file {state}",
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr  # the container MUST boot
+    got = calls.read_text().splitlines()
+    assert "install-2.2.1" in got  # old version (re)installed
+    assert "patch-2.2.1" in got
+    assert "SUMMARY: status=recovering phase=boot-check old=2.2.1 target=2.2.2 reason=version-mismatch" in proc.stdout
+    assert pending.exists()
+    pdata = json.loads(pending.read_text())
+    assert pdata["expect"] == "old"
+    data = json.loads(state.read_text())
+    assert data["state"] == "recovering"  # non-terminal: mutex engaged
+
+
+def test_boot_check_guard_no_reinstall_when_restored(tmp_path):
+    """T18: reboot mid-recovery — pending already carries expect=old and the
+    venv already reports the old version. The crash-loop guard (I3) must NOT
+    reinstall again (a crash loop would pip on every boot): it defers, keeps
+    pending, leaves the job recovering, and exits 0."""
+    d = tmp_path
+    (d / "version").write_text("2.2.1\n")  # already restored by the previous boot
+    calls = d / "calls"
+    up = d / "upgrade"
+    up.mkdir()
+    job = "upg-20261014-000000-llll"
+    state = up / f"upgrade-{job}.json"
+    state.write_text(json.dumps({
+        "job_id": job,
+        "state": "recovering",
+        "target": "2.2.2",
+        "started_at": "2026-10-14T00:00:00Z",
+    }))
+    pending = up / "pending.json"
+    pending.write_text(json.dumps({
+        "job_id": job,
+        "old": "2.2.1",
+        "target": "2.2.2",
+        "venv": str(d / "venv"),
+        "state_file": str(state),
+        "expect": "old",
+    }))
+    env = _stub_env(
+        d,
+        UG_VERSION_CMD=f"cat {d}/version",
+        UG_INSTALL_CMD=f'echo install-{{target}} >> {calls}; true',
+        UG_PATCH_CMD=f'echo patch-{{target}} >> {calls}; true',
+    )
+    proc = run_bash(
+        f"bash {SCRIPT} --phase boot-check --venv {d}/venv "
+        f"--pending-file {pending} --state-file {state}",
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not calls.exists()  # NO reinstall (crash-loop guard)
+    assert "SUMMARY: status=recovering phase=boot-check old=2.2.1 target=2.2.2 reason=already-restored" in proc.stdout
+    assert pending.exists()
+    data = json.loads(state.read_text())
+    assert data["state"] == "recovering"
