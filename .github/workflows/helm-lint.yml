@@ -42,6 +42,7 @@ on:
       - 'manager/agent/worker-skills/coding-cli/**'
       - 'manager/agent/skills/task-coordination/**'
       - 'tests/check-coding-cli-qoder-pat-processing.sh'
+      - 'tests/check-coding-cli-runs-metadata.sh'
       - 'manager/scripts/init/start-manager-agent.sh'
       - 'manager/tests/test-manager-startup-recovery.sh'
   workflow_dispatch: ~
@@ -107,6 +108,9 @@ jobs:
 
       - name: Check coding-cli Qoder PAT and .processing guard
         run: bash tests/check-coding-cli-qoder-pat-processing.sh
+
+      - name: Check coding-cli run outcome metadata (runs.jsonl)
+        run: bash tests/check-coding-cli-runs-metadata.sh
 
       - name: Check CoPaw upgrade gate failure modes
         run: bash tests/check-copaw-helm-upgrade-gate.sh

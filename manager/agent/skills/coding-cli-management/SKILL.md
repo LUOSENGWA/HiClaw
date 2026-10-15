@@ -236,6 +236,9 @@ workspace: /root/agentteams-fs/shared/tasks/{task-id}/workspace
 # 1. Sync workspace from MinIO
 task_id="task-YYYYMMDD-HHMMSS"
 workspace="/root/agentteams-fs/shared/tasks/${task_id}/workspace"
+# The worker this coding task serves (the sender of the coding-request) —
+# recorded in the run metadata so a reader sees whose task this run was.
+target_worker="worker-name"
 mc mirror "${AGENTTEAMS_STORAGE_PREFIX}/shared/tasks/${task_id}/" "/root/agentteams-fs/shared/tasks/${task_id}/"
 
 # 2. Check for processing marker (task coordination)
@@ -279,15 +282,26 @@ bash /opt/agentteams/agent/skills/coding-cli-management/scripts/run-coding-cli.s
   --task-dir "$task_dir" \
   --processor "manager" \
   --run-id "$run_id" \
+  --worker "$target_worker" \
   --timeout 3600
 exit_code=$?
 
 # 7. Remove processing marker
 bash /opt/agentteams/agent/skills/task-coordination/scripts/remove-processing-marker.sh "$task_id" "$run_id"
 
-# 8. On success (exit 0): push changes to MinIO
+# 8. Push records to MinIO.
+#    The run transcript + outcome metadata (coding-cli-logs/) and the prompt
+#    (coding-prompts/) are mirrored on EVERY outcome — a failed, timed-out or
+#    blocked run must stay diagnosable from storage, and runs.jsonl is the
+#    metadata source the read API enriches from. The full workspace/ (the code
+#    changes) is success-only: never push a failed run's code.
+mc mirror "/root/agentteams-fs/shared/tasks/${task_id}/workspace/coding-cli-logs/" \
+  "${AGENTTEAMS_STORAGE_PREFIX}/shared/tasks/${task_id}/workspace/coding-cli-logs/" --overwrite
+mc mirror "/root/agentteams-fs/shared/tasks/${task_id}/coding-prompts/" \
+  "${AGENTTEAMS_STORAGE_PREFIX}/shared/tasks/${task_id}/coding-prompts/" --overwrite
 if [ "$exit_code" -eq 0 ]; then
-    mc mirror "/root/agentteams-fs/shared/tasks/${task_id}/workspace/" "${AGENTTEAMS_STORAGE_PREFIX}/shared/tasks/${task_id}/workspace/" --overwrite
+    mc mirror "/root/agentteams-fs/shared/tasks/${task_id}/workspace/" \
+      "${AGENTTEAMS_STORAGE_PREFIX}/shared/tasks/${task_id}/workspace/" --overwrite
 fi
 ```
 

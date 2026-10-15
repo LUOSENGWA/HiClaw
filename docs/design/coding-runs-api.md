@@ -22,12 +22,78 @@ per-worker console port).
 **Read-only by design.** There is no create / delete / tail-stream route: the
 run is already finished (one-shot), and the log is immutable once the CLI exits.
 
+**v2 — list metadata + structured detail.** A run's *outcome* — which CLI ran,
+which worker it served, whether it succeeded / timed out / was blocked, how
+long it took, what prompt it was given — cannot be told from the transcript
+without reading every log, and the prompt does not live inside the workspace at
+all. `run-coding-cli.sh` therefore appends one JSON line per run to
+`coding-cli-logs/runs.jsonl` (write side below); the list reads that index once
+per task, and `?format=json` serves the structured envelope. Both are
+**additive**: the v1 list fields and the byte-transparent default detail are
+unchanged, and a run with no `runs.jsonl` record (every run recorded before
+v2) degrades to the v1 fields rather than failing. The list never reads a log
+body — one index read per task, not N per run.
+
 ## Routes
 
 | Route | Storage read | Returns |
 |-------|-------------|---------|
-| `GET /api/v1/coding-runs` | `ListObjects` over the caller's visible `…/coding-cli-logs/` prefixes | `list[{task_id, run, team}]` — the runs the caller may read (bounded by a 200-run cap) |
-| `GET /api/v1/coding-runs/{taskID}/runs/{run}` | `GetObject …/coding-cli-logs/{run}` | the raw `.log`, byte-transparent (`text/plain`) |
+| `GET /api/v1/coding-runs` | `ListObjects` over the caller's visible `…/coding-cli-logs/` prefixes, plus one `GetObject` of that task's `runs.jsonl` | `list[{task_id, run, team, cli, worker, status, exit_code, started_at, ended_at, log_bytes}]` — the runs the caller may read (bounded by a 200-run cap; the metadata keys are omitted when unrecorded) |
+| `GET /api/v1/coding-runs/{taskID}/runs/{run}` | `GetObject …/coding-cli-logs/{run}` | the raw `.log`, byte-transparent (`text/plain`) — unchanged |
+| `GET /api/v1/coding-runs/{taskID}/runs/{run}?format=json` | as above, plus `…/coding-cli-logs/runs.jsonl` and `…/coding-prompts/{prompt}` when present | the structured envelope `{task_id, run, team, meta, input, output}` |
+
+## List item (v2)
+
+```json
+{
+  "task_id": "t1", "run": "run-20261015-101500.log", "team": "alpha-team",
+  "cli": "qwen",              // omitempty — absent when unrecorded
+  "worker": "sysdev-coder",   // the worker this task served (delegator-supplied)
+  "status": "ok",             // ok | failed | timeout | blocked
+  "exit_code": 0,             // 0 is a legal value and shows; unknown omits
+  "started_at": "2026-10-15T10:15:00Z",
+  "ended_at": "2026-10-15T10:16:12Z",
+  "log_bytes": 12345
+}
+```
+
+- **Source**: the task's `…/coding-cli-logs/runs.jsonl`, mapped by run name
+  (one extra `GetObject` per task directory — never a per-run log read).
+- **Fallback**: with no record, the item keeps the v1 fields and derives
+  `started_at` from the run filename (`run-YYYYMMDD-HHMMSS.log`); an
+  implausible timestamp is dropped rather than fabricated.
+- **Tolerance**: a missing `runs.jsonl`, a bad line, or a line without a run
+  name is skipped — a malformed index never fails the list.
+- `runner` (the run's own container identity) is deliberately **not** in the
+  list; it appears in the detail `meta`.
+
+## Detail `?format=json`
+
+```json
+{
+  "task_id": "t1", "run": "run-20261015-101500.log", "team": "alpha-team",
+  "meta": { "cli": "qwen", "worker": "sysdev-coder", "runner": "sysdev-lead",
+            "status": "ok", "exit_code": 0, "timeout_secs": 3600,
+            "started_at": "…", "ended_at": "…", "log_bytes": 12345,
+            "prompt_file": "…", "prompt_sha256": "…" },
+  "input":  { "prompt_summary": "…first 200 chars…", "prompt_sha256": "…",
+              "prompt": "…full text when mirrored…", "prompt_available": true },
+  "output": { "transcript": "…the raw log…", "status": "ok", "exit_code": 0 }
+}
+```
+
+- `output.transcript` is the same bytes the default route returns verbatim; the
+  envelope adds no timestamp or wrapper of its own.
+- `input.prompt` is read from `…/{taskID}/coding-prompts/{basename}` — the
+  prompt lives *beside* the workspace, and is only readable because the mirror
+  rule below pushes it on every outcome. The basename comes from the record's
+  `prompt_file` when present, else from the run name.
+- **Degradation**: no `runs.jsonl` record → `meta` is an empty object and the
+  transcript still serves; no prompt object → `prompt_available: false` with
+  `prompt_summary` / `prompt_sha256` still present from the record. Neither is
+  an error — the route never 500s on missing metadata.
+- Any `format` value other than `json` (including none) keeps the v1
+  byte-transparent `text/plain` response.
 
 - **Data layout (dual-prefix)**, read via `oss.StorageClient`:
   - standalone task: `shared/tasks/{taskID}/workspace/coding-cli-logs/run-*.log`
@@ -85,22 +151,69 @@ team-scope logic would be dead code and real L2 requests would `403`.
 | no runs the caller may read | `200 []` (empty list, never `null`) |
 | caller denied at the authorizer (worker) | `403` |
 | storage read error mid-list | skipped for that prefix (the rest of the list still returns) |
+| `runs.jsonl` missing / malformed | list & default detail unchanged; `?format=json` degrades (`meta` empty shell) |
+
+## Write side: `runs.jsonl`
+
+`run-coding-cli.sh` appends exactly one JSON line per run to
+`{workspace}/coding-cli-logs/runs.jsonl` — the outcome index the read side
+enriches from:
+
+```json
+{"v":1,"run":"run-20261015-101500.log","cli":"qwen","worker":"sysdev-coder","runner":"sysdev-lead",
+ "status":"ok","reason":"","exit_code":0,"timeout_secs":3600,
+ "started_at":"2026-10-15T10:15:00Z","ended_at":"2026-10-15T10:16:12Z","log_bytes":12345,
+ "prompt_file":"/root/agentteams-fs/shared/tasks/t1/coding-prompts/20261015-101500.txt",
+ "prompt_sha256":"…","prompt_summary":"…"}
+```
+
+- **Appended on every exit path from argument validation onwards** — ok,
+  timeout (124), blocked-by-marker / blocked-missing-CLI (125), invalid
+  approval mode / unknown CLI / runner failure — so a run that never produced
+  a result still records why. Argument-validation failures (missing
+  `--cli` / missing prompt / missing workspace) are not runs and append
+  nothing. Empty values are omitted, matching the API's `omitempty` contract.
+- **`status` is the script's exit code mapped**: `0 → ok`, `124 → timeout`,
+  `125 → blocked`, anything else `failed`. `reason` disambiguates the blocked
+  paths (`marker-conflict`, `cli-missing`) and is empty otherwise.
+- `--worker <name>` records the worker the task served (passed by the
+  delegating agent); `runner` records the executing container
+  (`$AGENTTEAMS_WORKER_NAME`). `prompt_sha256` / `prompt_summary` come from the
+  prompt file (sha256; the first 200 characters, single-lined).
+- **Single writer**: runs of one task are serialized by the `.processing`
+  marker, so appends do not interleave.
+- **Mirror rule.** The skill mirrors `coding-cli-logs/` and `coding-prompts/`
+  on **every** outcome (a failure must stay diagnosable, and the index must
+  reach storage), while the full `workspace/` (the code changes) stays
+  **success-only**. This is what makes `runs.jsonl` and `input.prompt` readable
+  here at all.
 
 ## Example
 
 ```bash
-# L1 admin lists every coding run (team + standalone)
+# L1 admin lists every coding run (team + standalone), enriched from runs.jsonl
 curl -s http://127.0.0.1:8090/api/v1/coding-runs -H "Authorization: Bearer $ADMIN_TOKEN"
-# → 200 [{"task_id":"t1","run":"run-20261012-120000.log","team":"alpha-team"}, …]
+# → 200 [{"task_id":"t1","run":"run-20261012-120000.log","team":"alpha-team",
+#         "cli":"qwen","worker":"sysdev-coder","status":"ok","exit_code":0,
+#         "started_at":"2026-10-12T11:59:58Z","ended_at":"2026-10-12T12:00:00Z",
+#         "log_bytes":12345}, …]
 
 # team leader (alpha) sees only alpha-team runs; standalone + other teams absent
 curl -s http://127.0.0.1:8090/api/v1/coding-runs -H "Authorization: Bearer $ALPHA_LEAD_TOKEN"
-# → 200 [{"task_id":"t1","run":"run-20261012-120000.log","team":"alpha-team"}]
+# → 200 [{"task_id":"t1","run":"run-20261012-120000.log","team":"alpha-team", …}]
 
 # open one run's transcript (byte-transparent)
 curl -s http://127.0.0.1:8090/api/v1/coding-runs/t1/runs/run-20261012-120000.log \
   -H "Authorization: Bearer $ADMIN_TOKEN"
 # → 200 "[run-coding-cli] cli=qwen workspace=…\n<full CLI transcript>"
+
+# …or the structured envelope (same run)
+curl -s "http://127.0.0.1:8090/api/v1/coding-runs/t1/runs/run-20261012-120000.log?format=json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+# → 200 {"task_id":"t1","run":"…","team":"alpha-team",
+#         "meta":{"cli":"qwen","status":"ok","exit_code":0,…},
+#         "input":{"prompt_summary":"…","prompt_available":true,"prompt":"…"},
+#         "output":{"transcript":"…","status":"ok","exit_code":0}}
 
 # cross-team / standalone read as an L2 caller → 404, indistinguishable from absent
 curl -s http://127.0.0.1:8090/api/v1/coding-runs/t9/runs/run-20261012-120100.log \
@@ -130,6 +243,12 @@ curl -s "http://127.0.0.1:8090/api/v1/coding-runs/../etc/runs/run-20261012-12000
   arbitrary CLI stdout is out of scope for v1.
 - **Dashboard consumption** is a separate follow-up (mirrors how the worker-chats
   dashboard panel consumes `worker-chats-api.md`).
+- **v2 write side ships with the read side.** The enrichment is only as good
+  as the `runs.jsonl` the wrapper writes: runs recorded by an older wrapper
+  version (or before this change) have no line and stay on the v1 fields plus
+  the filename-derived `started_at`. No backfill is attempted — the transcript
+  itself remains the fallback record, and the list/index read costs one
+  `GetObject` per task, not per run.
 
 ## Tests
 
@@ -137,12 +256,29 @@ curl -s "http://127.0.0.1:8090/api/v1/coding-runs/../etc/runs/run-20261012-12000
   directory-view fake + fake K8s client:
   - list: `TestListCodingRuns_AdminSeesTeamAndStandalone`,
     `TestListCodingRuns_L2SeesOnlyOwnTeam`,
-    `TestListCodingRuns_SkipsNonRunFiles`
-  - detail: `TestGetCodingRun_AdminReadsByteTransparent`,
+    `TestListCodingRuns_SkipsNonRunFiles`,
+    `TestListCodingRuns_CapIsGlobalAcrossTeams` (the 200 cap stays global)
+  - list enrichment (v2): `TestListCodingRuns_EnrichedFromRunsJSONL` (fields
+    pass-through, `exit_code: 0` shown, second run degrading),
+    `TestListCodingRuns_MissingRunsJSONLFallsBackToFilename` (filename-derived
+    `started_at`, metadata keys omitted on the wire),
+    `TestListCodingRuns_MalformedRunsJSONLIsTolerated`
+  - detail: `TestGetCodingRun_AdminReadsByteTransparent` (default
+    `text/plain`, byte-identical),
     `TestGetCodingRun_L2OwnTeam`, `TestGetCodingRun_L2OtherTeam` (W4 404),
     `TestGetCodingRun_L2CannotSeeStandalone` (L1-only),
     `TestGetCodingRun_InvalidTaskID` (traversal 400),
     `TestGetCodingRun_InvalidRun` (400), `TestGetCodingRun_NotFound` (404)
+  - detail `?format=json` (v2): `TestGetCodingRun_JSONFormat_FullMetadata`,
+    `TestGetCodingRun_JSONFormat_PromptUnavailable`,
+    `TestGetCodingRun_JSONFormat_NoMetadata` (empty `meta` shell, no 500),
+    `TestGetCodingRun_JSONFormat_PromptBasenameFallback`
 - `internal/auth/authorizer_test.go` — `TestAuthorizer_CodingRunsScoped` pins
   the authorizer boundary: L2 human + team leader `get`/`list` allowed (so the
   handler scope runs), worker denied.
+- `tests/check-coding-cli-runs-metadata.sh` — the write side, over a stub CLI:
+  the ok / timeout / blocked-marker / blocked-missing-CLI paths each append
+  exactly one `runs.jsonl` line with the right `status` / `reason` /
+  `exit_code`, `--worker` and `AGENTTEAMS_WORKER_NAME` land as
+  `worker` / `runner`, empty values are omitted, and runs append
+  (one line per run). Wired into `.github/workflows/helm-lint.yml`.

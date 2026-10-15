@@ -3,7 +3,7 @@
 # Usage: run-coding-cli.sh --cli <tool> --workspace <dir> --prompt-file <file> [--timeout <secs>]
 #        [--model <name>] [--allowed-tools <csv>] [--allowed-mcp <csv>] [--safe-mode] [--bare] [--json-file <path>]
 #        [--approval-mode <tier>] [--max-wall-time <val>]
-#        [--task-dir <dir>] [--processor <name>] [--run-id <id>]
+#        [--task-dir <dir>] [--processor <name>] [--run-id <id>] [--worker <name>]
 # (governance flags apply to the qwen runner; other runners warn and ignore them)
 
 set -e
@@ -33,6 +33,10 @@ g_max_wall_time=""
 g_task_dir=""
 g_processor=""
 g_run_id=""
+# The worker this coding task serves (passed by the delegating agent, who
+# knows it from the coding-request). Recorded in runs.jsonl only; the run's
+# own container identity is the AGENTTEAMS_WORKER_NAME env var (runner).
+g_worker=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -51,6 +55,7 @@ while [[ $# -gt 0 ]]; do
         --task-dir)    g_task_dir="$2";    shift 2 ;;
         --processor)   g_processor="$2";   shift 2 ;;
         --run-id)      g_run_id="$2";      shift 2 ;;
+        --worker)      g_worker="$2";      shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -69,6 +74,81 @@ if [ ! -d "$workspace" ]; then
     echo "Workspace directory not found: $workspace" >&2
     exit 1
 fi
+
+# ── Run record (runs.jsonl) ─────────────────────────────────────────────────
+# Outcome metadata for the coding-runs read path: one appended JSON line per
+# run, covering EVERY exit path from here on (ok / timeout / blocked /
+# failed), so a failed or blocked run is as diagnosable from storage as a
+# successful one. This is also where the run's log path is fixed — before the
+# pre-flight guards below, so a blocked run still records which run it was.
+started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+timestamp=$(date +%Y%m%d-%H%M%S)
+log_dir="$workspace/coding-cli-logs"
+mkdir -p "$log_dir"
+run_name="run-${timestamp}.log"
+log_file="$log_dir/${run_name}"
+runs_jsonl="$log_dir/runs.jsonl"
+
+# The script's exit code -> the recorded status (the two-guard 125s are
+# "blocked, retry later"; 124 is the outer timeout; anything else failed).
+status_of_exit() {
+    case "$1" in
+        0)   echo "ok" ;;
+        124) echo "timeout" ;;
+        125) echo "blocked" ;;
+        *)   echo "failed" ;;
+    esac
+}
+
+# append_run_record <status> <reason> <exit_code>
+# Empty values are omitted (aligned with the API's omitempty contract).
+# Best-effort: a metadata failure must never change the run's outcome, so
+# every step degrades and the function always returns 0.
+append_run_record() {
+    local rec_status="$1" rec_reason="$2" rec_exit="$3"
+    command -v python3 >/dev/null 2>&1 || return 0
+    local ended_at log_bytes="" prompt_sha="" prompt_summary=""
+    ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if [ -f "$log_file" ]; then
+        log_bytes=$(wc -c < "$log_file" 2>/dev/null | tr -d '[:space:]') || log_bytes=""
+    fi
+    if [ -f "$prompt_file" ]; then
+        prompt_sha=$(sha256sum "$prompt_file" 2>/dev/null | awk '{print $1}') || prompt_sha=""
+        prompt_summary=$(head -c 200 "$prompt_file" 2>/dev/null | tr '\n\r' '  ' | sed -e 's/[[:space:]]*$//') || prompt_summary=""
+    fi
+    RUN_REC_RUN="$run_name" RUN_REC_CLI="$cli" RUN_REC_WORKER="$g_worker" \
+    RUN_REC_RUNNER="${AGENTTEAMS_WORKER_NAME:-}" RUN_REC_STATUS="$rec_status" \
+    RUN_REC_REASON="$rec_reason" RUN_REC_EXIT_CODE="$rec_exit" \
+    RUN_REC_TIMEOUT_SECS="$timeout_secs" RUN_REC_STARTED_AT="$started_at" \
+    RUN_REC_ENDED_AT="$ended_at" RUN_REC_LOG_BYTES="$log_bytes" \
+    RUN_REC_PROMPT_FILE="$prompt_file" RUN_REC_PROMPT_SHA256="$prompt_sha" \
+    RUN_REC_PROMPT_SUMMARY="$prompt_summary" \
+    python3 -c '
+import json, os
+e = os.environ
+def opt(k):
+    v = e.get("RUN_REC_" + k, "")
+    return v if v != "" else None
+rec = {"v": 1, "run": e["RUN_REC_RUN"], "cli": e["RUN_REC_CLI"]}
+for k in ("WORKER", "RUNNER", "STATUS", "REASON"):
+    v = opt(k)
+    if v is not None:
+        rec[k.lower()] = v
+rec["exit_code"] = int(e["RUN_REC_EXIT_CODE"])
+rec["timeout_secs"] = int(e["RUN_REC_TIMEOUT_SECS"])
+rec["started_at"] = e["RUN_REC_STARTED_AT"]
+rec["ended_at"] = e["RUN_REC_ENDED_AT"]
+v = opt("LOG_BYTES")
+if v is not None:
+    rec["log_bytes"] = int(v)
+for k in ("PROMPT_FILE", "PROMPT_SHA256", "PROMPT_SUMMARY"):
+    v = opt(k)
+    if v is not None:
+        rec[k.lower()] = v
+print(json.dumps(rec, ensure_ascii=False))
+' >> "$runs_jsonl" 2>/dev/null || true
+    return 0
+}
 
 # Pre-flight guard: a .processing marker at the TASK ROOT means another
 # operation holds the task. The marker lives at <task-root>/.processing (see
@@ -98,6 +178,7 @@ if [ -f "$marker_file" ]; then
         echo "[run-coding-cli] and does not match this run's ownership — a conflicting" >&2
         echo "[run-coding-cli] operation is in progress. Refusing to run; retry after the holder" >&2
         echo "[run-coding-cli] removes the marker or it expires." >&2
+        append_run_record blocked marker-conflict 125
         exit 125
     fi
     # Expired marker, or matching processor AND run ID -> proceed.
@@ -118,6 +199,7 @@ if ! command -v "$cli" >/dev/null 2>&1; then
     echo "[run-coding-cli] then retry. Auth settings are written container-local by that" >&2
     echo "[run-coding-cli] surface and may not survive a recreation — probe settings and" >&2
     echo "[run-coding-cli] re-apply via the settings endpoint if the probe shows them missing." >&2
+    append_run_record blocked cli-missing 125
     exit 125
 fi
 
@@ -126,12 +208,6 @@ fi
 if [ "$cli" != "qwen" ] && { [ -n "$g_model" ] || [ -n "$g_allowed_tools" ] || [ -n "$g_allowed_mcp" ] || [ "$g_safe_mode" = "1" ] || [ "$g_bare" = "1" ] || [ -n "$g_json_file" ] || [ -n "$g_approval_mode" ] || [ -n "$g_max_wall_time" ]; }; then
     echo "[run-coding-cli] note: governance flags (--model/--allowed-tools/--allowed-mcp/--safe-mode/--bare/--json-file/--approval-mode/--max-wall-time) are qwen-specific and were ignored for cli=$cli" >&2
 fi
-
-# Save output to log file in the workspace's coding-cli-logs directory
-log_dir="$workspace/coding-cli-logs"
-mkdir -p "$log_dir"
-timestamp=$(date +%Y%m%d-%H%M%S)
-log_file="$log_dir/run-${timestamp}.log"
 
 # Write the run metadata header to the log (and stdout) so the log file itself
 # records which workspace/prompt/timeout this run used.
@@ -197,6 +273,7 @@ case "$cli" in
                     echo "[run-coding-cli] source: approval_mode in ${config_file}" >&2
                 fi
                 echo "[run-coding-cli] Valid values: plan, default, auto-edit, auto, yolo" >&2
+                append_run_record failed invalid-approval-mode 1
                 exit 1
                 ;;
         esac
@@ -282,14 +359,17 @@ case "$cli" in
         ;;
     *)
         echo "Unknown CLI tool: $cli. Supported: claude, gemini, qodercli, qwen, opencode" >&2 | tee -a "$log_file"
+        append_run_record failed unknown-cli 1
         exit 1
         ;;
 esac
 
 if [ "$exit_code" -eq 124 ]; then
     echo "[run-coding-cli] TIMEOUT after ${timeout_secs}s" | tee -a "$log_file"
+    append_run_record timeout "" 124
     exit 124
 fi
 
 echo "[run-coding-cli] Finished with exit code $exit_code" | tee -a "$log_file"
+append_run_record "$(status_of_exit "$exit_code")" "" "$exit_code"
 exit "$exit_code"

@@ -32,10 +32,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
 	authpkg "github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/auth"
@@ -126,11 +129,89 @@ func visibleTaskPrefixes(all []string, caller *authpkg.CallerIdentity, crToEffec
 	return out
 }
 
-// codingRun is one run transcript entry in the list response.
+// codingRun is one run transcript entry in the list response. The base
+// fields (task_id / run / team) are v1; the metadata fields are additive
+// (v2) and omitted when the task's runs.jsonl has no record for the run
+// (older wrapper versions, or a pre-flight failure that left no record) —
+// started_at alone falls back to the run filename's timestamp.
 type codingRun struct {
-	TaskID string `json:"task_id"`
-	Run    string `json:"run"`
-	Team   string `json:"team,omitempty"`
+	TaskID    string `json:"task_id"`
+	Run       string `json:"run"`
+	Team      string `json:"team,omitempty"`
+	Cli       string `json:"cli,omitempty"`
+	Worker    string `json:"worker,omitempty"`
+	Status    string `json:"status,omitempty"`
+	ExitCode  *int   `json:"exit_code,omitempty"` // 0 is a legal value and must show; unknown omits
+	StartedAt string `json:"started_at,omitempty"`
+	EndedAt   string `json:"ended_at,omitempty"`
+	LogBytes  *int64 `json:"log_bytes,omitempty"`
+}
+
+// codingRunRecord is one line of the append-only runs.jsonl that
+// run-coding-cli.sh appends per run — the outcome metadata (status, exit
+// code, timing, prompt digest) the list and detail endpoints surface. Every
+// field is best-effort: absent when the wrapper did not record it.
+type codingRunRecord struct {
+	V             int    `json:"v"`
+	Run           string `json:"run"`
+	Cli           string `json:"cli"`
+	Worker        string `json:"worker"`
+	Runner        string `json:"runner"`
+	Status        string `json:"status"`
+	Reason        string `json:"reason"`
+	ExitCode      *int   `json:"exit_code"`
+	TimeoutSecs   *int   `json:"timeout_secs"`
+	StartedAt     string `json:"started_at"`
+	EndedAt       string `json:"ended_at"`
+	LogBytes      *int64 `json:"log_bytes"`
+	PromptFile    string `json:"prompt_file"`
+	PromptSHA256  string `json:"prompt_sha256"`
+	PromptSummary string `json:"prompt_summary"`
+}
+
+// parseRunsIndex parses an append-only runs.jsonl into a run-name → record
+// map. The index is best-effort worker-written metadata, so bad lines are
+// skipped and a missing run name drops the line — a malformed index must
+// never fail the read endpoints. When a run name repeats (it should not —
+// single writer, unique names), the later line wins.
+func parseRunsIndex(data []byte) map[string]*codingRunRecord {
+	out := map[string]*codingRunRecord{}
+	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var rec codingRunRecord
+		if err := json.Unmarshal(line, &rec); err != nil {
+			continue
+		}
+		if rec.Run == "" {
+			continue
+		}
+		out[rec.Run] = &rec
+	}
+	return out
+}
+
+// startedAtFromRunName derives a run's start time from its transcript
+// filename (run-YYYYMMDD-HHMMSS.log) — the fallback when the task has no
+// runs.jsonl record for the run. It returns "" for an implausible timestamp
+// (e.g. month 13), so a fallback never fabricates a time.
+func startedAtFromRunName(run string) string {
+	const prefix, suffix = "run-", ".log"
+	if !strings.HasPrefix(run, prefix) || !strings.HasSuffix(run, suffix) {
+		return ""
+	}
+	parts := strings.SplitN(strings.TrimSuffix(strings.TrimPrefix(run, prefix), suffix), "-", 2)
+	if len(parts) != 2 || len(parts[0]) != 8 || len(parts[1]) != 6 {
+		return ""
+	}
+	stamped := parts[0][:4] + "-" + parts[0][4:6] + "-" + parts[0][6:8] + "T" +
+		parts[1][:2] + ":" + parts[1][2:4] + ":" + parts[1][4:6] + "Z"
+	if _, err := time.Parse(time.RFC3339, stamped); err != nil {
+		return ""
+	}
+	return stamped
 }
 
 // GET /api/v1/coding-runs
@@ -155,15 +236,42 @@ func (h *CodingRunsHandler) ListCodingRuns(w http.ResponseWriter, r *http.Reques
 				continue
 			}
 			taskID := strings.TrimSuffix(d, "/")
-			files, err := h.oss.ListObjects(r.Context(), prefix+taskID+"/workspace/coding-cli-logs/")
+			logsPrefix := prefix + taskID + "/workspace/coding-cli-logs/"
+			files, err := h.oss.ListObjects(r.Context(), logsPrefix)
 			if err != nil {
 				continue
 			}
+			// One extra read per task WITH runs — the append-only runs.jsonl
+			// outcome index, never the .log bodies (a per-run read would be
+			// N+1). Loaded lazily so a directory holding no run file costs
+			// nothing; a missing index or bad lines degrade to the base
+			// fields.
+			index := map[string]*codingRunRecord{}
+			indexLoaded := false
 			for _, f := range files {
 				if !codingRunFilePattern.MatchString(f) {
 					continue
 				}
-				runs = append(runs, codingRun{TaskID: taskID, Run: f, Team: teamOfPrefix(prefix)})
+				if !indexLoaded {
+					if data, err := h.oss.GetObject(r.Context(), logsPrefix+"runs.jsonl"); err == nil {
+						index = parseRunsIndex(data)
+					}
+					indexLoaded = true
+				}
+				entry := codingRun{TaskID: taskID, Run: f, Team: teamOfPrefix(prefix)}
+				if rec, ok := index[f]; ok {
+					entry.Cli = rec.Cli
+					entry.Worker = rec.Worker
+					entry.Status = rec.Status
+					entry.ExitCode = rec.ExitCode
+					entry.StartedAt = rec.StartedAt
+					entry.EndedAt = rec.EndedAt
+					entry.LogBytes = rec.LogBytes
+				}
+				if entry.StartedAt == "" {
+					entry.StartedAt = startedAtFromRunName(f)
+				}
+				runs = append(runs, entry)
 				if len(runs) >= codingRunsListCap {
 					break
 				}
@@ -179,13 +287,54 @@ func (h *CodingRunsHandler) ListCodingRuns(w http.ResponseWriter, r *http.Reques
 	httputil.WriteJSON(w, http.StatusOK, runs)
 }
 
+// codingRunDetail is the ?format=json detail envelope. The transcript stays
+// byte-transparent inside output.transcript; meta carries the runs.jsonl
+// record (an empty object when the task has no record — degradation, never
+// an error), and input carries the prompt when the mirror made it readable.
+type codingRunDetail struct {
+	TaskID string          `json:"task_id"`
+	Run    string          `json:"run"`
+	Team   string          `json:"team,omitempty"`
+	Meta   codingRunMeta   `json:"meta"`
+	Input  codingRunInput  `json:"input"`
+	Output codingRunOutput `json:"output"`
+}
+
+type codingRunMeta struct {
+	Cli          string `json:"cli,omitempty"`
+	Worker       string `json:"worker,omitempty"`
+	Runner       string `json:"runner,omitempty"`
+	Status       string `json:"status,omitempty"`
+	ExitCode     *int   `json:"exit_code,omitempty"`
+	TimeoutSecs  *int   `json:"timeout_secs,omitempty"`
+	StartedAt    string `json:"started_at,omitempty"`
+	EndedAt      string `json:"ended_at,omitempty"`
+	LogBytes     *int64 `json:"log_bytes,omitempty"`
+	PromptFile   string `json:"prompt_file,omitempty"`
+	PromptSHA256 string `json:"prompt_sha256,omitempty"`
+}
+
+type codingRunInput struct {
+	PromptSummary   string `json:"prompt_summary,omitempty"`
+	PromptSHA256    string `json:"prompt_sha256,omitempty"`
+	Prompt          string `json:"prompt,omitempty"`
+	PromptAvailable bool   `json:"prompt_available"`
+}
+
+type codingRunOutput struct {
+	Transcript string `json:"transcript"`
+	Status     string `json:"status,omitempty"`
+	ExitCode   *int   `json:"exit_code,omitempty"`
+}
+
 // GET /api/v1/coding-runs/{taskID}/runs/{run}
 //
-// Serves one run transcript byte-transparent (the raw .log the CLI teed).
-// The path segments are validated (isSafeTaskID + the run filename pattern)
-// before any storage read, so they cannot carry path traversal. The run is
-// looked up across the caller's visible prefixes; a miss 404s like a missing
-// task (W4).
+// Serves one run transcript. The default (no format parameter) is
+// byte-transparent text/plain — the raw .log the CLI teed, unchanged from
+// v1; ?format=json adds the structured envelope above. The path segments are
+// validated (isSafeTaskID + the run filename pattern) before any storage
+// read, so they cannot carry path traversal. The run is looked up across the
+// caller's visible prefixes; a miss 404s like a missing task (W4).
 func (h *CodingRunsHandler) GetCodingRun(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("taskID")
 	run := r.PathValue("run")
@@ -211,18 +360,92 @@ func (h *CodingRunsHandler) GetCodingRun(w http.ResponseWriter, r *http.Request)
 		}
 		try = append(try, p)
 	}
+	var transcript []byte
+	var foundPrefix string
+	found := false
 	for _, p := range try {
 		key := p + taskID + "/workspace/coding-cli-logs/" + run
 		data, err := h.oss.GetObject(r.Context(), key)
 		if err != nil {
 			continue // not under this prefix; try the next
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(data)
+		transcript, foundPrefix, found = data, p, true
+		break
+	}
+	if !found {
+		httputil.WriteError(w, http.StatusNotFound, "coding run not found")
 		return
 	}
-	httputil.WriteError(w, http.StatusNotFound, "coding run not found")
+	if r.URL.Query().Get("format") == "json" {
+		h.writeRunDetailJSON(w, r, foundPrefix, taskID, run, transcript)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(transcript)
+}
+
+// writeRunDetailJSON serves the ?format=json detail. Metadata reads degrade
+// independently (meta empty shell / prompt unavailable) so a missing
+// runs.jsonl or prompt never turns a readable transcript into an error.
+func (h *CodingRunsHandler) writeRunDetailJSON(w http.ResponseWriter, r *http.Request, prefix, taskID, run string, transcript []byte) {
+	var rec *codingRunRecord
+	if data, err := h.oss.GetObject(r.Context(), prefix+taskID+"/workspace/coding-cli-logs/runs.jsonl"); err == nil {
+		rec = parseRunsIndex(data)[run]
+	}
+	meta := codingRunMeta{}
+	input := codingRunInput{}
+	output := codingRunOutput{Transcript: string(transcript)}
+	if rec != nil {
+		meta = codingRunMeta{
+			Cli:          rec.Cli,
+			Worker:       rec.Worker,
+			Runner:       rec.Runner,
+			Status:       rec.Status,
+			ExitCode:     rec.ExitCode,
+			TimeoutSecs:  rec.TimeoutSecs,
+			StartedAt:    rec.StartedAt,
+			EndedAt:      rec.EndedAt,
+			LogBytes:     rec.LogBytes,
+			PromptFile:   rec.PromptFile,
+			PromptSHA256: rec.PromptSHA256,
+		}
+		input.PromptSummary = rec.PromptSummary
+		input.PromptSHA256 = rec.PromptSHA256
+		output.Status = rec.Status
+		output.ExitCode = rec.ExitCode
+	}
+	// The prompt sits beside the workspace (…/{taskID}/coding-prompts/), not
+	// inside it; the "mirror on every outcome" rule is what makes it readable.
+	if base := promptBaseName(rec, run); base != "" {
+		if data, err := h.oss.GetObject(r.Context(), prefix+taskID+"/coding-prompts/"+base); err == nil {
+			input.Prompt = string(data)
+			input.PromptAvailable = true
+		}
+	}
+	httputil.WriteJSON(w, http.StatusOK, codingRunDetail{
+		TaskID: taskID,
+		Run:    run,
+		Team:   teamOfPrefix(prefix),
+		Meta:   meta,
+		Input:  input,
+		Output: output,
+	})
+}
+
+// promptBaseName resolves the prompt object's basename: the record's
+// prompt_file path element when the wrapper recorded one (authoritative — the
+// delegator names the prompt file, the wrapper names the run, and the two
+// clocks can straddle a second boundary), else the run filename's timestamp
+// as .txt.
+func promptBaseName(rec *codingRunRecord, run string) string {
+	if rec != nil && rec.PromptFile != "" {
+		if i := strings.LastIndex(rec.PromptFile, "/"); i >= 0 {
+			return rec.PromptFile[i+1:]
+		}
+		return rec.PromptFile
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(run, "run-"), ".log") + ".txt"
 }
 
 // teamOfPrefix extracts the team name from a storage prefix for the list
