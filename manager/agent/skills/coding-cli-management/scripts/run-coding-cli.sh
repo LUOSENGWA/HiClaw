@@ -84,23 +84,47 @@ fi
 # attempt must leave a readable artifact, not just metadata.
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 log_dir="$workspace/coding-cli-logs"
-mkdir -p "$log_dir"
+if ! mkdir -p "$log_dir"; then
+    echo "[run-coding-cli] ERROR: cannot create the run-log directory '${log_dir}' — no run was started." >&2
+    exit 1
+fi
 runs_jsonl="$log_dir/runs.jsonl"
 
-# claim_transcript fixes this run's transcript path, creating the file
-# exclusively (noclobber) so a transcript from the same wall-clock second is
-# never clobbered — the run that holds the task is exactly the one a blocked
-# attempt collides with. A taken name steps one second forward.
+# claim_transcript fixes this run's transcript path. The create is exclusive
+# (noclobber) so a transcript from the same wall-clock second is never
+# clobbered — the run that holds the task is exactly the one a blocked
+# attempt collides with. ONLY an existing name counts as a collision: the
+# candidate then steps FORWARD one second at a time, so a burst of runs within
+# one second each gets its own transcript. Any other create failure (read-only
+# or unwritable directory, full disk) refuses the run at once with a visible
+# diagnostic instead of retrying: a retry loop here would sit before the
+# pre-flight guards and outside the CLI timeout, so --timeout could not bound
+# it. The attempt cap is a safety net only (a monotonic step terminates on its
+# own; the cap guards against a pathological clock).
 claim_transcript() {
-    local epoch
-    timestamp=$(date +%Y%m%d-%H%M%S)
-    run_name="run-${timestamp}.log"
-    log_file="$log_dir/${run_name}"
-    while ! ( set -C; : > "$log_file" ) 2>/dev/null; do
-        epoch=$(( $(date +%s) + 1 ))
+    local epoch attempts=0
+    epoch=$(date +%s)
+    while true; do
         timestamp=$(date -d "@${epoch}" +%Y%m%d-%H%M%S)
         run_name="run-${timestamp}.log"
         log_file="$log_dir/${run_name}"
+        if ( set -C; : > "$log_file" ) 2>/dev/null; then
+            return 0
+        fi
+        if [ ! -e "$log_file" ]; then
+            echo "[run-coding-cli] ERROR: cannot create the run transcript '${log_file}'." >&2
+            echo "[run-coding-cli] The coding-cli-logs directory must be writable — a read-only" >&2
+            echo "[run-coding-cli] filesystem, directory permissions or a full disk blocks this run." >&2
+            echo "[run-coding-cli] No run was started; fix the directory and retry." >&2
+            exit 1
+        fi
+        attempts=$(( attempts + 1 ))
+        if [ "$attempts" -ge 64 ]; then
+            echo "[run-coding-cli] ERROR: no free run transcript name in '${log_dir}' after" >&2
+            echo "[run-coding-cli] ${attempts} same-second collisions — refusing to run." >&2
+            exit 1
+        fi
+        epoch=$(( epoch + 1 ))
     done
 }
 claim_transcript

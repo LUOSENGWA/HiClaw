@@ -187,14 +187,24 @@ enriches from:
 - **One transcript per record, on every exit path from argument validation
   onwards** — ok, timeout (124), blocked-by-marker / blocked-missing-CLI
   (125), invalid approval mode / unknown CLI / runner failure. Each of those
-  owns a `run-….log`: it is created up front (exclusively — a same-second
-  transcript is never clobbered; a taken name steps one second forward) and
-  finalized with the diagnostic that explains the outcome, which a refusing
-  exit writes to the transcript **and** stderr before appending the record.
-  `log_bytes` is that transcript's size, so it is present for every recorded
-  run. Argument-validation failures (missing `--cli` / missing prompt /
-  missing workspace) are not runs: no record, no transcript. Empty values are
-  omitted, matching the API's `omitempty` contract.
+  owns a `run-….log`: it is created up front and finalized with the diagnostic
+  that explains the outcome, which a refusing exit writes to the transcript
+  **and** stderr before appending the record. `log_bytes` is that transcript's
+  size, so it is present for every recorded run. Argument-validation failures
+  (missing `--cli` / missing prompt / missing workspace) are not runs: no
+  record, no transcript. Empty values are omitted, matching the API's
+  `omitempty` contract.
+- **Claiming the transcript name.** The create is exclusive: an existing
+  same-second transcript is never clobbered (that name belongs to the run
+  holding the task), and the claim steps **forward one second at a time** so a
+  burst of runs within one second still each get their own transcript. Only an
+  existing name is treated as a collision — any other create failure (read-only
+  or unwritable `coding-cli-logs/`, a full disk, an uncreatable directory)
+  refuses the run at once with a visible diagnostic instead of retrying: a
+  retry there would sit before the pre-flight guards and outside the CLI
+  `--timeout`, so nothing could bound it. Such a refusal writes no record (the
+  directory cannot hold one) — like the argument-validation class, the run
+  simply does not exist.
 - **`status` is the script's exit code mapped**: `0 → ok`, `124 → timeout`,
   `125 → blocked`, anything else `failed`. `reason` disambiguates the blocked
   paths (`marker-conflict`, `cli-missing`) and is empty otherwise.
@@ -313,7 +323,13 @@ curl -s "http://127.0.0.1:8090/api/v1/coding-runs/../etc/runs/run-20261012-12000
     regression for "recorded but invisible";
   - a closing invariant sweep asserts **every** recorded run names an existing
     transcript, whatever the outcome;
+  - an unwritable/read-only `coding-cli-logs/` fails the run **promptly** with
+    a visible diagnostic and without invoking the CLI (bounded by an external
+    `timeout`, so a regression back to retrying shows up as a failure and not
+    as a hang), and a same-second collision leaves the live transcript
+    byte-identical while the claim steps to a free name;
   - `--worker` and `AGENTTEAMS_WORKER_NAME` land as `worker` / `runner`, empty
-    values are omitted, runs append (one line per run), and a non-UTC
-    container (`TZ=Asia/Shanghai`) still records `started_at` in UTC.
+    values are omitted, runs append (one line **and** one transcript per run),
+    and a non-UTC container (`TZ=Asia/Shanghai`) still records `started_at` in
+    UTC.
   Wired into `.github/workflows/helm-lint.yml`.
