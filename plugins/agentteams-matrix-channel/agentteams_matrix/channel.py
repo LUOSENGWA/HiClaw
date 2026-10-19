@@ -4462,6 +4462,14 @@ class AgentTeamsMatrixChannel(BaseChannel):
             carry_meta_root = meta_dict.get(_THREAD_META_ROOT_KEY)
             if carry_meta_root:
                 retrigger_meta[_THREAD_META_ROOT_KEY] = carry_meta_root
+            # The placeholder flag must travel with the root id: without
+            # it the re-triggered turn completes on the non-placeholder
+            # path and posts its final answer as a thread reply, leaving
+            # the original "处理中..." root stranded on the main timeline
+            # (issue #1386 case B).  A NO_REPLY retry then also skips the
+            # placeholder close-out (case A).
+            if meta_dict.get(_MATRIX_PLACEHOLDER_THREAD_ROOT_KEY):
+                retrigger_meta[_MATRIX_PLACEHOLDER_THREAD_ROOT_KEY] = True
         # The re-triggered turn snapshots the room state it actually
         # received: the recovered window extends to the newest retained
         # event, so current gen/records — and the next gate can only
