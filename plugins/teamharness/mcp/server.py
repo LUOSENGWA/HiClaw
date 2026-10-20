@@ -463,6 +463,14 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "description": "DAG or Loop task nodes for planning actions.",
                     "items": {"type": "object", "additionalProperties": True},
                 },
+                "taskId": {
+                    "type": "string",
+                    "description": "For plan_loop, the task the loop iterates; recorded in the loop dict as task_id and checked against the task meta.",
+                },
+                "loopId": {
+                    "type": "string",
+                    "description": "For plan_loop, the Loop CRD identity recorded as the consistency anchor in the loop dict; the CRD itself is not read by plan_loop.",
+                },
                 "replyRoute": {
                     "type": "object",
                     "description": "Requester route for accepted outcome reports from external or cross-session requests.",
@@ -2828,6 +2836,7 @@ def _payload(arguments: dict[str, Any]) -> dict[str, Any]:
     aliases = {
         "projectId": ("projectId", "project_id"),
         "taskId": ("taskId", "task_id"),
+        "loopId": ("loopId", "loop_id"),
         "roomId": ("roomId", "room_id"),
         "sourceRoomId": ("sourceRoomId", "source_room_id"),
         "sender": ("sender", "senderId", "sender_id", "senderUserId", "sender_user_id", "sourceUserId", "source_user_id"),
@@ -3876,6 +3885,53 @@ def _pull_failed_response(tool: str, action: str) -> dict[str, Any]:
     }
 
 
+def _validate_loop_id_mapping(
+    arguments: dict[str, Any],
+    project_id: str,
+    loop: dict[str, Any],
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Validate the loop task mapping before plan_loop writes any state.
+
+    Only the project state (B) <-> task meta (C) directions are checked:
+    plan_loop has no k8s client and never reads the Loop CRD (A). Keeping
+    A and B consistent is the reconciler's job; a provided ``loopId`` is
+    recorded in the loop dict purely as the anchor for that later check.
+
+    The loop's ``task_id`` (B) is a stable anchor: an existing loop cannot
+    be re-pointed at a different task, and the task meta (C) of the mapped
+    task must not claim a different identity. Returns the structured
+    ``loop_id_mismatch`` error on conflict (the caller must perform no
+    writes), or ``None`` when the mapping is consistent or unmapped
+    (unmapped is allowed, keeping legacy calls byte-identical).
+    """
+    task_id = loop.get("task_id")
+    if not task_id:
+        return None
+    project_state = _read_json(_project_state_path(arguments, project_id), {})
+    previous_loop = project_state.get("loop") if isinstance(project_state.get("loop"), dict) else {}
+    previous_task_id = previous_loop.get("task_id")
+    task_meta = _read_json(_task_state_path(arguments, task_id))
+    meta_task_id = task_meta.get("task_id") if task_meta else None
+    if previous_task_id and previous_task_id != task_id:
+        return {
+            "ok": False,
+            "error": "loop_id_mismatch",
+            "crd_task_id": None,
+            "project_loop_task_id": previous_task_id,
+            "task_meta_task_id": meta_task_id,
+        }
+    if meta_task_id and meta_task_id != task_id:
+        return {
+            "ok": False,
+            "error": "loop_id_mismatch",
+            "crd_task_id": None,
+            "project_loop_task_id": task_id,
+            "task_meta_task_id": meta_task_id,
+        }
+    return None
+
+
 def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
     action = str(arguments.get("action") or "").strip()
     payload = _payload(arguments)
@@ -4052,6 +4108,10 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
             )
             if current_iteration > max_iterations:
                 raise ValueError("currentIteration cannot exceed maxIterations")
+            raw_task_id = payload.get("taskId") or payload.get("task_id") or previous_loop.get("task_id") or None
+            task_id = _safe_id(raw_task_id, "taskId") if raw_task_id else None
+            raw_loop_id = payload.get("loopId") or payload.get("loop_id") or None
+            loop_id = _safe_id(raw_loop_id, "loopId") if raw_loop_id else None
             planned_tasks = _normalize_tasks(raw_tasks, previous_tasks)
             _validate_task_graph(planned_tasks)
             loop = {
@@ -4064,12 +4124,19 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 "tasks": planned_tasks,
                 "history": previous_loop.get("history", []) if isinstance(previous_loop.get("history"), list) else [],
             }
+            if task_id:
+                loop["task_id"] = task_id
+            if loop_id:
+                loop["loop_id"] = loop_id
             if not loop["goal"]:
                 raise ValueError("goal is required")
             if not loop["stop_condition"]:
                 raise ValueError("stopCondition is required")
             if not loop["iteration_template"]:
                 raise ValueError("iterationTemplate is required")
+            mismatch = _validate_loop_id_mapping(arguments, project_id, loop, payload)
+            if mismatch:
+                return mismatch
             project["plan_type"] = "loop"
             project["loop"] = loop
             project_dir = _project_dir(arguments, project_id)

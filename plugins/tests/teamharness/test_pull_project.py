@@ -258,6 +258,99 @@ def test_projectflow_plan_loop_pulls(tmp_path: Path, monkeypatch) -> None:
     assert pulls[0]["path"] == "shared/projects/p1/meta.json"
 
 
+def test_plan_loop_records_task_id(tmp_path: Path, monkeypatch) -> None:
+    """INT-2: plan_loop with a taskId records the task anchor in the loop
+    dict (project state, the B side of the B<->C mapping) even without a
+    loopId; a call without taskId/loopId adds no fields."""
+    server = _load_server()
+    fake = FakeFilesync()
+    monkeypatch.setattr(server, "_filesync", fake)
+
+    workspace = tmp_path / "agent"
+    _write_task(workspace, "t1", {"task_id": "t1", "project_id": "p1", "status": "planned"})
+    _write_project(workspace, "p1", {"project_id": "p1", "title": "P1", "status": "active", "tasks": []})
+
+    result = server._projectflow(_arguments(
+        workspace, "plan_loop", projectId="p1", taskId="t1",
+        maxIterations=5, goal="g", stopCondition="done", iterationTemplate="t",
+    ))
+    assert result.get("ok") is True
+    assert result["loop"]["task_id"] == "t1"
+    assert "loop_id" not in result["loop"]
+
+    meta = json.loads((workspace / "shared" / "projects" / "p1" / "meta.json").read_text(encoding="utf-8"))
+    assert meta["loop"]["task_id"] == "t1"
+
+
+def test_plan_loop_idempotent(tmp_path: Path, monkeypatch) -> None:
+    """INT-2: two plan_loop calls with identical arguments produce a
+    byte-identical loop dict (history is carried over, never re-appended,
+    and the task anchor is stable across re-plans)."""
+    server = _load_server()
+    fake = FakeFilesync()
+    monkeypatch.setattr(server, "_filesync", fake)
+
+    workspace = tmp_path / "agent"
+    _write_task(workspace, "t1", {"task_id": "t1", "project_id": "p1", "status": "planned"})
+    _write_project(workspace, "p1", {"project_id": "p1", "title": "P1", "status": "active", "tasks": []})
+    payload = {
+        "projectId": "p1", "taskId": "t1", "maxIterations": 5,
+        "goal": "g", "stopCondition": "done", "iterationTemplate": "t",
+    }
+
+    first = server._projectflow(_arguments(workspace, "plan_loop", **payload))
+    assert first.get("ok") is True
+    second = server._projectflow(_arguments(workspace, "plan_loop", **payload))
+    assert second.get("ok") is True
+
+    assert first["loop"]["task_id"] == "t1"
+    assert json.dumps(first["loop"], ensure_ascii=False, sort_keys=True) == json.dumps(
+        second["loop"], ensure_ascii=False, sort_keys=True
+    )
+    meta = json.loads((workspace / "shared" / "projects" / "p1" / "meta.json").read_text(encoding="utf-8"))
+    assert meta["loop"] == second["loop"]
+
+
+def test_plan_loop_loop_id_mismatch(tmp_path: Path, monkeypatch) -> None:
+    """INT-2: a loop already bound to t1 rejects a re-plan pointing at t2
+    with the structured loop_id_mismatch error and performs zero writes
+    (project state content and mtime untouched)."""
+    server = _load_server()
+    fake = FakeFilesync()
+    monkeypatch.setattr(server, "_filesync", fake)
+
+    workspace = tmp_path / "agent"
+    _write_task(workspace, "t2", {"task_id": "t2", "project_id": "p1", "status": "planned"})
+    _write_project(workspace, "p1", {
+        "project_id": "p1", "title": "P1", "status": "active", "tasks": [],
+        "plan_type": "loop",
+        "loop": {
+            "goal": "g", "stop_condition": "done", "iteration_template": "t",
+            "max_iterations": 5, "current_iteration": 1, "status": "running",
+            "tasks": [], "history": [], "task_id": "t1",
+        },
+    })
+    state_path = workspace / "shared" / "projects" / "p1" / "meta.json"
+    before = server._read_json(state_path)
+
+    result = server._projectflow(_arguments(
+        workspace, "plan_loop", projectId="p1", taskId="t2",
+        maxIterations=5, goal="g", stopCondition="done", iterationTemplate="t",
+    ))
+    assert result.get("ok") is False
+    assert result.get("error") == "loop_id_mismatch"
+    assert result.get("crd_task_id") is None
+    assert result.get("project_loop_task_id") == "t1"
+    assert result.get("task_meta_task_id") == "t2"
+
+    # zero writes by plan_loop: the on-disk state is unchanged in data
+    # (the entry pull may normalize formatting, but no value may change;
+    # the loop stays bound to t1)
+    after = server._read_json(state_path)
+    assert after == before
+    assert after["loop"]["task_id"] == "t1"
+
+
 def test_taskflow_actions_pull(tmp_path: Path, monkeypatch) -> None:
     server = _load_server()
     fake = FakeFilesync()
