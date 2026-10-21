@@ -3270,6 +3270,38 @@ def _write_project_plan(project_dir: Path, project: dict[str, Any]) -> None:
     _atomic_write_text(project_dir / "plan.md", "\n".join(lines) + "\n")
 
 
+def _observe_project_pause(
+    arguments: dict[str, Any],
+    project_id: str,
+    project: dict[str, Any],
+    paused_by_project: bool,
+) -> None:
+    """Cascade the project pause state into the plan's loop record (INT-7b).
+
+    Observation only: the flag tells the worker's next loop tick that the
+    parent project is paused. It never drives the Loop CRD — the Go
+    control plane is the only writer of loop state. Best-effort by design:
+    a no-op when the project has no loop dict or the value is unchanged
+    (idempotent), and a rewrite failure never blocks the project
+    pause/resume flow.
+    """
+    loop = project.get("loop")
+    if not isinstance(loop, dict):
+        return
+    if bool(loop.get("paused_by_project")) == paused_by_project:
+        return
+    loop["paused_by_project"] = paused_by_project
+    try:
+        project_dir = _project_dir(arguments, project_id)
+        _write_json(_project_state_path(arguments, project_id), project)
+        _write_project_plan(project_dir, project)
+    except Exception as exc:  # observation must not block the flow
+        print(
+            f"[projectflow] warn: loop pause observation not persisted: {exc}",
+            file=sys.stderr,
+        )
+
+
 def _ready_nodes(project: dict[str, Any]) -> list[dict[str, Any]]:
     if project.get("plan_type") == "loop":
         raise ValueError(f"project plan is not a DAG: {project.get('project_id')}")
@@ -4196,6 +4228,16 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
             project_dir = _project_dir(arguments, project_id)
             _write_json(state_path, project)
             _write_project_plan(project_dir, project)
+            # INT-7b cascade: reflect the project pause/resume into the
+            # plan's loop dict before the shared-storage sync picks it up
+            # (observation only; best-effort, never blocks the flow).
+            if action in {"pause_project", "resume_project"}:
+                _observe_project_pause(
+                    arguments,
+                    project_id,
+                    project,
+                    paused_by_project=(action == "pause_project"),
+                )
             # P0 ordering (PR review 2026-09-14): the terminal state is
             # persisted locally first, then pushed to shared storage, and
             # only after a successful sync does the PROJECT_COMPLETED
