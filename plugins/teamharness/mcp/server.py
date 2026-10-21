@@ -4831,6 +4831,7 @@ _SIGNAL_EMITTERS: dict[str, tuple[str, str, str]] = {
     "accept_task_result": ("task_accepted", "SIG-COMPLETE", "submit"),
     "record_loop_iteration": ("loop_iteration_finished", "SIG-DECISION", "decision_lock"),
     "record_loop_iteration:review": ("loop_review_verdict", "SIG-VERDICT", "critic_verdict"),
+    "illegal_transition_rejected": ("mismatch_recorded", "SIG-MISMATCH", "mismatch_recorded"),
 }
 
 
@@ -5119,21 +5120,72 @@ def _transition_guidance(action: str, from_status: str) -> str:
     return "check the task transition table (task-transitions.json)"
 
 
-def _assert_transition(from_status: str, to_status: str, action: str) -> None:
-    """Table check.  Same-state re-entry is a legal no-op (idempotent retry)."""
+class IllegalTransitionError(ValueError):
+    """Structured illegal-transition rejection (INT-5).
+
+    Carries the from/to/action triple so the taskflow dispatch layer can
+    return a structured error; a ValueError subclass so the internal
+    protocol (call sites, OSError-only inner catches) is unchanged.
+    """
+
+    def __init__(self, from_status: str, to_status: str, action: str, message: str) -> None:
+        super().__init__(message)
+        self.from_status = from_status
+        self.to_status = to_status
+        self.action = action
+
+
+def _assert_transition(
+    from_status: str,
+    to_status: str,
+    action: str,
+    *,
+    arguments: dict[str, Any] | None = None,
+    task_id: str = "",
+) -> None:
+    """Table check.  Same-state re-entry is a legal no-op (idempotent retry).
+
+    Rejections raise IllegalTransitionError with an ``illegal_transition:``
+    message; terminal states and unknown states get distinct messages.  When
+    ``arguments`` + ``task_id`` are provided the rejection also emits
+    SIG-MISMATCH (best-effort — ``_emit_signal_event`` never raises).
+    """
     if from_status == to_status:
         return
-    allowed = TRANSITIONS.get(from_status)
-    if allowed is None:
-        raise ValueError(
-            f"{action}: task is in unexpected state {from_status or 'missing'}; "
-            f"{_transition_guidance(action, from_status)}"
+    if from_status in TERMINAL_TASK_STATUSES:
+        message = (
+            f"illegal_transition: {action}: task is in terminal state {from_status} "
+            f"(immutable); cannot transition to '{to_status}'"
         )
-    if to_status not in allowed:
-        raise ValueError(
-            f"{action}: task is '{from_status}'; {_transition_guidance(action, from_status)} "
-            f"(allowed transitions from '{from_status}': {', '.join(allowed)})"
+    else:
+        allowed = TRANSITIONS.get(from_status)
+        if allowed is None:
+            message = (
+                f"illegal_transition: {action}: task is in unexpected state "
+                f"{from_status or 'missing'}; {_transition_guidance(action, from_status)}"
+            )
+        elif to_status not in allowed:
+            message = (
+                f"illegal_transition: {action}: task is '{from_status}'; "
+                f"{_transition_guidance(action, from_status)} "
+                f"(allowed transitions from '{from_status}': {', '.join(allowed)})"
+            )
+        else:
+            return
+    if arguments is not None and task_id:
+        _emit_signal_event(
+            arguments,
+            "illegal_transition_rejected",
+            task_id=task_id,
+            ref=f"shared/tasks/{task_id}/meta.json",
+            ref_bytes=_safe_read_bytes(_task_state_path(arguments, task_id)),
+            payload={
+                "from_status": from_status,
+                "to_status": to_status,
+                "action": action,
+            },
         )
+    raise IllegalTransitionError(from_status, to_status, action, message)
 
 
 def _append_transition_history(
@@ -5207,7 +5259,7 @@ def _transition_task(
     Returns the previous task-meta status.
     """
     old_status = from_status if from_status is not None else str(task.get("status") or "")
-    _assert_transition(old_status, new_status, action)
+    _assert_transition(old_status, new_status, action, arguments=arguments, task_id=task_id)
     if extra:
         task.update(extra)
     _append_transition_history(task, old_status, new_status, action, _transition_actor(arguments), note)
@@ -6827,6 +6879,16 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 "effective": effective,
                 "pulled": pulled,
             }
+    except IllegalTransitionError as exc:
+        return {
+            "ok": False,
+            "tool": "taskflow",
+            "action": action,
+            "error": "illegal_transition",
+            "from": exc.from_status,
+            "to": exc.to_status,
+            "detail": str(exc),
+        }
     except ValueError as exc:
         return {"ok": False, "tool": "taskflow", "action": action, "error": str(exc)}
 

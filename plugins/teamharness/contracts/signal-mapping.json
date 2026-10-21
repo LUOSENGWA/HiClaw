@@ -100,7 +100,7 @@
       "source_events": ["mismatch_recorded"],
       "event_type": "SIG-MISMATCH",
       "source_layer": "verification",
-      "emitters": ["#future:mismatch_recorded"],
+      "emitters": ["py:illegal_transition_rejected"],
       "level": "error",
       "conditional": true,
       "#1394_type": null
