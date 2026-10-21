@@ -4334,17 +4334,66 @@ class AgentTeamsMatrixChannel(BaseChannel):
             await self._on_process_completed(None, to_handle, send_meta)
             self._proactive_send_state.pop(to_handle, None)
 
+    def _text_mentions_worker(self, text: str, worker_localpart: str) -> bool:
+        """Text-only mention check for gate relevance (#1386 P1).
+
+        Mirrors the plain-text arms of :meth:`_was_mentioned` (full MXID
+        + bare ``@localpart`` with localpart boundary rules); retained
+        history entries carry plain body text only, no event content.
+        """
+        if not text or not worker_localpart:
+            return False
+        if self._user_id and re.search(
+            re.escape(self._user_id), text, re.IGNORECASE
+        ):
+            return True
+        token = re.compile(
+            rf"(?<![\w@])@{re.escape(worker_localpart)}(?![A-Za-z0-9._=:/+-])"
+        )
+        return bool(token.search(text))
+
+    def _new_events_relevant_to_turn(
+        self, room_id: str, since_records: int, meta_dict: Dict[str, Any]
+    ) -> bool:
+        """Gate relevance check (#1386 P1).
+
+        A turn's pending reply obligation should only be voided by room
+        events that can plausibly change it: a new message from the
+        turn's trigger sender (the person who asked), or any message
+        that addresses this worker by name.  Unrelated peer traffic
+        (a parallel worker answering its own question) does not void the
+        obligation — the gate downgrades to ``"note"`` and the
+        completed draft is delivered as-is.
+        """
+        trigger_sender = (meta_dict.get("sender_id") or "").strip()
+        worker_name = str(meta_dict.get("worker_name") or "").strip()
+        if not worker_name and self._user_id:
+            worker_name = self._user_id.lstrip("@").split(":", 1)[0]
+        for record_idx, entry in self._room_event_log.get(room_id, []):
+            if record_idx <= since_records:
+                continue
+            if trigger_sender and entry.sender == trigger_sender:
+                return True
+            if worker_name and self._text_mentions_worker(
+                entry.body, worker_name
+            ):
+                return True
+        return False
+
     def _evaluate_send_gate(self, send_meta: Dict[str, Any], to_handle: str) -> tuple:
         """Send alignment gate (#1244).
 
         Returns ``(action, new_count)`` where action is:
           - ``"ok"``: aligned (or not gated: DM / thread / no snapshot) —
             flush the reply as usual.
-          - ``"retrigger"``: new room events landed after the turn's
-            context snapshot — drop the stale reply and re-trigger the
-            agent with the fresh context.
+          - ``"retrigger"``: new *relevant* room events landed after the
+            turn's context snapshot (from the trigger sender, or
+            addressing this worker — #1386 P1) — drop the stale reply
+            and re-trigger the agent with the fresh context.
           - ``"note"``: gate budget exhausted (retrigger count or
-            wall-clock deadline) — flush, then append a short note.
+            wall-clock deadline), or new events exist but are irrelevant
+            to this turn's obligation (#1386 P1) — flush, then append a
+            short note.
 
         Alignment is decided against the per-turn history-generation
         snapshot captured at enqueue time (``send_gate_snapshot_gen``),
@@ -4376,6 +4425,15 @@ class AgentTeamsMatrixChannel(BaseChannel):
             new_count = max(
                 0, self._room_history_records.get(room_id, 0) - snap_records
             )
+            # Relevance (#1386 P1): unrelated peer traffic must not void
+            # a completed reply obligation — a parallel worker's answer
+            # to its own question used to re-trigger this turn and the
+            # re-run often returned NO_REPLY, losing the original answer
+            # (case A).  Downgrade to "note": deliver the draft as-is.
+            if not self._new_events_relevant_to_turn(
+                room_id, snap_records, meta_dict
+            ):
+                return "note", new_count
         now = time.time()
         state = self._send_gate_state.get(room_id)
         if state is None or state.get("event_id") != turn_event_id:
