@@ -4,10 +4,12 @@ Python side).
 Covers project["loop"]["budget"] = {tier, iteration_budget, iterations_used,
 tokens_used, over_budget}:
 
-- plan_loop initializes the budget from the project tier (default standard)
-- record_loop_iteration accumulates iterations_used / over_budget and keeps
-  the loop running past budget (flag, don't truncate)
-- provenance marks each iteration's budget state (recent 5 retained)
+- No budget by default: absent/unrecognized tier and no explicit
+  iteration_budget → iteration_budget stays None and over_budget is never
+  set, while iterations_used / tokens_used still accumulate
+- Explicit tier → mapping simple=3 / standard=5 / full=10
+- Explicit iteration_budget (project meta) wins over the tier mapping
+- Over budget is flagged (over_budget + provenance), never truncated
 """
 
 from __future__ import annotations
@@ -77,9 +79,10 @@ def _loop_of(server: object, workspace: Path, project_id: str) -> dict:
     return project.get("loop", {})
 
 
-def test_plan_loop_budget_init_defaults(tmp_path: Path, monkeypatch) -> None:
-    """No tier in the project meta → the budget defaults to the standard
-    tier (iteration budget 5) with zero usage."""
+def test_plan_loop_no_budget_by_default(tmp_path: Path, monkeypatch) -> None:
+    """No tier and no explicit iteration_budget in the project meta → no
+    budget: iteration_budget stays None, over_budget is never set, and the
+    usage counters still accumulate on record_loop_iteration."""
     server = _load_server()
     monkeypatch.setattr(server, "_filesync", FakeFilesync())
 
@@ -93,27 +96,13 @@ def test_plan_loop_budget_init_defaults(tmp_path: Path, monkeypatch) -> None:
     assert result.get("ok") is True
     loop = result["loop"]
     assert loop["budget"] == {
-        "tier": "standard",
-        "iteration_budget": 5,
+        "tier": None,
+        "iteration_budget": None,
         "iterations_used": 0,
         "tokens_used": 0,
         "over_budget": False,
     }
     assert loop["provenance"] == []
-
-
-def test_record_loop_iteration_accumulates_budget(tmp_path: Path, monkeypatch) -> None:
-    """Each record_loop_iteration accumulates exactly one iteration; token
-    accounting stays 0 (loop history carries no token field) until it lands."""
-    server = _load_server()
-    monkeypatch.setattr(server, "_filesync", FakeFilesync())
-
-    workspace = tmp_path / "agent"
-    _write_project(workspace, "p1", {"project_id": "p1", "title": "P1", "status": "active", "tasks": []})
-    server._projectflow(_arguments(
-        workspace, "plan_loop", projectId="p1", maxIterations=10,
-        goal="g", stopCondition="done", iterationTemplate="t",
-    ))
 
     for iteration in (1, 2):
         result = server._projectflow(_arguments(
@@ -122,18 +111,83 @@ def test_record_loop_iteration_accumulates_budget(tmp_path: Path, monkeypatch) -
         ))
         assert result.get("ok") is True
 
-    loop = _loop_of(server, workspace, "p1")
+    loop = result["loop"]
     budget = loop["budget"]
-    assert budget["tier"] == "standard"
-    assert budget["iteration_budget"] == 5
+    assert budget["tier"] is None
+    assert budget["iteration_budget"] is None
     assert budget["iterations_used"] == 2
     assert budget["tokens_used"] == 0
     assert budget["over_budget"] is False
     assert len(loop["history"]) == 2
     assert len(loop["provenance"]) == 2
     assert loop["provenance"][-1] == {
-        "iteration": 2, "iterations_used": 2, "iteration_budget": 5, "over_budget": False,
+        "iteration": 2, "iterations_used": 2, "iteration_budget": None, "over_budget": False,
     }
+
+
+def test_plan_loop_explicit_tier_mapping(tmp_path: Path, monkeypatch) -> None:
+    """An explicitly declared tier maps to its iteration budget
+    (simple=3 / standard=5 / full=10); an unrecognized tier gives no
+    budget instead of falling back to a default tier."""
+    server = _load_server()
+    monkeypatch.setattr(server, "_filesync", FakeFilesync())
+
+    workspace = tmp_path / "agent"
+    for i, (tier, expected) in enumerate(
+        (("simple", 3), ("standard", 5), ("full", 10), ("weird", None)),
+        start=1,
+    ):
+        project_id = f"p{i}"
+        _write_project(workspace, project_id, {
+            "project_id": project_id, "title": f"P{i}", "status": "active",
+            "tasks": [], "tier": tier,
+        })
+        result = server._projectflow(_arguments(
+            workspace, "plan_loop", projectId=project_id, maxIterations=10,
+            goal="g", stopCondition="done", iterationTemplate="t",
+        ))
+        assert result.get("ok") is True
+        budget = result["loop"]["budget"]
+        assert budget["iteration_budget"] == expected
+        assert budget["over_budget"] is False
+        assert budget["iterations_used"] == 0
+        assert budget["tier"] == tier if expected is not None else budget["tier"] is None
+
+
+def test_plan_loop_explicit_iteration_budget_wins(tmp_path: Path, monkeypatch) -> None:
+    """An explicit iteration_budget in the project meta wins over the tier
+    mapping it sits next to, and on its own (without a tier) it enables a
+    budget."""
+    server = _load_server()
+    monkeypatch.setattr(server, "_filesync", FakeFilesync())
+
+    workspace = tmp_path / "agent"
+    _write_project(workspace, "p1", {
+        "project_id": "p1", "title": "P1", "status": "active",
+        "tasks": [], "tier": "simple", "iteration_budget": 7,
+    })
+    result = server._projectflow(_arguments(
+        workspace, "plan_loop", projectId="p1", maxIterations=10,
+        goal="g", stopCondition="done", iterationTemplate="t",
+    ))
+    assert result.get("ok") is True
+    budget = result["loop"]["budget"]
+    assert budget["tier"] == "simple"
+    assert budget["iteration_budget"] == 7
+
+    _write_project(workspace, "p2", {
+        "project_id": "p2", "title": "P2", "status": "active",
+        "tasks": [], "iteration_budget": 4,
+    })
+    result = server._projectflow(_arguments(
+        workspace, "plan_loop", projectId="p2", maxIterations=10,
+        goal="g", stopCondition="done", iterationTemplate="t",
+    ))
+    assert result.get("ok") is True
+    budget = result["loop"]["budget"]
+    assert budget["tier"] is None
+    assert budget["iteration_budget"] == 4
+    assert budget["over_budget"] is False
 
 
 def test_loop_over_budget_flagged_not_truncated(tmp_path: Path, monkeypatch) -> None:
