@@ -87,6 +87,13 @@ def _submit(workspace: Path, task_id: str, **overrides: Any) -> dict[str, Any]:
     )
 
 
+def _signal_event_path(task_id: str) -> str:
+    """Shared path of the SIG-COMPLETE (task_submitted) event mirror push (INT-3)."""
+    team = str(server._runtime_team_name() or "").strip() or "global"
+    event_id = server._signal_event_id(team, task_id, "SIG-COMPLETE", "task_submitted", 0)
+    return f"shared/events/{team}/{event_id}.json"
+
+
 @pytest.fixture(autouse=True)
 def authoritative_project_pull(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep continuation tests focused on the post-pull state contract.
@@ -1751,6 +1758,8 @@ def test_submit_pushes_and_verifies_result_payload_before_the_meta_commit_point(
         ("stat", f"shared/tasks/{task_id}/output.txt"),
         ("push", f"shared/tasks/{task_id}/meta.json"),
         ("stat", f"shared/tasks/{task_id}/meta.json"),
+        # S2 SIG-COMPLETE (task_submitted) event mirror push — deterministic id.
+        ("push", _signal_event_path(task_id)),
     ]
 
 
@@ -1887,7 +1896,12 @@ def test_submit_meta_commit_must_be_remotely_verified_before_success(
     assert second["task"]["submission_id"] == first["task"]["submission_id"]
     assert calls.count(("push", meta_path)) == 2
     assert calls.count(("stat", meta_path)) == 2
-    assert calls[-2:] == [("push", meta_path), ("stat", meta_path)]
+    assert calls[-3:] == [
+        ("push", meta_path),
+        ("stat", meta_path),
+        # S2 SIG-COMPLETE (task_submitted) event mirror push from the resubmit.
+        ("push", _signal_event_path(task_id)),
+    ]
 
 
 def test_submit_retry_repairs_interrupted_payload_publish_without_rotating_identity(
@@ -1924,7 +1938,9 @@ def test_submit_retry_repairs_interrupted_payload_publish_without_rotating_ident
     assert second["task"]["submission_id"] == first["task"]["submission_id"]
     meta_push = ("push", f"shared/tasks/{task_id}/meta.json")
     assert calls.count(meta_push) == 1
-    assert calls[-2:] == [
+    assert calls[-3:] == [
         meta_push,
         ("stat", f"shared/tasks/{task_id}/meta.json"),
+        # S2 SIG-COMPLETE (task_submitted) event mirror push from the resubmit.
+        ("push", _signal_event_path(task_id)),
     ]

@@ -2814,6 +2814,11 @@ func (h *ProjectHandler) PauseProject(w http.ResponseWriter, r *http.Request) {
 	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
+	h.emitSignalEvent(r.Context(), signalEmitters["PauseProject"], pwc.team, signalTeamID(meta, pwc.team), "", nil, pwc.key, refBytes(meta), map[string]any{
+		"project_id": meta.ProjectID,
+		"reason":     reqBody.Reason,
+		"actor":      authzActor(caller),
+	})
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("⏸️ 项目 %s 已被暂停%s", meta.ProjectID, pauseReasonSuffix(reqBody.Reason)))
 	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
 }
@@ -2837,6 +2842,10 @@ func (h *ProjectHandler) ResumeProject(w http.ResponseWriter, r *http.Request) {
 	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
+	h.emitSignalEvent(r.Context(), signalEmitters["ResumeProject"], pwc.team, signalTeamID(meta, pwc.team), "", nil, pwc.key, refBytes(meta), map[string]any{
+		"project_id": meta.ProjectID,
+		"actor":      authzActor(caller),
+	})
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("▶️ 项目 %s 已恢复", meta.ProjectID))
 	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
 }
@@ -2928,6 +2937,11 @@ func (h *ProjectHandler) ReplanProject(w http.ResponseWriter, r *http.Request) {
 	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
+	h.emitSignalEvent(r.Context(), signalEmitters["ReplanProject"], pwc.team, signalTeamID(meta, pwc.team), "", nil, pwc.key, refBytes(meta), map[string]any{
+		"project_id":  meta.ProjectID,
+		"task_count":  len(planned),
+		"actor":       authzActor(caller),
+	})
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("📋 项目 %s 已重规划（%d 个任务）", meta.ProjectID, len(planned)))
 	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
 }
@@ -3351,6 +3365,11 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "write task meta: "+err.Error())
 		return
 	}
+	h.emitSignalEvent(r.Context(), signalEmitters["CancelTask"], team, signalTeamID(meta, team), taskID, nil, taskMetaKeys(taskID, team)[0], taskJSON, map[string]any{
+		"project_id": meta.ProjectID,
+		"reason":     reason,
+		"actor":      authzActor(caller),
+	})
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("🚫 任务 %s 已取消（项目 %s）", taskID, meta.ProjectID))
 	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, team, false))
 }
@@ -3569,6 +3588,10 @@ func (h *ProjectHandler) CompleteProject(w http.ResponseWriter, r *http.Request)
 	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
+	h.emitSignalEvent(r.Context(), signalEmitters["CompleteProject"], pwc.team, signalTeamID(meta, pwc.team), "", nil, pwc.key, refBytes(meta), map[string]any{
+		"project_id": meta.ProjectID,
+		"actor":      authzActor(caller),
+	})
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("✅ 项目 %s 已完成", meta.ProjectID))
 	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
 }
