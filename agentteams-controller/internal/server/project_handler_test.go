@@ -5898,3 +5898,215 @@ func TestCancelTask_LeavesHistoryTrace(t *testing.T) {
 		t.Fatalf("history after retry=%v, want unchanged (no no-op entry)", task2["history"])
 	}
 }
+
+// --- INT-8: projection freshness (projection_age_ms / is_stale / ?consistency=strong) ---
+
+// freshnessScriptedOSS wraps mcLikeOSS to (a) override the StatMeta mtime
+// per key, (b) count GetObject calls per key, and (c) push a newer object
+// into the underlying store at a scripted StatMeta call — simulating a
+// filesync mirror advance landing between the two stats of a
+// strong-consistency read so the re-read observes the new version.
+type freshnessScriptedOSS struct {
+	*mcLikeOSS
+	statOverrides map[string]time.Time
+	getCounts     map[string]int
+	advanceKey    string
+	advanceData   []byte
+	advanceAt     int // 1-based: fire on this Nth StatMeta call for advanceKey
+}
+
+func (f *freshnessScriptedOSS) GetObject(ctx context.Context, key string) ([]byte, error) {
+	f.getCounts[key]++
+	return f.mcLikeOSS.GetObject(ctx, key)
+}
+
+func (f *freshnessScriptedOSS) StatMeta(ctx context.Context, key string) (oss.ObjectMeta, error) {
+	if key == f.advanceKey && f.advanceAt > 0 {
+		f.advanceAt--
+		if f.advanceAt == 0 {
+			if err := f.Memory.PutObject(ctx, f.advanceKey, f.advanceData); err != nil {
+				return oss.ObjectMeta{}, err
+			}
+		}
+	}
+	if tm, ok := f.statOverrides[key]; ok {
+		base, err := f.Memory.StatMeta(ctx, key)
+		if err != nil {
+			return oss.ObjectMeta{}, err
+		}
+		base.ModTime = tm
+		return base, nil
+	}
+	return f.Memory.StatMeta(ctx, key)
+}
+
+// TestWorkflowProjectionAgePresent covers INT-8 hard gate #13a: the default
+// workflow response carries projection_age_ms (int>=0) and is_stale (bool);
+// with the mirror mtimes 5s in the past the age is ~5000ms and not stale,
+// and the task-meta anchor path is exercised via includeTasks.
+func TestWorkflowProjectionAgePresent(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active",
+		"plan_type": "dag",
+		"tasks":     []any{map[string]any{"task_id": "t1", "status": "planned"}},
+	})
+	putProject(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "planned",
+	})
+	anchor := time.Now().Add(-5 * time.Second)
+	h := newProjectTestHandlerWithOSS(t, &freshnessScriptedOSS{
+		mcLikeOSS: &mcLikeOSS{Memory: store},
+		statOverrides: map[string]time.Time{
+			"shared/projects/p1/meta.json": anchor,
+			"shared/tasks/t1/meta.json":    anchor,
+		},
+		getCounts: map[string]int{},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow?includeTasks=true", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	age, ok := body["projection_age_ms"].(float64)
+	if !ok {
+		t.Fatalf("projection_age_ms missing or not a number: %v", body["projection_age_ms"])
+	}
+	if age < 4500 || age > 6000 {
+		t.Fatalf("projection_age_ms = %v, want ~5000 (anchors 5s old)", age)
+	}
+	if stale, _ := body["is_stale"].(bool); stale {
+		t.Fatalf("is_stale = true, want false (age < 30000ms default threshold)")
+	}
+	detail, _ := body["tasks_detail"].([]any)
+	if len(detail) != 1 {
+		t.Fatalf("tasks_detail len = %d, want 1 (task anchor path exercised)", len(detail))
+	}
+}
+
+// TestWorkflowStaleThreshold covers the PROJECTION_STALE_MS env override in
+// both directions: a 60s-old mirror is stale under the 30s default and fresh
+// under a 120s threshold.
+func TestWorkflowStaleThreshold(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+	})
+	old := time.Now().Add(-60 * time.Second)
+	h := newProjectTestHandlerWithOSS(t, &freshnessScriptedOSS{
+		mcLikeOSS:     &mcLikeOSS{Memory: store},
+		statOverrides: map[string]time.Time{"shared/projects/p1/meta.json": old},
+		getCounts:     map[string]int{},
+	})
+
+	mkReq := func() *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow", nil)
+		req.SetPathValue("id", "p1")
+		return withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	}
+
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, mkReq())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("default: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	age, _ := body["projection_age_ms"].(float64)
+	if age < 55000 || age > 70000 {
+		t.Fatalf("projection_age_ms = %v, want ~60000", age)
+	}
+	if stale, _ := body["is_stale"].(bool); !stale {
+		t.Fatalf("is_stale = false under 30s default, want true (age ~60000)")
+	}
+
+	t.Setenv("PROJECTION_STALE_MS", "120000")
+	rec2 := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec2, mkReq())
+	var body2 map[string]any
+	_ = json.Unmarshal(rec2.Body.Bytes(), &body2)
+	if stale, _ := body2["is_stale"].(bool); stale {
+		t.Fatalf("is_stale = true under 120000ms threshold, want false (age ~60000)")
+	}
+}
+
+// TestWorkflowStrongConsistencyReadsLatest covers INT-8 hard gate #13b: with
+// ?consistency=strong, a mirror advance landing between the anchor stat and
+// the re-stat is picked up — the response reflects the new version, carries
+// the X-Consistency: strong header, and the meta object was read twice.
+func TestWorkflowStrongConsistencyReadsLatest(t *testing.T) {
+	store := ossfake.NewMemory()
+	metaKey := "shared/projects/p1/meta.json"
+	v1, _ := json.Marshal(map[string]any{"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag"})
+	v2, _ := json.Marshal(map[string]any{"project_id": "p1", "title": "P1", "status": "paused", "plan_type": "dag"})
+	_ = store.PutObject(context.Background(), metaKey, v1)
+	getCounts := map[string]int{}
+	h := newProjectTestHandlerWithOSS(t, &freshnessScriptedOSS{
+		mcLikeOSS:   &mcLikeOSS{Memory: store},
+		getCounts:   getCounts,
+		advanceKey:  metaKey,
+		advanceData: v2,
+		advanceAt:   2, // stat#1 = anchor; stat#2 = strong re-stat → mirror advances
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow?consistency=strong", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if body["status"] != "paused" {
+		t.Fatalf("status = %v, want \"paused\" (strong read must pick up the advanced mirror)", body["status"])
+	}
+	if got := rec.Header().Get("X-Consistency"); got != "strong" {
+		t.Fatalf("X-Consistency = %q, want \"strong\"", got)
+	}
+	if n := getCounts[metaKey]; n != 2 {
+		t.Fatalf("meta GetObject count = %d, want 2 (double read)", n)
+	}
+}
+
+// TestWorkflowDefaultSingleRead locks the zero-behavior-change gate: without
+// ?consistency the meta object is read exactly once and no X-Consistency
+// header is emitted.
+func TestWorkflowDefaultSingleRead(t *testing.T) {
+	store := ossfake.NewMemory()
+	metaKey := "shared/projects/p1/meta.json"
+	putProject(store, metaKey, map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+	})
+	getCounts := map[string]int{}
+	h := newProjectTestHandlerWithOSS(t, &freshnessScriptedOSS{
+		mcLikeOSS: &mcLikeOSS{Memory: store},
+		getCounts: getCounts,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if n := getCounts[metaKey]; n != 1 {
+		t.Fatalf("meta GetObject count = %d, want 1 (default must not double-read)", n)
+	}
+	if got := rec.Header().Get("X-Consistency"); got != "" {
+		t.Fatalf("X-Consistency = %q, want empty (default path unchanged)", got)
+	}
+}
