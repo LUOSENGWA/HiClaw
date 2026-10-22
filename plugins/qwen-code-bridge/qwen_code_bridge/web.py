@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import os
+import re
 import secrets
 import socket
 import time
@@ -30,6 +32,7 @@ from fastapi.responses import JSONResponse, Response
 SERVE_URL_ENV = "QWEN_CODE_BRIDGE_SERVE_URL"
 SERVE_AUTOSTART_ENV = "QWEN_CODE_BRIDGE_SERVE_AUTOSTART"
 SERVE_WORKSPACE_ENV = "QWEN_CODE_BRIDGE_SERVE_WORKSPACE"
+WEB_DIST_ENV = "QWEN_CODE_BRIDGE_WEB_DIST"
 SERVE_TOKEN_ENV = "QWEN_CODE_BRIDGE_SERVE_TOKEN"
 DEFAULT_SERVE_URL = ""  # resolved from env/serve.json; auto-start allocates a free port
 
@@ -88,6 +91,60 @@ def _rewrite_console_html(html: bytes) -> bytes:
     return text.encode("utf-8")
 
 router = APIRouter(tags=["qwen-code-bridge"])
+
+
+_WS_SUFFIXES = ("sessions/live-state", "session-groups", "sessions", "session", "git")
+
+
+def _fix_workspace_path(path: str) -> str:
+    """Encode an absolute workspace selector (``/workspaces//tmp/...``).
+
+    The shell emits ``/workspaces/<cwd>/<tail>`` unencoded; the daemon expects
+    one path segment, so ``/tmp`` must become ``%2Ftmp``.
+    """
+    match = re.match(r"^(/?workspaces?)/(.*)$", path)
+    if not match:
+        return path
+    base, rest = match.group(1), match.group(2)
+    if not rest.startswith("/"):
+        return path
+    for suffix in _WS_SUFFIXES:
+        idx = rest.rfind("/" + suffix)
+        if idx > 0:
+            from urllib.parse import quote
+
+            workspace = rest[:idx]
+            tail = rest[idx + 1:]
+            return f"{base}/{quote(workspace, safe='')}/{tail}"
+    return path
+
+
+def web_dist() -> Path | None:
+    """Optional rebuilt web-shell (base-prefixed). Served statically when present."""
+    try:
+        from .state import state_dir
+
+        raw = os.environ.get(WEB_DIST_ENV, "").strip()
+        path = Path(raw) if raw else state_dir() / "web-shell" / "dist"
+        return path if (path / "index.html").is_file() else None
+    except Exception:
+        return None
+
+
+def _inject_daemon_base(data: bytes) -> bytes:
+    html = data.decode("utf-8", "ignore")
+    inject = (
+        "<script>window.__QWEN_DAEMON_BASE__="
+        + json.dumps(WEB_PREFIX)
+        + ";</script>"
+    )
+    if "__QWEN_DAEMON_BASE__" not in html:
+        html = html.replace("<head>", "<head>" + inject, 1)
+    return html.encode("utf-8")
+
+
+def _spa_index(dist: Path) -> bytes:
+    return _inject_daemon_base((dist / "index.html").read_bytes())
 
 
 def _config() -> dict:
@@ -265,12 +322,27 @@ async def web_status() -> dict:
 )
 async def web_proxy(path: str, request: Request) -> Response:
     """Reverse-proxy a request to the local ``qwen serve`` instance."""
+    dist = web_dist()
+    if dist is not None and request.method == "GET":
+        rel = (path or "").strip("/")
+        candidate = (dist / rel) if rel else (dist / "index.html")
+        try:
+            candidate.resolve().relative_to(dist.resolve())
+        except Exception:
+            candidate = None
+        if candidate is not None and candidate.is_file():
+            ctype = mimetypes.guess_type(str(candidate))[0] or "application/octet-stream"
+            data = candidate.read_bytes()
+            if ctype.startswith("text/html"):
+                data = _inject_daemon_base(data)
+            return Response(content=data, status_code=200, media_type=ctype)
     base = await ensure_serve()
     if not base:
         return JSONResponse(
             status_code=502,
             content={"error": "serve-url-unconfigured"},
         )
+    path = _fix_workspace_path(path)
     url = f"{base}/{path}"
     body = await request.body()
     try:
@@ -291,10 +363,25 @@ async def web_proxy(path: str, request: Request) -> Response:
                 "detail": f"{type(exc).__name__}: {str(exc)[:160]}",
             },
         )
+    try:  # diagnostics: last 200 proxied calls
+        from .state import state_dir
+
+        log = state_dir() / "web-proxy.log"
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(f"{request.method} /{path} -> {upstream.status_code}\n")
+        if log.stat().st_size > 200_000:
+            lines = log.read_text(encoding="utf-8", errors="ignore").splitlines()[-500:]
+            log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass
     media_type = upstream.headers.get("content-type", "application/octet-stream")
     content = upstream.content
     if "text/html" in media_type.lower():
-        content = _rewrite_console_html(content)
+        if dist is not None:
+            content = _spa_index(dist)
+            media_type = "text/html; charset=utf-8"
+        else:
+            content = _rewrite_console_html(content)
     return Response(
         content=content,
         status_code=upstream.status_code,

@@ -50,8 +50,9 @@ def upstream(monkeypatch):
 
 
 @pytest.fixture
-def client(monkeypatch):
+def client(monkeypatch, tmp_path):
     monkeypatch.setenv("QWEN_CODE_BRIDGE_SERVE_AUTOSTART", "0")
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_STATE_DIR", str(tmp_path / "state"))
     app = FastAPI()
     app.include_router(build_router(), prefix="/api/qwen-code-bridge")
     return TestClient(app)
@@ -134,3 +135,47 @@ def test_html_rewrite_and_asset_passthrough(monkeypatch, client) -> None:
         assert "XMLHttpRequest" not in js.text
     finally:
         server.shutdown()
+
+
+def test_rebuilt_dist_served_statically(monkeypatch, tmp_path) -> None:
+    """A rebuilt (base-prefixed) shell in <state>/web-shell/dist wins over proxy."""
+    state = tmp_path / "state"
+    dist = state / "web-shell" / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text(
+        "<html><head></head><body>REBUILT-SHELL</body></html>",
+        encoding="utf-8",
+    )
+    (dist / "assets" / "a.js").write_text("console.log(1)", encoding="utf-8")
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_STATE_DIR", str(state))
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_SERVE_AUTOSTART", "0")
+    monkeypatch.setenv(web.SERVE_URL_ENV, "http://127.0.0.1:9")
+    app = FastAPI()
+    app.include_router(build_router(), prefix="/api/qwen-code-bridge")
+    http = TestClient(app)
+    html = http.get("/api/qwen-code-bridge/web/").text
+    assert "REBUILT-SHELL" in html
+    assert "window.__QWEN_DAEMON_BASE__" in html
+    js = http.get("/api/qwen-code-bridge/web/assets/a.js")
+    assert js.text == "console.log(1)"
+
+
+def test_workspace_path_normalization() -> None:
+    """The shell emits /workspaces//tmp/sessions; the daemon needs one segment."""
+    assert (
+        web._fix_workspace_path("workspaces//tmp/sessions")
+        == "workspaces/%2Ftmp/sessions"
+    )
+    assert (
+        web._fix_workspace_path("/workspaces//app/x/sessions/live-state")
+        == "/workspaces/%2Fapp%2Fx/sessions/live-state"
+    )
+    assert (
+        web._fix_workspace_path("workspace//tmp/session-groups")
+        == "workspace/%2Ftmp/session-groups"
+    )
+    assert web._fix_workspace_path("capabilities") == "capabilities"
+    assert (
+        web._fix_workspace_path("workspaces/e9671acd244849c5/sessions")
+        == "workspaces/e9671acd244849c5/sessions"
+    )
