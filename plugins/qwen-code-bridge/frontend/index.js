@@ -32,14 +32,22 @@
     );
   }
 
+  function useHostTheme() {
+    try {
+      if (HOST.useTheme) return HOST.useTheme() === "dark";
+    } catch (e) {}
+    return isDark();
+  }
+
   function QwenCodePage() {
-    var st = React.useState(isDark());
+    var hostDark = useHostTheme();
+    var st = React.useState(hostDark);
     var dark = st[0];
     var setDark = st[1];
 
     React.useEffect(function () {
       function sync() {
-        var next = isDark();
+        var next = hostDark;
         setDark(function (prev) {
           return prev === next ? prev : next;
         });
@@ -110,6 +118,52 @@
     );
   }
 
+
+  function bridgeChatLookup(sessionId) {
+    var base = (HOST.apiBaseUrl || "") + "/";
+    function get(path) {
+      var f = HOST.fetch ? HOST.fetch.bind(HOST) : window.fetch.bind(window);
+      return f(path).then(function (r) { return r.ok ? r.json() : null; });
+    }
+    return get(base + "api/chats/" + encodeURIComponent(sessionId))
+      .catch(function () { return null; })
+      .then(function (chat) {
+        if (chat && chat.channel) return chat;
+        return get(base + "api/chats").then(function (list) {
+          for (var i = 0; list && i < list.length; i += 1) {
+            var c = list[i];
+            if (c.id === sessionId || c.session_id === sessionId) return c;
+          }
+          return null;
+        }).catch(function () { return null; });
+      });
+  }
+
+  function makeChatWrapper(Inner) {
+    return function BridgeChatRoute() {
+      var session = null;
+      try {
+        session = HOST.useCurrentSession ? HOST.useCurrentSession() : null;
+      } catch (e) {}
+      var sid = (session && session.id) || "";
+      var st = React.useState(null);
+      var chat = st[0];
+      var setChat = st[1];
+      React.useEffect(function () {
+        var alive = true;
+        if (!sid) { setChat(null); return function () {}; }
+        bridgeChatLookup(sid).then(function (found) {
+          if (alive) setChat(found || {});
+        });
+        return function () { alive = false; };
+      }, [sid]);
+      if (chat && chat.channel === "qwen-code-bridge") {
+        return React.createElement(QwenCodePage);
+      }
+      return React.createElement(Inner);
+    };
+  }
+
   try {
     H.registerRoutes("qwen-code-bridge", [
       {
@@ -121,6 +175,10 @@
       },
     ]);
     console.info("[plugin:qwen-code-bridge] route /qwen-code registered");
+    if (H.route && typeof H.route.wrap === "function") {
+      H.route.wrap("qwen-code-bridge", "core.chat", makeChatWrapper);
+      console.info("[plugin:qwen-code-bridge] core.chat wrapped");
+    }
   } catch (err) {
     console.warn("[qwen-code-bridge] registerRoutes failed", err);
   }
