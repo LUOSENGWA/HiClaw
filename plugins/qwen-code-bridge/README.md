@@ -136,6 +136,20 @@ curl -X POST http://127.0.0.1:8088/api/qwen-code-bridge/dispatch \
 - **状态目录**：`<workspace>/.qwenpaw/qwen-code-bridge/`（任务/会话映射/证据/重建产物）
 - 已知边界：控制台内会话列表依赖“重建 base 版 shell”；未重建时只能用直聊/`/qcode`，见 `web.py` 的回退逻辑
 
+## 排障：控制台白屏/崩溃（10/22 实修）
+
+**现象**：打开 QwenPaw console 的任意聊天即崩溃，`ReferenceError: bridgeChatLookup is not defined`（blob 里的 `BridgeChatRoute`）。
+
+**根因**：插件前端用 `H.route.wrap("qwen-code-bridge", "core.chat", ...)` **全局包裹**聊天路由；wrapper 里调用了未定义的 `bridgeChatLookup` → 每次聊天渲染都抛错 → React 根错误边界把整个 console 打掉。**删插件/重建容器都不够**：已打开的浏览器标签仍持有旧 blob 与注册的 wrapper，容器重建不会刷新浏览器。
+
+**修复（0.1.0+）**：
+- `bridgeChatLookup` 已实现（读 `qwenpaw-agent-storage.state.selectedAgent` → `X-Agent-Id` + auth token；404/网络错误返回 null）
+- wrapper 全程 fail-open（try/catch + `.catch` → 渲染宿主聊天）
+- **应急开关**：`localStorage["qwen-code-bridge-disable-wrap"]="1"` 后刷新，跳过 `core.chat` 包裹（不必卸载插件）
+- 回归：`tests/test_frontend_wrapper.py` 用 node 执行 wrapper（断言不抛错、回退宿主组件、lookup 被调用）
+
+**恢复步骤**：① 硬刷新/关闭标签重开（清 site data 若仍白屏）② 选择 agent `AgentTeamGuide` ③ 打开派单会话 → 原生 Qwen Code 控制台；若仍异常，用上面的 localStorage 开关。
+
 ## 排障
 
 - **直接访问客户端路由并刷新出现 `{"detail":"Not Found"}`**：已修（10/22）；页面内已无“新标签打开”入口。浏览器导航到客户端路由（`/session/<id>`、`/threads`、`/settings`…）时，代理会在两种情况下都回退到 SPA：① 有重建产物 → 我们的 index；② 没有重建产物 → daemon 自己的 index（前缀改写）。若仍复现：硬刷新（Ctrl+Shift+R）并给出完整 URL。
