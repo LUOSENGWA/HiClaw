@@ -215,6 +215,20 @@ class CodingCliService:
             return None
 
     @staticmethod
+    def _cli_prefix() -> str:
+        """Persisted npm prefix (container rebuild safe), or "" for default."""
+        import os as _os
+
+        raw = _os.environ.get("QWEN_CODE_BRIDGE_CLI_PREFIX", "").strip()
+        if raw:
+            return raw
+        # QwenPaw containers persist /app/working (qwenpaw-data); keep the
+        # CLI next to the bridge data instead of the ephemeral image layer.
+        if _os.path.isdir("/app/working"):
+            return "/app/working/.qwen-cli"
+        return ""
+
+    @staticmethod
     def _load_settings(spec: CliSpec) -> dict[str, Any] | None:
         path = _expand(spec.settings_path)
         if not os.path.isfile(path):
@@ -309,10 +323,13 @@ class CodingCliService:
             # nightly) and concrete versions (0.25.0) uniformly, so the
             # tag is always appended explicitly.
             version_ref = f"{spec.npm_package}@{task['tag']}"
-            proc = await asyncio.to_thread(
-                self._run,
-                ("npm", "install", "-g", version_ref),
+            prefix = self._cli_prefix()
+            cmd = (
+                ("npm", "install", "-g", "--prefix", prefix, version_ref)
+                if prefix
+                else ("npm", "install", "-g", version_ref)
             )
+            proc = await asyncio.to_thread(self._run, cmd)
             if proc is None:
                 raise RuntimeError("npm failed to start")
             task["log_tail"] = (proc.stdout or "")[-_LOG_TAIL_LIMIT:]
@@ -321,9 +338,14 @@ class CodingCliService:
                     -_LOG_TAIL_LIMIT:
                 ]
                 raise RuntimeError(f"npm exit {proc.returncode}")
+            bin_path = (
+                f"{prefix}/bin/{spec.bin_name}"
+                if prefix and os.path.exists(f"{prefix}/bin/{spec.bin_name}")
+                else spec.bin_name
+            )
             check = await asyncio.to_thread(
                 self._run,
-                (spec.bin_name, "--version"),
+                (bin_path, "--version"),
             )
             if check is not None and check.returncode == 0:
                 match = _VERSION_RE.search(check.stdout or "")

@@ -224,7 +224,11 @@ def test_install_nightly_tag_uses_dist_tag(client) -> None:
     ):
         asyncio.run(drive())
 
-    assert ("npm", "install", "-g", "@qwen-code/qwen-code@nightly") in calls
+    assert any(
+        cmd[:3] == ("npm", "install", "-g")
+        and cmd[-1] == "@qwen-code/qwen-code@nightly"
+        for cmd in calls
+    )
 
 
 def test_install_invalid_tag_400(client) -> None:
