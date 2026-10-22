@@ -39,13 +39,42 @@ WEB_PREFIX = "/api/qwen-code-bridge/web"
 #: Injected into the console HTML: prefix every root-absolute request the
 #: shell makes (fetch / XHR / WebSocket / EventSource) so a prefixed mount
 #: behaves like the original origin root.
-_PREFIX_SHIM = """<script>(function(){var P=location.pathname.replace(/\\/?[^/]*\\/?$/,"")||"";
-function fix(u){try{if(typeof u==="string"&&u.charAt(0)==="/"&&u.indexOf(P+"/")!==0)return P+u;}catch(e){}return u;}
-var f=window.fetch;if(f){window.fetch=function(u,o){return f.call(this,fix(u),o)};}
+_PREFIX_SHIM = """<script>(function(){
+var P=location.pathname.replace(/\\/?[^/]*\\/?$/,"")||"";
+function fix(u){try{
+  if(typeof u!=="string") return u;
+  if(u.indexOf(P+"/")===0) return u;
+  if(u.charAt(0)==="/") return P+u;
+  var o=location.origin;
+  if(o && u.indexOf(o+"/")===0) return o+P+u.slice(o.length);
+}catch(e){}return u;}
+var f=window.fetch;if(f){window.fetch=function(u,o){
+  try{if(typeof u==="object"&&u&&typeof u.url==="string"&&window.Request&&u instanceof Request){
+    var nu=fix(u.url); if(nu!==u.url){u=new Request(nu,u);}
+  }}catch(e){}
+  return f.call(this,fix(u),o)};}
+  try{if(typeof u==="object"&&u&&typeof u.url==="string"&&window.Request&&u instanceof Request){
+    var nu=fix(u.url); if(nu!==u.url){u=new Request(nu,u);}
+  }}catch(e){}
 var x=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){var a=[].slice.call(arguments);a[1]=fix(u);return x.apply(this,a)};
 var W=window.WebSocket;if(W){window.WebSocket=function(u,p){return new W(fix(u),p)};window.WebSocket.prototype=W.prototype;}
 var E=window.EventSource;if(E){window.EventSource=function(u,o){return new E(fix(u),o)};window.EventSource.prototype=E.prototype;}
-var WK=window.Worker;if(WK){window.Worker=function(u,o){try{if(String(u).indexOf("blob:")===0&&o&&o.type==="module"){var b2="const P="+JSON.stringify(P)+";const _f=self.fetch;self.fetch=(u,o)=>{try{if(typeof u==='string'&&u.charAt(0)==='/'&&u.indexOf(P+'/')!==0)u=P+u;}catch(e){}return _f(u,o)};if(self.XMLHttpRequest){var _x=self.XMLHttpRequest.prototype.open;self.XMLHttpRequest.prototype.open=function(m,u){var a=[].slice.call(arguments);try{if(typeof a[1]==='string'&&a[1].charAt(0)==='/'&&a[1].indexOf(P+'/')!==0)a[1]=P+a[1];}catch(e){}return _x.apply(this,a)}};await import("+JSON.stringify(String(u))+");";var w2=URL.createObjectURL(new Blob([b2],{type:"text/javascript"}));return new WK(w2,{type:"module"});}if(String(u).indexOf("blob:")===0&&!(o&&o.type==="module")){var boot="var P="+JSON.stringify(P)+";var _f=self.fetch;self.fetch=function(u,o){try{if(typeof u==='string'&&u.charAt(0)==='/'&&u.indexOf(P+'/')!==0)u=P+u;}catch(e){}return _f(u,o)};if(self.XMLHttpRequest){var _o=self.XMLHttpRequest.prototype.open;self.XMLHttpRequest.prototype.open=function(m,u){var a=[].slice.call(arguments);try{if(typeof a[1]==='string'&&a[1].charAt(0)==='/'&&a[1].indexOf(P+'/')!==0)a[1]=P+a[1];}catch(e){}return _o.apply(this,a)}};importScripts("+JSON.stringify(String(u))+");";var wu=URL.createObjectURL(new Blob([boot],{type:"text/javascript"}));return new WK(wu,o);}}catch(e){}return new WK(u,o)};}
+var WK=window.Worker;
+if(WK){
+  var bootCommon="var P="+JSON.stringify(P)+";function fix(u){try{if(typeof u!==\"string\")return u;if(u.indexOf(P+\"/\")===0)return u;if(u.charAt(0)===\"/\")return P+u;var o=location.origin;if(o&&u.indexOf(o+\"/\")===0)return o+P+u.slice(o.length);}catch(e){}return u;}var _f=self.fetch;self.fetch=function(u,o){return _f(fix(u),o)};if(self.XMLHttpRequest){var _x=self.XMLHttpRequest.prototype.open;self.XMLHttpRequest.prototype.open=function(m,u){var a=[].slice.call(arguments);a[1]=fix(u);return _x.apply(this,a)}};";
+  window.Worker=function(u,o){try{
+    if(String(u).indexOf("blob:")===0&&o&&o.type==="module"){
+      var b2=bootCommon+"await import("+JSON.stringify(String(u))+");";
+      var w2=URL.createObjectURL(new Blob([b2],{type:"text/javascript"}));
+      return new WK(w2,{type:"module"});
+    }
+    if(String(u).indexOf("blob:")===0){
+      var b1=bootCommon+"importScripts("+JSON.stringify(String(u))+");";
+      var w1=URL.createObjectURL(new Blob([b1],{type:"text/javascript"}));
+      return new WK(w1,o);
+    }
+  }catch(e){}return new WK(u,o)};
+}
 })();</script>"""
 
 
