@@ -131,6 +131,16 @@ class DispatchRequest(BaseModel):
     cli: str = "qwen"
     timeout: float = Field(default=DEFAULT_DISPATCH_TIMEOUT, ge=1)
     files_to_touch: list[str] = Field(default_factory=list)
+    evidence: str | None = Field(
+        default=None,
+        description="Claimed evidence grade: A (merged/deployed+E2E), B (code+tests), C (design), D (retired).",
+    )
+    max_wall_time: str | None = Field(
+        default=None,
+        description="#1379 native wall budget (qwen format, e.g. 90 / 5m / 1h).",
+    )
+    max_session_turns: int | None = Field(default=None, ge=0)
+    allowed_tools: list[str] = Field(default_factory=list)
     approval_mode: str | None = Field(
         default=None,
         description=(
@@ -174,6 +184,10 @@ async def post_dispatch(
             wake=wake,
             origin=origin,
             approval_mode=body.approval_mode,
+            evidence=body.evidence,
+            max_wall_time=body.max_wall_time,
+            max_session_turns=body.max_session_turns,
+            allowed_tools=body.allowed_tools,
         )
     except DispatchBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -319,6 +333,29 @@ async def get_dispatch_progress(
         "approvals": task.get("approvals"),
         "terminal_summary": task.get("terminal_summary"),
     }
+
+
+@router.get("/dispatch/{task_id}/run")
+async def get_dispatch_run(
+    task_id: str,
+    service: DispatchService = Depends(_get_dispatch_service),
+) -> dict:
+    """T5: project the task onto the coding-runs read contract (千锻)."""
+    task = service.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    from . import millforge
+
+    return millforge.coding_run_record(task)
+
+
+@router.post("/dispatch/cleanup")
+async def post_dispatch_cleanup(
+    kill: bool = False,
+    service: DispatchService = Depends(_get_dispatch_service),
+) -> dict:
+    """Mark dead ``running`` tasks as stale (never kills live runs)."""
+    return service.cleanup(kill=kill)
 
 
 @router.get("/dispatch/{task_id}/log")

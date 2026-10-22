@@ -124,7 +124,12 @@ STREAM_INPUT_MODES: tuple[str, ...] = ("default", "auto-edit", "auto")
 
 
 def build_spawn_plan(
-    mode: str, session_id: str, prompt: str
+    mode: str,
+    session_id: str,
+    prompt: str,
+    max_wall_time: str | None = None,
+    max_session_turns: int | None = None,
+    allowed_tools: list[str] | None = None,
 ) -> tuple[list[str], bool]:
     """Return ``(argv, prompt_via_stdin)`` for one dispatch.
 
@@ -133,6 +138,13 @@ def build_spawn_plan(
     the channel stays open for ``can_use_tool`` control responses.
     ``yolo``/``plan`` keep the byte-compatible one-shot argv.
     """
+    extra: list[str] = []
+    if max_wall_time:
+        extra += ["--max-wall-time", str(max_wall_time)]
+    if max_session_turns:
+        extra += ["--max-session-turns", str(int(max_session_turns))]
+    if allowed_tools:
+        extra += ["--allowed-tools", ",".join(str(t) for t in allowed_tools if str(t))]
     if mode in STREAM_INPUT_MODES:
         return (
             [
@@ -147,7 +159,8 @@ def build_spawn_plan(
                 session_id,
                 "--input-format",
                 "stream-json",
-            ],
+            ]
+            + extra,
             True,
         )
     args: list[str] = []
@@ -160,7 +173,7 @@ def build_spawn_plan(
             args.append(mode)
         else:
             args.append(item)
-    return args, False
+    return args + extra, False
 
 
 def initialize_message(can_use_tool_timeout: int = 600) -> str:
@@ -524,8 +537,57 @@ class DispatchService:
 
     # ---- queries ----
 
+    @staticmethod
+    def _pid_alive(pid: Any) -> bool:
+        try:
+            value = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if value <= 0:
+            return False
+        try:
+            os.kill(value, 0)
+            return True
+        except OSError:
+            return False
+
+    def _mark_stale(self, task: dict[str, Any]) -> dict[str, Any]:
+        """A ``running`` task whose pid is gone can never finish by itself.
+
+        The age guard keeps the spawn window (pid not written yet) and
+        short-lived test doubles from being reaped; a real crashed task
+        stops updating and crosses the threshold.
+        """
+        age = time.time() - float(
+            task.get("started_epoch") or 0.0
+        )
+        stale_after = float(
+            os.environ.get("QWENPAW_DISPATCH_STALE_AFTER", "60") or 60
+        )
+        if (
+            task.get("state") == "running"
+            and task.get("pid") is not None
+            and age > stale_after
+            and not self._pid_alive(task.get("pid"))
+        ):
+            task.update(
+                {
+                    "state": "stale",
+                    "exit_code": None,
+                    "finished_at": task.get("finished_at") or _utcnow(),
+                    "updated_at": _utcnow(),
+                    "terminal_summary": [
+                        f"[{task.get('task')}] stale · 进程已消失（重启/崩溃）",
+                        "none: 无终态记录（原 watchdog 已随进程退出）",
+                        "下一步：重新派单，或 POST /dispatch/cleanup 清理",
+                    ],
+                }
+            )
+            self._write_task(task)
+        return task
+
     def running_task_named(self, task_name: str) -> dict[str, Any] | None:
-        """Claim flag: a ``running`` task file with the same task name."""
+        """Claim flag: a live ``running`` task file with the same task name."""
         for path in sorted(self._dispatch_dir.glob("*.json")):
             try:
                 task = json.loads(path.read_text(encoding="utf-8"))
@@ -535,8 +597,28 @@ class DispatchService:
                 return task
         return None
 
+    def cleanup(self, kill: bool = False) -> dict[str, Any]:
+        """Mark dead ``running`` tasks as stale (report-first).
+
+        ``kill=True`` only removes nothing live: it is accepted for API
+        symmetry; stale task files are kept for audit.
+        """
+        stale: list[str] = []
+        for path in sorted(self._dispatch_dir.glob("*.json")):
+            try:
+                task = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if task.get("state") == "running" and not self._pid_alive(task.get("pid")):
+                task = self._mark_stale(task)
+                stale.append(str(task.get("task_id")))
+        return {"stale": stale, "count": len(stale), "kill": bool(kill)}
+
     def get_task(self, task_id: str) -> dict[str, Any] | None:
-        return self._read_task(task_id)
+        task = self._read_task(task_id)
+        if task is None:
+            return None
+        return self._mark_stale(task)
 
     def list_tasks(self) -> list[dict[str, Any]]:
         """All dispatch tasks, newest first (summary fields only)."""
@@ -546,6 +628,7 @@ class DispatchService:
                 raw.append(json.loads(path.read_text(encoding="utf-8")))
             except (OSError, ValueError):
                 continue
+        raw = [self._mark_stale(t) for t in raw]
         raw.sort(key=lambda t: t.get("started_epoch") or 0.0, reverse=True)
         return [
             {
@@ -592,6 +675,10 @@ class DispatchService:
         wake: dict[str, Any] | None,
         origin: dict[str, Any] | None = None,
         approval_mode: str | None = None,
+        evidence: str | None = None,
+        max_wall_time: str | None = None,
+        max_session_turns: int | None = None,
+        allowed_tools: list[str] | None = None,
     ) -> str:
         """Spawn a headless CLI run; returns the new task id.
 
@@ -669,12 +756,23 @@ class DispatchService:
             "input_format": "text",
             "approvals": {"allowed": 0, "denied": 0, "escalated": 0},
             "progress": None,
+            "evidence": str(evidence).upper() if evidence else None,
+            "max_wall_time": max_wall_time,
+            "max_session_turns": max_session_turns,
+            "allowed_tools": list(allowed_tools or []),
         }
         self._write_task(task)
 
         env = dict(os.environ)
         env["QWENPAW_SESSION_ID"] = session_id
-        spawn_args, prompt_via_stdin = build_spawn_plan(mode, session_id, prompt)
+        spawn_args, prompt_via_stdin = build_spawn_plan(
+            mode,
+            session_id,
+            prompt,
+            max_wall_time=max_wall_time,
+            max_session_turns=max_session_turns,
+            allowed_tools=allowed_tools,
+        )
         self._update_task(
             task_id,
             {"input_format": "stream-json" if prompt_via_stdin else "text"},
