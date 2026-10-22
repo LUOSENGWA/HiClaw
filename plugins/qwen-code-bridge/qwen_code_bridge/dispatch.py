@@ -39,6 +39,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from . import chats
 from .registry import CLIS
 from .state import state_dir
 
@@ -575,6 +576,32 @@ class DispatchService:
             self._watch(task_id, proc, timeout),
             name=f"coding-cli-dispatch-{task_id}",
         )
+        # 侧栏同步（P1）：在 console 左栏 "QwenCode" 分组里建一条会话记录；失败不影响派单
+        try:
+            _wake = task.get("wake") or {}
+            _origin = task.get("origin") or {}
+            _root = chats.resolve_root(_wake.get("base_url"))
+            _agent = chats.resolve_agent(_wake.get("agent_id"))
+            _gid = await asyncio.to_thread(chats.ensure_group, _root, _agent)
+            _cid = await asyncio.to_thread(
+                chats.create_run_chat,
+                _root,
+                _agent,
+                name=chats.run_chat_name(task_name, cli, "running"),
+                session_id=f"qwen-code-bridge:{task_id}",
+                user_id=str(_origin.get("user_id") or "default"),
+                group_id=_gid,
+                meta={"task_id": task_id, "cli": cli, "task": task_name},
+            )
+            self._update_task(
+                task_id,
+                {"chat_id": _cid, "chat_sync": "created" if _cid else "empty"},
+            )
+        except Exception as exc:  # best-effort
+            self._update_task(
+                task_id,
+                {"chat_sync": f"failed: {str(exc)[:120]}"},
+            )
         return task_id
 
     @staticmethod
@@ -671,6 +698,28 @@ class DispatchService:
                 "wake_status": "pending" if wake_session_id else "skipped",
             },
         )
+
+        # 侧栏同步（P1）：终态改名（状态进名字）
+        _chat_id = str(task.get("chat_id") or "")
+        if _chat_id:
+            try:
+                await asyncio.to_thread(
+                    chats.rename_chat,
+                    chats.resolve_root(wake.get("base_url")),
+                    chats.resolve_agent(wake.get("agent_id")),
+                    _chat_id,
+                    chats.run_chat_name(
+                        str(task.get("task") or ""),
+                        str(task.get("cli") or ""),
+                        status,
+                    ),
+                )
+                self._update_task(task_id, {"chat_sync": f"renamed:{status}"})
+            except Exception as exc:  # best-effort
+                self._update_task(
+                    task_id,
+                    {"chat_sync": f"rename_failed: {str(exc)[:80]}"},
+                )
 
         if wake_session_id:
             text = self._wake_text(task, status, code, wall)

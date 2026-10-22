@@ -753,3 +753,50 @@ async def test_origin_replays_source_session_identity(tmp_path) -> None:
             "user_id": "!room:mx",
             "channel": "agentteams_matrix",
         }
+
+
+@pytest.mark.asyncio
+async def test_dispatch_creates_and_renames_sidebar_chat(tmp_path, monkeypatch) -> None:
+    """P1: start creates a 'running' chat; terminal renames it with the state."""
+    import qwen_code_bridge.dispatch as dispatch_mod
+
+    events: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        dispatch_mod.chats,
+        "ensure_group",
+        lambda _root, _agent: "g-1",
+    )
+    monkeypatch.setattr(
+        dispatch_mod.chats,
+        "create_run_chat",
+        lambda _root, _agent, **kw: (
+            events.append(("create", kw["name"])) or "chat-1"
+        ),
+    )
+    monkeypatch.setattr(
+        dispatch_mod.chats,
+        "rename_chat",
+        lambda _root, _agent, _cid, name: (
+            events.append(("rename", name)) or True
+        ),
+    )
+    with Env(tmp_path) as env:
+        _make_bin(env.bin_dir, "fakeq", 'echo \'{"type":"result","result":"ok"}\'')
+        service = DispatchService()
+        task_id = await service.start(
+            task_name="t-sidebar",
+            prompt="do it",
+            cwd=None,
+            cli="fakeq",
+            timeout=30,
+            wake=None,
+        )
+        terminal = await _wait_terminal(service, task_id)
+        assert terminal["state"] == "done"
+        for _ in range(50):
+            if any(e[0] == "rename" for e in events):
+                break
+            await asyncio.sleep(0.05)
+    assert ("create", "t-sidebar · fakeq · running") in events
+    assert ("rename", "t-sidebar · fakeq · done") in events
+    assert service.get_task(task_id)["chat_id"] == "chat-1"
