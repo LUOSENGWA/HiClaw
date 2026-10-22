@@ -73,8 +73,8 @@ sh web-shell/build.sh <SC/qwen-code 源码目录> [qwenpaw working 目录]
 | 入口 | 行为 |
 |---|---|
 | 左栏 **QwenCode** 组（置顶） | 每次派单一行：`<task> · <cli> · <state>`（终态改名） |
-| 点任一派单会话 | 页面直接变成 **原生 Qwen Code 控制台**（会话列表/会话/输入框全原生；`route.wrap("core.chat")`） |
-| `QwenCode · 直接对话` | 原生控制台；**不需要前缀**，直接打字即由 Qwen Code 回答（PRE_DISPATCH 短路，逐会话续聊） |
+| 点任一派单会话 | 页面**整屏**变成原生 Qwen Code 控制台（无插件自建标题栏；`route.wrap("core.chat")` + 全屏 iframe） |
+| `QwenCode · 直接对话` | 原生控制台（整屏）；**不需要前缀**，直接打字即由 Qwen Code 回答（PRE_DISPATCH 短路，逐会话续聊） |
 | 任意聊天里 `/qcode <prompt>` | 零模型成本的直连回答（`--session-id` 首轮 / `-r` 续聊） |
 | 审批 | QwenPaw 等级 → CLI tier：`STRICT→plan / SMART→auto-edit / AUTO→auto / OFF→yolo`（请求/env 可覆盖） |
 | 门铃（可选） | `room_bell`：终态 3 行摘要投到房间（需部署侧有消息频道） |
@@ -102,6 +102,6 @@ curl -X POST http://127.0.0.1:8088/api/qwen-code-bridge/dispatch \
 
 ## 排障
 
-- **新标签打开后刷新出现 `{"detail":"Not Found"}`**：已修（10/22）。浏览器导航到客户端路由（`/session/<id>`、`/threads`、`/settings`…）时，代理会在两种情况下都回退到 SPA：① 有重建产物 → 我们的 index；② 没有重建产物 → daemon 自己的 index（前缀改写）。若仍复现：硬刷新（Ctrl+Shift+R）并给出完整 URL。
+- **直接访问客户端路由并刷新出现 `{"detail":"Not Found"}`**：已修（10/22）；页面内已无“新标签打开”入口。浏览器导航到客户端路由（`/session/<id>`、`/threads`、`/settings`…）时，代理会在两种情况下都回退到 SPA：① 有重建产物 → 我们的 index；② 没有重建产物 → daemon 自己的 index（前缀改写）。若仍复现：硬刷新（Ctrl+Shift+R）并给出完整 URL。
 - **控制台里会话列表为空**：说明跑的是**未重建**的 shell（`<state>/web-shell/dist` 不存在）——按 `web-shell/README.md` 构建一次，或从别的实例拷贝 dist。
 - **`/web/settings` 返回 `Unknown coding CLI: web`**：已修（`/web/*` 路由前置，不再被 `/{cli_id}/settings` 吞）。

@@ -68,89 +68,13 @@
     }, [setDark]);
 
     var src = BASE + "?theme=" + (dark ? "dark" : "light");
-    return React.createElement(
-      "div",
-      {
-        style: {
-          height: "100%",
-          minHeight: 480,
-          display: "flex",
-          flexDirection: "column",
-          gap: 6,
-          background: dark ? "#141414" : "#ffffff",
-        },
-      },
-      React.createElement(
-        "div",
-        {
-          style: {
-            display: "flex",
-            alignItems: "center",
-            gap: 12,
-            padding: "6px 4px",
-          },
-        },
-        React.createElement("strong", null, "Qwen Code"),
-        React.createElement(
-          "a",
-          { href: src, target: "_blank", rel: "noreferrer" },
-          "新标签打开",
-        ),
-      ),
-      React.createElement("iframe", {
-        key: dark ? "dark" : "light",
-        src: src,
-        title: "Qwen Code",
-        style: {
-          flex: 1,
-          width: "100%",
-          minHeight: 420,
-          border: 0,
-          borderRadius: 8,
-        },
-        allow: "clipboard-read; clipboard-write",
-      }),
-    );
-  }
-
-
-  function authFetch(path, withAgent) {
-    var headers = {};
-    try {
-      var token = HOST.getApiToken ? HOST.getApiToken() : null;
-      if (token) headers.Authorization = "Bearer " + token;
-    } catch (e) {}
-    if (withAgent) {
-      try {
-        var agent = HOST.getSelectedAgentId ? HOST.getSelectedAgentId() : "";
-        if (agent) headers["X-Agent-Id"] = agent;
-      } catch (e) {}
-    }
-    var f = HOST.fetch ? HOST.fetch.bind(HOST) : window.fetch.bind(window);
-    return f(path, { headers: headers });
-  }
-
-  function listChats(withAgent) {
-    var base = (HOST.apiBaseUrl || "") + "/";
-    return authFetch(base + "api/chats", withAgent)
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .catch(function () { return null; });
-  }
-
-  function findChat(list, sessionId) {
-    for (var i = 0; list && i < list.length; i += 1) {
-      var c = list[i];
-      if (c && (c.id === sessionId || c.session_id === sessionId)) return c;
-    }
-    return null;
-  }
-
-  function bridgeChatLookup(sessionId) {
-    var base = (HOST.apiBaseUrl || "") + "/";
-    return window
-      .fetch(base + "api/qwen-code-bridge/chat/" + encodeURIComponent(sessionId))
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .catch(function () { return null; });
+    return React.createElement("iframe", {
+      key: dark ? "dark" : "light",
+      src: src,
+      title: "Qwen Code",
+      style: { width: "100%", height: "100%", minHeight: 480, border: 0, display: "block" },
+      allow: "clipboard-read; clipboard-write",
+    });
   }
 
   function chatIdFromUrl() {
