@@ -84,6 +84,8 @@ def _wake_recorder() -> tuple[list[dict[str, str]], Any]:
         base_url: str,
         text: str,
         channel: str = "console",
+        user_id: str = "default",
+        room_bell: bool = False,
     ) -> None:
         calls.append(
             {
@@ -92,6 +94,8 @@ def _wake_recorder() -> tuple[list[dict[str, str]], Any]:
                 "base_url": base_url,
                 "text": text,
                 "channel": channel,
+                "user_id": user_id,
+                "room_bell": room_bell,
             }
         )
 
@@ -562,7 +566,10 @@ def test_wake_body_pins_approval_level() -> None:
     assert body["request_context"] == {"approval_level": "SMART"}
     assert body["session_id"] == "sid-1"
     assert body["channel"] == "console"
-    assert _wake_body("matrix:!r:mx", "t", "", "matrix")["channel"] == "matrix"
+    assert body["user_id"] == "default"
+    m = _wake_body("matrix:!r:mx", "t", "", "agentteams_matrix", "!r:mx")
+    assert m["channel"] == "agentteams_matrix"
+    assert m["user_id"] == "!r:mx"
     assert _wake_body("sid-2", "t", "") == {
         "channel": "console",
         "user_id": "default",
@@ -660,3 +667,55 @@ def test_pending_approval_line_reads_operation(monkeypatch) -> None:
     assert "rm -rf /tmp/x" in line
     assert "reason=No rule hit" in line
     assert "其余 1 条: write_file" in line
+
+
+def test_room_bell_posts_to_messages_send(monkeypatch) -> None:
+    """matrix wake + room_bell: chat inject then POST /api/messages/send."""
+    import agentteams_coding_cli.dispatch as dispatch_mod
+
+    calls: list[tuple[str, dict]] = []
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, _n: int = -1) -> bytes:
+            return b'{"ok":true}'
+
+    def fake_urlopen(req, timeout=0):  # noqa: ARG001
+        calls.append((req.full_url, json.loads(req.data.decode("utf-8"))))
+        return _Resp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        dispatch_mod,
+        "_effective_approval_level",
+        lambda _agent: "",
+    )
+    monkeypatch.setattr(
+        dispatch_mod,
+        "_pending_approval_line",
+        lambda _base, _sid: "",
+    )
+    dispatch_mod.default_wake_sender(
+        "matrix:!room:mx",
+        "worker-a",
+        "",
+        "l1\nl2\nl3",
+        "agentteams_matrix",
+        "!room:mx",
+        True,
+    )
+    urls = [u for u, _ in calls]
+    assert any(u.endswith("/api/console/chat") for u in urls)
+    bell = [b for u, b in calls if u.endswith("/api/messages/send")]
+    assert bell, "room bell not posted"
+    assert bell[0] == {
+        "channel": "agentteams_matrix",
+        "target_user": "!room:mx",
+        "target_session": "matrix:!room:mx",
+        "text": "l1\nl2\nl3",
+    }

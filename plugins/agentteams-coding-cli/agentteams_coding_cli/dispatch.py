@@ -131,7 +131,7 @@ class SpawnFailedError(RuntimeError):
 
 #: ``wake_sender(session_id, agent_id, base_url, text) -> None``;
 #: returns on success, raises on final failure.
-WakeSender = Callable[[str, str, str, str, str], None]
+WakeSender = Callable[..., None]
 
 
 def _effective_approval_level(agent_id: str) -> str:
@@ -216,12 +216,13 @@ def _wake_body(
     text: str,
     approval_level: str,
     channel: str = "console",
+    user_id: str = "default",
 ) -> dict:
     """Chat payload; ``channel`` picks console vs matrix, ``request_context``
     pins the wake turn's approval level."""
     body: dict[str, Any] = {
         "channel": str(channel or "console"),
-        "user_id": "default",
+        "user_id": str(user_id or "default"),
         "session_id": session_id,
         "input": [
             {"content": [{"type": "text", "text": text}], "metadata": {}},
@@ -232,12 +233,42 @@ def _wake_body(
     return body
 
 
+def _send_room_bell(
+    root: str,
+    channel: str,
+    session_id: str,
+    user_id: str,
+    text: str,
+    agent_id: str,
+) -> None:
+    """Post the terminal summary to the room via POST /api/messages/send."""
+    payload = {
+        "channel": channel,
+        "target_user": user_id,
+        "target_session": session_id,
+        "text": text,
+    }
+    req = urllib.request.Request(
+        root + "/api/messages/send",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-Agent-Id": agent_id or "AgentTeamGuide",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read(64)
+
+
 def default_wake_sender(
     session_id: str,
     agent_id: str,
     base_url: str,
     text: str,
     channel: str = "console",
+    user_id: str = "default",
+    room_bell: bool = False,
 ) -> None:
     """Real-HTTP session inject (dispatch_notify.py default backend).
 
@@ -255,6 +286,7 @@ def default_wake_sender(
         text,
         _effective_approval_level(agent_id),
         channel,
+        user_id,
     )
     pending_line = _pending_approval_line(base_url, session_id)
     if pending_line:
@@ -275,6 +307,15 @@ def default_wake_sender(
             )
             with urllib.request.urlopen(req, timeout=15) as resp:
                 resp.read(64)
+            if room_bell and str(channel or "console") != "console":
+                _send_room_bell(
+                    root,
+                    str(channel),
+                    session_id,
+                    user_id,
+                    text,
+                    agent_id,
+                )
             return
         except urllib.error.HTTPError as exc:
             last = f"http {exc.code}"
@@ -636,6 +677,8 @@ class DispatchService:
                     str(wake.get("base_url") or ""),
                     text,
                     str(wake.get("channel") or "console"),
+                    str(wake.get("user_id") or "default"),
+                    bool(wake.get("room_bell")),
                 )
                 wake_status = "sent"
             except Exception as exc:  # wake is best-effort; state stands

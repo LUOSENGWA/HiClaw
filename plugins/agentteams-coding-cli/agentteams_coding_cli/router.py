@@ -78,16 +78,26 @@ class WakeSpec(BaseModel):
     means no wake. ``base_url`` overrides the app URL (else the
     ``QWENPAW_APP_URL`` env var, else ``http://127.0.0.1:8088``).
 
-    ``channel`` selects the delivery surface: ``console`` (same-app
-    session inject, default) or ``matrix`` (AgentTeams worker containers
-    with the matrix-channel plugin; ``session_id`` must be
-    ``matrix:<room_id>``). Exactly one surface per wake.
+    ``channel`` selects the delivery surface. ``console`` = same-app
+    session inject (default). AgentTeams workers run the **plugin**
+    channel ``agentteams_matrix`` (NOT the built-in ``matrix`` key);
+    ``session_id`` must be ``matrix:<room_id>``.
+
+    ``user_id`` is part of the session identity: QwenPaw keys session
+    state on ``session_id`` **and** ``user_id``. For AgentTeams group
+    rooms ``share_session_in_group=true`` maps ``user_id`` to the
+    **room_id** (legacy shared session); ``false`` maps it to the real
+    sender (per-sender isolation). DMs use the room_id.
+    ``room_bell`` (matrix only) additionally posts the 3-line terminal
+    summary to the room via ``POST /api/messages/send``.
     """
 
     session_id: str = ""
     agent_id: str = ""
     base_url: str | None = None
     channel: str = "console"
+    user_id: str = "default"
+    room_bell: bool = False
 
 
 class DispatchRequest(BaseModel):
