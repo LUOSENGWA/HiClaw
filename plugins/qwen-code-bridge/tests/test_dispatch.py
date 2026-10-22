@@ -29,16 +29,16 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agentteams_coding_cli.dispatch import (
+from qwen_code_bridge.dispatch import (
     WATCH_INTERVAL_ENV,
     CliNotFoundError,
     DispatchBusyError,
     DispatchService,
 )
-from agentteams_coding_cli.router import build_router
-from agentteams_coding_cli.state import STATE_DIR_ENV
+from qwen_code_bridge.router import build_router
+from qwen_code_bridge.state import STATE_DIR_ENV
 
-API = "/api/agentteams-coding-cli"
+API = "/api/qwen-code-bridge"
 
 WAKE = {
     "session_id": "matrix:!wake42:matrix.example",
@@ -339,7 +339,7 @@ async def test_claim_flag_and_not_found(tmp_path) -> None:
                 wake=None,
             )
         assert (
-            "POST /api/agentteams-coding-cli/qwen-code/install"
+            "POST /api/qwen-code-bridge/qwen-code/install"
             in str(excinfo2.value)
         )
         # bad cwd -> ValueError
@@ -371,7 +371,7 @@ def dispatch_http(tmp_path) -> Generator[tuple[TestClient, Env], None, None]:
         _make_bin(env.bin_dir, "fakeq", 'echo \'{"type":"assistant","text":"ok"}\'')
         application = FastAPI()
         application.include_router(
-            build_router(), prefix="/api/agentteams-coding-cli"
+            build_router(), prefix="/api/qwen-code-bridge"
         )
         with TestClient(application) as client:
             yield client, env
@@ -460,7 +460,7 @@ def test_http_cli_not_installed_409(dispatch_http) -> None:
     )
     assert res.status_code == 409
     assert (
-        "POST /api/agentteams-coding-cli/qwen-code/install"
+        "POST /api/qwen-code-bridge/qwen-code/install"
         in res.json()["detail"]
     )
 
@@ -547,7 +547,7 @@ async def test_approval_mode_default_yolo_and_invalid(tmp_path) -> None:
 
 
 def test_resolve_approval_mode_precedence(monkeypatch) -> None:
-    from agentteams_coding_cli.dispatch import (
+    from qwen_code_bridge.dispatch import (
         APPROVAL_MODE_ENV,
         resolve_approval_mode,
     )
@@ -560,7 +560,7 @@ def test_resolve_approval_mode_precedence(monkeypatch) -> None:
 
 
 def test_wake_body_pins_approval_level() -> None:
-    from agentteams_coding_cli.dispatch import _wake_body
+    from qwen_code_bridge.dispatch import _wake_body
 
     body = _wake_body("sid-1", "3 lines", "SMART")
     assert body["request_context"] == {"approval_level": "SMART"}
@@ -580,7 +580,7 @@ def test_wake_body_pins_approval_level() -> None:
 
 def test_default_wake_sender_carries_level_and_pending(monkeypatch) -> None:
     """Wake POST body: request_context level + pending approvals appended."""
-    import agentteams_coding_cli.dispatch as dispatch_mod
+    import qwen_code_bridge.dispatch as dispatch_mod
 
     monkeypatch.setattr(
         dispatch_mod,
@@ -627,7 +627,7 @@ def test_default_wake_sender_carries_level_and_pending(monkeypatch) -> None:
 
 def test_pending_approval_line_reads_operation(monkeypatch) -> None:
     """The wake line carries what the newest pending approval actually is."""
-    import agentteams_coding_cli.dispatch as dispatch_mod
+    import qwen_code_bridge.dispatch as dispatch_mod
 
     payload = {
         "pending_approvals": [
@@ -671,7 +671,7 @@ def test_pending_approval_line_reads_operation(monkeypatch) -> None:
 
 def test_room_bell_posts_to_messages_send(monkeypatch) -> None:
     """matrix wake + room_bell: chat inject then POST /api/messages/send."""
-    import agentteams_coding_cli.dispatch as dispatch_mod
+    import qwen_code_bridge.dispatch as dispatch_mod
 
     calls: list[tuple[str, dict]] = []
 

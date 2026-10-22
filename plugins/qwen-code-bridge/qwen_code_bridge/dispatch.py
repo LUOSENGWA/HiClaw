@@ -77,7 +77,7 @@ APPROVAL_MODES: tuple[str, ...] = (
 DEFAULT_APPROVAL_MODE = "yolo"
 
 #: Env override mirroring the runner's config fallback (#1379).
-APPROVAL_MODE_ENV = "AGENTTEAMS_CODING_CLI_APPROVAL_MODE"
+APPROVAL_MODE_ENV = "QWEN_CODE_BRIDGE_APPROVAL_MODE"
 
 #: Headless spawn args, 1:1 with the production adapter.
 #: Authoritative source: ``tools/dispatch_adapters.json`` (entry "qwen",
@@ -338,7 +338,7 @@ def _install_hint(cli: str) -> str:
         if spec.bin_name == cli:
             return (
                 f"CLI {cli!r} not found on PATH; install it via "
-                f"POST /api/agentteams-coding-cli/{spec.id}/install"
+                f"POST /api/qwen-code-bridge/{spec.id}/install"
             )
     return (
         f"CLI {cli!r} not found on PATH; it is not a managed coding "
@@ -586,7 +586,7 @@ class DispatchService:
             [
                 f"[dispatch] {task.get('task')} 终态={status} "
                 f"exit={code} wall={wall}s",
-                f"日志: GET /api/agentteams-coding-cli/dispatch/"
+                f"日志: GET /api/qwen-code-bridge/dispatch/"
                 f"{task.get('task_id')}/log",
                 "下一步：按任务书验收（复跑门/抽查 diff/给推送命令）",
             ]

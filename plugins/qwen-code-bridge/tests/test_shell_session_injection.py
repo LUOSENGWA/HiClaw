@@ -2,7 +2,7 @@
 """P2 acceptance tests: session-injection middleware (design doc §5).
 
 P1 ships only the management surface. The session-injection middleware
-(``agentteams_coding_cli.middleware.SessionEnvMiddleware``) lands in
+(``qwen_code_bridge.middleware.SessionEnvMiddleware``) lands in
 P2. The T0 spike (``spike-report.md``, ``spike/test_t0_spike.py``) has
 already verified both premises — H1 (an ``on_acting`` input mutation
 reaches the tool execution layer) and H2 (the factory's
@@ -11,7 +11,7 @@ reaches the tool execution layer) and H2 (the factory's
 
 These tests are the P2 acceptance criteria and are marked
 ``xfail(strict=True)``: they xfail while
-``agentteams_coding_cli/middleware.py`` does not exist, and should go
+``qwen_code_bridge/middleware.py`` does not exist, and should go
 green in P2 without test changes once the module is implemented
 (remove the marker at that time).
 
@@ -121,7 +121,7 @@ def _make_ctx(session_id: str, workspace_dir: Path) -> Any:
 @pytest.mark.asyncio
 async def test_session_id_injected_into_shell_command(tmp_path) -> None:
     """Closed loop: ctx.session_id → middleware → shell tool command."""
-    from agentteams_coding_cli.middleware import (  # noqa: F401  (P2)
+    from qwen_code_bridge.middleware import (  # noqa: F401  (P2)
         SessionEnvMiddleware,
     )
 
@@ -140,7 +140,7 @@ async def test_session_id_injected_into_shell_command(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_injection_is_idempotent(tmp_path) -> None:
     """A command that already sets QWENPAW_SESSION_ID is not re-prefixed."""
-    from agentteams_coding_cli.middleware import (  # noqa: F401  (P2)
+    from qwen_code_bridge.middleware import (  # noqa: F401  (P2)
         SessionEnvMiddleware,
     )
 

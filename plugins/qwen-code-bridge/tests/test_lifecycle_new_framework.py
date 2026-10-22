@@ -30,7 +30,7 @@ _lifecycle = pytest.importorskip("qwenpaw.plugins.lifecycle")
 
 @pytest.fixture
 def workspace(tmp_path, monkeypatch):
-    installed = tmp_path / "plugins" / "agentteams-coding-cli"
+    installed = tmp_path / "plugins" / "qwen-code-bridge"
     shutil.copytree(
         _PLUGIN_DIR,
         installed,
@@ -100,7 +100,7 @@ async def test_load_reload_unload_is_clean(workspace) -> None:
             json.dumps({"task_id": "0123456789abcdef0123456789abcdef", "status": "running"}),
             encoding="utf-8",
         )
-        from agentteams_coding_cli.dispatch import DispatchService
+        from qwen_code_bridge.dispatch import DispatchService
 
         assert DispatchService().get_task("0123456789abcdef0123456789abcdef")["status"] == (
             "running"

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AgentTeams coding-cli plugin backend package.
+"""Qwen Code Bridge plugin backend package.
 
 P1: management surface (probe/settings/install) ported from QwenPaw
 upstream PR 8156. P2: session-injection middleware (design doc §5) and

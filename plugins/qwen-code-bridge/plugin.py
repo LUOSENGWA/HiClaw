@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AgentTeams coding-cli plugin entry (P1: skeleton + management API).
+"""Qwen Code Bridge plugin entry (management + dispatch + session tooling).
 
 Compatibility contract (design doc §2):
 
@@ -12,7 +12,7 @@ Compatibility contract (design doc §2):
 - No runtime patching of framework internals, no module-level mutable
   state: all state lives
   under ``$WORKSPACE/.qwenpaw/coding-cli/`` as files (see
-  ``agentteams_coding_cli/state.py``).
+  ``qwen_code_bridge/state.py``).
 - ``register`` is idempotent: a repeated call (e.g. new-framework
   update_config replay) detects existing registrations through the
   public registry introspection API and skips them instead of raising.
@@ -27,10 +27,10 @@ from qwenpaw.plugins.api import PluginApi
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_ID = "agentteams-coding-cli"
-HTTP_PREFIX = "/agentteams-coding-cli"
-STARTUP_HOOK_NAME = "agentteams_coding_cli.ensure_state_dir"
-SHUTDOWN_HOOK_NAME = "agentteams_coding_cli.shutdown"
+PLUGIN_ID = "qwen-code-bridge"
+HTTP_PREFIX = "/qwen-code-bridge"
+STARTUP_HOOK_NAME = "qwen_code_bridge.ensure_state_dir"
+SHUTDOWN_HOOK_NAME = "qwen_code_bridge.shutdown"
 
 _PLUGIN_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 
@@ -64,7 +64,7 @@ def _hook_owner(api: PluginApi, hooks, hook_name: str) -> str | None:
 
 
 def _ensure_state_dir() -> None:
-    from agentteams_coding_cli.state import state_dir
+    from qwen_code_bridge.state import state_dir
 
     state_dir().mkdir(parents=True, exist_ok=True)
 
@@ -76,26 +76,26 @@ def _on_shutdown() -> None:
     )
 
 
-class AgentTeamsCodingCliPlugin:
+class QwenCodeBridgePlugin:
     """Plugin entry: P1 management surface (probe/settings/install)."""
 
     def register(self, api: PluginApi) -> None:
         _ensure_importable()
-        from agentteams_coding_cli.middleware import (
+        from qwen_code_bridge.middleware import (
             session_middleware_factory,
         )
-        from agentteams_coding_cli.router import build_router
+        from qwen_code_bridge.router import build_router
 
         registry = _registry(api)
 
-        # 1) Management API under /api/agentteams-coding-cli (idempotent).
+        # 1) Management API under /api/qwen-code-bridge (idempotent).
         if registry is None:
             # Degraded path (framework setup incomplete): plain register;
             # the framework's own duplicate check still applies.
             api.register_http_router(
                 build_router(),
                 prefix=HTTP_PREFIX,
-                tags=["agentteams-coding-cli"],
+                tags=["qwen-code-bridge"],
             )
             api.register_startup_hook(
                 STARTUP_HOOK_NAME,
@@ -116,7 +116,7 @@ class AgentTeamsCodingCliPlugin:
             api.register_http_router(
                 build_router(),
                 prefix=HTTP_PREFIX,
-                tags=["agentteams-coding-cli"],
+                tags=["qwen-code-bridge"],
             )
         elif owner == PLUGIN_ID:
             logger.debug(
@@ -202,4 +202,4 @@ class AgentTeamsCodingCliPlugin:
             )
 
 
-plugin = AgentTeamsCodingCliPlugin()
+plugin = QwenCodeBridgePlugin()

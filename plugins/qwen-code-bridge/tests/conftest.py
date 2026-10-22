@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Make the plugin root (``agentteams_coding_cli`` package) importable."""
+"""Make the plugin root (``qwen_code_bridge`` package) importable."""
 
 import sys
 from pathlib import Path

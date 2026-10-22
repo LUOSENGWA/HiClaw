@@ -1167,7 +1167,7 @@ async def test_start_uses_image_builtin_plugins_without_runtime_install(
     _write_builtin_plugin(builtin_plugins, "workerflow", "apply_workerflow")
     _write_builtin_plugin(
         builtin_plugins,
-        "agentteams-coding-cli",
+        "qwen-code-bridge",
         "apply_coding_cli",
     )
     teamharness_zip = _write_plugin_zip(
@@ -1222,7 +1222,7 @@ async def test_start_uses_image_builtin_plugins_without_runtime_install(
     assert (
         config.qwenpaw_working_dir
         / "plugins"
-        / "agentteams-coding-cli"
+        / "qwen-code-bridge"
         / "plugin.py"
     ).is_file()
 
@@ -1253,7 +1253,7 @@ def test_runtime_adapter_reapplies_builtin_assets_without_runtime_install(
     _write_builtin_plugin(builtin_plugins, "workerflow", "apply_workerflow")
     _write_builtin_plugin(
         builtin_plugins,
-        "agentteams-coding-cli",
+        "qwen-code-bridge",
         "apply_coding_cli",
     )
     install_commands: list[list[str]] = []
@@ -1279,7 +1279,7 @@ def test_runtime_adapter_reapplies_builtin_assets_without_runtime_install(
     assert (
         config.qwenpaw_working_dir
         / "plugins"
-        / "agentteams-coding-cli"
+        / "qwen-code-bridge"
         / "plugin.py"
     ).is_file()
 

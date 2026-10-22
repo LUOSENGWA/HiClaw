@@ -652,8 +652,8 @@ class Worker:
         self._prepare_builtin_plugin("teamharness", builtin_root / "teamharness")
         self._prepare_builtin_plugin("workerflow", builtin_root / "workerflow")
         self._prepare_builtin_plugin(
-            "agentteams-coding-cli",
-            builtin_root / "agentteams-coding-cli",
+            "qwen-code-bridge",
+            builtin_root / "qwen-code-bridge",
         )
 
     def _builtin_qwenpaw_plugins_dir(self) -> Path:

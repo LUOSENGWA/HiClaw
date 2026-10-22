@@ -11,7 +11,7 @@ patterns. Deltas vs upstream:
   FastAPI ``Depends`` (all state is file-backed, see ``service.py`` /
   ``state.py``), so the router carries no module-level mutable state.
 - The URL prefix is applied by ``plugin.py`` through
-  ``PluginApi.register_http_router(prefix="/agentteams-coding-cli")``;
+  ``PluginApi.register_http_router(prefix="/qwen-code-bridge")``;
   this router therefore defines no prefix of its own.
 """
 
@@ -32,7 +32,7 @@ from .dispatch import (
 from .registry import CLIS, get_cli
 from .service import CodingCliService, InstallBusyError
 
-router = APIRouter(tags=["agentteams-coding-cli"])
+router = APIRouter(tags=["qwen-code-bridge"])
 
 
 def _get_service() -> CodingCliService:
@@ -79,12 +79,12 @@ class WakeSpec(BaseModel):
     ``QWENPAW_APP_URL`` env var, else ``http://127.0.0.1:8088``).
 
     ``channel`` selects the delivery surface. ``console`` = same-app
-    session inject (default). AgentTeams workers run the **plugin**
+    session inject (default). AgentTeams deployments run the **plugin**
     channel ``agentteams_matrix`` (NOT the built-in ``matrix`` key);
     ``session_id`` must be ``matrix:<room_id>``.
 
     ``user_id`` is part of the session identity: QwenPaw keys session
-    state on ``session_id`` **and** ``user_id``. For AgentTeams group
+    state on ``session_id`` **and** ``user_id``. For team group
     rooms ``share_session_in_group=true`` maps ``user_id`` to the
     **room_id** (legacy shared session); ``false`` maps it to the real
     sender (per-sender isolation). DMs use the room_id.
@@ -134,7 +134,7 @@ class DispatchRequest(BaseModel):
         default=None,
         description=(
             "Per-run qwen approval tier (plan/default/auto-edit/auto/yolo); "
-            "resolution: request > env AGENTTEAMS_CODING_CLI_APPROVAL_MODE > "
+            "resolution: request > env QWEN_CODE_BRIDGE_APPROVAL_MODE > "
             "'yolo' (#1379 parity)."
         ),
     )

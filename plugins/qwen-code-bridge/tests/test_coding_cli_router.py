@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Unit tests for ``agentteams_coding_cli.router``.
+"""Unit tests for ``qwen_code_bridge.router``.
 
 Ported from QwenPaw upstream PR 8156
 (``tests/unit/app/routers/test_coding_cli_router.py``, 281 lines / 13
@@ -29,11 +29,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agentteams_coding_cli.router import router as coding_cli_router
-from agentteams_coding_cli.service import CodingCliService
-from agentteams_coding_cli.state import STATE_DIR_ENV
+from qwen_code_bridge.router import router as coding_cli_router
+from qwen_code_bridge.service import CodingCliService
+from qwen_code_bridge.state import STATE_DIR_ENV
 
-API = "/api/agentteams-coding-cli"
+API = "/api/qwen-code-bridge"
 
 
 @pytest.fixture
@@ -61,7 +61,7 @@ def no_bin() -> Generator[None, None, None]:
     """Make version probing report 'not installed'."""
 
     with patch(
-        "agentteams_coding_cli.service.CodingCliService._run",
+        "qwen_code_bridge.service.CodingCliService._run",
         return_value=None,
     ):
         yield
@@ -154,7 +154,7 @@ def test_install_lifecycle(client) -> None:
     """Drive the install state machine deterministically on one loop."""
     import asyncio
 
-    from agentteams_coding_cli.registry import get_cli
+    from qwen_code_bridge.registry import get_cli
 
     service = CodingCliService()
     spec = get_cli("qwen-code")
@@ -170,7 +170,7 @@ def test_install_lifecycle(client) -> None:
 
     with (
         patch(
-            "agentteams_coding_cli.service.CodingCliService._run",
+            "qwen_code_bridge.service.CodingCliService._run",
             return_value=SimpleNamespace(
                 returncode=0,
                 stdout="qwen 0.25.0",
@@ -178,7 +178,7 @@ def test_install_lifecycle(client) -> None:
             ),
         ),
         patch(
-            "agentteams_coding_cli.service.CodingCliService._installable",
+            "qwen_code_bridge.service.CodingCliService._installable",
             return_value=True,
         ),
     ):
@@ -196,7 +196,7 @@ def test_install_nightly_tag_uses_dist_tag(client) -> None:
     not silently dropped to latest."""
     import asyncio
 
-    from agentteams_coding_cli.registry import get_cli
+    from qwen_code_bridge.registry import get_cli
 
     service = CodingCliService()
     spec = get_cli("qwen-code")
