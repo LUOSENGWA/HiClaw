@@ -62,7 +62,7 @@ def _run_card(task_id: str) -> str:
     if not task:
         return (
             f"⚠️ 找不到派单记录 `{task_id}`（可能已清理）。\n"
-            "本会话是派单运行视图；发消息可刷新。"
+            "本会话由 Qwen Code 控制台承载；如未显示请刷新。"
         )
     state = task.get("state") or "?"
     exit_code = task.get("exit_code")
@@ -73,7 +73,7 @@ def _run_card(task_id: str) -> str:
     header = (
         f"**{task.get('task')}** · {cli} · {state}"
         f" · exit={exit_code} · wall={wall}s · approval={mode}\n"
-        "[在 Qwen Code 原生控制台查看](/qwen-code) "
+        "[打开 Qwen Code 控制台](/qwen-code) "
         f"· session `{task.get('session_id')}`\n"
     )
     if tail:

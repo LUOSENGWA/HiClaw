@@ -20,7 +20,6 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from .dispatch import (
@@ -224,44 +223,6 @@ async def post_sidebar(
 
 
 
-class MirrorRequest(BaseModel):
-    """One mirrored run event appended to the run chat."""
-
-    text: str = Field(min_length=1, max_length=4000)
-    user_id: str = "default"
-
-
-@router.post("/runs/{task_id}/mirror")
-async def mirror_run_event(
-    task_id: str,
-    body: MirrorRequest,
-    request: Request,
-) -> dict:
-    """Append one run event to the run chat's session (event granularity)."""
-    from qwenpaw.app.agent_context import get_agent_for_request
-
-    from .slash import append_to_session
-
-    try:
-        workspace = await get_agent_for_request(request)
-    except Exception as exc:  # no active agent
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    session = getattr(workspace, "session", None)
-    if session is None:
-        raise HTTPException(status_code=503, detail="session store unavailable")
-    ok = await append_to_session(
-        session,
-        f"qwen-code-bridge:{task_id}",
-        body.user_id,
-        "qwen-code-bridge",
-        role="assistant",
-        name="qwen-code",
-        text=body.text,
-    )
-    return {"appended": ok, "session_id": f"qwen-code-bridge:{task_id}"}
-
-
-
 @router.get("/chat/{chat_id}")
 async def get_chat_meta(chat_id: str, request: Request) -> dict:
     """Channel lookup for the console chat wrapper (server-side, no auth)."""
@@ -284,72 +245,6 @@ async def get_chat_meta(chat_id: str, request: Request) -> dict:
         "session_id": chat.session_id,
         "group_id": chat.group_id,
     }
-
-
-@router.get("/runs/{task_id}/stream")
-async def stream_run(task_id: str) -> StreamingResponse:
-    """SSE: tail a dispatch run's transcript + state transitions."""
-    import asyncio
-    import json as _json
-    import time as _time
-
-    from .dispatch import load_task
-    from .state import state_dir
-
-    log_path = state_dir() / "dispatch" / f"{task_id}.log"
-
-    async def _gen():
-        offset = 0
-        last_state = None
-        idle = 0
-        deadline = _time.time() + 3600
-        while _time.time() < deadline:
-            chunk = b""
-            try:
-                if log_path.exists():
-                    with log_path.open("rb") as fh:
-                        fh.seek(offset)
-                        chunk = fh.read()
-                        offset = fh.tell()
-            except Exception:
-                chunk = b""
-            if chunk:
-                idle = 0
-                for line in chunk.decode("utf-8", "ignore").splitlines():
-                    if line.strip():
-                        yield (
-                            "data: "
-                            + _json.dumps({"type": "log", "line": line})
-                            + "\n\n"
-                        )
-            else:
-                idle += 1
-            task = load_task(task_id) or {}
-            state = str(task.get("state") or "")
-            if state and state != last_state:
-                last_state = state
-                yield (
-                    "data: "
-                    + _json.dumps(
-                        {
-                            "type": "state",
-                            "state": state,
-                            "exit_code": task.get("exit_code"),
-                            "wall_s": task.get("wall_s"),
-                        },
-                    )
-                    + "\n\n"
-                )
-            if state in {"done", "failed", "timeout", "killed"} and idle >= 3:
-                yield "data: " + _json.dumps({"type": "end"}) + "\n\n"
-                break
-            await asyncio.sleep(0.4)
-
-    return StreamingResponse(
-        _gen(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
 
 
 @router.get("/dispatch")
