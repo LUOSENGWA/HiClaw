@@ -148,6 +148,10 @@ curl -X POST http://127.0.0.1:8088/api/qwen-code-bridge/dispatch \
 - **应急开关**：`localStorage["qwen-code-bridge-disable-wrap"]="1"` 后刷新，跳过 `core.chat` 包裹（不必卸载插件）
 - 回归：`tests/test_frontend_wrapper.py` 用 node 执行 wrapper（断言不抛错、回退宿主组件、lookup 被调用）
 
+**另一个常见现象**：原生控制台显示「守护进程尚未就绪，正在重试…」——这是 `qwen` CLI 在**容器重建后丢失**（镜像不带 CLI），`qwen serve` 起不来。修复：`bash tools/qwen-setup/reinstall.sh`（装 CLI + 恢复 settings/serve-token），再刷新；`/web/status` 会重新拉起 serve。
+
+**左栏 QwenCode 组**：`state/config.json` 写 `{"chat_sync": false}`（或环境变量 `QWEN_CODE_BRIDGE_CHAT_SYNC=0`）即**不再建组/运行卡**，`POST /sidebar` 变 no-op；`/q-code` 路由与 `/dispatch` 状态 API 不受影响。
+
 **恢复步骤**：① 硬刷新/关闭标签重开（清 site data 若仍白屏）② 选择 agent `AgentTeamGuide` ③ 打开派单会话 → 原生 Qwen Code 控制台；若仍异常，用上面的 localStorage 开关。
 
 ## 排障
