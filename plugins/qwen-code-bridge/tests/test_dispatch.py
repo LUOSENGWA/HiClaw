@@ -68,6 +68,7 @@ class Env:
         os.environ[STATE_DIR_ENV] = str(self.state_dir)
         os.environ[WATCH_INTERVAL_ENV] = "0.1"
         os.environ["PATH"] = f"{self.bin_dir}:/usr/bin:/bin"
+        os.environ["QWEN_CODE_BRIDGE_CHAT_SYNC"] = "0"
         return self
 
     def __exit__(self, *exc_info: Any) -> None:
@@ -781,6 +782,7 @@ async def test_dispatch_creates_and_renames_sidebar_chat(tmp_path, monkeypatch) 
         ),
     )
     with Env(tmp_path) as env:
+        monkeypatch.setenv("QWEN_CODE_BRIDGE_CHAT_SYNC", "1")
         _make_bin(env.bin_dir, "fakeq", 'echo \'{"type":"result","result":"ok"}\'')
         service = DispatchService()
         task_id = await service.start(

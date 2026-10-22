@@ -577,31 +577,33 @@ class DispatchService:
             name=f"coding-cli-dispatch-{task_id}",
         )
         # 侧栏同步（P1）：在 console 左栏 "QwenCode" 分组里建一条会话记录；失败不影响派单
-        try:
-            _wake = task.get("wake") or {}
-            _origin = task.get("origin") or {}
-            _root = chats.resolve_root(_wake.get("base_url"))
-            _agent = chats.resolve_agent(_wake.get("agent_id"))
-            _gid = await asyncio.to_thread(chats.ensure_group, _root, _agent)
-            _cid = await asyncio.to_thread(
-                chats.create_run_chat,
-                _root,
-                _agent,
-                name=chats.run_chat_name(task_name, cli, "running"),
-                session_id=f"qwen-code-bridge:{task_id}",
-                user_id=str(_origin.get("user_id") or "default"),
-                group_id=_gid,
-                meta={"task_id": task_id, "cli": cli, "task": task_name},
-            )
-            self._update_task(
-                task_id,
-                {"chat_id": _cid, "chat_sync": "created" if _cid else "empty"},
-            )
-        except Exception as exc:  # best-effort
-            self._update_task(
-                task_id,
-                {"chat_sync": f"failed: {str(exc)[:120]}"},
-            )
+        _sync = os.environ.get("QWEN_CODE_BRIDGE_CHAT_SYNC", "1") != "0"
+        if _sync:
+          try:
+              _wake = task.get("wake") or {}
+              _origin = task.get("origin") or {}
+              _root = chats.resolve_root(_wake.get("base_url"))
+              _agent = chats.resolve_agent(_wake.get("agent_id"))
+              _gid = await asyncio.to_thread(chats.ensure_group, _root, _agent)
+              _cid = await asyncio.to_thread(
+                  chats.create_run_chat,
+                  _root,
+                  _agent,
+                  name=chats.run_chat_name(task_name, cli, "running"),
+                  session_id=f"qwen-code-bridge:{task_id}",
+                  user_id=str(_origin.get("user_id") or "default"),
+                  group_id=_gid,
+                  meta={"task_id": task_id, "cli": cli, "task": task_name},
+              )
+              self._update_task(
+                  task_id,
+                  {"chat_id": _cid, "chat_sync": "created" if _cid else "empty"},
+              )
+          except Exception as exc:  # best-effort
+              self._update_task(
+                  task_id,
+                  {"chat_sync": f"failed: {str(exc)[:120]}"},
+              )
         return task_id
 
     @staticmethod
