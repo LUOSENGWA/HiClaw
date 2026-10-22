@@ -5,8 +5,8 @@ Compatibility contract (design doc §2):
 
 - Only the two-generation intersection ``PluginApi`` methods are used
   (``register_http_router`` / ``register_startup_hook`` /
-  ``register_shutdown_hook``; ``register_middleware`` is exercised by the
-  P2 session-injection middleware).
+  ``register_shutdown_hook`` / ``register_middleware``; the last one
+  carries the P2 session-injection middleware).
 - New-framework-only capabilities are probed with ``hasattr`` (P1
   declares none).
 - No runtime patching of framework internals, no module-level mutable
@@ -81,6 +81,9 @@ class AgentTeamsCodingCliPlugin:
 
     def register(self, api: PluginApi) -> None:
         _ensure_importable()
+        from agentteams_coding_cli.middleware import (
+            session_middleware_factory,
+        )
         from agentteams_coding_cli.router import build_router
 
         registry = _registry(api)
@@ -104,6 +107,7 @@ class AgentTeamsCodingCliPlugin:
                 _on_shutdown,
                 priority=200,
             )
+            api.register_middleware(session_middleware_factory, priority=50)
             self._probe_new_framework(api)
             return
 
@@ -146,7 +150,7 @@ class AgentTeamsCodingCliPlugin:
                 f"{owner!r}",
             )
 
-        # 3) Shutdown: log (P2 dispatch surface will release state here).
+        # 3) Shutdown: log only (file-backed state needs no release).
         owner = _hook_owner(
             api, registry.get_shutdown_hooks(), SHUTDOWN_HOOK_NAME
         )
@@ -166,6 +170,17 @@ class AgentTeamsCodingCliPlugin:
                 f"shutdown hook {SHUTDOWN_HOOK_NAME!r} is owned by plugin "
                 f"{owner!r}",
             )
+
+        # 4) Middleware: session env injection (design §5), priority 50.
+        if any(
+            reg.plugin_id == PLUGIN_ID
+            for reg in registry.get_middleware_factories()
+        ):
+            logger.debug(
+                "middleware factory already registered; skipping",
+            )
+        else:
+            api.register_middleware(session_middleware_factory, priority=50)
 
         self._probe_new_framework(api)
         logger.info(

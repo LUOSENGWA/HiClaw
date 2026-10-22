@@ -44,15 +44,6 @@ from agentscope.middleware import MiddlewareBase
 from agentscope.state import AgentState
 from agentscope.tool import FunctionTool, Toolkit, ToolChunk
 
-pytestmark = pytest.mark.xfail(
-    reason=(
-        "P2 scope: agentteams_coding_cli.middleware (SessionEnvMiddleware, "
-        "design doc §5) is not implemented in P1. T0 spike (spike-report.md) "
-        "verified H1 (on_acting input mutation reaches the tool layer) and "
-        "H2 (factory ctx.session_id populated) — 6/6 green."
-    ),
-    strict=True,
-)
 
 RECEIVED: dict[str, Any] = {}
 
