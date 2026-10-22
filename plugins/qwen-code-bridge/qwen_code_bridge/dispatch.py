@@ -39,7 +39,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from . import chats
+from . import chats, millforge
 from .endpoints import app_base
 from .registry import CLIS
 from .state import state_dir
@@ -805,6 +805,7 @@ class DispatchService:
                 "updated_at": now,
                 "log_tail": tail[0],
                 "wake_status": "pending" if wake_session_id else "skipped",
+                "notify_tier": millforge.notify_tier(status),
             },
         )
 

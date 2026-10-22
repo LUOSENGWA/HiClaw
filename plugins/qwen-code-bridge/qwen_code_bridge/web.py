@@ -152,22 +152,30 @@ async def ensure_serve() -> str:
             chunk = chunk.strip()
             if chunk and os.path.isdir(chunk) and chunk not in workspaces:
                 workspaces.append(chunk)
-        workspaces.append(str(state_dir()))
-        try:  # every run's cwd becomes a serve workspace (native session list)
+        try:  # every run's cwd becomes a serve workspace, in recency order
             import json as _json
+            import time as _time
 
-            seen = set(workspaces)
-            for path in sorted((state_dir() / "dispatch").glob("*.json"))[-20:]:
+            tasks = []
+            for path in (state_dir() / "dispatch").glob("*.json"):
                 try:
                     task = _json.loads(path.read_text(encoding="utf-8"))
                 except Exception:
                     continue
                 cwd = str(task.get("cwd") or "").strip()
-                if cwd and os.path.isdir(cwd) and cwd not in seen:
-                    seen.add(cwd)
+                if cwd and os.path.isdir(cwd):
+                    tasks.append((float(task.get("started_epoch") or 0), cwd))
+            for _, cwd in sorted(tasks, reverse=True):
+                if cwd not in workspaces:
                     workspaces.append(cwd)
         except Exception:
             pass
+        # primary workspace first: the first entry drives the console's default
+        # project view, so task cwds must precede the plugin's state dir.
+        state = str(state_dir())
+        if state in workspaces:
+            workspaces.remove(state)
+        workspaces.append(state)
         ws_args: list[str] = []
         for workspace in workspaces[:8]:
             ws_args += ["--workspace", workspace]
