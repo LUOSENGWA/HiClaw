@@ -19,6 +19,7 @@ import asyncio
 import json
 import mimetypes
 import os
+import shutil
 import re
 import secrets
 import socket
@@ -250,6 +251,8 @@ async def ensure_serve() -> str:
     token = serve_token() or secrets.token_urlsafe(16)
     url = f"http://127.0.0.1:{port}"
     binary = os.environ.get("QWEN_CODE_BRIDGE_CLI", "").strip() or "qwen"
+    if shutil.which(binary) is None:
+        return ""
     try:
         from .state import state_dir
 
@@ -286,6 +289,15 @@ async def ensure_serve() -> str:
         ws_args: list[str] = []
         for workspace in workspaces[:8]:
             ws_args += ["--workspace", workspace]
+        env = dict(os.environ)
+        try:
+            from .state import qwen_home
+
+            home = qwen_home()
+            if home:
+                env["QWEN_HOME"] = home
+        except Exception:
+            pass
         proc = await asyncio.create_subprocess_exec(
             binary,
             "serve",
@@ -296,6 +308,7 @@ async def ensure_serve() -> str:
             "--token",
             token,
             *ws_args,
+            env=env,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -317,6 +330,18 @@ async def ensure_serve() -> str:
 @router.get("/web/status")
 async def web_status() -> dict:
     """Probe ``qwen serve`` reachability (never raises)."""
+    binary = os.environ.get("QWEN_CODE_BRIDGE_CLI", "").strip() or "qwen"
+    if shutil.which(binary) is None:
+        return {
+            "reachable": False,
+            "url": "",
+            "error": "qwen-cli-missing",
+            "hint": (
+                "qwen CLI is not on PATH (container rebuild drops it). "
+                "Run tools/qwen-setup/reinstall.sh or use the prebuilt "
+                "qwenpaw:node image."
+            ),
+        }
     url = await ensure_serve()
     if not url:
         return {"reachable": False, "url": "", "error": "serve-url-unconfigured"}

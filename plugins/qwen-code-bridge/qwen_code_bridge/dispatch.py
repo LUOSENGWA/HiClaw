@@ -43,7 +43,7 @@ from typing import Any, Callable
 from . import approval, chats, millforge, progress, runs
 from .endpoints import app_base
 from .registry import CLIS
-from .state import state_dir
+from .state import qwen_home, state_dir
 
 #: Task ids are ``uuid4().hex``; the check also keeps task file names
 #: safe against traversal via ``get_task`` / ``get_log`` input.
@@ -940,6 +940,12 @@ class DispatchService:
 
         env = dict(os.environ)
         env["QWENPAW_SESSION_ID"] = session_id
+        try:
+            _home = qwen_home()
+            if _home:
+                env["QWEN_HOME"] = _home
+        except Exception:
+            pass
         spawn_args, prompt_via_stdin = build_spawn_plan(
             mode,
             session_id,

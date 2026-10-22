@@ -934,3 +934,13 @@ def test_chat_sync_switch_env_and_config(tmp_path, monkeypatch):
     assert d.chat_sync_enabled() is False
     (tmp_path / "config.json").write_text('{"chat_sync": true}', encoding="utf-8")
     assert d.chat_sync_enabled() is True
+
+
+def test_qwen_home_env_and_config(tmp_path, monkeypatch):
+    from qwen_code_bridge import state
+
+    monkeypatch.setattr(state, "state_dir", lambda: tmp_path)
+    (tmp_path / "config.json").write_text('{"qwen_home": "/persist/.qwen"}', encoding="utf-8")
+    assert state.qwen_home() == "/persist/.qwen"
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_QWEN_HOME", "/env/.qwen")
+    assert state.qwen_home() == "/env/.qwen"

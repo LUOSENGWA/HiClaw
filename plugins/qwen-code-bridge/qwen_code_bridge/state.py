@@ -49,3 +49,26 @@ def install_dir() -> Path:
 
 
 __all__ = ["STATE_DIR_ENV", "WORKING_DIR_ENV", "install_dir", "state_dir"]
+
+
+def qwen_home() -> str:
+    """Persisted CLI home (QWEN_HOME) from env or state/config.json.
+
+    Empty means "use the CLI default" (~/.qwen). Point it at a workspace
+    path to keep sessions/settings across container rebuilds.
+    """
+    import json as _json
+    import os as _os
+
+    raw = _os.environ.get("QWEN_CODE_BRIDGE_QWEN_HOME", "").strip()
+    if raw:
+        return raw
+    try:
+        cfg = state_dir() / "config.json"
+        if cfg.exists():
+            data = _json.loads(cfg.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return str(data.get("qwen_home") or "").strip()
+    except (OSError, ValueError):
+        pass
+    return ""
