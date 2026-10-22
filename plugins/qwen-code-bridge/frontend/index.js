@@ -119,11 +119,24 @@
   }
 
 
+  function authFetch(path) {
+    var headers = {};
+    try {
+      var token = HOST.getApiToken ? HOST.getApiToken() : null;
+      if (token) headers.Authorization = "Bearer " + token;
+    } catch (e) {}
+    try {
+      var agent = HOST.getSelectedAgentId ? HOST.getSelectedAgentId() : "";
+      if (agent) headers["X-Agent-Id"] = agent;
+    } catch (e) {}
+    var f = HOST.fetch ? HOST.fetch.bind(HOST) : window.fetch.bind(window);
+    return f(path, { headers: headers });
+  }
+
   function bridgeChatLookup(sessionId) {
     var base = (HOST.apiBaseUrl || "") + "/";
     function get(path) {
-      var f = HOST.fetch ? HOST.fetch.bind(HOST) : window.fetch.bind(window);
-      return f(path).then(function (r) { return r.ok ? r.json() : null; });
+      return authFetch(path).then(function (r) { return r.ok ? r.json() : null; });
     }
     return get(base + "api/chats/" + encodeURIComponent(sessionId))
       .catch(function () { return null; })
