@@ -95,7 +95,7 @@ async def test_missing_cli_reports_error(monkeypatch, tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_handler_persists_turn_into_session(stub, tmp_path) -> None:
     """The slash turn is appended to agent.state.context (chat history)."""
-    recorded: dict = {}
+    recorded: dict = {"saves": []}
 
     class FakeSession:
         async def get_session_state_dict(self, session_id, user_id="", channel=""):
@@ -103,7 +103,7 @@ async def test_handler_persists_turn_into_session(stub, tmp_path) -> None:
             return {}
 
         async def update_session_state(self, session_id, key, value, user_id="", channel=""):
-            recorded["save"] = (session_id, key, value, user_id, channel)
+            recorded["saves"].append((session_id, key, value, user_id, channel))
 
     class FakeWorkspace:
         session = FakeSession()
@@ -121,14 +121,17 @@ async def test_handler_persists_turn_into_session(stub, tmp_path) -> None:
     handler = slash.make_handler()
     msg = await handler(Ctx(), "hello cli")
     assert msg.content[0].text == "STUB-ANSWER"
-    session_id, key, value, user_id, channel = recorded["save"]
-    assert session_id == "qwen-code-bridge:direct"
-    assert key == "agent.state"
-    assert user_id == "default" and channel == "qwen-code-bridge"
-    roles = [m["role"] for m in value["context"]]
-    assert roles == ["user", "assistant"]
-    assert value["context"][0]["content"][0]["text"] == "hello cli"
-    assert value["context"][1]["content"][0]["text"] == "STUB-ANSWER"
+    saves = recorded["saves"]
+    assert len(saves) == 2
+    (sid_u, key_u, val_u, uid_u, ch_u) = saves[0]
+    (sid_a, key_a, val_a, uid_a, ch_a) = saves[1]
+    assert sid_u == sid_a == "qwen-code-bridge:direct"
+    assert key_u == key_a == "agent.state"
+    assert uid_u == uid_a == "default" and ch_u == ch_a == "qwen-code-bridge"
+    assert val_u["context"][-1]["role"] == "user"
+    assert val_u["context"][-1]["content"][0]["text"] == "hello cli"
+    assert val_a["context"][-1]["role"] == "assistant"
+    assert val_a["context"][-1]["content"][0]["text"] == "STUB-ANSWER"
 
 
 @pytest.mark.asyncio

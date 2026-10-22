@@ -164,6 +164,26 @@ def ensure_direct_chat(
     )
 
 
+def mirror_run(
+    root: str,
+    agent_id: str,
+    task_id: str,
+    text: str,
+    user_id: str = "default",
+) -> bool:
+    """Append one run event to the run chat (best-effort, returns success)."""
+    try:
+        _request(
+            "POST",
+            f"{root}/api/qwen-code-bridge/runs/{task_id}/mirror",
+            {"text": text, "user_id": user_id},
+            agent_id,
+        )
+        return True
+    except Exception:
+        return False
+
+
 def rename_chat(
     root: str,
     agent_id: str,

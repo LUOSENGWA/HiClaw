@@ -668,6 +668,54 @@ class DispatchService:
             ]
         )
 
+    async def _mirror_loop(
+        self,
+        task_id: str,
+        root: str,
+        agent_id: str,
+        user_id: str,
+        interval: float = 5.0,
+    ) -> None:
+        """Stream run events into the run chat (event granularity)."""
+        last = ""
+        while True:
+            task = self._read_task(task_id) or {}
+            state = str(task.get("state") or "")
+            tail = str(task.get("log_tail") or "").strip().splitlines()
+            line = tail[-1][:500] if tail else ""
+            text = f"[{state}] {line}" if line else f"[{state}]"
+            if text != last:
+                last = text
+                try:
+                    await asyncio.to_thread(
+                        chats.mirror_run,
+                        root,
+                        agent_id,
+                        task_id,
+                        text,
+                        user_id,
+                    )
+                except Exception:
+                    pass
+            if state in {"done", "failed", "timeout", "killed"}:
+                try:
+                    await asyncio.to_thread(
+                        chats.mirror_run,
+                        root,
+                        agent_id,
+                        task_id,
+                        "[final] state={} exit={} wall={}s".format(
+                            state,
+                            task.get("exit_code"),
+                            task.get("wall_s"),
+                        ),
+                        user_id,
+                    )
+                except Exception:
+                    pass
+                return
+            await asyncio.sleep(interval)
+
     async def _watch(
         self,
         task_id: str,
@@ -699,6 +747,17 @@ class DispatchService:
                     )
 
         pump = asyncio.ensure_future(_pump())
+        _w = (self._read_task(task_id) or {}).get("wake") or {}
+        _o = (self._read_task(task_id) or {}).get("origin") or {}
+        mirror_task = asyncio.create_task(
+            self._mirror_loop(
+                task_id,
+                chats.resolve_root(_w.get("base_url")),
+                chats.resolve_agent(_w.get("agent_id")),
+                str(_o.get("user_id") or _w.get("user_id") or "default"),
+            ),
+            name=f"qwen-code-bridge-mirror-{task_id}",
+        )
         try:
             while True:
                 await asyncio.sleep(self._watch_interval)
@@ -748,6 +807,10 @@ class DispatchService:
             },
         )
 
+        try:
+            await asyncio.wait_for(mirror_task, timeout=2.0)
+        except Exception:
+            mirror_task.cancel()
         # 侧栏同步（P1）：终态改名（状态进名字）
         _chat_id = str(task.get("chat_id") or "")
         if _chat_id:

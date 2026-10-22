@@ -185,6 +185,51 @@ async def run_cli(
 
 
 
+
+async def append_to_session(
+    session: Any,
+    session_id: str,
+    user_id: str,
+    channel: str,
+    *,
+    role: str,
+    name: str,
+    text: str,
+) -> bool:
+    """Append one message to a session's agent context (chat history)."""
+    try:
+        from agentscope.message import Msg, TextBlock
+        from agentscope.state import AgentState
+
+        state_dict = await session.get_session_state_dict(
+            session_id,
+            user_id=user_id,
+            channel=channel,
+        )
+        raw = ((state_dict or {}).get("agent") or {}).get("state") or {}
+        try:
+            state = AgentState.model_validate(raw) if raw else AgentState()
+        except Exception:
+            state = AgentState()
+        state.context.append(
+            Msg(
+                name=name,
+                role=role,
+                content=[TextBlock(type="text", text=text)],
+            ),
+        )
+        await session.update_session_state(
+            session_id,
+            "agent.state",
+            state.model_dump(mode="json"),
+            user_id=user_id,
+            channel=channel,
+        )
+        return True
+    except Exception:
+        return False
+
+
 async def _persist_turn(ctx: Any, user_text: str, answer: str) -> None:
     """Append the slash turn to the session store so the chat shows it.
 
@@ -202,39 +247,23 @@ async def _persist_turn(ctx: Any, user_text: str, answer: str) -> None:
         session_id = str(getattr(ctx, "session_id", "") or "")
         if not session_id:
             return
-        state_dict = await session.get_session_state_dict(
+        await append_to_session(
+            session,
             session_id,
-            user_id=user_id,
-            channel=channel,
+            user_id,
+            channel,
+            role="user",
+            name=user_id,
+            text=user_text,
         )
-        raw = ((state_dict or {}).get("agent") or {}).get("state") or {}
-        from agentscope.message import Msg, TextBlock
-        from agentscope.state import AgentState
-
-        try:
-            state = AgentState.model_validate(raw) if raw else AgentState()
-        except Exception:
-            state = AgentState()
-        state.context.append(
-            Msg(
-                name=user_id,
-                role="user",
-                content=[TextBlock(type="text", text=user_text)],
-            ),
-        )
-        state.context.append(
-            Msg(
-                name="qwen-code",
-                role="assistant",
-                content=[TextBlock(type="text", text=answer)],
-            ),
-        )
-        await session.update_session_state(
+        await append_to_session(
+            session,
             session_id,
-            "agent.state",
-            state.model_dump(mode="json"),
-            user_id=user_id,
-            channel=channel,
+            user_id,
+            channel,
+            role="assistant",
+            name="qwen-code",
+            text=answer,
         )
     except Exception:
         return

@@ -58,6 +58,23 @@ def _http_prefix_owner(api: PluginApi, prefix: str) -> str | None:
 
 
 
+
+def _register_prompt_section(api: PluginApi) -> None:
+    """Register the bridge guidance section (idempotent, best-effort)."""
+    try:
+        from qwen_code_bridge.prompt import bridge_prompt
+
+        api.register_prompt_section(
+            "qwen_code_bridge",
+            after="workspace",
+            provider=bridge_prompt,
+            priority=60,
+        )
+        logger.info("prompt section qwen_code_bridge registered")
+    except Exception as exc:
+        logger.warning("prompt section registration skipped: %s", exc)
+
+
 def _register_runtime_hook(api: PluginApi) -> None:
     """Register the PRE_DISPATCH bridge-chat hook (idempotent)."""
     registry = _registry(api)
@@ -167,6 +184,7 @@ class QwenCodeBridgePlugin:
             api.register_middleware(session_middleware_factory, priority=50)
             _register_slash(api)
             _register_runtime_hook(api)
+            _register_prompt_section(api)
             self._probe_new_framework(api)
             return
 
@@ -243,6 +261,7 @@ class QwenCodeBridgePlugin:
 
         _register_slash(api)
         _register_runtime_hook(api)
+        _register_prompt_section(api)
         self._probe_new_framework(api)
         logger.info(
             "%s registered: management API at /api%s",
