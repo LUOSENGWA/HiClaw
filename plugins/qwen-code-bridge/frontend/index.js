@@ -92,11 +92,6 @@
         },
         React.createElement("strong", null, "Qwen Code"),
         React.createElement(
-          "span",
-          { style: { opacity: 0.6, fontSize: 12 } },
-          dark ? "深色" : "浅色",
-        ),
-        React.createElement(
           "a",
           { href: src, target: "_blank", rel: "noreferrer" },
           "新标签打开",
