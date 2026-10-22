@@ -148,7 +148,11 @@ curl -X POST http://127.0.0.1:8088/api/qwen-code-bridge/dispatch \
 - **应急开关**：`localStorage["qwen-code-bridge-disable-wrap"]="1"` 后刷新，跳过 `core.chat` 包裹（不必卸载插件）
 - 回归：`tests/test_frontend_wrapper.py` 用 node 执行 wrapper（断言不抛错、回退宿主组件、lookup 被调用）
 
-**另一个常见现象**：原生控制台显示「守护进程尚未就绪，正在重试…」——这是 `qwen` CLI 在**容器重建后丢失**（镜像不带 CLI），`qwen serve` 起不来。修复：`bash tools/qwen-setup/reinstall.sh`（装 CLI + 恢复 settings/serve-token），再刷新；`/web/status` 会重新拉起 serve。
+**另一个常见现象**：原生控制台显示「守护进程尚未就绪，正在重试…」。两个已实证原因：
+1. **qwen CLI 在容器重建后丢失**（上游镜像不带 CLI）→ `bash tools/qwen-setup/reinstall.sh`；
+2. **`qwen serve` 拒绝嵌套 `--workspace`**（例如同时传 `/tmp` 与 `/tmp/qcb-persist`）→ 进程秒退。插件已过滤嵌套 workspace；若再遇到看 `state/web-serve.log`（spawn 的 stderr 已落盘）。
+
+**会话持久化**：CLI 会话在 `$HOME/.qwen/projects/<dir>/chats/*.jsonl`（只设 `QWEN_HOME` 不够）。`state/config.json` 设 `{"cli_home": "/app/working/.cli-home"}` 后，serve 与 dispatch 都用该 HOME（首次自动播种 settings/token，git 配置用 `GIT_CONFIG_GLOBAL` 保留），**容器重建后会话仍在**。推荐同时用预装 CLI 的派生镜像 `qwenpaw:node`（`tools/qwenpaw001-image/Dockerfile.run-as-node`）。
 
 **左栏 QwenCode 组**：`state/config.json` 写 `{"chat_sync": false}`（或环境变量 `QWEN_CODE_BRIDGE_CHAT_SYNC=0`）即**不再建组/运行卡**，`POST /sidebar` 变 no-op；`/q-code` 路由与 `/dispatch` 状态 API 不受影响。
 
