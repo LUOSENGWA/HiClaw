@@ -131,7 +131,7 @@ class SpawnFailedError(RuntimeError):
 
 #: ``wake_sender(session_id, agent_id, base_url, text) -> None``;
 #: returns on success, raises on final failure.
-WakeSender = Callable[[str, str, str, str], None]
+WakeSender = Callable[[str, str, str, str, str], None]
 
 
 def _effective_approval_level(agent_id: str) -> str:
@@ -211,10 +211,16 @@ def _pending_approval_line(base_url: str, session_id: str) -> str:
     return line
 
 
-def _wake_body(session_id: str, text: str, approval_level: str) -> dict:
-    """Console chat payload; ``request_context`` pins the wake turn level."""
+def _wake_body(
+    session_id: str,
+    text: str,
+    approval_level: str,
+    channel: str = "console",
+) -> dict:
+    """Chat payload; ``channel`` picks console vs matrix, ``request_context``
+    pins the wake turn's approval level."""
     body: dict[str, Any] = {
-        "channel": "console",
+        "channel": str(channel or "console"),
         "user_id": "default",
         "session_id": session_id,
         "input": [
@@ -231,6 +237,7 @@ def default_wake_sender(
     agent_id: str,
     base_url: str,
     text: str,
+    channel: str = "console",
 ) -> None:
     """Real-HTTP session inject (dispatch_notify.py default backend).
 
@@ -243,7 +250,12 @@ def default_wake_sender(
         or os.environ.get("QWENPAW_APP_URL", "").strip()
         or _DEFAULT_WAKE_URL
     ).rstrip("/")
-    body = _wake_body(session_id, text, _effective_approval_level(agent_id))
+    body = _wake_body(
+        session_id,
+        text,
+        _effective_approval_level(agent_id),
+        channel,
+    )
     pending_line = _pending_approval_line(base_url, session_id)
     if pending_line:
         body["input"][0]["content"][0]["text"] += (
@@ -623,6 +635,7 @@ class DispatchService:
                     str(wake.get("agent_id") or ""),
                     str(wake.get("base_url") or ""),
                     text,
+                    str(wake.get("channel") or "console"),
                 )
                 wake_status = "sent"
             except Exception as exc:  # wake is best-effort; state stands

@@ -78,13 +78,20 @@ class Env:
 def _wake_recorder() -> tuple[list[dict[str, str]], Any]:
     calls: list[dict[str, str]] = []
 
-    def sender(session_id: str, agent_id: str, base_url: str, text: str) -> None:
+    def sender(
+        session_id: str,
+        agent_id: str,
+        base_url: str,
+        text: str,
+        channel: str = "console",
+    ) -> None:
         calls.append(
             {
                 "session_id": session_id,
                 "agent_id": agent_id,
                 "base_url": base_url,
                 "text": text,
+                "channel": channel,
             }
         )
 
@@ -554,6 +561,8 @@ def test_wake_body_pins_approval_level() -> None:
     body = _wake_body("sid-1", "3 lines", "SMART")
     assert body["request_context"] == {"approval_level": "SMART"}
     assert body["session_id"] == "sid-1"
+    assert body["channel"] == "console"
+    assert _wake_body("matrix:!r:mx", "t", "", "matrix")["channel"] == "matrix"
     assert _wake_body("sid-2", "t", "") == {
         "channel": "console",
         "user_id": "default",

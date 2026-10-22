@@ -77,11 +77,17 @@ class WakeSpec(BaseModel):
     ``session_id`` selects the QwenPaw session to wake; empty/absent
     means no wake. ``base_url`` overrides the app URL (else the
     ``QWENPAW_APP_URL`` env var, else ``http://127.0.0.1:8088``).
+
+    ``channel`` selects the delivery surface: ``console`` (same-app
+    session inject, default) or ``matrix`` (AgentTeams worker containers
+    with the matrix-channel plugin; ``session_id`` must be
+    ``matrix:<room_id>``). Exactly one surface per wake.
     """
 
     session_id: str = ""
     agent_id: str = ""
     base_url: str | None = None
+    channel: str = "console"
 
 
 class DispatchRequest(BaseModel):
