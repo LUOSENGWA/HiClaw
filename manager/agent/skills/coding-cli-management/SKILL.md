@@ -129,6 +129,33 @@ Note: the pre-existing claude/gemini cases already run skip-permissions-class fl
 
 ---
 
+## Workflow visibility (TeamHarness)
+
+**Default ownership: the Worker manages the coding CLI.** The Worker has the
+`coding-cli` skill and runs/stops the CLI itself; a Manager/Leader runs it on
+the Worker's behalf only as a fallback (return the `run_id`/status to the
+Worker). The CLI is an **execution tool**, not a TeamHarness client. When a CLI
+run serves a TeamHarness task (the task id is in the assignment/spec), the
+**Worker** owns the run lifecycle and records it in the existing workflow task —
+no separate CLI task is created:
+
+1. **Dispatch**: the Worker calls
+   `taskflow report_progress` with a short note, e.g.
+   `coding-cli:<cli> run=<run_id> dispatched` (worker/remote-member role;
+   note ≤ 200 chars; it lands in the task audit history, state unchanged).
+2. **Terminal**: the Worker calls `taskflow submit_task`:
+   - success → `SUCCESS` / `SUCCESS_WITH_NOTES` (+ summary/deliverables),
+   - blocked/interrupted → `BLOCKED` / `INTERRUPTED`.
+3. **Cancellation**: stopping the CLI process is **Worker-managed**; the
+   workflow task's `cancel_task` is **Leader-only** by TeamHarness contract.
+   The Worker reports the stopped run, and the Leader cancels the task when
+   appropriate. Do not invent a second task or a parallel state.
+
+If a Manager/Leader runs the CLI **on behalf of** a Worker, it must return the
+`run_id` and terminal status to that Worker; only the Worker can call
+`report_progress` / `submit_task` for its own task. This keeps the workflow
+view = the existing task's status + history (dispatch/completed/blocked/cancelled).
+
 ## Persistence and re-install after worker recreation
 
 The CLI binary and its `npm install -g` payload live in the worker container's
