@@ -573,8 +573,11 @@ def test_default_wake_sender_carries_level_and_pending(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         dispatch_mod,
-        "_pending_approvals",
-        lambda _base, _sid: ["r1 tool=shell ls"],
+        "_pending_approval_line",
+        lambda _base, _sid: (
+            "待审批 1 条 | 最近: run_shell_command → ls -la "
+            "(age 3s, medium) reason=No rule hit"
+        ),
     )
 
     captured: list[dict] = []
@@ -601,4 +604,50 @@ def test_default_wake_sender_carries_level_and_pending(monkeypatch) -> None:
     assert body["request_context"] == {"approval_level": "AUTO"}
     text = body["input"][0]["content"][0]["text"]
     assert text.startswith("line1\nline2\nline3")
-    assert "待审批 1 条" in text and "r1 tool=shell" in text
+    assert "待审批 1 条" in text
+    assert "最近: run_shell_command" in text and "ls -la" in text
+    assert "唤醒回合请先处理" in text
+
+
+def test_pending_approval_line_reads_operation(monkeypatch) -> None:
+    """The wake line carries what the newest pending approval actually is."""
+    import agentteams_coding_cli.dispatch as dispatch_mod
+
+    payload = {
+        "pending_approvals": [
+            {
+                "tool_name": "run_shell_command",
+                "tool_display_name": "run_shell_command",
+                "exact_target": "rm -rf /tmp/x",
+                "reasoning": "No rule hit",
+                "severity": "high",
+                "created_at": time.time() - 5,
+            },
+            {
+                "tool_name": "write_file",
+                "created_at": time.time() - 50,
+            },
+        ],
+        "count": 2,
+    }
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, _n: int = -1) -> bytes:
+            return json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda req, timeout=0: _Resp(),  # noqa: ARG005
+    )
+    line = dispatch_mod._pending_approval_line("", "sid-x")
+    assert "待审批 2 条" in line
+    assert "最近: run_shell_command" in line
+    assert "rm -rf /tmp/x" in line
+    assert "reason=No rule hit" in line
+    assert "其余 1 条: write_file" in line

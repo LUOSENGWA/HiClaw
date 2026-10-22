@@ -154,8 +154,13 @@ def _effective_approval_level(agent_id: str) -> str:
         return ""
 
 
-def _pending_approvals(base_url: str, session_id: str) -> list[str]:
-    """Best-effort compact lines for approvals pending on the session."""
+def _pending_approval_line(base_url: str, session_id: str) -> str:
+    """One compact line describing the newest pending approval ("" if none).
+
+    Reads the host approval list; ``exact_target`` is the literal operation
+    (e.g. the shell command) and ``reasoning`` is why the guard flagged it.
+    Resolved approvals are not queryable — the service keeps no history.
+    """
     root = (
         base_url
         or os.environ.get("QWENPAW_APP_URL", "").strip()
@@ -169,22 +174,41 @@ def _pending_approvals(base_url: str, session_id: str) -> list[str]:
         with urllib.request.urlopen(url, timeout=3) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception:
-        return []
-    items = (data or {}).get("pending_approvals") or []
-    lines: list[str] = []
-    for item in items[:3]:
-        if not isinstance(item, dict):
-            continue
-        rid = str(item.get("request_id") or "?")
-        tool = str(item.get("tool_name") or "?")
-        detail = str(
-            item.get("command")
-            or item.get("summary")
-            or item.get("description")
-            or "",
-        )[:60]
-        lines.append(f"{rid} tool={tool} {detail}".strip())
-    return lines
+        return ""
+    items = [
+        item
+        for item in ((data or {}).get("pending_approvals") or [])
+        if isinstance(item, dict)
+    ]
+    if not items:
+        return ""
+    items.sort(key=lambda x: float(x.get("created_at") or 0.0), reverse=True)
+    newest = items[0]
+    tool = str(
+        newest.get("tool_display_name") or newest.get("tool_name") or "?"
+    )
+    target = str(newest.get("exact_target") or "")[:80]
+    try:
+        age = int(max(0.0, time.time() - float(newest.get("created_at") or 0.0)))
+    except (TypeError, ValueError):
+        age = -1
+    sev = str(newest.get("severity") or "")
+    line = f"待审批 {len(items)} 条 | 最近: {tool}"
+    if target:
+        line += f" → {target}"
+    line += f" (age {age}s"
+    if sev:
+        line += f", {sev}"
+    line += ")"
+    reason = str(newest.get("reasoning") or "")[:60]
+    if reason:
+        line += f" reason={reason}"
+    if len(items) > 1:
+        others = ",".join(
+            str(i.get("tool_name") or "?") for i in items[1:4]
+        )
+        line += f"; 其余 {len(items) - 1} 条: {others}"
+    return line
 
 
 def _wake_body(session_id: str, text: str, approval_level: str) -> dict:
@@ -220,13 +244,10 @@ def default_wake_sender(
         or _DEFAULT_WAKE_URL
     ).rstrip("/")
     body = _wake_body(session_id, text, _effective_approval_level(agent_id))
-    pending = _pending_approvals(base_url, session_id)
-    if pending:
+    pending_line = _pending_approval_line(base_url, session_id)
+    if pending_line:
         body["input"][0]["content"][0]["text"] += (
-            "\n待审批 "
-            + str(len(pending))
-            + " 条（唤醒回合请先处理）: "
-            + "; ".join(pending)
+            "\n" + pending_line + "（唤醒回合请先处理）"
         )
     last = ""
     for attempt in range(_WAKE_ATTEMPTS):
