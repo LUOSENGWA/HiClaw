@@ -125,8 +125,18 @@ def web_dist() -> Path | None:
         from .state import state_dir
 
         raw = os.environ.get(WEB_DIST_ENV, "").strip()
-        path = Path(raw) if raw else state_dir() / "web-shell" / "dist"
-        return path if (path / "index.html").is_file() else None
+        candidates = []
+        if raw:
+            candidates.append(Path(raw))
+        candidates.append(state_dir() / "web-shell" / "dist")
+        # a "-full" plugin ZIP may ship the dist inside the plugin directory
+        candidates.append(
+            Path(__file__).resolve().parent.parent / "web-shell" / "dist",
+        )
+        for path in candidates:
+            if (path / "index.html").is_file():
+                return path
+        return None
     except Exception:
         return None
 

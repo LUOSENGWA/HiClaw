@@ -58,6 +58,23 @@ curl -s http://127.0.0.1:8088/api/plugins -H "X-Agent-Id: $AGENT" | grep qwen-co
    `_prepare_builtin_plugin("qwen-code-bridge", builtin_root / "qwen-code-bridge")`
 4. 重建 worker 镜像 → 新 worker 启动即带插件（`/api/plugins` 显示 loaded）
 
+
+### C. ZIP 安装（分发用）
+
+```bash
+curl -X POST 'http://127.0.0.1:8088/api/plugins/upload?force=true' \
+  -H "X-Agent-Id: $AGENT" -F 'file=@qwen-code-bridge-0.1.0.zip;type=application/zip'
+```
+
+两个产物（`dist/`）：
+
+| 包 | 大小 | 内容 | 适用 |
+|---|---|---|---|
+| `qwen-code-bridge-0.1.0.zip` | ~74 KB | 插件代码/文档/测试/构建脚本（无 web-shell 产物） | 已自行构建 web shell 的部署 |
+| `qwen-code-bridge-0.1.0-full.zip` | ~5.6 MB | 同上 + `web-shell/dist`（409 文件，原生控制台开箱即用） | 绝大多数部署 |
+
+> 上传安装已实测：`loaded=true`，插件目录内含 `web-shell/dist`；`/web/` 200、客户端路由刷新回退正常。
+
 ### 3) 原生 Web 控制台（可选但推荐）
 
 QwenPaw 单端口内跑**原生 Qwen Code web**需要一份按 base 重建的 shell：
