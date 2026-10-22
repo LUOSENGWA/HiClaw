@@ -6,8 +6,37 @@
  * theme (preference key "qwenpaw-theme" + prefers-color-scheme fallback).
  */
 (function () {
+  var PROBE_ID = "qwen-code-bridge-probe";
+  function probe(msg) {
+    try {
+      var el = document.getElementById(PROBE_ID);
+      if (!el) {
+        el = document.createElement("div");
+        el.id = PROBE_ID;
+        el.style.cssText =
+          "position:fixed;bottom:4px;left:4px;z-index:99999;font:11px/1.4 monospace;" +
+          "background:rgba(0,0,0,.72);color:#7CFC00;padding:3px 6px;border-radius:4px;" +
+          "max-width:70vw;overflow:hidden;pointer-events:none";
+        (document.body || document.documentElement).appendChild(el);
+      }
+      el.textContent = "QCBRIDGE " + msg;
+    } catch (e) {}
+  }
+  try {
+    var H0 = window.QwenPaw || {};
+    probe(
+      "host=" + (window.QwenPaw ? "yes" : "no") +
+      " keys=" + Object.keys(H0).slice(0, 12).join(",") +
+      " hostReact=" + ((H0.host && H0.host.React) ? "yes" : "no") +
+      " registerRoutes=" + (typeof H0.registerRoutes)
+    );
+  } catch (e) {
+    probe("probe-error " + e);
+  }
+
   var H = window.QwenPaw || {};
-  var React = H.React;
+  var HOST = H.host || {};
+  var React = HOST.React || H.React;
   if (!React || typeof H.registerRoutes !== "function") {
     console.warn("[qwen-code-bridge] host API unavailable; route not registered");
     return;

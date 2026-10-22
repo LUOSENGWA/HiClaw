@@ -73,6 +73,8 @@ def _run_card(task_id: str) -> str:
     header = (
         f"**{task.get('task')}** · {cli} · {state}"
         f" · exit={exit_code} · wall={wall}s · approval={mode}\n"
+        "[在 Qwen Code 原生控制台查看](/qwen-code) "
+        f"· session `{task.get('session_id')}`\n"
     )
     if tail:
         header += "```\n" + "\n".join(tail) + "\n```"

@@ -10,19 +10,19 @@ from __future__ import annotations
 
 PROMPT_TEXT = (
     "## Qwen Code bridge\n"
-    "- Chats whose channel is `qwen-code-bridge` are bridge chats:\n"
-    "  `QwenCode · 直接对话` is a passthrough to the local Qwen Code CLI "
-    "(your messages are answered by the CLI, not by you); "
-    "`<task> · <cli> · <state>` chats are read-only dispatch views — sending "
-    "a message there refreshes a status card, it does not start a task.\n"
-    "- For coding work, prefer dispatching through the bridge API "
-    "(`POST /api/qwen-code-bridge/dispatch`) with `origin` set to your own "
-    "session triple; the terminal wake returns to that session. Do not poll: "
-    "read the task state file or wait for the wake.\n"
-    "- `/qcode <prompt>` answers from Qwen Code inside any chat, with "
-    "per-session continuity. Approval tiers follow the host tool-execution "
-    "level (STRICT→plan, SMART→auto-edit, AUTO→auto, OFF→yolo).\n"
+    "- Bridge chats (channel `qwen-code-bridge`) bypass you: "
+    "`QwenCode \u00b7 直接对话` is answered by the local Qwen Code CLI, and "
+    "`<task> \u00b7 <cli> \u00b7 <state>` chats render a read-only run card "
+    "that links to the native Qwen Code console (`/qwen-code`).\n"
+    "- Delegate coding work with `POST /api/qwen-code-bridge/dispatch` and "
+    "pass `origin` = your own session triple (session_id / user_id / channel); "
+    "the terminal wake returns to that session. Check status with "
+    "`GET /api/qwen-code-bridge/dispatch/<task>` \u2014 never poll a shell.\n"
+    "- `/qcode <prompt>` answers from Qwen Code in any chat with per-session "
+    "continuity. Approval tiers follow the host tool-execution level "
+    "(STRICT\u2192plan, SMART\u2192auto-edit, AUTO\u2192auto, OFF\u2192yolo).\n"
 )
+
 
 
 def bridge_prompt(_agent=None) -> str:

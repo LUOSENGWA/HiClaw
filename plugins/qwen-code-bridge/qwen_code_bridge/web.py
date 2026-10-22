@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse, Response
 
 SERVE_URL_ENV = "QWEN_CODE_BRIDGE_SERVE_URL"
 SERVE_AUTOSTART_ENV = "QWEN_CODE_BRIDGE_SERVE_AUTOSTART"
+SERVE_WORKSPACE_ENV = "QWEN_CODE_BRIDGE_SERVE_WORKSPACE"
 SERVE_TOKEN_ENV = "QWEN_CODE_BRIDGE_SERVE_TOKEN"
 DEFAULT_SERVE_URL = ""  # resolved from env/serve.json; auto-start allocates a free port
 
@@ -145,7 +146,31 @@ async def ensure_serve() -> str:
     try:
         from .state import state_dir
 
-        workdir = str(state_dir())
+        workspaces: list[str] = []
+        env_ws = os.environ.get(SERVE_WORKSPACE_ENV, "").strip()
+        for chunk in env_ws.replace(":", ",").split(","):
+            chunk = chunk.strip()
+            if chunk and os.path.isdir(chunk) and chunk not in workspaces:
+                workspaces.append(chunk)
+        workspaces.append(str(state_dir()))
+        try:  # every run's cwd becomes a serve workspace (native session list)
+            import json as _json
+
+            seen = set(workspaces)
+            for path in sorted((state_dir() / "dispatch").glob("*.json"))[-20:]:
+                try:
+                    task = _json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                cwd = str(task.get("cwd") or "").strip()
+                if cwd and os.path.isdir(cwd) and cwd not in seen:
+                    seen.add(cwd)
+                    workspaces.append(cwd)
+        except Exception:
+            pass
+        ws_args: list[str] = []
+        for workspace in workspaces[:8]:
+            ws_args += ["--workspace", workspace]
         proc = await asyncio.create_subprocess_exec(
             binary,
             "serve",
@@ -155,8 +180,7 @@ async def ensure_serve() -> str:
             str(port),
             "--token",
             token,
-            "--workspace",
-            workdir,
+            *ws_args,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )

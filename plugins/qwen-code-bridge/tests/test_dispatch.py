@@ -225,6 +225,7 @@ async def test_spawn_args_match_production_adapter(tmp_path, monkeypatch) -> Non
             "CI",
             "-o",
             "stream-json",
+            "--chat-recording",
             "--session-id",
             terminal["session_id"],
             "-p",

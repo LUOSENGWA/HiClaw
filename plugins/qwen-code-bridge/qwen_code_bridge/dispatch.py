@@ -110,6 +110,7 @@ SPAWN_ARG_TEMPLATE: tuple[str, ...] = (
     "CI",
     "-o",
     "stream-json",
+    "--chat-recording",
     "--session-id",
     "{sid}",
     "-p",
