@@ -33,6 +33,7 @@ import re
 import shutil
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -62,12 +63,29 @@ _DEFAULT_WAKE_URL = "http://127.0.0.1:8088"
 _WAKE_ENDPOINT = "/api/console/chat"
 _WAKE_ATTEMPTS = 3
 
+#: Approval tiers accepted by the qwen CLI. Resolution order is 1:1 with
+#: ``run-coding-cli.sh`` (#1379): per-run request > env > default "yolo".
+APPROVAL_MODES: tuple[str, ...] = (
+    "plan",
+    "default",
+    "auto-edit",
+    "auto",
+    "yolo",
+)
+
+#: Default tier for unattended dispatch (10/22 ruling).
+DEFAULT_APPROVAL_MODE = "yolo"
+
+#: Env override mirroring the runner's config fallback (#1379).
+APPROVAL_MODE_ENV = "AGENTTEAMS_CODING_CLI_APPROVAL_MODE"
+
 #: Headless spawn args, 1:1 with the production adapter.
 #: Authoritative source: ``tools/dispatch_adapters.json`` (entry "qwen",
-#: key "args"); ``{sid}`` / ``{prompt}`` are substituted in ``start()``.
+#: key "args"); ``{approval_mode}`` / ``{sid}`` / ``{prompt}`` are
+#: substituted in ``start()``.
 SPAWN_ARG_TEMPLATE: tuple[str, ...] = (
     "--approval-mode",
-    "yolo",
+    "{approval_mode}",
     "--channel",
     "CI",
     "-o",
@@ -77,6 +95,26 @@ SPAWN_ARG_TEMPLATE: tuple[str, ...] = (
     "-p",
     "{prompt}",
 )
+
+
+def resolve_approval_mode(requested: str | None = None) -> str:
+    """Resolve the per-run approval tier (flag > env > default "yolo").
+
+    Mirrors ``run-coding-cli.sh`` (#1379). Raises ``ValueError`` on an
+    unknown tier so the API answers 400 instead of spawning a CLI with
+    an invalid flag.
+    """
+    for raw in (requested, os.environ.get(APPROVAL_MODE_ENV, "")):
+        value = str(raw or "").strip()
+        if not value:
+            continue
+        if value not in APPROVAL_MODES:
+            raise ValueError(
+                f"invalid approval_mode {value!r}; expected one of "
+                + ", ".join(APPROVAL_MODES),
+            )
+        return value
+    return DEFAULT_APPROVAL_MODE
 
 
 class DispatchBusyError(RuntimeError):
@@ -96,6 +134,74 @@ class SpawnFailedError(RuntimeError):
 WakeSender = Callable[[str, str, str, str], None]
 
 
+def _effective_approval_level(agent_id: str) -> str:
+    """Read the effective QwenPaw tool-execution level for the wake turn.
+
+    Returns ``""`` when the host config is unavailable; the wake then
+    omits ``request_context`` and the session default applies (never
+    fail the wake over this).
+    """
+    try:
+        from qwenpaw.config.config import load_agent_config
+        from qwenpaw.config.utils import load_config
+
+        aid = str(agent_id or "").strip()
+        if not aid:
+            aid = str(load_config().agents.active_agent or "default")
+        profile = load_agent_config(aid)
+        return str(getattr(profile, "approval_level", "") or "").strip()
+    except Exception:  # pragma: no cover - host config always present
+        return ""
+
+
+def _pending_approvals(base_url: str, session_id: str) -> list[str]:
+    """Best-effort compact lines for approvals pending on the session."""
+    root = (
+        base_url
+        or os.environ.get("QWENPAW_APP_URL", "").strip()
+        or _DEFAULT_WAKE_URL
+    ).rstrip("/")
+    url = (
+        f"{root}/api/approval/list?session_id="
+        + urllib.parse.quote(session_id, safe="")
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return []
+    items = (data or {}).get("pending_approvals") or []
+    lines: list[str] = []
+    for item in items[:3]:
+        if not isinstance(item, dict):
+            continue
+        rid = str(item.get("request_id") or "?")
+        tool = str(item.get("tool_name") or "?")
+        detail = str(
+            item.get("command")
+            or item.get("summary")
+            or item.get("description")
+            or "",
+        )[:60]
+        lines.append(f"{rid} tool={tool} {detail}".strip())
+    return lines
+
+
+def _wake_body(session_id: str, text: str, approval_level: str) -> dict:
+    """Console chat payload; ``request_context`` pins the wake turn level."""
+    body: dict[str, Any] = {
+        "channel": "console",
+        "user_id": "default",
+        "session_id": session_id,
+        "input": [
+            {"content": [{"type": "text", "text": text}], "metadata": {}},
+        ],
+    }
+    if approval_level:
+        body["request_context"] = {"approval_level": approval_level}
+    return body
+
+
 def default_wake_sender(
     session_id: str,
     agent_id: str,
@@ -113,12 +219,15 @@ def default_wake_sender(
         or os.environ.get("QWENPAW_APP_URL", "").strip()
         or _DEFAULT_WAKE_URL
     ).rstrip("/")
-    body = {
-        "channel": "console",
-        "user_id": "default",
-        "session_id": session_id,
-        "input": [{"content": [{"type": "text", "text": text}], "metadata": {}}],
-    }
+    body = _wake_body(session_id, text, _effective_approval_level(agent_id))
+    pending = _pending_approvals(base_url, session_id)
+    if pending:
+        body["input"][0]["content"][0]["text"] += (
+            "\n待审批 "
+            + str(len(pending))
+            + " 条（唤醒回合请先处理）: "
+            + "; ".join(pending)
+        )
     last = ""
     for attempt in range(_WAKE_ATTEMPTS):
         try:
@@ -288,21 +397,25 @@ class DispatchService:
         cli: str,
         timeout: float,
         wake: dict[str, Any] | None,
+        approval_mode: str | None = None,
     ) -> str:
         """Spawn a headless CLI run; returns the new task id.
 
-        The child is ``<cli> --approval-mode yolo --channel CI
+        The child is ``<cli> --approval-mode <tier> --channel CI
         -o stream-json --session-id <uuid> -p <prompt>`` (args 1:1 with
         ``tools/dispatch_adapters.json``, design §4.2) with
         ``QWENPAW_SESSION_ID`` set in its env — the spawn path is
-        plugin-controlled, so no middleware is involved.
+        plugin-controlled, so no middleware is involved. ``approval_mode``
+        resolves flag > env > default "yolo" (#1379 parity).
 
         Raises:
             DispatchBusyError: same task name already running (claim flag).
             CliNotFoundError: ``cli`` binary not on PATH (hint in message).
-            ValueError: ``cwd`` given but not a directory.
+            ValueError: ``cwd`` given but not a directory, or an invalid
+                ``approval_mode``.
             SpawnFailedError: the child process could not be started.
         """
+        mode = resolve_approval_mode(approval_mode)
         running = self.running_task_named(task_name)
         if running is not None:
             raise DispatchBusyError(
@@ -340,6 +453,7 @@ class DispatchService:
             "finished_at": None,
             "wall_s": None,
             "log_tail": "",
+            "approval_mode": mode,
             "wake": dict(wake) if wake else None,
             "wake_status": None,
         }
@@ -353,6 +467,8 @@ class DispatchService:
                 spawn_args.append(prompt)
             elif item == "{sid}":
                 spawn_args.append(session_id)
+            elif item == "{approval_mode}":
+                spawn_args.append(mode)
             else:
                 spawn_args.append(item)
         try:
@@ -496,6 +612,9 @@ class DispatchService:
 
 
 __all__ = [
+    "APPROVAL_MODES",
+    "APPROVAL_MODE_ENV",
+    "DEFAULT_APPROVAL_MODE",
     "DEFAULT_DISPATCH_TIMEOUT",
     "SPAWN_ARG_TEMPLATE",
     "WATCH_INTERVAL_ENV",
@@ -505,4 +624,5 @@ __all__ = [
     "SpawnFailedError",
     "WakeSender",
     "default_wake_sender",
+    "resolve_approval_mode",
 ]

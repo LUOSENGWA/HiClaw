@@ -472,3 +472,133 @@ def test_http_bad_cwd_400(dispatch_http) -> None:
     )
     assert res.status_code == 400
     assert "cwd is not a directory" in res.json()["detail"]
+
+
+# ---- approval mode (#1379 parity) + wake approval context (10/22) ----
+
+
+@pytest.mark.asyncio
+async def test_approval_mode_override_reaches_argv(tmp_path) -> None:
+    """approval_mode=PATCH_THROUGH: explicit tier lands in the spawn argv."""
+    with Env(tmp_path) as env:
+        args_file = env.tmp / "captured-args.txt"
+        body = (
+            'printf "%s\\n" "$@" > '
+            f"{args_file}; "
+            'echo \'{"type":"assistant","text":"ok"}\''
+        )
+        _make_bin(env.bin_dir, "fakeq", body)
+        service = DispatchService()
+        task_id = await service.start(
+            task_name="t-approval",
+            prompt="do it",
+            cwd=None,
+            cli="fakeq",
+            timeout=30,
+            wake=None,
+            approval_mode="auto",
+        )
+        terminal = await _wait_terminal(service, task_id)
+        assert terminal["state"] == "done"
+        assert terminal["approval_mode"] == "auto"
+        captured = args_file.read_text(encoding="utf-8").splitlines()
+        idx = captured.index("--approval-mode")
+        assert captured[idx + 1] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_approval_mode_default_yolo_and_invalid(tmp_path) -> None:
+    """No request/env -> yolo; unknown tier -> ValueError before spawn."""
+    with Env(tmp_path) as env:
+        _make_bin(env.bin_dir, "fakeq", 'echo \'{"type":"result","result":"ok"}\'')
+        service = DispatchService()
+        task_id = await service.start(
+            task_name="t-approval-default",
+            prompt="do it",
+            cwd=None,
+            cli="fakeq",
+            timeout=30,
+            wake=None,
+        )
+        terminal = await _wait_terminal(service, task_id)
+        assert terminal["approval_mode"] == "yolo"
+
+        with pytest.raises(ValueError):
+            await service.start(
+                task_name="t-approval-bad",
+                prompt="do it",
+                cwd=None,
+                cli="fakeq",
+                timeout=30,
+                wake=None,
+                approval_mode="bogus",
+            )
+
+
+def test_resolve_approval_mode_precedence(monkeypatch) -> None:
+    from agentteams_coding_cli.dispatch import (
+        APPROVAL_MODE_ENV,
+        resolve_approval_mode,
+    )
+
+    monkeypatch.delenv(APPROVAL_MODE_ENV, raising=False)
+    assert resolve_approval_mode(None) == "yolo"
+    monkeypatch.setenv(APPROVAL_MODE_ENV, "auto")
+    assert resolve_approval_mode(None) == "auto"
+    assert resolve_approval_mode("plan") == "plan"
+
+
+def test_wake_body_pins_approval_level() -> None:
+    from agentteams_coding_cli.dispatch import _wake_body
+
+    body = _wake_body("sid-1", "3 lines", "SMART")
+    assert body["request_context"] == {"approval_level": "SMART"}
+    assert body["session_id"] == "sid-1"
+    assert _wake_body("sid-2", "t", "") == {
+        "channel": "console",
+        "user_id": "default",
+        "session_id": "sid-2",
+        "input": [{"content": [{"type": "text", "text": "t"}], "metadata": {}}],
+    }
+
+
+def test_default_wake_sender_carries_level_and_pending(monkeypatch) -> None:
+    """Wake POST body: request_context level + pending approvals appended."""
+    import agentteams_coding_cli.dispatch as dispatch_mod
+
+    monkeypatch.setattr(
+        dispatch_mod,
+        "_effective_approval_level",
+        lambda _agent_id: "AUTO",
+    )
+    monkeypatch.setattr(
+        dispatch_mod,
+        "_pending_approvals",
+        lambda _base, _sid: ["r1 tool=shell ls"],
+    )
+
+    captured: list[dict] = []
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, _n: int = -1) -> bytes:
+            return b'{"ok":true}'
+
+    def fake_urlopen(req, timeout=0):  # noqa: ARG001
+        captured.append(json.loads(req.data.decode("utf-8")))
+        return _Resp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    dispatch_mod.default_wake_sender("sid-9", "AgentTeamGuide", "", "line1\nline2\nline3")
+
+    assert captured, "wake never POSTed"
+    body = captured[0]
+    assert body["request_context"] == {"approval_level": "AUTO"}
+    text = body["input"][0]["content"][0]["text"]
+    assert text.startswith("line1\nline2\nline3")
+    assert "待审批 1 条" in text and "r1 tool=shell" in text

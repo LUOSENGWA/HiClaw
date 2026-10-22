@@ -100,6 +100,14 @@ class DispatchRequest(BaseModel):
     cli: str = "qwen"
     timeout: float = Field(default=DEFAULT_DISPATCH_TIMEOUT, ge=1)
     files_to_touch: list[str] = Field(default_factory=list)
+    approval_mode: str | None = Field(
+        default=None,
+        description=(
+            "Per-run qwen approval tier (plan/default/auto-edit/auto/yolo); "
+            "resolution: request > env AGENTTEAMS_CODING_CLI_APPROVAL_MODE > "
+            "'yolo' (#1379 parity)."
+        ),
+    )
     wake: WakeSpec | None = None
 
 
@@ -128,6 +136,7 @@ async def post_dispatch(
             cli=body.cli,
             timeout=body.timeout,
             wake=wake,
+            approval_mode=body.approval_mode,
         )
     except DispatchBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
