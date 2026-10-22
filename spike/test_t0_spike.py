@@ -271,6 +271,16 @@ def _unregister_spike(registry: Any) -> None:
     ]
 
 
+def _unwrap_plugin_middleware(mw: Any) -> Any:
+    """New framework (#7565+) wraps plugin middlewares in PluginMiddlewareGuard.
+
+    The guard forwards hooks to ``.middleware``; unwrap it so assertions and
+    driving target the plugin instance itself. Old framework returns raw.
+    """
+    inner = getattr(mw, "middleware", None)
+    return inner if inner is not None else mw
+
+
 def test_h2_factory_receives_ctx_with_session_id(tmp_path) -> None:
     """H2：PluginRegistry 注册 → AgentBuilder._build_middlewares 调工厂，
     工厂收到的 ctx 即请求 HookContext 且 session_id 有值。"""
@@ -298,7 +308,8 @@ def test_h2_factory_receives_ctx_with_session_id(tmp_path) -> None:
     assert factory_ctx is ctx
     assert factory_ctx.session_id == session_id
     assert any(
-        isinstance(mw, SpikeSessionMiddleware) for mw in mws
+        isinstance(_unwrap_plugin_middleware(mw), SpikeSessionMiddleware)
+        for mw in mws
     ), f"plugin middleware missing from built list: {mws!r}"
 
 
@@ -323,7 +334,11 @@ async def test_h2_closed_loop_session_id_reaches_shell_tool(tmp_path) -> None:
     finally:
         _unregister_spike(registry)
 
-    mw = next(m for m in mws if isinstance(m, SpikeSessionMiddleware))
+    mw = next(
+        _unwrap_plugin_middleware(m)
+        for m in mws
+        if isinstance(_unwrap_plugin_middleware(m), SpikeSessionMiddleware)
+    )
     agent = _make_agent(mw)
     received = await _drive_agent(agent, command="qwen --version")
     assert (

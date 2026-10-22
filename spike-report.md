@@ -45,3 +45,13 @@ spike 三组对偶测试（`test_t0_spike.py::test_h1_*`）：
 - 采用「`json.loads(input_kwargs["tool_call"].input)` → 若已是 shell 类工具且 `command` 未含目标变量 → 拼接 `export QWENPAW_SESSION_ID='...'` 前缀（幂等：已含则跳过）→ `json.dumps` 原地写回 `tc.input`」——即 spike 策略 A（对象引用传递，最贴近设计文档 §5 的形态）。
 - 工厂内 `if not ctx.session_id: return None`（与 spike `test_h2_empty_session_factory_returns_none` 行为一致，空 session 不装中间件）。
 - 工具白名单只认 shell 类工具（按 `tool_call.name` / 工具类型判断），避免误改其他工具的 input。
+
+## P3-a 增补：新框架（#7565 @0db9a8e）双跑实测（2026-10-22）
+
+**新框架差异点（实测）**：
+1. `AgentBuilder._build_middlewares` 返回的列表里，插件中间件被包进 `qwenpaw.runtime.plugin_middleware.PluginMiddlewareGuard`（`guard.middleware` = 内层实例，钩子经 guard 转发；guard 负责插件钩子故障隔离 + 流回收）。因此任何「按类型挑出插件实例」的断言/驱动必须先解包，否则会误判"中间件没被采用"。
+2. 任务态恢复与 `PluginLifecycle`（`load / unload / reload / update_config`）实测：`load` 后 router/hooks/middleware 各 1 条；`reload` 后仍各 1 条（无重复注册）；`unload(UNLOAD)` 后全部清零且不删插件源码目录。
+3. 文件态 dispatch 任务（`<state_dir>/dispatch/<32hex>.json`，task_id 必须匹配 `^[0-9a-f]{32}$`）在 reload 后由新实例可读 —— D5「状态全落文件」跨重载成立。
+4. `register_shutdown_hook` 在新框架已标记 deprecated（建议 `api.effect` / runtime ledger）；本插件保留交集 API，警告不影响功能。
+
+**双跑结果**：旧框架（venv 2.2.2）**31 passed, 1 skipped**（新框架专属 lifecycle 测试自动 skip）；新框架（PYTHONPATH=#7565 树）**32 passed**。环境依赖：新树需 `typesafe_sdk`（PyPI 0.7.5）。
