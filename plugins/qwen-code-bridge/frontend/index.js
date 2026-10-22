@@ -84,6 +84,26 @@
     return q || "";
   }
 
+  // Look up a chat's channel server-side. This was referenced by the wrapper
+  // but never defined — any chat render threw ReferenceError and took the
+  // whole console down (React error boundary). Keep it total: never throw.
+  function bridgeChatLookup(chatId) {
+    try {
+      return fetch("/api/qwen-code-bridge/chat/" + encodeURIComponent(chatId), {
+        credentials: "same-origin",
+        headers: { Accept: "application/json" },
+      })
+        .then(function (resp) {
+          return resp && resp.ok ? resp.json() : null;
+        })
+        .catch(function () {
+          return null;
+        });
+    } catch (e) {
+      return Promise.resolve(null);
+    }
+  }
+
   function makeChatWrapper(Inner) {
     return function BridgeChatRoute() {
       var st = React.useState({ id: "", chat: null });
@@ -94,16 +114,25 @@
         var alive = true;
         var timer = null;
         function tick() {
-          var sid = chatIdFromUrl();
-          if (sid === lastId.current) return;
-          lastId.current = sid;
-          if (!sid) {
-            setState({ id: "", chat: null });
-            return;
+          try {
+            var sid = chatIdFromUrl();
+            if (sid === lastId.current) return;
+            lastId.current = sid;
+            if (!sid) {
+              setState({ id: "", chat: null });
+              return;
+            }
+            bridgeChatLookup(sid)
+              .then(function (found) {
+                if (alive) setState({ id: sid, chat: found || null });
+              })
+              .catch(function () {
+                if (alive) setState({ id: sid, chat: null });
+              });
+          } catch (e) {
+            // A plugin bug must never brick the host console.
+            if (alive) setState({ id: "", chat: null });
           }
-          bridgeChatLookup(sid).then(function (found) {
-            if (alive) setState({ id: sid, chat: found || null });
-          });
         }
         tick();
         timer = setInterval(tick, 800);
@@ -123,7 +152,7 @@
       {
         path: "/qwen-code",
         label: "Qwen Code",
-        icon: HOST.React.createElement("img", {src: 'data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2224%22%20height%3D%2224%22%20viewBox%3D%2217.5%2027.7%20135.6%20135.6%22%3E%0A%20%20%3Cstyle%3E%40media%20(prefers-color-scheme%3A%20dark)%20%7B%20path%20%7B%20fill%3A%20%238B9BFF%3B%20%7D%20%7D%3C%2Fstyle%3E%0A%20%20%3Cpath%20fill%3D%22%23082DFF%22%20d%3D%22M130.06%2C43.66h-33.37c0-1.42-.37-2.84-1.1-4.11l-4.47-7.74c-1.47-2.54-4.18-4.11-7.12-4.11h-8.93c-2.94%2C0-5.65%2C1.57-7.12%2C4.11l-13.68%2C23.69c-1.47%2C2.54-1.47%2C5.67%2C0%2C8.22l4.47%2C7.74c1.47%2C2.54%2C4.18%2C4.11%2C7.12%2C4.11h64.19c2.94%2C0%2C5.65-1.57%2C7.12-4.11l4.47-7.74c1.47-2.54%2C1.47-5.67%2C0-8.22l-4.47-7.74c-1.47-2.54-4.18-4.11-7.12-4.11Z%22%20%2F%3E%0A%20%20%3Cpath%20fill%3D%22%23082DFF%22%20d%3D%22M19.75%2C83.66l16.68%2C28.9c-1.23.71-2.27%2C1.74-3.01%2C3.01l-4.47%2C7.74c-1.47%2C2.54-1.47%2C5.67%2C0%2C8.22l4.47%2C7.74c1.47%2C2.54%2C4.18%2C4.11%2C7.12%2C4.11h27.35c2.94%2C0%2C5.65-1.57%2C7.12-4.11l4.47-7.74c1.47-2.54%2C1.47-5.67%2C0-8.22l-32.1-55.59c-1.47-2.54-4.18-4.11-7.12-4.11h-8.93c-2.94%2C0-5.65%2C1.57-7.12%2C4.11l-4.47%2C7.74c-1.47%2C2.54-1.47%2C5.67%2C0%2C8.22Z%22%20%2F%3E%0A%20%20%3Cpath%20fill%3D%22%23082DFF%22%20d%3D%22M109.55%2C159.19l16.68-28.9c1.23.71%2C2.64%2C1.1%2C4.11%2C1.1h8.93c2.94%2C0%2C5.65-1.57%2C7.12-4.11l4.47-7.74c1.47-2.54%2C1.47-5.67%2C0-8.22l-13.68-23.69c-1.47-2.54-4.18-4.11-7.12-4.11h-8.93c-2.94%2C0-5.65%2C1.57-7.12%2C4.11l-32.1%2C55.59c-1.47%2C2.54-1.47%2C5.67%2C0%2C8.22l4.47%2C7.74c1.47%2C2.54%2C4.18%2C4.11%2C7.12%2C4.11h8.93c2.94%2C0%2C5.65-1.57%2C7.12-4.11Z%22%20%2F%3E%0A%3C%2Fsvg%3E%0A', alt: "Qwen Code", style: {width: 16, height: 16, display: "block"}}),
+        icon: React.createElement("img", {src: 'data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2224%22%20height%3D%2224%22%20viewBox%3D%2217.5%2027.7%20135.6%20135.6%22%3E%0A%20%20%3Cstyle%3E%40media%20(prefers-color-scheme%3A%20dark)%20%7B%20path%20%7B%20fill%3A%20%238B9BFF%3B%20%7D%20%7D%3C%2Fstyle%3E%0A%20%20%3Cpath%20fill%3D%22%23082DFF%22%20d%3D%22M130.06%2C43.66h-33.37c0-1.42-.37-2.84-1.1-4.11l-4.47-7.74c-1.47-2.54-4.18-4.11-7.12-4.11h-8.93c-2.94%2C0-5.65%2C1.57-7.12%2C4.11l-13.68%2C23.69c-1.47%2C2.54-1.47%2C5.67%2C0%2C8.22l4.47%2C7.74c1.47%2C2.54%2C4.18%2C4.11%2C7.12%2C4.11h64.19c2.94%2C0%2C5.65-1.57%2C7.12-4.11l4.47-7.74c1.47-2.54%2C1.47-5.67%2C0-8.22l-4.47-7.74c-1.47-2.54-4.18-4.11-7.12-4.11Z%22%20%2F%3E%0A%20%20%3Cpath%20fill%3D%22%23082DFF%22%20d%3D%22M19.75%2C83.66l16.68%2C28.9c-1.23.71-2.27%2C1.74-3.01%2C3.01l-4.47%2C7.74c-1.47%2C2.54-1.47%2C5.67%2C0%2C8.22l4.47%2C7.74c1.47%2C2.54%2C4.18%2C4.11%2C7.12%2C4.11h27.35c2.94%2C0%2C5.65-1.57%2C7.12-4.11l4.47-7.74c1.47-2.54%2C1.47-5.67%2C0-8.22l-32.1-55.59c-1.47-2.54-4.18-4.11-7.12-4.11h-8.93c-2.94%2C0-5.65%2C1.57-7.12%2C4.11l-4.47%2C7.74c-1.47%2C2.54-1.47%2C5.67%2C0%2C8.22Z%22%20%2F%3E%0A%20%20%3Cpath%20fill%3D%22%23082DFF%22%20d%3D%22M109.55%2C159.19l16.68-28.9c1.23.71%2C2.64%2C1.1%2C4.11%2C1.1h8.93c2.94%2C0%2C5.65-1.57%2C7.12-4.11l4.47-7.74c1.47-2.54%2C1.47-5.67%2C0-8.22l-13.68-23.69c-1.47-2.54-4.18-4.11-7.12-4.11h-8.93c-2.94%2C0-5.65%2C1.57-7.12%2C4.11l-32.1%2C55.59c-1.47%2C2.54-1.47%2C5.67%2C0%2C8.22l4.47%2C7.74c1.47%2C2.54%2C4.18%2C4.11%2C7.12%2C4.11h8.93c2.94%2C0%2C5.65-1.57%2C7.12-4.11Z%22%20%2F%3E%0A%3C%2Fsvg%3E%0A', alt: "Qwen Code", style: {width: 16, height: 16, display: "block"}}),
         priority: 20,
         component: QwenCodePage,
       },
