@@ -1045,7 +1045,13 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
             "spec": "Late delegate should not overwrite a cancelled task.",
         },
     })
-    if late_delegate.get("ok") or "terminal task: cancelled" not in late_delegate.get("error", ""):
+    if (
+        late_delegate.get("ok")
+        or late_delegate.get("error") != "illegal_transition"
+        or late_delegate.get("from") != "cancelled"
+        or late_delegate.get("to") != "assigned"
+        or "terminal state cancelled" not in late_delegate.get("detail", "")
+    ):
         raise AssertionError(f"cancelled task should reject late delegate_task: {late_delegate!r}")
     if old_spec_path.read_text(encoding="utf-8") != old_spec:
         raise AssertionError("late delegate_task should not overwrite spec.md for a cancelled task")
@@ -1054,14 +1060,26 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
         "action": "ack_task",
         "payload": {"taskId": old_task_id},
     })
-    if late_ack.get("ok") or "terminal task: cancelled" not in late_ack.get("error", ""):
+    if (
+        late_ack.get("ok")
+        or late_ack.get("error") != "illegal_transition"
+        or late_ack.get("from") != "cancelled"
+        or late_ack.get("to") != "in_progress"
+        or "terminal state cancelled" not in late_ack.get("detail", "")
+    ):
         raise AssertionError(f"cancelled task should reject late ack_task: {late_ack!r}")
     late_submit = payload("taskflow", {
         "role": "worker",
         "action": "submit_task",
         "payload": {"taskId": old_task_id, "summary": "late result", "deliverables": []},
     })
-    if late_submit.get("ok") or "terminal task: cancelled" not in late_submit.get("error", ""):
+    if (
+        late_submit.get("ok")
+        or late_submit.get("error") != "illegal_transition"
+        or late_submit.get("from") != "cancelled"
+        or late_submit.get("to") != "submitted"
+        or "terminal state cancelled" not in late_submit.get("detail", "")
+    ):
         raise AssertionError(f"cancelled task should reject late submit_task: {late_submit!r}")
     old_meta_path = pathlib.Path("#{workspace}") / f"shared/tasks/{old_task_id}/meta.json"
     old_meta = json.loads(old_meta_path.read_text(encoding="utf-8"))
@@ -1128,7 +1146,13 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
             "spec": "Late delegate should not revive the loop task.",
         },
     })
-    if dag_loop_delegate.get("ok") or "terminal task: cancelled" not in dag_loop_delegate.get("error", ""):
+    if (
+        dag_loop_delegate.get("ok")
+        or dag_loop_delegate.get("error") != "illegal_transition"
+        or dag_loop_delegate.get("from") != "cancelled"
+        or dag_loop_delegate.get("to") != "assigned"
+        or "terminal state cancelled" not in dag_loop_delegate.get("detail", "")
+    ):
         raise AssertionError(f"DAG-to-loop terminal task should reject delegate_task: {dag_loop_delegate!r}")
     dag_loop_after = json.loads(dag_loop_meta_path.read_text(encoding="utf-8"))
     dag_loop_top_nodes = {task["task_id"]: task for task in dag_loop_after.get("tasks", [])}
@@ -1165,7 +1189,13 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
             "reason": "manual_replan",
         },
     })
-    if completed_cancel.get("ok") or "cannot cancel terminal task" not in completed_cancel.get("error", ""):
+    if (
+        completed_cancel.get("ok")
+        or completed_cancel.get("error") != "illegal_transition"
+        or completed_cancel.get("from") != "completed"
+        or completed_cancel.get("to") != "cancelled"
+        or "terminal state completed" not in completed_cancel.get("detail", "")
+    ):
         raise AssertionError(f"completed task should not be silently cancelled: {completed_cancel!r}")
 
     terminal_project_id = "terminal-cancel-project"
@@ -1268,7 +1298,12 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
                 "reason": "manual_replan",
             },
         })
-        if terminal_cancel.get("ok") or "cannot cancel terminal task" not in terminal_cancel.get("error", ""):
+        if (
+            terminal_cancel.get("ok")
+            or terminal_cancel.get("error") != "illegal_transition"
+            or terminal_cancel.get("to") != "cancelled"
+            or "terminal state" not in terminal_cancel.get("detail", "")
+        ):
             raise AssertionError(f"terminal task should not be silently cancelled: {terminal_task_id} {terminal_cancel!r}")
     repeated_cancel = payload("taskflow", {
         "role": "leader",
