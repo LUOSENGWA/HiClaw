@@ -145,6 +145,16 @@ class DispatchRequest(BaseModel):
         default=None,
         description="Existing CLI session id; re-dispatch with --resume so a kill+re-dispatch keeps context (steering).",
     )
+    runs_dir: str | None = Field(
+        default=None,
+        description="AgentTeams coding-cli-logs dir; when set, the terminal run writes runs.jsonl + transcript for /api/v1/coding-runs.",
+    )
+    worker: str | None = Field(
+        default=None, description="Worker this run served (recorded in runs.jsonl)."
+    )
+    runner: str | None = Field(
+        default=None, description="Delegating runner/agent (recorded in runs.jsonl)."
+    )
     approval_mode: str | None = Field(
         default=None,
         description=(
@@ -193,6 +203,9 @@ async def post_dispatch(
             max_session_turns=body.max_session_turns,
             allowed_tools=body.allowed_tools,
             resume_session_id=body.resume_session_id,
+            runs_dir=body.runs_dir,
+            worker=body.worker,
+            runner=body.runner,
         )
     except DispatchBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

@@ -31,6 +31,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -39,7 +40,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from . import approval, chats, millforge, progress
+from . import approval, chats, millforge, progress, runs
 from .endpoints import app_base
 from .registry import CLIS
 from .state import state_dir
@@ -669,6 +670,19 @@ class DispatchService:
         return changed
 
     async def _notify_external(self, task: dict[str, Any]) -> None:
+        try:
+            if not task.get("run_record"):
+                log_text = await asyncio.to_thread(self.get_log, task["task_id"]) or ""
+                rec = await asyncio.to_thread(
+                    runs.write_run_record, task, log_text, task.get("runs_dir")
+                )
+                if rec:
+                    self._update_task(
+                        task["task_id"],
+                        {"run_record": rec["record"], "run_log": rec["run"]},
+                    )
+        except Exception:
+            pass
         wake = task.get("wake") or {}
         origin = task.get("origin") or {}
         sid = str(origin.get("session_id") or wake.get("session_id") or "").strip()
@@ -795,6 +809,9 @@ class DispatchService:
         max_session_turns: int | None = None,
         allowed_tools: list[str] | None = None,
         resume_session_id: str | None = None,
+        runs_dir: str | None = None,
+        worker: str | None = None,
+        runner: str | None = None,
     ) -> str:
         """Spawn a headless CLI run; returns the new task id.
 
@@ -826,6 +843,22 @@ class DispatchService:
         bin_path = shutil.which(cli)
         if bin_path is None:
             raise CliNotFoundError(_install_hint(cli))
+        cli_version = None
+        try:
+            probe = await asyncio.to_thread(
+                subprocess.run,
+                [bin_path, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            cli_version = runs.parse_cli_version(probe.stdout or probe.stderr)
+        except Exception:
+            cli_version = None
+        tested_cli_versions = {"0.26.0"}
+        cli_version_supported = (
+            cli_version in tested_cli_versions if cli_version else None
+        )
         if cwd:
             cwd = str(Path(cwd).expanduser())
             if not os.path.isdir(cwd):
@@ -879,6 +912,11 @@ class DispatchService:
             "progress": None,
             "evidence": str(evidence).upper() if evidence else None,
             "resumed_from": resumed_from,
+            "runs_dir": runs_dir or None,
+            "worker": worker or None,
+            "runner": runner or None,
+            "cli_version": cli_version,
+            "cli_version_supported": cli_version_supported,
             "max_wall_time": max_wall_time,
             "max_session_turns": max_session_turns,
             "allowed_tools": list(allowed_tools or []),
@@ -1254,6 +1292,20 @@ class DispatchService:
                 "terminal_summary": terminal_summary,
             },
         )
+
+        # Q3: AgentTeams coding-runs index (only when runs_dir is configured)
+        try:
+            log_text = await asyncio.to_thread(self.get_log, task_id) or ""
+            rec = await asyncio.to_thread(
+                runs.write_run_record, task, log_text, task.get("runs_dir")
+            )
+            if rec:
+                self._update_task(
+                    task_id,
+                    {"run_record": rec["record"], "run_log": rec["run"]},
+                )
+        except Exception:
+            pass
 
         # 侧栏同步（P1）：终态改名（状态进名字）
         _chat_id = str(task.get("chat_id") or "")
