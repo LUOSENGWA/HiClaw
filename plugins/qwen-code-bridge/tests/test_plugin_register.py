@@ -99,7 +99,14 @@ def test_register_is_idempotent(plugin_module, state_env, tmp_path) -> None:
             for h in registry.get_startup_hooks()
             if h.plugin_id == plugin_id
         ]
-        assert len(startup) == 1
+        # [/qcode] adds its own deferred startup/workspace hooks, so the
+        # contract is "no duplicates" rather than "exactly one".
+        names = [h.hook_name for h in startup]
+        assert len(names) == len(set(names)), names
+        assert sum(1 for n in names if n.endswith("ensure_state_dir")) == 1
+        assert any(
+            ("slash_cmd_" in n or "slash_command_" in n) for n in names
+        ), names
         shutdown = [
             h
             for h in registry.get_shutdown_hooks()
@@ -107,8 +114,10 @@ def test_register_is_idempotent(plugin_module, state_env, tmp_path) -> None:
         ]
         assert len(shutdown) == 1
 
-        # The startup hook callback creates the state directory.
-        startup[0].callback()
+        # The state-dir startup hook creates the state directory.
+        next(
+            h for h in startup if h.hook_name.endswith("ensure_state_dir")
+        ).callback()
         assert (tmp_path / "state").is_dir()
     finally:
         registry.unregister_plugin(plugin_id)

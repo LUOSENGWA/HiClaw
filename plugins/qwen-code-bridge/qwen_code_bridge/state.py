@@ -2,14 +2,14 @@
 """File-backed state directory for the coding-cli plugin (design doc §3).
 
 All mutable plugin state (install task state; dispatch task state from P2)
-lives under ``<workspace>/.qwenpaw/coding-cli/`` as files, so the plugin
+lives under ``<workspace>/.qwenpaw/qwen-code-bridge/`` as files, so the plugin
 survives hot reloads and restarts without module-level mutable globals.
 
 Resolution priority:
 1. ``QWENPAW_CODING_CLI_STATE_DIR`` env override (tests / ops).
-2. ``$QWENPAW_WORKING_DIR/.qwenpaw/coding-cli`` — same env resolution as
+2. ``$QWENPAW_WORKING_DIR/.qwenpaw/qwen-code-bridge`` — same env resolution as
    agentteams-matrix-channel (channel.py L3796-3802).
-3. ``qwenpaw.constant.WORKING_DIR/.qwenpaw/coding-cli``.
+3. ``qwenpaw.constant.WORKING_DIR/.qwenpaw/qwen-code-bridge``.
 """
 
 from __future__ import annotations
@@ -17,7 +17,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-STATE_DIR_ENV = "QWENPAW_CODING_CLI_STATE_DIR"
+STATE_DIR_ENV = "QWEN_CODE_BRIDGE_STATE_DIR"
+LEGACY_STATE_DIR_ENV = "QWENPAW_CODING_CLI_STATE_DIR"
 WORKING_DIR_ENV = "QWENPAW_WORKING_DIR"
 
 
@@ -35,9 +36,11 @@ def _qwenpaw_working_dir() -> Path:
 def state_dir() -> Path:
     """Resolve the plugin state directory (does not create it)."""
     override = os.environ.get(STATE_DIR_ENV, "").strip()
+    if not override:
+        override = os.environ.get(LEGACY_STATE_DIR_ENV, "").strip()
     if override:
         return Path(override).expanduser()
-    return _qwenpaw_working_dir() / ".qwenpaw" / "coding-cli"
+    return _qwenpaw_working_dir() / ".qwenpaw" / "qwen-code-bridge"
 
 
 def install_dir() -> Path:

@@ -107,13 +107,14 @@ async def test_load_reload_unload_is_clean(workspace) -> None:
         )
 
         # reload: same source, must succeed and not duplicate registrations
+        startup_names = sorted(h.hook_name for h in startup)
         report = await lifecycle.reload(plugin_id)
         assert getattr(report, "ok", True), report
         http2, startup2, shutdown2, middlewares2 = _regs(registry, plugin_id)
         assert len(http2) == 1
-        assert len(startup2) == 1
-        assert len(shutdown2) == 1
         assert len(middlewares2) == 1
+        # reload must not duplicate or drop startup hooks (slash hooks included)
+        assert sorted(h.hook_name for h in startup2) == startup_names
 
         # state survives reload (fresh service instance, same dir)
         assert DispatchService().get_task("0123456789abcdef0123456789abcdef")["status"] == (

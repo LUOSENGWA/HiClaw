@@ -1,0 +1,92 @@
+# -*- coding: utf-8 -*-
+"""`/qcode` slash command tests: usage, CLI bridge, session continuity."""
+
+# pylint: disable=redefined-outer-name
+from __future__ import annotations
+
+import pytest
+
+from qwen_code_bridge import slash
+
+
+def _write_stub(path, answer: str) -> None:
+    path.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$@" > {path.parent}/argv.txt\n'
+        f'echo \'{{"type":"result","result":"{answer}","is_error":false}}\'\n',
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+@pytest.fixture
+def stub(tmp_path, monkeypatch):
+    path = tmp_path / "qwen"
+    _write_stub(path, "STUB-ANSWER")
+    monkeypatch.setenv(slash.CLI_ENV, str(path))
+    monkeypatch.setenv(slash.TIMEOUT_ENV, "20")
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_STATE_DIR", str(tmp_path / "state"))
+    return path
+
+
+def _argv(stub_path) -> list[str]:
+    args = stub_path.parent / "argv.txt"
+    return args.read_text(encoding="utf-8").splitlines() if args.exists() else []
+
+
+@pytest.mark.asyncio
+async def test_usage_when_empty() -> None:
+    handler = slash.make_handler()
+
+    class Ctx:
+        session_id = "s-usage"
+        workspace_dir = ""
+
+    msg = await handler(Ctx(), "")
+    assert "用法" in msg.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_first_turn_creates_cli_session(stub, tmp_path) -> None:
+    answer = await slash.run_cli("hello", cwd=str(tmp_path), qwenpaw_session_id="s1")
+    assert answer == "STUB-ANSWER"
+    argv = _argv(stub)
+    assert "--session-id" in argv and "--chat-recording" in argv
+    assert "-r" not in argv
+    cli_sid = slash.load_cli_session("s1")
+    assert cli_sid and cli_sid in argv
+
+
+@pytest.mark.asyncio
+async def test_second_turn_resumes_cli_session(stub, tmp_path) -> None:
+    await slash.run_cli("first", cwd=str(tmp_path), qwenpaw_session_id="s2")
+    first_sid = slash.load_cli_session("s2")
+    assert first_sid
+    _write_stub(stub, "RESUMED")
+    answer = await slash.run_cli("second", cwd=str(tmp_path), qwenpaw_session_id="s2")
+    assert answer == "RESUMED"
+    argv = _argv(stub)
+    assert "-r" in argv
+    assert argv[argv.index("-r") + 1] == first_sid
+    assert "--session-id" not in argv
+
+
+@pytest.mark.asyncio
+async def test_handler_returns_msg(stub, tmp_path) -> None:
+    handler = slash.make_handler()
+
+    class Ctx:
+        session_id = "s-handler"
+        workspace_dir = str(tmp_path)
+
+    msg = await handler(Ctx(), "what is up")
+    assert msg.content[0].text == "STUB-ANSWER"
+    assert getattr(msg, "name", "") == "qwen-code"
+
+
+@pytest.mark.asyncio
+async def test_missing_cli_reports_error(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(slash.CLI_ENV, str(tmp_path / "does-not-exist"))
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_STATE_DIR", str(tmp_path / "state"))
+    answer = await slash.run_cli("x", cwd=str(tmp_path), qwenpaw_session_id="s3")
+    assert "启动失败" in answer

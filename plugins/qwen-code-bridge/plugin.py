@@ -56,6 +56,39 @@ def _http_prefix_owner(api: PluginApi, prefix: str) -> str | None:
     return None
 
 
+
+def _register_slash(api: PluginApi) -> None:
+    """Register ``/qcode`` (alias ``/qwen``); idempotent, best-effort."""
+    registry = _registry(api)
+    if registry is not None:
+        try:
+            if any(
+                hook.plugin_id == PLUGIN_ID
+                and (
+                    "slash_cmd_" in str(getattr(hook, "hook_name", ""))
+                    or "slash_command_" in str(getattr(hook, "hook_name", ""))
+                )
+                for hook in registry.get_startup_hooks()
+            ):
+                logger.debug("slash command already registered; skipping")
+                return
+        except Exception:
+            pass
+    try:
+        from qwen_code_bridge.slash import make_handler
+
+        api.register_slash_command(
+            "qcode",
+            make_handler(),
+            aliases=("qwen",),
+            help_text="Talk to Qwen Code in this chat (per-session continuity)",
+            category="plugin",
+        )
+        logger.info("slash command /qcode registered")
+    except Exception as exc:  # older builds may lack slash support
+        logger.warning("slash command registration skipped: %s", exc)
+
+
 def _hook_owner(api: PluginApi, hooks, hook_name: str) -> str | None:
     for hook in hooks:
         if hook.hook_name == hook_name:
@@ -108,6 +141,7 @@ class QwenCodeBridgePlugin:
                 priority=200,
             )
             api.register_middleware(session_middleware_factory, priority=50)
+            _register_slash(api)
             self._probe_new_framework(api)
             return
 
@@ -182,6 +216,7 @@ class QwenCodeBridgePlugin:
         else:
             api.register_middleware(session_middleware_factory, priority=50)
 
+        _register_slash(api)
         self._probe_new_framework(api)
         logger.info(
             "%s registered: management API at /api%s",
