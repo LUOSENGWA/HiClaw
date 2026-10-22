@@ -51,16 +51,17 @@ def install_dir() -> Path:
 __all__ = ["STATE_DIR_ENV", "WORKING_DIR_ENV", "install_dir", "state_dir"]
 
 
-def qwen_home() -> str:
-    """Persisted CLI home (QWEN_HOME) from env or state/config.json.
+def cli_home() -> str:
+    """Persisted CLI HOME from env or state/config.json.
 
-    Empty means "use the CLI default" (~/.qwen). Point it at a workspace
-    path to keep sessions/settings across container rebuilds.
+    Setting HOME (not just QWEN_HOME) is what moves the CLI session store:
+    Storage uses ``os.homedir()/.qwen/projects/<dir>/chats``. Empty means
+    the container-default home (lost on rebuild).
     """
     import json as _json
     import os as _os
 
-    raw = _os.environ.get("QWEN_CODE_BRIDGE_QWEN_HOME", "").strip()
+    raw = _os.environ.get("QWEN_CODE_BRIDGE_CLI_HOME", "").strip()
     if raw:
         return raw
     try:
@@ -68,7 +69,50 @@ def qwen_home() -> str:
         if cfg.exists():
             data = _json.loads(cfg.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                return str(data.get("qwen_home") or "").strip()
+                value = data.get("cli_home") or data.get("qwen_home")
+                return str(value or "").strip()
     except (OSError, ValueError):
         pass
     return ""
+
+
+# Backwards-compatible name used by earlier builds.
+def qwen_home() -> str:
+    return cli_home()
+
+
+def prepare_cli_home(home: str) -> str:
+    """Ensure ``<home>/.qwen`` has settings/token; return the QWEN_HOME path.
+
+    Seeds from the current/default homes on first use so auth keeps working
+    when HOME is redirected to a persisted path.
+    """
+    import shutil
+    from pathlib import Path
+
+    if not home:
+        return ""
+    base = Path(home).expanduser()
+    qdir = base / ".qwen"
+    qdir.mkdir(parents=True, exist_ok=True)
+    for name in ("settings.json", "serve-token"):
+        dst = qdir / name
+        if dst.exists():
+            continue
+        for src in (
+            Path.home() / ".qwen" / name,
+            Path("/root/.qwen") / name,
+            Path("/home/node/.qwen") / name,
+        ):
+            try:
+                if src.exists():
+                    shutil.copy2(src, dst)
+                    break
+            except OSError:
+                continue
+    for name in ("settings.json", "serve-token"):
+        try:
+            (qdir / name).chmod(0o600)
+        except OSError:
+            pass
+    return str(qdir)

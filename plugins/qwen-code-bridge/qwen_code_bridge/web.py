@@ -291,11 +291,17 @@ async def ensure_serve() -> str:
             ws_args += ["--workspace", workspace]
         env = dict(os.environ)
         try:
-            from .state import qwen_home
+            from .state import cli_home, prepare_cli_home
 
-            home = qwen_home()
+            home = cli_home()
             if home:
-                env["QWEN_HOME"] = home
+                env["HOME"] = home
+                prepared = prepare_cli_home(home)
+                if prepared:
+                    env["QWEN_HOME"] = prepared
+                gitconfig = os.path.expanduser("~/.gitconfig")
+                if os.path.exists(gitconfig):
+                    env.setdefault("GIT_CONFIG_GLOBAL", gitconfig)
         except Exception:
             pass
         proc = await asyncio.create_subprocess_exec(

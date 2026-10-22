@@ -43,7 +43,7 @@ from typing import Any, Callable
 from . import approval, chats, millforge, progress, runs
 from .endpoints import app_base
 from .registry import CLIS
-from .state import qwen_home, state_dir
+from .state import cli_home, prepare_cli_home, state_dir
 
 #: Task ids are ``uuid4().hex``; the check also keeps task file names
 #: safe against traversal via ``get_task`` / ``get_log`` input.
@@ -941,9 +941,15 @@ class DispatchService:
         env = dict(os.environ)
         env["QWENPAW_SESSION_ID"] = session_id
         try:
-            _home = qwen_home()
+            _home = cli_home()
             if _home:
-                env["QWEN_HOME"] = _home
+                env["HOME"] = _home
+                _prepared = prepare_cli_home(_home)
+                if _prepared:
+                    env["QWEN_HOME"] = _prepared
+            _gitconfig = os.path.expanduser("~/.gitconfig")
+            if os.path.exists(_gitconfig):
+                env.setdefault("GIT_CONFIG_GLOBAL", _gitconfig)
         except Exception:
             pass
         spawn_args, prompt_via_stdin = build_spawn_plan(
