@@ -139,25 +139,39 @@
       });
   }
 
+  function chatIdFromUrl() {
+    var m = window.location.pathname.match(/\/chat\/([0-9a-zA-Z-]+)/);
+    if (m) return m[1];
+    var q = new URLSearchParams(window.location.search).get("id");
+    return q || "";
+  }
+
   function makeChatWrapper(Inner) {
     return function BridgeChatRoute() {
-      var session = null;
-      try {
-        session = HOST.useCurrentSession ? HOST.useCurrentSession() : null;
-      } catch (e) {}
-      var sid = (session && session.id) || "";
-      var st = React.useState(null);
-      var chat = st[0];
-      var setChat = st[1];
+      var st = React.useState({ id: "", chat: null });
+      var state = st[0];
+      var setState = st[1];
       React.useEffect(function () {
         var alive = true;
-        if (!sid) { setChat(null); return function () {}; }
-        bridgeChatLookup(sid).then(function (found) {
-          if (alive) setChat(found || {});
-        });
-        return function () { alive = false; };
-      }, [sid]);
-      if (chat && chat.channel === "qwen-code-bridge") {
+        function tick() {
+          var sid = chatIdFromUrl();
+          if (!sid) {
+            setState({ id: "", chat: null });
+            return;
+          }
+          if (sid === state.id) return;
+          bridgeChatLookup(sid).then(function (found) {
+            if (alive) setState({ id: sid, chat: found || {} });
+          });
+        }
+        tick();
+        var timer = setInterval(tick, 800);
+        return function () {
+          alive = false;
+          clearInterval(timer);
+        };
+      }, [state.id]);
+      if (state.chat && state.chat.channel === "qwen-code-bridge") {
         return React.createElement(QwenCodePage);
       }
       return React.createElement(Inner);
