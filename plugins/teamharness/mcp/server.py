@@ -469,7 +469,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
                 "loopId": {
                     "type": "string",
-                    "description": "For plan_loop, the Loop CRD identity recorded as the consistency anchor in the loop dict; the CRD itself is not read by plan_loop.",
+                    "description": "For plan_loop, the Loop CRD identity recorded as the consistency anchor in the loop dict; the CRD itself is not read by plan_loop. When omitted, the anchor of the existing loop is preserved on re-plans.",
                 },
                 "replyRoute": {
                     "type": "object",
@@ -4110,7 +4110,16 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("currentIteration cannot exceed maxIterations")
             raw_task_id = payload.get("taskId") or payload.get("task_id") or previous_loop.get("task_id") or None
             task_id = _safe_id(raw_task_id, "taskId") if raw_task_id else None
-            raw_loop_id = payload.get("loopId") or payload.get("loop_id") or None
+            # Omitted fields keep the existing loop anchors, symmetric with
+            # task_id above: a re-plan that does not re-declare the Loop CRD
+            # identity must not silently drop the loop_id anchor that the
+            # later reconciler (A<->B check) will compare against.
+            raw_loop_id = (
+                payload.get("loopId")
+                or payload.get("loop_id")
+                or previous_loop.get("loop_id")
+                or None
+            )
             loop_id = _safe_id(raw_loop_id, "loopId") if raw_loop_id else None
             planned_tasks = _normalize_tasks(raw_tasks, previous_tasks)
             _validate_task_graph(planned_tasks)

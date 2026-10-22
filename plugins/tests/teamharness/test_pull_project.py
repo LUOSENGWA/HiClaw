@@ -351,6 +351,79 @@ def test_plan_loop_loop_id_mismatch(tmp_path: Path, monkeypatch) -> None:
     assert after["loop"]["task_id"] == "t1"
 
 
+def test_plan_loop_replan_omitted_fields_preserve_anchors(tmp_path: Path, monkeypatch) -> None:
+    """INT-2 review round: a re-plan that omits taskId/loopId must keep
+    the existing loop anchors instead of silently dropping the loop_id
+    anchor that the later reconciler (A<->B check) compares against."""
+    server = _load_server()
+    fake = FakeFilesync()
+    monkeypatch.setattr(server, "_filesync", fake)
+
+    workspace = tmp_path / "agent"
+    _write_task(workspace, "t1", {"task_id": "t1", "project_id": "p1", "status": "planned"})
+    _write_project(workspace, "p1", {"project_id": "p1", "title": "P1", "status": "active", "tasks": []})
+
+    first = server._projectflow(_arguments(
+        workspace, "plan_loop", projectId="p1", taskId="t1", loopId="loop-1",
+        maxIterations=5, goal="g", stopCondition="done", iterationTemplate="t",
+    ))
+    assert first.get("ok") is True
+    assert first["loop"]["task_id"] == "t1"
+    assert first["loop"]["loop_id"] == "loop-1"
+
+    # Omitted-field re-plan: only the budget and goal change; neither
+    # taskId nor loopId is re-declared.
+    second = server._projectflow(_arguments(
+        workspace, "plan_loop", projectId="p1",
+        maxIterations=8, goal="g2", stopCondition="done", iterationTemplate="t",
+    ))
+    assert second.get("ok") is True
+    # Both anchors survive the re-plan (before the fix, loop_id was dropped).
+    assert second["loop"]["task_id"] == "t1"
+    assert second["loop"]["loop_id"] == "loop-1"
+    assert second["loop"]["max_iterations"] == 8
+
+    meta = json.loads((workspace / "shared" / "projects" / "p1" / "meta.json").read_text(encoding="utf-8"))
+    assert meta["loop"]["task_id"] == "t1"
+    assert meta["loop"]["loop_id"] == "loop-1"
+
+
+def test_plan_loop_replan_partial_omission_keeps_both_anchors(tmp_path: Path, monkeypatch) -> None:
+    """INT-2 review round: each anchor field falls back independently —
+    re-declaring taskId while omitting loopId keeps the recorded loop_id,
+    and re-declaring loopId while omitting taskId keeps the recorded
+    task_id."""
+    server = _load_server()
+    fake = FakeFilesync()
+    monkeypatch.setattr(server, "_filesync", fake)
+
+    workspace = tmp_path / "agent"
+    _write_task(workspace, "t1", {"task_id": "t1", "project_id": "p1", "status": "planned"})
+    _write_project(workspace, "p1", {"project_id": "p1", "title": "P1", "status": "active", "tasks": []})
+
+    base = {
+        "projectId": "p1", "taskId": "t1", "loopId": "loop-1",
+        "maxIterations": 5, "goal": "g", "stopCondition": "done", "iterationTemplate": "t",
+    }
+    assert server._projectflow(_arguments(workspace, "plan_loop", **base)).get("ok") is True
+
+    # Omit loopId, re-declare taskId -> the recorded loop_id is preserved.
+    partial = {k: v for k, v in base.items() if k != "loopId"}
+    partial["goal"] = "g-partial"
+    second = server._projectflow(_arguments(workspace, "plan_loop", **partial))
+    assert second.get("ok") is True
+    assert second["loop"]["task_id"] == "t1"
+    assert second["loop"]["loop_id"] == "loop-1"
+
+    # Omit taskId, re-declare loopId -> the recorded task_id is preserved.
+    partial = {k: v for k, v in base.items() if k != "taskId"}
+    partial["goal"] = "g-partial-2"
+    third = server._projectflow(_arguments(workspace, "plan_loop", **partial))
+    assert third.get("ok") is True
+    assert third["loop"]["task_id"] == "t1"
+    assert third["loop"]["loop_id"] == "loop-1"
+
+
 def test_taskflow_actions_pull(tmp_path: Path, monkeypatch) -> None:
     server = _load_server()
     fake = FakeFilesync()
