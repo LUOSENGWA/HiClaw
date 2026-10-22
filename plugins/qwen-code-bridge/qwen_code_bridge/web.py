@@ -32,6 +32,30 @@ SERVE_AUTOSTART_ENV = "QWEN_CODE_BRIDGE_SERVE_AUTOSTART"
 SERVE_TOKEN_ENV = "QWEN_CODE_BRIDGE_SERVE_TOKEN"
 DEFAULT_SERVE_URL = ""  # resolved from env/serve.json; auto-start allocates a free port
 
+#: Where this proxy is mounted; the embedded console treats it as its root.
+WEB_PREFIX = "/api/qwen-code-bridge/web"
+
+#: Injected into the console HTML: prefix every root-absolute request the
+#: shell makes (fetch / XHR / WebSocket / EventSource) so a prefixed mount
+#: behaves like the original origin root.
+_PREFIX_SHIM = """<script>(function(){var P=location.pathname.replace(/\\/?[^/]*\\/?$/,"")||"";
+function fix(u){try{if(typeof u==="string"&&u.charAt(0)==="/"&&u.indexOf(P+"/")!==0)return P+u;}catch(e){}return u;}
+var f=window.fetch;if(f){window.fetch=function(u,o){return f.call(this,fix(u),o)};}
+var x=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){var a=[].slice.call(arguments);a[1]=fix(u);return x.apply(this,a)};
+var W=window.WebSocket;if(W){window.WebSocket=function(u,p){return new W(fix(u),p)};window.WebSocket.prototype=W.prototype;}
+var E=window.EventSource;if(E){window.EventSource=function(u,o){return new E(fix(u),o)};window.EventSource.prototype=E.prototype;}
+})();</script>"""
+
+
+def _rewrite_console_html(html: bytes) -> bytes:
+    """Prefix root-absolute shell assets and inject the request shim."""
+    text = html.decode("utf-8", "ignore")
+    for path in ("/assets/", "/manifest.webmanifest", "/favicon"):
+        text = text.replace('="' + path, '="' + WEB_PREFIX + path)
+    if _PREFIX_SHIM not in text:
+        text = text.replace("<head>", "<head>" + _PREFIX_SHIM, 1)
+    return text.encode("utf-8")
+
 router = APIRouter(tags=["qwen-code-bridge"])
 
 
@@ -206,8 +230,11 @@ async def web_proxy(path: str, request: Request) -> Response:
             },
         )
     media_type = upstream.headers.get("content-type", "application/octet-stream")
+    content = upstream.content
+    if "text/html" in media_type.lower():
+        content = _rewrite_console_html(content)
     return Response(
-        content=upstream.content,
+        content=content,
         status_code=upstream.status_code,
         media_type=media_type,
     )

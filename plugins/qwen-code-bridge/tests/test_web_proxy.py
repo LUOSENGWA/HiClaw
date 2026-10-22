@@ -96,3 +96,41 @@ def test_token_from_env(monkeypatch) -> None:
     assert web.serve_token() == "tok-1"
     monkeypatch.delenv(web.SERVE_TOKEN_ENV)
     assert isinstance(web.serve_token(), str)
+
+
+class _HtmlUpstream(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path.startswith("/assets/"):
+            body = b"console.log(1)"
+            ctype = "application/javascript"
+        else:
+            body = (
+                b"<html><head></head><body>"
+                b'<script src="/assets/app.js"></script>'
+                b'<link href="/manifest.webmanifest"></body></html>'
+            )
+            ctype = "text/html"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+def test_html_rewrite_and_asset_passthrough(monkeypatch, client) -> None:
+    server = HTTPServer(("127.0.0.1", 0), _HtmlUpstream)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv(web.SERVE_URL_ENV, f"http://127.0.0.1:{server.server_address[1]}")
+    try:
+        html = client.get("/api/qwen-code-bridge/web/").text
+        assert '="/api/qwen-code-bridge/web/assets/app.js"' in html
+        assert '="/api/qwen-code-bridge/web/manifest.webmanifest"' in html
+        assert "XMLHttpRequest.prototype.open" in html  # prefix shim injected
+        js = client.get("/api/qwen-code-bridge/web/assets/app.js")
+        assert js.text == "console.log(1)"
+        assert "XMLHttpRequest" not in js.text
+    finally:
+        server.shutdown()
