@@ -651,7 +651,12 @@ def test_late_worker_updates_cannot_revive_a_terminal_task(
     )
 
     assert late_update["ok"] is False
-    assert f"{action} cannot update terminal task: completed" in late_update["error"]
+    # The terminal guard rejects through the structured illegal_transition
+    # surface (from/to + detail), not a bare error string (INT-5 round 2).
+    assert late_update["error"] == "illegal_transition"
+    assert late_update["from"] == "completed"
+    assert late_update["to"] == ("in_progress" if action == "ack_task" else "submitted")
+    assert "terminal state completed" in late_update["detail"]
     assert project_path.read_bytes() == before_project
     assert task_path.read_bytes() == before_task
     assert successful_side_effects["publish"] == []
@@ -673,7 +678,10 @@ def test_late_submit_cannot_revive_a_project_terminal_fence_when_task_meta_is_st
     late_submit = _submit(tmp_path, task_id)
 
     assert late_submit["ok"] is False
-    assert "submit_task cannot update terminal task: completed" in late_submit["error"]
+    assert late_submit["error"] == "illegal_transition"
+    assert late_submit["from"] == "completed"
+    assert late_submit["to"] == "submitted"
+    assert "terminal state completed" in late_submit["detail"]
     assert project_path.read_bytes() == before_project
     assert task_path.read_bytes() == before_task
     assert successful_side_effects["publish"] == []
@@ -1010,7 +1018,12 @@ def test_legacy_cancelled_task_still_rejects_a_second_cancel(
     )
 
     assert retried["ok"] is False
-    assert "cannot cancel terminal task: cancelled" in retried["error"]
+    # Uncommitted legacy cancel: the cancel terminal guard now rejects with
+    # the structured illegal_transition surface (from == to == cancelled).
+    assert retried["error"] == "illegal_transition"
+    assert retried["from"] == "cancelled"
+    assert retried["to"] == "cancelled"
+    assert "terminal state cancelled" in retried["detail"]
     assert successful_side_effects["sync"] == []
 
 

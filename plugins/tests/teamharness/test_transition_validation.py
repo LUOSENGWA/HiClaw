@@ -12,6 +12,11 @@ _assert_transition/_transition_task layer (no rebuild):
 - static audit: every task/task_meta status write sits in the whitelisted
   functions (_transition_task entry + _accept_task_result declared guard
   paths) — the detector self-proves it catches an injected bypass
+- round 2 (public entry): the pre-``_transition_task`` guards (terminal
+  immutability via _require_task_mutable, the ack/submit/report_progress
+  ordering pre-checks, the cancel terminal guard) reject through the same
+  structured surface as the table check — tests enter from ``_taskflow``
+  and assert the ``illegal_transition`` dict (from/to) plus SIG-MISMATCH
 """
 
 from __future__ import annotations
@@ -271,3 +276,236 @@ def test_status_write_coverage_audit() -> None:
     violations = _status_write_violations(probe)
     assert len(violations) == 1
     assert violations[0][2] == "_audit_probe_bypass"
+
+
+# ---------------------------------------------------------------------------
+# Round 2: the pre-_transition_task guards (terminal immutability,
+# ack/submit/report_progress ordering, cancel terminal) must reject through
+# the same structured surface as the table check.  Tests enter from the
+# public _taskflow dispatch — not from _assert_transition — because the
+# regression is exactly that these guards used to return a bare error
+# string (no from/to, no SIG-MISMATCH) before reaching _transition_task.
+# ---------------------------------------------------------------------------
+
+
+def _single_mismatch_event(workspace: Path, server: Any, task_id: str) -> dict[str, Any]:
+    """Exactly one event exists and it is the deterministic SIG-MISMATCH."""
+    team = _team(server)
+    events_dir = workspace / "shared" / "events" / team
+    files = sorted(events_dir.glob("*.json"))
+    meta_bytes = (workspace / "shared" / "tasks" / task_id / "meta.json").read_bytes()
+    fingerprint = hashlib.sha256(meta_bytes).hexdigest()
+    expected_id = server._signal_event_id(
+        team, "", task_id, "", "SIG-MISMATCH", "mismatch_recorded", None, fingerprint, 0, 0,
+    )
+    assert [f.name for f in files] == [f"{expected_id}.json"]
+    return json.loads(files[0].read_text(encoding="utf-8"))
+
+
+def test_ack_terminal_via_taskflow_is_structured(
+    server: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Public ack_task on a completed task: structured illegal_transition
+    (from/to) + SIG-MISMATCH — not a bare error string.  Retry is
+    idempotent (same deterministic id, no second object)."""
+    monkeypatch.setattr(server, "_filesync", FakeFilesync())
+    monkeypatch.setenv("AGENTTEAMS_AGENT_ROLE", "worker")
+    workspace = tmp_path / "agent"
+    task_id = "int5r2-ack-completed"
+    _write_task(workspace, task_id, {"task_id": task_id, "status": "completed", "project_id": ""})
+    args = _arguments(workspace, "ack_task", taskId=task_id)
+
+    result = server._taskflow(args)
+
+    assert result["ok"] is False
+    assert result["tool"] == "taskflow"
+    assert result["error"] == "illegal_transition"
+    assert result["from"] == "completed"
+    assert result["to"] == "in_progress"
+    assert "terminal state completed" in result["detail"]
+    # State unchanged on disk.
+    assert server._read_json(server._task_state_path(args, task_id))["status"] == "completed"
+    # SIG-MISMATCH emitted for the rejection.
+    event = _single_mismatch_event(workspace, server, task_id)
+    assert event["event_type"] == "SIG-MISMATCH"
+    assert event["payload"] == {
+        "from_status": "completed",
+        "to_status": "in_progress",
+        "action": "ack_task",
+    }
+    # Retry: same rejection, same event id, no second object.
+    result2 = server._taskflow(args)
+    assert result2 == result
+    team = _team(server)
+    files = sorted((workspace / "shared" / "events" / team).glob("*.json"))
+    assert len(files) == 1
+
+
+def test_ack_planned_via_taskflow_is_structured(
+    server: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The ack ordering pre-check (planned -> delegate first) now rejects
+    with the structured error + SIG-MISMATCH.  Note planned -> in_progress
+    IS a legal table edge (reached via delegate_task) — this is an
+    action-level rule, which is why it lives in the guard, not the table."""
+    monkeypatch.setattr(server, "_filesync", FakeFilesync())
+    monkeypatch.setenv("AGENTTEAMS_AGENT_ROLE", "worker")
+    workspace = tmp_path / "agent"
+    task_id = "int5r2-ack-planned"
+    _write_task(workspace, task_id, {"task_id": task_id, "status": "planned", "project_id": ""})
+    args = _arguments(workspace, "ack_task", taskId=task_id)
+
+    result = server._taskflow(args)
+
+    assert result["ok"] is False
+    assert result["error"] == "illegal_transition"
+    assert result["from"] == "planned"
+    assert result["to"] == "in_progress"
+    assert "ack_task: task is 'planned'; delegate_task it first" in result["detail"]
+    event = _single_mismatch_event(workspace, server, task_id)
+    assert event["payload"] == {
+        "from_status": "planned",
+        "to_status": "in_progress",
+        "action": "ack_task",
+    }
+    assert server._read_json(server._task_state_path(args, task_id))["status"] == "planned"
+
+
+def test_submit_planned_via_taskflow_is_structured(
+    server: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The submit ordering pre-check (planned -> ack first): structured
+    rejection + SIG-MISMATCH."""
+    monkeypatch.setattr(server, "_filesync", FakeFilesync())
+    monkeypatch.setenv("AGENTTEAMS_AGENT_ROLE", "worker")
+    workspace = tmp_path / "agent"
+    task_id = "int5r2-submit-planned"
+    _write_task(workspace, task_id, {"task_id": task_id, "status": "planned", "project_id": ""})
+    args = _arguments(
+        workspace, "submit_task", taskId=task_id, status="SUCCESS", summary="done"
+    )
+
+    result = server._taskflow(args)
+
+    assert result["ok"] is False
+    assert result["error"] == "illegal_transition"
+    assert result["from"] == "planned"
+    assert result["to"] == "submitted"
+    assert "submit_task: task is 'planned'; ack_task it first" in result["detail"]
+    event = _single_mismatch_event(workspace, server, task_id)
+    assert event["payload"] == {
+        "from_status": "planned",
+        "to_status": "submitted",
+        "action": "submit_task",
+    }
+
+
+def test_report_progress_planned_via_taskflow_is_structured(
+    server: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The report_progress ordering pre-check: structured rejection +
+    SIG-MISMATCH.  Progress never changes the status, so to == from."""
+    monkeypatch.setattr(server, "_filesync", FakeFilesync())
+    monkeypatch.setenv("AGENTTEAMS_AGENT_ROLE", "worker")
+    workspace = tmp_path / "agent"
+    task_id = "int5r2-progress-planned"
+    _write_task(workspace, task_id, {"task_id": task_id, "status": "planned", "project_id": ""})
+    args = _arguments(workspace, "report_progress", taskId=task_id, note="halfway")
+
+    result = server._taskflow(args)
+
+    assert result["ok"] is False
+    assert result["error"] == "illegal_transition"
+    assert result["from"] == "planned"
+    assert result["to"] == "planned"
+    assert "report_progress: task is 'planned'; ack_task it first" in result["detail"]
+    event = _single_mismatch_event(workspace, server, task_id)
+    assert event["payload"] == {
+        "from_status": "planned",
+        "to_status": "planned",
+        "action": "report_progress",
+    }
+
+
+def test_ack_after_submit_retry_still_ok(
+    server: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Retry semantics preserved: ack after submit is the idempotent no-op
+    success path — no rejection, no event (the tightening only orders
+    actions BEFORE their state; a late re-ack must not fail a finished job)."""
+    monkeypatch.setattr(server, "_filesync", FakeFilesync())
+    monkeypatch.setenv("AGENTTEAMS_AGENT_ROLE", "worker")
+    workspace = tmp_path / "agent"
+    task_id = "int5r2-ack-submitted"
+    _write_task(workspace, task_id, {"task_id": task_id, "status": "submitted", "project_id": ""})
+    args = _arguments(workspace, "ack_task", taskId=task_id)
+
+    result = server._taskflow(args)
+
+    assert result["ok"] is True
+    assert server._read_json(server._task_state_path(args, task_id))["status"] == "submitted"
+    events_dir = workspace / "shared" / "events"
+    assert not events_dir.exists() or not any(events_dir.rglob("*.json"))
+
+
+def test_cancel_terminal_via_taskflow_is_structured(
+    server: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The cancel terminal guard (non-committed terminal state): structured
+    rejection + SIG-MISMATCH.  The committed-cancellation retry path
+    (cancelled + cancelled_at, matching reason) is untouched and stays ok."""
+    monkeypatch.setattr(server, "_filesync", FakeFilesync())
+    monkeypatch.setenv("AGENTTEAMS_AGENT_ROLE", "leader")
+    workspace = tmp_path / "agent"
+    task_id = "int5r2-cancel-completed"
+    _write_task(workspace, task_id, {"task_id": task_id, "status": "completed", "project_id": ""})
+    args = _arguments(workspace, "cancel_task", taskId=task_id, reason="cleanup")
+
+    result = server._taskflow(args)
+
+    assert result["ok"] is False
+    assert result["error"] == "illegal_transition"
+    assert result["from"] == "completed"
+    assert result["to"] == "cancelled"
+    assert "terminal state completed" in result["detail"]
+    event = _single_mismatch_event(workspace, server, task_id)
+    assert event["payload"] == {
+        "from_status": "completed",
+        "to_status": "cancelled",
+        "action": "cancel_task",
+    }
+
+
+def test_delegate_terminal_via_taskflow_is_structured(
+    server: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The delegate guard on a terminal task meta: structured rejection
+    (to = the assignment target 'assigned') + SIG-MISMATCH."""
+    monkeypatch.setattr(server, "_filesync", FakeFilesync())
+    monkeypatch.setenv("AGENTTEAMS_AGENT_ROLE", "leader")
+    workspace = tmp_path / "agent"
+    task_id = "int5r2-delegate-completed"
+    args = _arguments(
+        workspace,
+        "delegate_task",
+        projectId="p1",
+        taskId=task_id,
+        roomId="!room:matrix.local",
+        assignedTo="@worker:matrix.local",
+    )
+    _write_json(server._project_state_path(args, "p1"), {"project_id": "p1", "status": "active"})
+    _write_task(workspace, task_id, {"task_id": task_id, "status": "completed", "project_id": "p1"})
+
+    result = server._taskflow(args)
+
+    assert result["ok"] is False
+    assert result["error"] == "illegal_transition"
+    assert result["from"] == "completed"
+    assert result["to"] == "assigned"
+    assert "terminal state completed" in result["detail"]
+    event = _single_mismatch_event(workspace, server, task_id)
+    assert event["payload"] == {
+        "from_status": "completed",
+        "to_status": "assigned",
+        "action": "delegate_task",
+    }

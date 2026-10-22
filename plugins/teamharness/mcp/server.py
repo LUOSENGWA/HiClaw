@@ -5071,10 +5071,34 @@ def _terminal_task_status(arguments: dict[str, Any], task: dict[str, Any], task_
     return task_status if task_status in TERMINAL_TASK_STATUSES else ""
 
 
-def _require_task_mutable(arguments: dict[str, Any], task: dict[str, Any], task_id: str, action: str) -> None:
+def _require_task_mutable(
+    arguments: dict[str, Any],
+    task: dict[str, Any],
+    task_id: str,
+    action: str,
+    to_status: str = "",
+) -> None:
+    """Terminal-state guard for taskflow actions.
+
+    Rejection uses the same structured surface as the table check
+    (IllegalTransitionError + SIG-MISMATCH) so the public taskflow entry
+    returns ``illegal_transition`` with from/to instead of a bare error
+    string.  ``to_status`` is the status the action would have written
+    ("" for status-preserving actions — the reported to equals from).
+    """
     terminal_status = _terminal_task_status(arguments, task, task_id)
     if terminal_status:
-        raise ValueError(f"{action} cannot update terminal task: {terminal_status}")
+        _reject_task_transition(
+            terminal_status,
+            to_status or terminal_status,
+            action,
+            (
+                f"illegal_transition: {action}: task is in terminal state "
+                f"{terminal_status} (immutable); cannot update"
+            ),
+            arguments=arguments,
+            task_id=task_id,
+        )
 
 
 def _update_project_task(arguments: dict[str, Any], project_id: str, task_id: str, **updates: Any) -> bool:
@@ -5172,6 +5196,42 @@ def _assert_transition(
             )
         else:
             return
+    if arguments is not None and task_id:
+        _emit_signal_event(
+            arguments,
+            "illegal_transition_rejected",
+            task_id=task_id,
+            ref=f"shared/tasks/{task_id}/meta.json",
+            ref_bytes=_safe_read_bytes(_task_state_path(arguments, task_id)),
+            payload={
+                "from_status": from_status,
+                "to_status": to_status,
+                "action": action,
+            },
+        )
+    raise IllegalTransitionError(from_status, to_status, action, message)
+
+
+def _reject_task_transition(
+    from_status: str,
+    to_status: str,
+    action: str,
+    message: str,
+    *,
+    arguments: dict[str, Any] | None = None,
+    task_id: str = "",
+) -> None:
+    """Action-level guard rejection (pre-``_transition_task`` checks:
+    terminal immutability, ack/submit/progress ordering, cancel).
+
+    Same structured surface as the table check: raises
+    IllegalTransitionError so the taskflow dispatch returns
+    ``illegal_transition`` with from/to, and emits SIG-MISMATCH when the
+    task is named.  The TRANSITIONS table itself is untouched — these
+    guards encode action-level rules stricter than the table (e.g. ack on
+    a planned task is rejected even though planned -> in_progress is a
+    legal table edge reached via delegate_task).
+    """
     if arguments is not None and task_id:
         _emit_signal_event(
             arguments,
@@ -5846,7 +5906,7 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             _validate_assignment_room(project, room_id)
             _validate_task_redelegation(arguments, project, task_id, room_id)
             existing_task = _read_json(_task_state_path(arguments, task_id), {"project_id": project_id})
-            _require_task_mutable(arguments, existing_task, task_id, action)
+            _require_task_mutable(arguments, existing_task, task_id, action, to_status="assigned")
             assigned_to = str(payload.get("assignedTo") or payload.get("assigned_to") or "").strip()
             if not assigned_to:
                 tasks = project.get("tasks", []) if isinstance(project.get("tasks"), list) else []
@@ -6160,17 +6220,27 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             task_id = _safe_id(payload.get("taskId") or payload.get("task_id"), "taskId")
             local_task = _read_json(_task_state_path(arguments, task_id))
             if local_task:
-                _require_task_mutable(arguments, local_task, task_id, action)
+                _require_task_mutable(arguments, local_task, task_id, action, to_status="in_progress")
             pulled = _pull_task(arguments, task_id)
             task = _load_task(arguments, task_id)
-            _require_task_mutable(arguments, task, task_id, action)
+            _require_task_mutable(arguments, task, task_id, action, to_status="in_progress")
             if task.get("status") != "submitted":
                 # Tightening: ack only makes sense after the assignment
                 # (planned/prepared/missing -> structured error, not a
                 # silent state jump).
                 _ack_from = str(task.get("status") or "")
                 if _ack_from not in ("assigned", "in_progress"):
-                    raise ValueError(f"ack_task: task is '{_ack_from}'; delegate_task it first")
+                    _reject_task_transition(
+                        _ack_from,
+                        "in_progress",
+                        "ack_task",
+                        (
+                            f"illegal_transition: ack_task: task is '{_ack_from}'; "
+                            "delegate_task it first"
+                        ),
+                        arguments=arguments,
+                        task_id=task_id,
+                    )
                 _transition_task(
                     arguments,
                     task,
@@ -6197,7 +6267,7 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("submit_task requires worker or remote-member role")
             task_id = _safe_id(payload.get("taskId") or payload.get("task_id"), "taskId")
             task = _load_task(arguments, task_id)
-            _require_task_mutable(arguments, task, task_id, action)
+            _require_task_mutable(arguments, task, task_id, action, to_status="submitted")
             summary = str(payload.get("summary") or "")
             status = _validate_task_result_status(payload.get("status"))
             deliverables = payload.get("deliverables") or []
@@ -6334,7 +6404,17 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             # Tightening: submission requires an acknowledged assignment.
             _submit_from = str(task.get("status") or "")
             if _submit_from not in ("assigned", "in_progress"):
-                raise ValueError(f"submit_task: task is '{_submit_from}'; ack_task it first")
+                _reject_task_transition(
+                    _submit_from,
+                    "submitted",
+                    "submit_task",
+                    (
+                        f"illegal_transition: submit_task: task is '{_submit_from}'; "
+                        "ack_task it first"
+                    ),
+                    arguments=arguments,
+                    task_id=task_id,
+                )
             task_dir = _task_dir(arguments, task_id)
             task_dir.mkdir(parents=True, exist_ok=True)
             submission_id = uuid.uuid4().hex
@@ -6465,8 +6545,16 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             # Progress notes only exist while the task is actually in flight.
             _progress_from = str(task.get("status") or "")
             if _progress_from not in ("assigned", "in_progress"):
-                raise ValueError(
-                    f"report_progress: task is '{_progress_from}'; ack_task it first"
+                _reject_task_transition(
+                    _progress_from,
+                    _progress_from,
+                    "report_progress",
+                    (
+                        f"illegal_transition: report_progress: task is '{_progress_from}'; "
+                        "ack_task it first"
+                    ),
+                    arguments=arguments,
+                    task_id=task_id,
                 )
             note = str(payload.get("note") or "").strip()
             if not note:
@@ -6804,7 +6892,17 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     return _sync_failure_result(result, "cancel_task")
                 return result
             if terminal_status:
-                raise ValueError(f"cannot cancel terminal task: {terminal_status}")
+                _reject_task_transition(
+                    terminal_status,
+                    "cancelled",
+                    "cancel_task",
+                    (
+                        f"illegal_transition: cancel_task: task is in terminal state "
+                        f"{terminal_status} (immutable); cannot update"
+                    ),
+                    arguments=arguments,
+                    task_id=task_id,
+                )
 
             _resolve_task_continuation(task, "cancelled")
             if normalized_replacement_task_id:
