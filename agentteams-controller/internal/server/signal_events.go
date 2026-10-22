@@ -69,22 +69,27 @@ var signalEmitters = map[string]signalEmitter{
 }
 
 // signalEventID = "ev_" + first 16 hex of sha256(teamID|projectID|taskID|
-// loopID|eventType|sourceEvent|iteration|fingerprint|attempt) (contract
-// id_rule v1.1). fingerprint is the hex sha256 of the ref bytes after the
-// main write — the stable identity of the logical operation's result:
-// retrying the same operation re-reads the same state bytes and re-lands on
-// the same id (consumer dedupes, #1394), while two distinct operations
-// (another project, another iteration, a second pause) hash distinct inputs.
-// Empty strings where the emitter carries no such identity. Must stay
-// byte-identical to the contract id_rule and to
-// plugins/teamharness/mcp/server.py _signal_event_id (both test suites pin
-// the same fixed vector).
-func signalEventID(teamID, projectID, taskID, loopID, eventType, sourceEvent string, iteration *int, fingerprint string, attempt int) string {
+// loopID|eventType|sourceEvent|iteration|fingerprint|attempt|auditSeq)
+// (contract id_rule v1.2). fingerprint is the hex sha256 of the ref bytes
+// after the main write — the stable identity of the logical operation's
+// result. auditSeq is the project's committed-operation revision (the
+// project meta's audit_seq, advanced by markAuditFields on each committed
+// write; 0 where the emitter carries no project revision): the persistent
+// identity of the operation INSTANCE, so two distinct operations that would
+// otherwise write byte-identical state within the same wall-clock second
+// (same-actor pause→resume→pause with the same reason) still hash distinct
+// inputs, while a retry of the same operation (same committed seq, same
+// state bytes) re-lands on the same id (consumer dedupes, #1394). No raw
+// timestamp is part of the identity — never. Empty strings where the emitter
+// carries no such identity. Must stay byte-identical to the contract
+// id_rule and to plugins/teamharness/mcp/server.py _signal_event_id (both
+// test suites pin the same fixed vector).
+func signalEventID(teamID, projectID, taskID, loopID, eventType, sourceEvent string, iteration *int, fingerprint string, attempt, auditSeq int) string {
 	iter := ""
 	if iteration != nil {
 		iter = strconv.Itoa(*iteration)
 	}
-	sum := sha256.Sum256([]byte(teamID + "|" + projectID + "|" + taskID + "|" + loopID + "|" + eventType + "|" + sourceEvent + "|" + iter + "|" + fingerprint + "|" + strconv.Itoa(attempt)))
+	sum := sha256.Sum256([]byte(teamID + "|" + projectID + "|" + taskID + "|" + loopID + "|" + eventType + "|" + sourceEvent + "|" + iter + "|" + fingerprint + "|" + strconv.Itoa(attempt) + "|" + strconv.Itoa(auditSeq)))
 	return "ev_" + hex.EncodeToString(sum[:])[:16]
 }
 
@@ -103,9 +108,14 @@ func signalEventKey(team, teamID, eventID string) string {
 // already succeeded, the event is a convenience (same policy as
 // interventionNotify). Idempotent: an existing object at the same key is
 // left untouched (the deterministic id makes a re-emit a no-op).
-func (h *ProjectHandler) emitSignalEvent(ctx context.Context, em signalEmitter, team, teamID, projectID, taskID string, iteration *int, ref string, refBytes []byte, payload map[string]any) {
+// auditSeq is the project's committed-operation revision at the moment of
+// this commit (id_rule v1.2) — for the project-write endpoints that is
+// meta.AuditSeq as just written, and for CancelTask the revision persisted
+// by the attempt that committed the project write (its convergence retry
+// emits with the read value, not a fresh increment).
+func (h *ProjectHandler) emitSignalEvent(ctx context.Context, em signalEmitter, team, teamID, projectID, taskID string, iteration *int, ref string, refBytes []byte, payload map[string]any, auditSeq int) {
 	fingerprint := sha256.Sum256(refBytes)
-	eventID := signalEventID(teamID, projectID, taskID, "", em.EventType, em.SourceEvent, iteration, hex.EncodeToString(fingerprint[:]), 0)
+	eventID := signalEventID(teamID, projectID, taskID, "", em.EventType, em.SourceEvent, iteration, hex.EncodeToString(fingerprint[:]), 0, auditSeq)
 	key := signalEventKey(team, teamID, eventID)
 	if _, err := h.oss.GetObject(ctx, key); err == nil {
 		return // already emitted — idempotent re-emit, keep the original

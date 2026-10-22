@@ -27,16 +27,17 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 MCP_DIR = REPO_ROOT / "plugins" / "teamharness" / "mcp"
 CONTRACT_PATH = REPO_ROOT / "plugins" / "teamharness" / "contracts" / "signal-mapping.json"
 
-# id_rule v1.1 fixed input: the post-write ref state bytes `{"project_id":
+# id_rule v1.2 fixed input: the post-write ref state bytes `{"project_id":
 # "p1"}`, whose sha256 hex is the fingerprint field of the id input.
 FIXED_REF_BYTES = b'{"project_id": "p1"}'
 FIXED_FINGERPRINT = hashlib.sha256(FIXED_REF_BYTES).hexdigest()
 
 # Same vector as signal_events_test.go (signalIDFixedVector): first 16 hex
 # of sha256 of "alpha-team|p1|t1||SIG-DECISION|project_paused||" +
-# FIXED_FINGERPRINT + "|0". Both suites pin the exact same value for the
-# exact same 9-tuple, so an id_rule drift on either side fails both.
-FIXED_VECTOR = "ev_1302b6e06591390d"
+# FIXED_FINGERPRINT + "|0|1" (attempt=0, audit_seq=1). Both suites pin the
+# exact same value for the exact same 10-tuple, so an id_rule drift on
+# either side fails both.
+FIXED_VECTOR = "ev_afb958c6b34a7132"
 
 EVENT_FIELDS = {
     "event_id", "task_id", "loop_id", "event_type", "is_signal",
@@ -116,12 +117,12 @@ def test_signal_id_fixed_vector_and_rule(server: Any) -> None:
     # Cross-language fixed vector (same 9-tuple and same value as the Go
     # signal_events_test.go pins).
     assert (
-        server._signal_event_id("alpha-team", "p1", "t1", "", "SIG-DECISION", "project_paused", None, FIXED_FINGERPRINT)
+        server._signal_event_id("alpha-team", "p1", "t1", "", "SIG-DECISION", "project_paused", None, FIXED_FINGERPRINT, 0, 1)
         == FIXED_VECTOR
     )
     # attempt changes the id: a retry of a different attempt is a different event.
     assert (
-        server._signal_event_id("alpha-team", "p1", "t1", "", "SIG-DECISION", "project_paused", None, FIXED_FINGERPRINT, 1)
+        server._signal_event_id("alpha-team", "p1", "t1", "", "SIG-DECISION", "project_paused", None, FIXED_FINGERPRINT, 1, 1)
         != FIXED_VECTOR
     )
     # submit vs accept of the same task hash distinct source_events — no collision.
@@ -129,7 +130,7 @@ def test_signal_id_fixed_vector_and_rule(server: Any) -> None:
         "alpha-team", "p1", "task1", "", "SIG-COMPLETE", "task_accepted", None, FIXED_FINGERPRINT
     )
 
-    # P1 regressions (id_rule v1.1): distinct logical events never share an
+    # P1 regressions (id_rule v1.2): distinct logical events never share an
     # id; a retry of the same operation keeps its id.
     same_bytes = hashlib.sha256(b'{"status":"paused"}').hexdigest()
     # Two projects, same operation, even identical state bytes.
@@ -143,14 +144,15 @@ def test_signal_id_fixed_vector_and_rule(server: Any) -> None:
         server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", 2, fp_i2)
     )
     # pause -> resume -> pause: three distinct events (pause #2 differs via
-    # the advanced state bytes, resume via source_event).
-    pause1 = server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", None, fp_i1)
-    resume = server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_resumed", None, fp_i2)
-    pause2 = server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", None, hashlib.sha256(b'{"status":"paused","again":true}').hexdigest())
+    # the committed audit_seq, resume via source_event).
+    pause1 = server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", None, fp_i1, 0, 1)
+    resume = server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_resumed", None, fp_i2, 0, 2)
+    # Same second, byte-identical post-write state; only audit_seq separates it.
+    pause2 = server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", None, fp_i1, 0, 3)
     assert len({pause1, resume, pause2}) == 3
     # Retry of the same operation: same identity fields + same state bytes
-    # → same id (consumer dedupe relies on this).
-    assert server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", None, fp_i1) == pause1
+    # + same audit_seq → same id (consumer dedupe relies on this).
+    assert server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", None, fp_i1, 0, 1) == pause1
 
 
 def test_contract_matches_py_emitters(server: Any) -> None:
@@ -204,13 +206,15 @@ def test_emit_idempotent_local(server: Any, tmp_path: Path, monkeypatch: Any) ->
 
     files = sorted(_events_dir(server, workspace).glob("*.json"))
     assert len(files) == 2
-    data = json.loads(files[0].read_text(encoding="utf-8"))
+    events = [json.loads(f.read_text(encoding="utf-8")) for f in files]
+    by_iter = {e["iteration_index"]: e for e in events}
+    data = by_iter[1]
     assert set(data) == EVENT_FIELDS  # exactly the 11 schema fields
-    assert data["event_id"] == files[0].stem
+    assert data["event_id"] in {f.stem for f in files}
     assert data["fingerprint"] == FIXED_FINGERPRINT
     assert data["payload"] == {"project_id": "p1"}  # original kept, retry dropped
-    data2 = json.loads(files[1].read_text(encoding="utf-8"))
-    assert data2["event_id"] == files[1].stem
+    data2 = by_iter[2]
+    assert data2["event_id"] in {f.stem for f in files}
     assert data2["iteration_index"] == 2
     assert data2["fingerprint"] == hashlib.sha256(state2).hexdigest()
     # One mirror push per written object (first and third emit only).
@@ -219,13 +223,13 @@ def test_emit_idempotent_local(server: Any, tmp_path: Path, monkeypatch: Any) ->
             "workspaceDir": str(workspace),
             "action": "push",
             "payload": {},
-            "path": f"shared/events/{_team(server)}/{files[0].name}",
+            "path": f"shared/events/{_team(server)}/{data['event_id']}.json",
         },
         {
             "workspaceDir": str(workspace),
             "action": "push",
             "payload": {},
-            "path": f"shared/events/{_team(server)}/{files[1].name}",
+            "path": f"shared/events/{_team(server)}/{data2['event_id']}.json",
         },
     ]
 
@@ -275,7 +279,7 @@ def test_record_loop_iteration_two_rounds_distinct_events(
 
     evs = _read_events(server, workspace)
     assert len(evs) == 2
-    assert [e["iteration_index"] for e in evs] == [1, 2]
+    assert sorted(e["iteration_index"] for e in evs) == [1, 2]
     assert len({e["event_id"] for e in evs}) == 2
     assert all(e["task_id"] == "" for e in evs)
     assert all(e["payload"]["project_id"] == "p1" for e in evs)

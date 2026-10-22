@@ -82,6 +82,17 @@ type projectMeta struct {
 	UpdatedBy   string `json:"updated_by,omitempty"`
 	UpdatedAt   string `json:"updated_at,omitempty"`
 	PauseReason string `json:"pause_reason,omitempty"`
+	// AuditSeq is the project's committed-operation revision (id_rule v1.2):
+	// a monotonically increasing counter advanced by markAuditFields on every
+	// committed intervention write. It is the persistent identity of a
+	// committed operation — two distinct operations never share a seq even
+	// when they land in the same wall-clock second and would otherwise write
+	// byte-identical state (same-actor pause→resume→pause with the same
+	// reason). It is hashed into the signal event id, which is what keeps
+	// same-second repeats distinct while a retry of the same operation
+	// (same seq, same bytes) re-lands on the same id. Always serialized (no
+	// omitempty) so the field is a stable part of the stored bytes.
+	AuditSeq int `json:"audit_seq"`
 }
 
 type projectTaskMeta struct {
@@ -2686,10 +2697,18 @@ func contentETag(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// nowFunc is the clock behind utcTimestamp. It is a package-level var (not a
+// let-bound function) so tests can pin it to a fixed instant and exercise
+// operation sequences inside a single wall-clock second deterministically —
+// the id_rule v1.2 regression, where pause→resume→pause within one second
+// must still yield three distinct events because the identity is the
+// committed audit_seq, never the clock.
+var nowFunc = time.Now
+
 // utcTimestamp returns an RFC3339 UTC timestamp for the audit fields
 // (updated_at / created_at).
 func utcTimestamp() string {
-	return time.Now().UTC().Format(time.RFC3339)
+	return nowFunc().UTC().Format(time.RFC3339)
 }
 
 // authzActor returns the human-readable identity of the caller for the audit
@@ -2706,10 +2725,18 @@ func authzActor(caller *authpkg.CallerIdentity) string {
 }
 
 // markAuditFields stamps the human-intervention audit fields on a
-// project before writing it back.
+// project before writing it back. It also advances the project's committed
+// operation revision (AuditSeq) in the same step: the increment only becomes
+// persistent when the caller's conditional write succeeds (the ETag binds it
+// to the read version — a concurrent writer wins, the write 409s, and the
+// in-memory increment is discarded with the meta), so a committed operation
+// always consumes exactly one seq and a failed/retried attempt consumes none.
+// Callers on a convergence path that does NOT commit a project write must not
+// call this — see CancelTask.
 func markAuditFields(meta *projectMeta, actor, reason string) {
 	meta.UpdatedBy = actor
 	meta.UpdatedAt = utcTimestamp()
+	meta.AuditSeq++
 	if reason != "" {
 		meta.PauseReason = reason
 	}
@@ -2818,7 +2845,7 @@ func (h *ProjectHandler) PauseProject(w http.ResponseWriter, r *http.Request) {
 		"project_id": meta.ProjectID,
 		"reason":     reqBody.Reason,
 		"actor":      authzActor(caller),
-	})
+	}, meta.AuditSeq)
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("⏸️ 项目 %s 已被暂停%s", meta.ProjectID, pauseReasonSuffix(reqBody.Reason)))
 	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
 }
@@ -2845,7 +2872,7 @@ func (h *ProjectHandler) ResumeProject(w http.ResponseWriter, r *http.Request) {
 	h.emitSignalEvent(r.Context(), signalEmitters["ResumeProject"], pwc.team, signalTeamID(meta, pwc.team), meta.ProjectID, "", nil, pwc.key, refBytes(meta), map[string]any{
 		"project_id": meta.ProjectID,
 		"actor":      authzActor(caller),
-	})
+	}, meta.AuditSeq)
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("▶️ 项目 %s 已恢复", meta.ProjectID))
 	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
 }
@@ -2941,7 +2968,7 @@ func (h *ProjectHandler) ReplanProject(w http.ResponseWriter, r *http.Request) {
 		"project_id":  meta.ProjectID,
 		"task_count":  len(planned),
 		"actor":       authzActor(caller),
-	})
+	}, meta.AuditSeq)
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("📋 项目 %s 已重规划（%d 个任务）", meta.ProjectID, len(planned)))
 	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
 }
@@ -3354,9 +3381,17 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	markAuditFields(meta, authzActor(caller), reason)
+	// The audit stamp — including the audit_seq increment — happens only when
+	// THIS request commits the project write. On the retry-convergence path
+	// (project node already cancelled by the first attempt) the intervention
+	// was already committed with the persisted revision; re-stamping here
+	// would advance the in-memory seq for a write that never happens, and the
+	// re-emit would then hash a revision the store never contained, breaking
+	// the same-operation retry idempotency the deterministic id provides.
 	if nodeStatus != "cancelled" {
-		// First attempt: write the project node, then the task meta.
+		// First attempt: stamp the audit fields, write the project node,
+		// then the task meta.
+		markAuditFields(meta, authzActor(caller), reason)
 		if !h.writeProjectMeta(r.Context(), w, key, meta, etag) {
 			return
 		}
@@ -3369,7 +3404,7 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		"project_id": meta.ProjectID,
 		"reason":     reason,
 		"actor":      authzActor(caller),
-	})
+	}, meta.AuditSeq)
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("🚫 任务 %s 已取消（项目 %s）", taskID, meta.ProjectID))
 	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, team, false))
 }
@@ -3591,7 +3626,7 @@ func (h *ProjectHandler) CompleteProject(w http.ResponseWriter, r *http.Request)
 	h.emitSignalEvent(r.Context(), signalEmitters["CompleteProject"], pwc.team, signalTeamID(meta, pwc.team), meta.ProjectID, "", nil, pwc.key, refBytes(meta), map[string]any{
 		"project_id": meta.ProjectID,
 		"actor":      authzActor(caller),
-	})
+	}, meta.AuditSeq)
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("✅ 项目 %s 已完成", meta.ProjectID))
 	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
 }

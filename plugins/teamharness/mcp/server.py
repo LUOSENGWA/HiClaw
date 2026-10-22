@@ -3798,6 +3798,7 @@ def _accept_task_result(arguments: dict[str, Any], payload: dict[str, Any]) -> d
             "node_status": node_status,
             "submission_id": persisted_submission_id or None,
         },
+        audit_seq=_project_audit_seq(project),
     )
     return result
 
@@ -4213,6 +4214,7 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     "decision": decision,
                     "loop_status": loop.get("status"),
                 },
+                audit_seq=_project_audit_seq(project),
             )
             verdict = payload.get("verdict")
             evidence_ref = str(payload.get("evidenceRef") or payload.get("evidence_ref") or "").strip()
@@ -4232,6 +4234,7 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         "verdict": verdict if isinstance(verdict, dict) else {},
                         "evidence_ref": evidence_ref,
                     },
+                    audit_seq=_project_audit_seq(project),
                 )
             return {
                 "ok": True,
@@ -4765,14 +4768,18 @@ def _signal_event_id(
     iteration: int | None,
     fingerprint: str,
     attempt: int = 0,
+    audit_seq: int = 0,
 ) -> str:
-    # Contract id_rule (v1.1): 'ev_' + sha256(team_id|project_id|task_id|
-    # loop_id|event_type|source_event|iteration|fingerprint|attempt)[:16].
-    # fingerprint is the hex sha256 of the ref bytes after the main write —
-    # the stable identity of the logical operation's result, so a retry of
-    # the same operation re-reads the same state bytes and re-lands on the
-    # same id (consumer dedupes), while two distinct operations (another
-    # project, another iteration, a second pause) hash distinct inputs.
+    # Contract id_rule (v1.2): 'ev_' + sha256(team_id|project_id|task_id|
+    # loop_id|event_type|source_event|iteration|fingerprint|attempt|
+    # audit_seq)[:16]. fingerprint is the hex sha256 of the ref bytes after
+    # the main write — the stable identity of the logical operation's
+    # result; audit_seq is the project's persisted committed-operation
+    # revision (the operation INSTANCE identity), so two distinct
+    # operations whose post-write state bytes are byte-identical (e.g. a
+    # second pause within the same wall-clock second) still hash distinct
+    # inputs, while a retry of the same operation (same committed revision
+    # + same state bytes) re-lands on the same id (consumer dedupes).
     # Must stay byte-identical to the Go signalEventID (both test suites
     # pin the same fixed vector).
     digest = hashlib.sha256(
@@ -4786,9 +4793,24 @@ def _signal_event_id(
             str(iteration) if iteration is not None else "",
             fingerprint,
             str(attempt),
+            str(audit_seq),
         ]).encode("utf-8")
     ).hexdigest()
     return "ev_" + digest[:16]
+
+
+def _project_audit_seq(project: dict[str, Any] | Any) -> int:
+    # id_rule v1.2: the project's committed-operation revision as persisted
+    # by the Go intervention endpoints (markAuditFields advances it per
+    # committed write). This runtime only ever READS it — Python writes
+    # always change state bytes, so no increment is needed here. 0 when
+    # absent (projects written before v1.2).
+    if not isinstance(project, dict):
+        return 0
+    seq = project.get("audit_seq")
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        return 0
+    return seq
 
 
 def _safe_read_bytes(path: Path) -> bytes:
@@ -4809,6 +4831,7 @@ def _emit_signal_event(
     ref: str = "",
     ref_bytes: bytes = b"",
     payload: dict[str, Any] | None = None,
+    audit_seq: int = 0,
 ) -> bool:
     """Append one S2 signal event object under shared/events/{team_id}/.
 
@@ -4818,15 +4841,21 @@ def _emit_signal_event(
     land on the same object key, which is then skipped. The local write is
     followed by a best-effort single-file mirror push (failure warn-only,
     the local object stays). Returns True when the object was written.
+
+    audit_seq (contract id_rule v1.2) is the project's persisted
+    committed-operation revision — the operation instance identity that
+    distinguishes two operations whose post-write state bytes would
+    otherwise be identical; 0 when the project carries none.
     """
     try:
         source_event, event_type, origin = _SIGNAL_EMITTERS[emitter]
         team_name = str(_runtime_team_name() or "").strip()
         team_id = team_name or "global"
-        # The fingerprint of the post-write ref state is the stable identity
-        # of this logical operation (contract id_rule v1.1) — hashed into
-        # the event id so distinct operations never share a key while a
-        # retry of the same operation re-lands on the original.
+        # The fingerprint of the post-write ref state plus the committed
+        # audit_seq are the stable identity of this logical operation
+        # (contract id_rule v1.2) — hashed into the event id so distinct
+        # operations never share a key while a retry of the same operation
+        # re-lands on the original.
         fingerprint = hashlib.sha256(ref_bytes).hexdigest()
         event_id = _signal_event_id(
             team_id,
@@ -4838,6 +4867,7 @@ def _emit_signal_event(
             iteration_index,
             fingerprint,
             0,
+            audit_seq,
         )
         path = _workspace_dir(arguments) / "shared" / "events" / team_id / f"{event_id}.json"
         if path.exists():
@@ -6164,6 +6194,9 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         "result_status": status,
                         "reused": True,
                     },
+                    audit_seq=_project_audit_seq(
+                        _read_json(_project_state_path(arguments, str(task.get("project_id") or "")))
+                    ),
                 )
                 return result
             # Tightening: submission requires an acknowledged assignment.
