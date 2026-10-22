@@ -183,6 +183,62 @@ async def run_cli(
     )
 
 
+
+async def _persist_turn(ctx: Any, user_text: str, answer: str) -> None:
+    """Append the slash turn to the session store so the chat shows it.
+
+    Slash dispatch short-circuits the agent, so nothing else writes the
+    conversation. We mirror what an agent turn would persist: append the
+    user message and the assistant reply to ``agent.state.context``.
+    """
+    try:
+        session = getattr(getattr(ctx, "workspace", None), "session", None)
+        if session is None:
+            return
+        request = getattr(ctx, "request", None)
+        user_id = str(getattr(request, "user_id", "") or "default")
+        channel = str(getattr(request, "channel", "") or "console")
+        session_id = str(getattr(ctx, "session_id", "") or "")
+        if not session_id:
+            return
+        state_dict = await session.get_session_state_dict(
+            session_id,
+            user_id=user_id,
+            channel=channel,
+        )
+        raw = ((state_dict or {}).get("agent") or {}).get("state") or {}
+        from agentscope.message import Msg, TextBlock
+        from agentscope.state import AgentState
+
+        try:
+            state = AgentState.model_validate(raw) if raw else AgentState()
+        except Exception:
+            state = AgentState()
+        state.context.append(
+            Msg(
+                name=user_id,
+                role="user",
+                content=[TextBlock(type="text", text=user_text)],
+            ),
+        )
+        state.context.append(
+            Msg(
+                name="qwen-code",
+                role="assistant",
+                content=[TextBlock(type="text", text=answer)],
+            ),
+        )
+        await session.update_session_state(
+            session_id,
+            "agent.state",
+            state.model_dump(mode="json"),
+            user_id=user_id,
+            channel=channel,
+        )
+    except Exception:
+        return
+
+
 def make_handler():
     """Build the async slash-command handler ``(ctx, args) -> Msg``."""
 
@@ -203,6 +259,7 @@ def make_handler():
             cwd=workspace or None,
             qwenpaw_session_id=session_id,
         )
+        await _persist_turn(ctx, prompt, answer)
         return Msg(
             name="qwen-code",
             role="assistant",

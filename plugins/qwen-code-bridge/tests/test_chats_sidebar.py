@@ -15,17 +15,22 @@ def calls(monkeypatch):
 
     def fake_request(method, url, body, agent_id, timeout=5.0):  # noqa: ARG001
         recorded.append((method, url, body))
+        if url.endswith("/api/chats") and method == "GET":
+            return list(fake_request.chats)  # type: ignore[attr-defined]
         if url.endswith("/api/chats/groups") and method == "GET":
             return list(fake_request.groups)  # type: ignore[attr-defined]
         if url.endswith("/api/chats/groups") and method == "POST":
             return {"id": "g-new", "name": body["name"], "pinned": False}
         if url.endswith("/api/chats") and method == "POST":
-            return {"id": "chat-new"}
+            created = {"id": "chat-new", **(body or {})}
+            fake_request.chats.append(created)  # type: ignore[attr-defined]
+            return created
         if "/api/chats/" in url and method == "PUT":
             return {"id": url.rsplit("/", 1)[-1]}
         return None
 
     fake_request.groups = []  # type: ignore[attr-defined]
+    fake_request.chats = []  # type: ignore[attr-defined]
     monkeypatch.setattr(chats, "_request", fake_request)
     return recorded, fake_request
 
@@ -91,3 +96,16 @@ def test_rename_chat(calls) -> None:
 
 def test_run_chat_name() -> None:
     assert chats.run_chat_name("t1", "qwen", "running") == "t1 · qwen · running"
+
+
+def test_ensure_direct_chat_reuses_or_creates(calls) -> None:
+    recorded, fake = calls
+    cid = chats.ensure_direct_chat("http://app", "agent-x", "g-1")
+    assert cid == "chat-new"
+    body = [b for m, u, b in recorded if m == "POST" and u.endswith("/api/chats")][-1]
+    assert body["session_id"] == chats.DIRECT_SESSION_ID
+    assert body["name"] == chats.DIRECT_CHAT_NAME
+    # second call finds the existing chat (no extra POST)
+    recorded.clear()
+    assert chats.ensure_direct_chat("http://app", "agent-x", "g-1") == "chat-new"
+    assert not any(m == "POST" for m, _, _ in recorded)

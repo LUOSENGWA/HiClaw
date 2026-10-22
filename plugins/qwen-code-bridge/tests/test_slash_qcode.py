@@ -90,3 +90,42 @@ async def test_missing_cli_reports_error(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("QWEN_CODE_BRIDGE_STATE_DIR", str(tmp_path / "state"))
     answer = await slash.run_cli("x", cwd=str(tmp_path), qwenpaw_session_id="s3")
     assert "启动失败" in answer
+
+
+@pytest.mark.asyncio
+async def test_handler_persists_turn_into_session(stub, tmp_path) -> None:
+    """The slash turn is appended to agent.state.context (chat history)."""
+    recorded: dict = {}
+
+    class FakeSession:
+        async def get_session_state_dict(self, session_id, user_id="", channel=""):
+            recorded["load"] = (session_id, user_id, channel)
+            return {}
+
+        async def update_session_state(self, session_id, key, value, user_id="", channel=""):
+            recorded["save"] = (session_id, key, value, user_id, channel)
+
+    class FakeWorkspace:
+        session = FakeSession()
+
+    class FakeRequest:
+        user_id = "default"
+        channel = "qwen-code-bridge"
+
+    class Ctx:
+        session_id = "qwen-code-bridge:direct"
+        workspace_dir = str(tmp_path)
+        workspace = FakeWorkspace()
+        request = FakeRequest()
+
+    handler = slash.make_handler()
+    msg = await handler(Ctx(), "hello cli")
+    assert msg.content[0].text == "STUB-ANSWER"
+    session_id, key, value, user_id, channel = recorded["save"]
+    assert session_id == "qwen-code-bridge:direct"
+    assert key == "agent.state"
+    assert user_id == "default" and channel == "qwen-code-bridge"
+    roles = [m["role"] for m in value["context"]]
+    assert roles == ["user", "assistant"]
+    assert value["context"][0]["content"][0]["text"] == "hello cli"
+    assert value["context"][1]["content"][0]["text"] == "STUB-ANSWER"

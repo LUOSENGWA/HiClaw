@@ -182,6 +182,39 @@ async def post_dispatch(
     return {"task_id": task_id}
 
 
+class SidebarRequest(BaseModel):
+    """Optional agent override for sidebar provisioning."""
+
+    agent_id: str = ""
+
+
+@router.post("/sidebar")
+async def post_sidebar(body: SidebarRequest | None = None) -> dict:
+    """Ensure the pinned QwenCode group + the direct-chat session exist."""
+    import asyncio
+
+    from . import chats
+
+    agent = chats.resolve_agent(
+        (body.agent_id if body else "")
+        or None,
+    )
+    root = chats.resolve_root(None)
+    group_id = await asyncio.to_thread(chats.ensure_group, root, agent)
+    chat_id = await asyncio.to_thread(
+        chats.ensure_direct_chat,
+        root,
+        agent,
+        group_id,
+    )
+    return {
+        "agent_id": agent,
+        "group_id": group_id,
+        "direct_chat_id": chat_id,
+        "direct_session_id": chats.DIRECT_SESSION_ID,
+    }
+
+
 @router.get("/dispatch")
 async def list_dispatch(
     service: DispatchService = Depends(_get_dispatch_service),

@@ -135,6 +135,37 @@ def create_run_chat(
     return str(created.get("id") or "")
 
 
+DIRECT_SESSION_ID = "qwen-code-bridge:direct"
+DIRECT_CHAT_NAME = "QwenCode · 直接对话"
+
+
+def ensure_direct_chat(
+    root: str,
+    agent_id: str,
+    group_id: str,
+    user_id: str = "default",
+) -> str:
+    """Return the group's direct-chat id, creating it once if needed."""
+    existing = _request("GET", root + "/api/chats", None, agent_id) or []
+    for chat in existing:
+        if not isinstance(chat, dict):
+            continue
+        if (
+            str(chat.get("channel") or "") == CHAT_CHANNEL
+            and str(chat.get("session_id") or "") == DIRECT_SESSION_ID
+        ):
+            return str(chat.get("id") or "")
+    return create_run_chat(
+        root,
+        agent_id,
+        name=DIRECT_CHAT_NAME,
+        session_id=DIRECT_SESSION_ID,
+        user_id=user_id,
+        group_id=group_id,
+        meta={"kind": "direct", "product": "qwen-code-bridge"},
+    )
+
+
 def rename_chat(
     root: str,
     agent_id: str,
