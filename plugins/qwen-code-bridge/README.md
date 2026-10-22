@@ -4,7 +4,7 @@
 
 - plugin id：`qwen-code-bridge`　后端包：`qwen_code_bridge`　HTTP 前缀：`/api/qwen-code-bridge`
 - 版本矩阵：QwenPaw **2.2.x**（旧插件框架）与 **#7565 新框架**双绿；Qwen Code CLI **0.26.0**（web shell 按同版本重建，见 `web-shell/`）
-- 测试：`76 passed + 1 skipped`（旧框架）/ `77 passed`（#7565）；发布门 `scripts/verify-bridge.sh`（双框架 + 4 项 live 检查 + evidence JSON）
+- 测试：`78 passed + 1 skipped`（旧框架）/ `78 passed`（#7565）；发布门 `scripts/verify-bridge.sh`（双框架 + 4 项 live 检查 + evidence JSON）
 
 ## 目录
 
