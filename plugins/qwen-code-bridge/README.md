@@ -99,3 +99,9 @@ curl -X POST http://127.0.0.1:8088/api/qwen-code-bridge/dispatch \
 - **web shell**：Qwen Code 版本升级 → 重跑 `web-shell/build.sh`（补丁见 `web-shell/README.md`）
 - **状态目录**：`<workspace>/.qwenpaw/qwen-code-bridge/`（任务/会话映射/证据/重建产物）
 - 已知边界：控制台内会话列表依赖“重建 base 版 shell”；未重建时只能用直聊/`/qcode`，见 `web.py` 的回退逻辑
+
+## 排障
+
+- **新标签打开后刷新出现 `{"detail":"Not Found"}`**：已修（10/22）。浏览器导航到客户端路由（`/session/<id>`、`/threads`、`/settings`…）时，代理会在两种情况下都回退到 SPA：① 有重建产物 → 我们的 index；② 没有重建产物 → daemon 自己的 index（前缀改写）。若仍复现：硬刷新（Ctrl+Shift+R）并给出完整 URL。
+- **控制台里会话列表为空**：说明跑的是**未重建**的 shell（`<state>/web-shell/dist` 不存在）——按 `web-shell/README.md` 构建一次，或从别的实例拷贝 dist。
+- **`/web/settings` 返回 `Unknown coding CLI: web`**：已修（`/web/*` 路由前置，不再被 `/{cli_id}/settings` 吞）。

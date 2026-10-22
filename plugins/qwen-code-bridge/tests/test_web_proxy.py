@@ -203,3 +203,41 @@ def test_client_routes_serve_spa_not_management_404(monkeypatch, tmp_path) -> No
         )
         assert resp.status_code == 200, path
         assert "REBUILT" in resp.text, path
+
+
+class _SpaUpstream(BaseHTTPRequestHandler):
+    """/ → HTML index, other client routes → 404 JSON (like qwen serve)."""
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path in ("/", ""):
+            body = b"<html><head></head><body>UPSTREAM-SHELL</body></html>"
+            code, ctype = 200, "text/html"
+        else:
+            body = b'{"detail":"Not Found"}'
+            code, ctype = 404, "application/json"
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+def test_client_route_falls_back_without_rebuilt_dist(monkeypatch, tmp_path, client) -> None:
+    """No rebuilt shell: client-route 404s must still boot the daemon's SPA."""
+    server = HTTPServer(("127.0.0.1", 0), _SpaUpstream)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv(web.SERVE_URL_ENV, f"http://127.0.0.1:{server.server_address[1]}")
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_STATE_DIR", str(tmp_path / "no-dist"))
+    try:
+        resp = client.get(
+            "/api/qwen-code-bridge/web/session/abc",
+            headers={"Accept": "text/html"},
+        )
+        assert resp.status_code == 200
+        assert "UPSTREAM-SHELL" in resp.text
+        assert '{"detail"' not in resp.text
+    finally:
+        server.shutdown()

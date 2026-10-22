@@ -384,14 +384,29 @@ async def web_proxy(path: str, request: Request) -> Response:
     media_type = upstream.headers.get("content-type", "application/octet-stream")
     content = upstream.content
     wants_html = "text/html" in request.headers.get("accept", "").lower()
-    if dist is not None and wants_html and upstream.status_code >= 400:
+    if wants_html and upstream.status_code >= 400:
         # Browser navigation to a client-side route (/session/<id>, /threads, …):
-        # the daemon answers 404 JSON, the SPA must boot instead.
-        return Response(
-            content=_spa_index(dist),
-            status_code=200,
-            media_type="text/html; charset=utf-8",
-        )
+        # the daemon answers 404 JSON, the SPA must boot instead. Works with or
+        # without a rebuilt shell (without it, the daemon's own index is reused).
+        if dist is not None:
+            return Response(
+                content=_spa_index(dist),
+                status_code=200,
+                media_type="text/html; charset=utf-8",
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                index = await client.get(base + "/", headers=_headers(request))
+            if index.status_code < 400 and index.content:
+                return Response(
+                    content=_rewrite_console_html(index.content),
+                    status_code=200,
+                    media_type="text/html; charset=utf-8",
+                    headers={"Cache-Control": "no-store"},
+                )
+        except Exception:
+            pass
     if "text/html" in media_type.lower():
         if dist is not None:
             content = _spa_index(dist)
