@@ -921,3 +921,16 @@ def test_scan_once_marks_orphan_stale(tmp_path, monkeypatch):
     changed = svc._scan_once()
     assert [t["task_id"] for t in changed] == [tid]
     assert changed[0]["state"] == "stale"
+
+
+def test_chat_sync_switch_env_and_config(tmp_path, monkeypatch):
+    from qwen_code_bridge import dispatch as d
+
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_CHAT_SYNC", "0")
+    assert d.chat_sync_enabled() is False
+    monkeypatch.delenv("QWEN_CODE_BRIDGE_CHAT_SYNC", raising=False)
+    monkeypatch.setattr(d, "state_dir", lambda: tmp_path)
+    (tmp_path / "config.json").write_text('{"chat_sync": false}', encoding="utf-8")
+    assert d.chat_sync_enabled() is False
+    (tmp_path / "config.json").write_text('{"chat_sync": true}', encoding="utf-8")
+    assert d.chat_sync_enabled() is True

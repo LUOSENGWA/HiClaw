@@ -226,6 +226,21 @@ def user_message(session_id: str, prompt: str) -> str:
     )
 
 
+def chat_sync_enabled() -> bool:
+    """Sidebar chat sync switch: env > state/config.json > default true."""
+    if os.environ.get("QWEN_CODE_BRIDGE_CHAT_SYNC", "1") == "0":
+        return False
+    try:
+        cfg = state_dir() / "config.json"
+        if cfg.exists():
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "chat_sync" in data:
+                return bool(data.get("chat_sync"))
+    except (OSError, ValueError):
+        pass
+    return True
+
+
 def resolve_approval_mode(
     requested: str | None = None,
     level: str | None = None,
@@ -980,7 +995,7 @@ class DispatchService:
             name=f"coding-cli-dispatch-{task_id}",
         )
         # 侧栏同步（P1）：在 console 左栏 "QwenCode" 分组里建一条会话记录；失败不影响派单
-        _sync = os.environ.get("QWEN_CODE_BRIDGE_CHAT_SYNC", "1") != "0"
+        _sync = chat_sync_enabled()
         if _sync:
           try:
               _wake = task.get("wake") or {}

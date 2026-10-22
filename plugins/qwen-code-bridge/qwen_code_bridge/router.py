@@ -233,7 +233,11 @@ async def post_sidebar(
     import asyncio
 
     from . import chats
+    from .dispatch import chat_sync_enabled
     from .endpoints import app_base
+
+    if not chat_sync_enabled():
+        return {"disabled": True, "reason": "chat_sync=false"}
 
     agent = chats.resolve_agent(
         (body.agent_id if body else "")
