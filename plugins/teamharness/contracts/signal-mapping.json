@@ -1,7 +1,7 @@
 {
-  "version": "1.0",
+  "version": "1.1",
   "description": "Cross-language golden fixture for S2 signal emission (INT-3, #1394 S2 aligned). Single source of truth for the 14-event list: the Go side keeps an in-code emitter table (F8 precedent, task-transitions.json) and cross-checks it against this file in tests; the Python side reads this file at runtime. Precedent: task-transitions.json.",
-  "id_rule": "event_id = 'ev_' + sha256(team_id|task_id|event_type|source_event|attempt)[:16] hex (no timestamp: a retry of the same logical event yields the same id; consumers dedupe by event_id, keyed taskId+type+attempt semantics per #1394)",
+  "id_rule": "event_id = 'ev_' + sha256(team_id|project_id|task_id|loop_id|event_type|source_event|iteration|fingerprint|attempt)[:16] hex. Fixed field order; each field is a plain string, empty string when the emitter carries no such identity (project-level events leave task_id empty; task events set project_id and leave loop_id/iteration empty; iteration is the decimal iteration_index or empty). fingerprint = the event fingerprint field = hex(sha256 of the ref bytes after the main write) - the stable identity of the logical operation's result: a retry of the same operation re-reads the same state bytes and re-lands on the same id (consumers dedupe by event_id, keyed on the operation identity per #1394), while two distinct operations - another project, another loop iteration, or a second occurrence of the same control operation (pause/resume/pause) - hash distinct inputs and cannot share a key. No raw timestamp is hashed; the state bytes carry the identity.",
   "levels": ["info", "warn", "error", "critical"],
   "source_event_note": "source_event = the row's row id, unique per emit point. It is hashed into id_rule, so two emit points must never share it (11-SIGNAL: submit and accept share source_event.origin=submit but use different source_events to keep ids distinct).",
   "events": [

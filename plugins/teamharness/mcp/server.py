@@ -3789,6 +3789,7 @@ def _accept_task_result(arguments: dict[str, Any], payload: dict[str, Any]) -> d
         arguments,
         "accept_task_result",
         task_id=task_id,
+        project_id=str(project.get("project_id") or ""),
         ref=f"shared/tasks/{task_id}/meta.json",
         ref_bytes=_safe_read_bytes(_task_state_path(arguments, task_id)),
         payload={
@@ -4201,6 +4202,7 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 arguments,
                 "record_loop_iteration",
                 task_id="",
+                project_id=project_id,
                 loop_id=None,
                 iteration_index=iteration,
                 ref=f"shared/projects/{project_id}/meta.json",
@@ -4219,6 +4221,7 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     arguments,
                     "record_loop_iteration:review",
                     task_id="",
+                    project_id=project_id,
                     loop_id=None,
                     iteration_index=iteration,
                     ref=f"shared/projects/{project_id}/meta.json",
@@ -4752,13 +4755,38 @@ _SIGNAL_EMITTERS: dict[str, tuple[str, str, str]] = {
 }
 
 
-def _signal_event_id(team_id: str, task_id: str, event_type: str, source_event: str, attempt: int = 0) -> str:
-    # Contract id_rule: 'ev_' + sha256(team_id|task_id|event_type|
-    # source_event|attempt)[:16] hex — no timestamp (retry = same id,
-    # consumer dedupes). Must stay byte-identical to the Go signalEventID
-    # (both test suites pin the same fixed vector).
+def _signal_event_id(
+    team_id: str,
+    project_id: str,
+    task_id: str,
+    loop_id: str,
+    event_type: str,
+    source_event: str,
+    iteration: int | None,
+    fingerprint: str,
+    attempt: int = 0,
+) -> str:
+    # Contract id_rule (v1.1): 'ev_' + sha256(team_id|project_id|task_id|
+    # loop_id|event_type|source_event|iteration|fingerprint|attempt)[:16].
+    # fingerprint is the hex sha256 of the ref bytes after the main write —
+    # the stable identity of the logical operation's result, so a retry of
+    # the same operation re-reads the same state bytes and re-lands on the
+    # same id (consumer dedupes), while two distinct operations (another
+    # project, another iteration, a second pause) hash distinct inputs.
+    # Must stay byte-identical to the Go signalEventID (both test suites
+    # pin the same fixed vector).
     digest = hashlib.sha256(
-        f"{team_id}|{task_id}|{event_type}|{source_event}|{attempt}".encode("utf-8")
+        "|".join([
+            team_id,
+            project_id,
+            task_id,
+            loop_id,
+            event_type,
+            source_event,
+            str(iteration) if iteration is not None else "",
+            fingerprint,
+            str(attempt),
+        ]).encode("utf-8")
     ).hexdigest()
     return "ev_" + digest[:16]
 
@@ -4775,6 +4803,7 @@ def _emit_signal_event(
     emitter: str,
     *,
     task_id: str = "",
+    project_id: str = "",
     loop_id: str | None = None,
     iteration_index: int | None = None,
     ref: str = "",
@@ -4794,7 +4823,22 @@ def _emit_signal_event(
         source_event, event_type, origin = _SIGNAL_EMITTERS[emitter]
         team_name = str(_runtime_team_name() or "").strip()
         team_id = team_name or "global"
-        event_id = _signal_event_id(team_id, task_id, event_type, source_event, 0)
+        # The fingerprint of the post-write ref state is the stable identity
+        # of this logical operation (contract id_rule v1.1) — hashed into
+        # the event id so distinct operations never share a key while a
+        # retry of the same operation re-lands on the original.
+        fingerprint = hashlib.sha256(ref_bytes).hexdigest()
+        event_id = _signal_event_id(
+            team_id,
+            project_id,
+            task_id,
+            loop_id or "",
+            event_type,
+            source_event,
+            iteration_index,
+            fingerprint,
+            0,
+        )
         path = _workspace_dir(arguments) / "shared" / "events" / team_id / f"{event_id}.json"
         if path.exists():
             return False  # idempotent re-emit: keep the original object
@@ -4806,7 +4850,7 @@ def _emit_signal_event(
             "is_signal": True,
             "source_event": {"origin": origin, "request_id": None},
             "ref": ref,
-            "fingerprint": hashlib.sha256(ref_bytes).hexdigest(),
+            "fingerprint": fingerprint,
             "iteration_index": iteration_index,
             "payload": payload or {},
             "occurred_at": _utc_timestamp(),
@@ -6111,6 +6155,7 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     arguments,
                     "submit_task",
                     task_id=task_id,
+                    project_id=str(task.get("project_id") or ""),
                     ref=f"shared/tasks/{task_id}/meta.json",
                     ref_bytes=_safe_read_bytes(_task_state_path(arguments, task_id)),
                     payload={
@@ -6232,6 +6277,7 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 arguments,
                 "submit_task",
                 task_id=task_id,
+                project_id=str(task.get("project_id") or ""),
                 ref=f"shared/tasks/{task_id}/meta.json",
                 ref_bytes=_safe_read_bytes(_task_state_path(arguments, task_id)),
                 payload={

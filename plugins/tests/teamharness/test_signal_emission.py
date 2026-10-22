@@ -1,16 +1,19 @@
 """S2 signal emission (INT-3, #1394 aligned) tests for TeamHarness server.py.
 
 Covers the Python side of the shared contract:
-- id_rule: the cross-language fixed vector (Go's signal_events_test.go pins
-  the same value)
+- id_rule (v1.1): the cross-language fixed vector (Go's signal_events_test.go
+  pins the same value) + distinct-project / distinct-iteration /
+  pause-resume-pause / retry regressions
 - list_events: types / taskId / since filters + cursor pagination
 - record_loop_iteration: SIG-DECISION + conditional SIG-VERDICT
 - submit_task / accept_task_result: SIG-COMPLETE
-- idempotency: a re-emit of the same logical event is one object on disk
+- idempotency: an emit-level retry of the same operation is one object on
+  disk, while a later operation (advanced state bytes) gets a new object
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -24,9 +27,16 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 MCP_DIR = REPO_ROOT / "plugins" / "teamharness" / "mcp"
 CONTRACT_PATH = REPO_ROOT / "plugins" / "teamharness" / "contracts" / "signal-mapping.json"
 
-# Same vector as signal_events_test.go: first 16 hex of sha256 of
-# "alpha-team|t1|SIG-DECISION|project_paused|0".
-FIXED_VECTOR = "ev_2718c107ecfba1e8"
+# id_rule v1.1 fixed input: the post-write ref state bytes `{"project_id":
+# "p1"}`, whose sha256 hex is the fingerprint field of the id input.
+FIXED_REF_BYTES = b'{"project_id": "p1"}'
+FIXED_FINGERPRINT = hashlib.sha256(FIXED_REF_BYTES).hexdigest()
+
+# Same vector as signal_events_test.go (signalIDFixedVector): first 16 hex
+# of sha256 of "alpha-team|p1|t1||SIG-DECISION|project_paused||" +
+# FIXED_FINGERPRINT + "|0". Both suites pin the exact same value for the
+# exact same 9-tuple, so an id_rule drift on either side fails both.
+FIXED_VECTOR = "ev_1302b6e06591390d"
 
 EVENT_FIELDS = {
     "event_id", "task_id", "loop_id", "event_type", "is_signal",
@@ -103,13 +113,44 @@ def _write_task(workspace: Path, task_id: str, meta: dict[str, Any]) -> None:
 
 
 def test_signal_id_fixed_vector_and_rule(server: Any) -> None:
-    assert server._signal_event_id("alpha-team", "t1", "SIG-DECISION", "project_paused", 0) == FIXED_VECTOR
-    # attempt changes the id: a retry of a different attempt is a different event.
-    assert server._signal_event_id("alpha-team", "t1", "SIG-DECISION", "project_paused", 1) != FIXED_VECTOR
-    # submit vs accept of the same task hash distinct source_events — no collision.
-    assert server._signal_event_id("t1", "task1", "SIG-COMPLETE", "task_submitted", 0) != server._signal_event_id(
-        "t1", "task1", "SIG-COMPLETE", "task_accepted", 0
+    # Cross-language fixed vector (same 9-tuple and same value as the Go
+    # signal_events_test.go pins).
+    assert (
+        server._signal_event_id("alpha-team", "p1", "t1", "", "SIG-DECISION", "project_paused", None, FIXED_FINGERPRINT)
+        == FIXED_VECTOR
     )
+    # attempt changes the id: a retry of a different attempt is a different event.
+    assert (
+        server._signal_event_id("alpha-team", "p1", "t1", "", "SIG-DECISION", "project_paused", None, FIXED_FINGERPRINT, 1)
+        != FIXED_VECTOR
+    )
+    # submit vs accept of the same task hash distinct source_events — no collision.
+    assert server._signal_event_id("alpha-team", "p1", "task1", "", "SIG-COMPLETE", "task_submitted", None, FIXED_FINGERPRINT) != server._signal_event_id(
+        "alpha-team", "p1", "task1", "", "SIG-COMPLETE", "task_accepted", None, FIXED_FINGERPRINT
+    )
+
+    # P1 regressions (id_rule v1.1): distinct logical events never share an
+    # id; a retry of the same operation keeps its id.
+    same_bytes = hashlib.sha256(b'{"status":"paused"}').hexdigest()
+    # Two projects, same operation, even identical state bytes.
+    assert server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", None, same_bytes) != (
+        server._signal_event_id("alpha-team", "p2", "", "", "SIG-DECISION", "project_paused", None, same_bytes)
+    )
+    # Two iterations of the same loop (different post-write bytes).
+    fp_i1 = hashlib.sha256(b'{"iteration": 1}').hexdigest()
+    fp_i2 = hashlib.sha256(b'{"iteration": 2}').hexdigest()
+    assert server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", 1, fp_i1) != (
+        server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", 2, fp_i2)
+    )
+    # pause -> resume -> pause: three distinct events (pause #2 differs via
+    # the advanced state bytes, resume via source_event).
+    pause1 = server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", None, fp_i1)
+    resume = server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_resumed", None, fp_i2)
+    pause2 = server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", None, hashlib.sha256(b'{"status":"paused","again":true}').hexdigest())
+    assert len({pause1, resume, pause2}) == 3
+    # Retry of the same operation: same identity fields + same state bytes
+    # → same id (consumer dedupe relies on this).
+    assert server._signal_event_id("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", None, fp_i1) == pause1
 
 
 def test_contract_matches_py_emitters(server: Any) -> None:
@@ -136,35 +177,108 @@ def test_emit_idempotent_local(server: Any, tmp_path: Path, monkeypatch: Any) ->
     args = _arguments(workspace, "noop")
 
     first = server._emit_signal_event(
-        args, "record_loop_iteration", task_id="", iteration_index=1,
-        ref="shared/projects/p1/meta.json", ref_bytes=b'{"project_id": "p1"}',
+        args, "record_loop_iteration", task_id="", project_id="p1", iteration_index=1,
+        ref="shared/projects/p1/meta.json", ref_bytes=FIXED_REF_BYTES,
         payload={"project_id": "p1"},
     )
     assert first is True
-    # Retry of the same logical event (same id input) — must be a no-op,
-    # even with a changed payload.
+    # Emit-level retry of the same operation: same post-write bytes (→ same
+    # fingerprint) with a changed payload — must be a no-op, original kept.
     second = server._emit_signal_event(
-        args, "record_loop_iteration", task_id="", iteration_index=1,
-        ref="shared/projects/p1/meta.json", ref_bytes=b'{"project_id": "p1", "retry": true}',
+        args, "record_loop_iteration", task_id="", project_id="p1", iteration_index=1,
+        ref="shared/projects/p1/meta.json", ref_bytes=FIXED_REF_BYTES,
         payload={"project_id": "p1", "note": "retry"},
     )
     assert second is False
 
+    # A later iteration of the same loop (the stored state advanced):
+    # different post-write bytes → a different event object, and the first
+    # object stays untouched.
+    state2 = b'{"project_id": "p1", "current_iteration": 2}'
+    third = server._emit_signal_event(
+        args, "record_loop_iteration", task_id="", project_id="p1", iteration_index=2,
+        ref="shared/projects/p1/meta.json", ref_bytes=state2,
+        payload={"project_id": "p1", "iteration": 2},
+    )
+    assert third is True
+
     files = sorted(_events_dir(server, workspace).glob("*.json"))
-    assert len(files) == 1
+    assert len(files) == 2
     data = json.loads(files[0].read_text(encoding="utf-8"))
     assert set(data) == EVENT_FIELDS  # exactly the 11 schema fields
     assert data["event_id"] == files[0].stem
+    assert data["fingerprint"] == FIXED_FINGERPRINT
     assert data["payload"] == {"project_id": "p1"}  # original kept, retry dropped
-    # The mirror push fired exactly once (first emit only).
+    data2 = json.loads(files[1].read_text(encoding="utf-8"))
+    assert data2["event_id"] == files[1].stem
+    assert data2["iteration_index"] == 2
+    assert data2["fingerprint"] == hashlib.sha256(state2).hexdigest()
+    # One mirror push per written object (first and third emit only).
     assert [c for c in fake.calls if c.get("action") == "push"] == [
         {
             "workspaceDir": str(workspace),
             "action": "push",
             "payload": {},
             "path": f"shared/events/{_team(server)}/{files[0].name}",
-        }
+        },
+        {
+            "workspaceDir": str(workspace),
+            "action": "push",
+            "payload": {},
+            "path": f"shared/events/{_team(server)}/{files[1].name}",
+        },
     ]
+
+
+def test_emit_two_projects_distinct_keys(server: Any, tmp_path: Path, monkeypatch: Any) -> None:
+    """P1 regression: two projects' pause of the same shape must not share
+    one event key (the original cross-language collision)."""
+    monkeypatch.setattr(server, "_filesync", FakeFilesync())
+    workspace = tmp_path / "agent"
+    args = _arguments(workspace, "noop")
+    # Identical state bytes on both sides — project identity alone must
+    # keep the keys apart.
+    state = b'{"status": "paused"}'
+    for project_id in ("p1", "p2"):
+        emitted = server._emit_signal_event(
+            args, "record_loop_iteration", task_id="", project_id=project_id, iteration_index=None,
+            ref=f"shared/projects/{project_id}/meta.json", ref_bytes=state,
+            payload={"project_id": project_id},
+        )
+        assert emitted is True
+    files = sorted(_events_dir(server, workspace).glob("*.json"))
+    assert len(files) == 2
+    by_project = {json.loads(p.read_text(encoding="utf-8"))["payload"]["project_id"]: p.stem for p in files}
+    assert set(by_project) == {"p1", "p2"}
+    assert len(set(by_project.values())) == 2
+
+
+def test_record_loop_iteration_two_rounds_distinct_events(
+    server: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """P1 regression: iteration 2 of a loop must not be deduped as a repeat
+    of iteration 1 — the real _projectflow path writes the loop state on
+    every call, so the post-write bytes (and thus the ids) differ."""
+    monkeypatch.setattr(server, "_filesync", FakeFilesync())
+    monkeypatch.setattr(server, "_sync_project", lambda *a, **k: True)
+    loop = {"goal": "g", "stop_condition": "s", "max_iterations": 3, "current_iteration": 0,
+            "status": "running", "tasks": [], "history": []}
+    workspace = tmp_path / "agent"
+    _write_project(workspace, "p1", {"project_id": "p1", "title": "P1", "status": "active",
+                                      "plan_type": "loop", "loop": loop})
+
+    for iteration, decision in ((1, "continue"), (2, "continue")):
+        res = server._projectflow(_arguments(workspace, "record_loop_iteration", projectId="p1",
+                                             iteration=iteration, decision=decision,
+                                             summary=f"s{iteration}"))
+        assert res["ok"] is True
+
+    evs = _read_events(server, workspace)
+    assert len(evs) == 2
+    assert [e["iteration_index"] for e in evs] == [1, 2]
+    assert len({e["event_id"] for e in evs}) == 2
+    assert all(e["task_id"] == "" for e in evs)
+    assert all(e["payload"]["project_id"] == "p1" for e in evs)
 
 
 def test_list_events_filters_and_pagination(server: Any, tmp_path: Path, monkeypatch: Any) -> None:

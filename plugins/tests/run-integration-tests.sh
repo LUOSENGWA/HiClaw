@@ -13,6 +13,7 @@ ruby plugins/tests/teamharness/test-contracts.rb
 python3 -m pytest plugins/tests/teamharness/adapters/qwenpaw/test_adapter.py -q
 python3 -m pytest plugins/tests/teamharness/adapters/qwenpaw/test_package.py -q
 python3 -m pytest plugins/tests/teamharness/test_pull_project.py -q
+python3 -m pytest plugins/tests/teamharness/test_signal_emission.py -q
 python3 -m pytest plugins/tests/teamharness/mcp/test_continuation.py -q
 PYTHONPATH="${REPO_ROOT}/manager/src/agentteams_manager${PYTHONPATH:+:${PYTHONPATH}}" \
   python3 -m pytest manager/src/agentteams_manager/agentteams_manager/tests/test_taskflow_tool.py -q

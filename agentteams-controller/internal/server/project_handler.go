@@ -2814,7 +2814,7 @@ func (h *ProjectHandler) PauseProject(w http.ResponseWriter, r *http.Request) {
 	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
-	h.emitSignalEvent(r.Context(), signalEmitters["PauseProject"], pwc.team, signalTeamID(meta, pwc.team), "", nil, pwc.key, refBytes(meta), map[string]any{
+	h.emitSignalEvent(r.Context(), signalEmitters["PauseProject"], pwc.team, signalTeamID(meta, pwc.team), meta.ProjectID, "", nil, pwc.key, refBytes(meta), map[string]any{
 		"project_id": meta.ProjectID,
 		"reason":     reqBody.Reason,
 		"actor":      authzActor(caller),
@@ -2842,7 +2842,7 @@ func (h *ProjectHandler) ResumeProject(w http.ResponseWriter, r *http.Request) {
 	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
-	h.emitSignalEvent(r.Context(), signalEmitters["ResumeProject"], pwc.team, signalTeamID(meta, pwc.team), "", nil, pwc.key, refBytes(meta), map[string]any{
+	h.emitSignalEvent(r.Context(), signalEmitters["ResumeProject"], pwc.team, signalTeamID(meta, pwc.team), meta.ProjectID, "", nil, pwc.key, refBytes(meta), map[string]any{
 		"project_id": meta.ProjectID,
 		"actor":      authzActor(caller),
 	})
@@ -2937,7 +2937,7 @@ func (h *ProjectHandler) ReplanProject(w http.ResponseWriter, r *http.Request) {
 	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
-	h.emitSignalEvent(r.Context(), signalEmitters["ReplanProject"], pwc.team, signalTeamID(meta, pwc.team), "", nil, pwc.key, refBytes(meta), map[string]any{
+	h.emitSignalEvent(r.Context(), signalEmitters["ReplanProject"], pwc.team, signalTeamID(meta, pwc.team), meta.ProjectID, "", nil, pwc.key, refBytes(meta), map[string]any{
 		"project_id":  meta.ProjectID,
 		"task_count":  len(planned),
 		"actor":       authzActor(caller),
@@ -3365,7 +3365,7 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "write task meta: "+err.Error())
 		return
 	}
-	h.emitSignalEvent(r.Context(), signalEmitters["CancelTask"], team, signalTeamID(meta, team), taskID, nil, taskMetaKeys(taskID, team)[0], taskJSON, map[string]any{
+	h.emitSignalEvent(r.Context(), signalEmitters["CancelTask"], team, signalTeamID(meta, team), meta.ProjectID, taskID, nil, taskMetaKeys(taskID, team)[0], taskJSON, map[string]any{
 		"project_id": meta.ProjectID,
 		"reason":     reason,
 		"actor":      authzActor(caller),
@@ -3588,7 +3588,7 @@ func (h *ProjectHandler) CompleteProject(w http.ResponseWriter, r *http.Request)
 	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
-	h.emitSignalEvent(r.Context(), signalEmitters["CompleteProject"], pwc.team, signalTeamID(meta, pwc.team), "", nil, pwc.key, refBytes(meta), map[string]any{
+	h.emitSignalEvent(r.Context(), signalEmitters["CompleteProject"], pwc.team, signalTeamID(meta, pwc.team), meta.ProjectID, "", nil, pwc.key, refBytes(meta), map[string]any{
 		"project_id": meta.ProjectID,
 		"actor":      authzActor(caller),
 	})

@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -19,10 +21,36 @@ import (
 // precedent (task-transitions.json): the in-code signalEmitters table is
 // verified against plugins/teamharness/contracts/signal-mapping.json.
 
-// Fixed cross-language vector: sha256("alpha-team|t1|SIG-DECISION|
-// project_paused|0")[:16]. The Python test suite (test_signal_emission.py)
-// pins the exact same value, so a drift on either side fails both.
-const signalIDFixedVector = "ev_2718c107ecfba1e8"
+// Fixed cross-language vector (contract id_rule v1.1): first 16 hex of
+// sha256("alpha-team|p1|t1||SIG-DECISION|project_paused||" +
+// signalIDFixedFingerprint + "|0"). The Python test suite
+// (test_signal_emission.py) pins the exact same value, so a drift on either
+// side fails both.
+const signalIDFixedVector = "ev_1302b6e06591390d"
+
+// Fingerprint input of signalIDFixedVector: sha256 of the reference
+// post-write state bytes `{"project_id": "p1"}`.
+const signalIDFixedFingerprint = "6a454e45559e0a550fc0c106556516be8c0435281d643b53648c68d58c337c89"
+
+// testSignalFingerprint hashes reference state bytes the way the emitters do.
+func testSignalFingerprint(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// expectedSignalEventID derives the deterministic event id for an emit whose
+// ref is the object currently stored at refKey: the id_rule fingerprint is
+// the sha256 of exactly those stored post-write bytes. Call it right after
+// the write that produced the bytes (a later operation rewrites the object
+// and would change the fingerprint).
+func expectedSignalEventID(t *testing.T, store *ossfake.Memory, refKey, teamID, projectID, taskID, eventType, sourceEvent string) string {
+	t.Helper()
+	data, err := store.GetObject(context.Background(), refKey)
+	if err != nil {
+		t.Fatalf("read ref %s for fingerprint: %v", refKey, err)
+	}
+	return signalEventID(teamID, projectID, taskID, "", eventType, sourceEvent, nil, testSignalFingerprint(data), 0)
+}
 
 var signalEventTypeClosed = map[string]bool{
 	"SIG-COMPLETE":  true,
@@ -79,19 +107,72 @@ func loadSignalContract(t *testing.T) signalContract {
 }
 
 func TestSignalEventIDFixedVector(t *testing.T) {
-	if got := signalEventID("alpha-team", "t1", "SIG-DECISION", "project_paused", 0); got != signalIDFixedVector {
+	if got := signalEventID("alpha-team", "p1", "t1", "", "SIG-DECISION", "project_paused", nil, signalIDFixedFingerprint, 0); got != signalIDFixedVector {
 		t.Fatalf("id_rule drift: got %s, want %s (contract id_rule fixed vector, cross-checked with Python)", got, signalIDFixedVector)
 	}
 	// attempt changes the id (retry of a different attempt is a different event).
-	if got := signalEventID("alpha-team", "t1", "SIG-DECISION", "project_paused", 1); got == signalIDFixedVector {
+	if got := signalEventID("alpha-team", "p1", "t1", "", "SIG-DECISION", "project_paused", nil, signalIDFixedFingerprint, 1); got == signalIDFixedVector {
 		t.Fatalf("attempt=1 must not collide with attempt=0")
+	}
+}
+
+// P1 regressions (id_rule v1.1): distinct logical events must never share an
+// event key, while a retry of the same operation stays idempotent.
+
+// Two projects in the same scope: the same logical operation (pause) must
+// not share one event key (the original P1 reproduction).
+func TestSignalEventIDTwoProjectsDistinct(t *testing.T) {
+	stateP1 := []byte(`{"project_id":"p1","updated_at":"t1"}`)
+	a := signalEventID("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", nil, testSignalFingerprint(stateP1), 0)
+	b := signalEventID("alpha-team", "p2", "", "", "SIG-DECISION", "project_paused", nil, testSignalFingerprint([]byte(`{"project_id":"p2","updated_at":"t1"}`)), 0)
+	if a == b {
+		t.Fatalf("two projects' pause events share an id: %s", a)
+	}
+	// Even with identical state bytes, project identity alone keeps the ids
+	// apart.
+	c := signalEventID("alpha-team", "p2", "", "", "SIG-DECISION", "project_paused", nil, testSignalFingerprint(stateP1), 0)
+	if a == c {
+		t.Fatalf("project identity alone must keep pause ids distinct: %s", a)
+	}
+}
+
+// Two loop iterations of the same project: distinct iteration identity.
+func TestSignalEventIDTwoIterationsDistinct(t *testing.T) {
+	fp := testSignalFingerprint([]byte(`{"loop":{"current_iteration":1}}`))
+	iter1, iter2 := 1, 2
+	a := signalEventID("alpha-team", "p1", "", "", "SIG-DECISION", "loop_iteration_finished", &iter1, fp, 0)
+	b := signalEventID("alpha-team", "p1", "", "", "SIG-DECISION", "loop_iteration_finished", &iter2, fp, 0)
+	if a == b {
+		t.Fatalf("two loop iterations share an id: %s", a)
+	}
+	// Retry of the same iteration (same state bytes) re-lands on the same id.
+	c := signalEventID("alpha-team", "p1", "", "", "SIG-DECISION", "loop_iteration_finished", &iter1, fp, 0)
+	if a != c {
+		t.Fatalf("retry of the same iteration changed the id: %s vs %s", a, c)
+	}
+}
+
+// pause/resume/pause on one project: three distinct logical operations must
+// yield three distinct ids; a retry of one operation keeps its id.
+func TestSignalEventIDPauseResumePauseDistinct(t *testing.T) {
+	pause1 := signalEventID("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", nil, testSignalFingerprint([]byte(`{"status":"paused","updated_at":"t1"}`)), 0)
+	resume := signalEventID("alpha-team", "p1", "", "", "SIG-DECISION", "project_resumed", nil, testSignalFingerprint([]byte(`{"status":"active","updated_at":"t2"}`)), 0)
+	pause2State := []byte(`{"status":"paused","updated_at":"t3"}`)
+	pause2 := signalEventID("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", nil, testSignalFingerprint(pause2State), 0)
+	if pause1 == resume || resume == pause2 || pause1 == pause2 {
+		t.Fatalf("pause/resume/pause ids must be pairwise distinct: %s %s %s", pause1, resume, pause2)
+	}
+	// Retry of the second pause (same post-write state) keeps its id.
+	pause2Retry := signalEventID("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", nil, testSignalFingerprint(pause2State), 0)
+	if pause2 != pause2Retry {
+		t.Fatalf("retry of the second pause changed the id: %s vs %s", pause2, pause2Retry)
 	}
 }
 
 func TestContractCoversAllEmitters(t *testing.T) {
 	c := loadSignalContract(t)
-	if c.Version != "1.0" {
-		t.Fatalf("contract version=%q, want 1.0", c.Version)
+	if c.Version != "1.1" {
+		t.Fatalf("contract version=%q, want 1.1", c.Version)
 	}
 	if len(c.Events) != 14 {
 		t.Fatalf("contract has %d events, want 14", len(c.Events))
@@ -169,7 +250,7 @@ func TestContractCoversAllEmitters(t *testing.T) {
 	// The two SIG-COMPLETE emit points (Go complete vs Python accept) hash
 	// distinct source_events, so their ids cannot collide even at task_id="".
 	complete := signalEmitters["CompleteProject"]
-	if !strings.Contains(c.IDRule, "sha256(team_id|task_id|event_type|source_event|attempt)") {
+	if !strings.Contains(c.IDRule, "sha256(team_id|project_id|task_id|loop_id|event_type|source_event|iteration|fingerprint|attempt)") {
 		t.Fatalf("contract id_rule does not document the hash input order: %q", c.IDRule)
 	}
 	_ = complete
@@ -250,7 +331,10 @@ func TestPauseResumeEmits(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("pause status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	pauseID := signalEventID("alpha-team", "", "SIG-DECISION", "project_paused", 0)
+	metaKey := "teams/alpha-team/shared/projects/p1/meta.json"
+	// The fingerprint is the sha256 of the stored post-pause meta bytes —
+	// capture it now, before the resume below rewrites the object.
+	pauseID := expectedSignalEventID(t, store, metaKey, "alpha-team", "p1", "", "SIG-DECISION", "project_paused")
 	ev := readSignalEvent(t, store, "teams/alpha-team/shared/events/alpha-team/"+pauseID+".json")
 	assertSignalEventShape(t, ev, "SIG-DECISION", "teams/alpha-team/shared/projects/p1/meta.json", "")
 	if ev["event_id"] != pauseID {
@@ -268,7 +352,7 @@ func TestPauseResumeEmits(t *testing.T) {
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("resume status=%d body=%s", rec2.Code, rec2.Body.String())
 	}
-	resumeID := signalEventID("alpha-team", "", "SIG-DECISION", "project_resumed", 0)
+	resumeID := expectedSignalEventID(t, store, metaKey, "alpha-team", "p1", "", "SIG-DECISION", "project_resumed")
 	ev2 := readSignalEvent(t, store, "teams/alpha-team/shared/events/alpha-team/"+resumeID+".json")
 	assertSignalEventShape(t, ev2, "SIG-DECISION", "teams/alpha-team/shared/projects/p1/meta.json", "")
 	if ev2["event_id"] != resumeID {
@@ -295,7 +379,7 @@ func TestReplanProjectEmitsDecision(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("replan status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	replanID := signalEventID("alpha-team", "", "SIG-DECISION", "project_replanned", 0)
+	replanID := expectedSignalEventID(t, store, "teams/alpha-team/shared/projects/p1/meta.json", "alpha-team", "p1", "", "SIG-DECISION", "project_replanned")
 	ev := readSignalEvent(t, store, "teams/alpha-team/shared/events/alpha-team/"+replanID+".json")
 	assertSignalEventShape(t, ev, "SIG-DECISION", "teams/alpha-team/shared/projects/p1/meta.json", "")
 	if ev["event_id"] != replanID {
@@ -328,7 +412,7 @@ func TestCancelTaskEmitsDecision(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("cancel status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	cancelID := signalEventID("global", "t1", "SIG-DECISION", "task_cancelled", 0)
+	cancelID := expectedSignalEventID(t, store, "shared/tasks/t1/meta.json", "global", "p1", "t1", "SIG-DECISION", "task_cancelled")
 	ev := readSignalEvent(t, store, "shared/events/global/"+cancelID+".json")
 	assertSignalEventShape(t, ev, "SIG-DECISION", "shared/tasks/t1/meta.json", "t1")
 	if ev["event_id"] != cancelID {
@@ -354,7 +438,7 @@ func TestCompleteProjectEmitsComplete(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("complete status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	completeID := signalEventID("alpha-team", "", "SIG-COMPLETE", "project_completed", 0)
+	completeID := expectedSignalEventID(t, store, "teams/alpha-team/shared/projects/p1/meta.json", "alpha-team", "p1", "", "SIG-COMPLETE", "project_completed")
 	ev := readSignalEvent(t, store, "teams/alpha-team/shared/events/alpha-team/"+completeID+".json")
 	assertSignalEventShape(t, ev, "SIG-COMPLETE", "teams/alpha-team/shared/projects/p1/meta.json", "")
 	if ev["event_id"] != completeID {
@@ -362,28 +446,33 @@ func TestCompleteProjectEmitsComplete(t *testing.T) {
 	}
 }
 
-// TestSignalEventIdempotent: a re-emit of the same logical event (same
-// team/task/type/source/attempt) lands on the same key and must not modify
-// the stored object — even when the retry would carry a newer occurred_at
-// or payload.
+// TestSignalEventIdempotent: an emit-level retry of the same logical
+// operation (same stored post-write bytes → same fingerprint, plus the same
+// identity fields) lands on the same key and must not modify the stored
+// object — even when the retry carries a different payload or occurred_at.
+// A *different* operation (the stored state bytes advanced) must produce a
+// different key and leave the original object untouched.
 func TestSignalEventIdempotent(t *testing.T) {
 	store := ossfake.NewMemory()
 	h := newProjectTestHandler(t, store, team("alpha-team"))
 	ctx := context.Background()
 	em := signalEmitters["PauseProject"]
-	key := "teams/alpha-team/shared/events/alpha-team/" + signalEventID("alpha-team", "", "SIG-DECISION", "project_paused", 0) + ".json"
+	state := []byte(`{"status":"paused"}`)
+	key := "teams/alpha-team/shared/events/alpha-team/" +
+		signalEventID("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", nil, testSignalFingerprint(state), 0) + ".json"
 
-	h.emitSignalEvent(ctx, em, "alpha-team", "alpha-team", "", nil,
-		"teams/alpha-team/shared/projects/p1/meta.json", []byte(`{"status":"paused"}`),
+	h.emitSignalEvent(ctx, em, "alpha-team", "alpha-team", "p1", "", nil,
+		"teams/alpha-team/shared/projects/p1/meta.json", state,
 		map[string]any{"project_id": "p1"})
 	data1, err := store.GetObject(ctx, key)
 	if err != nil {
 		t.Fatalf("first emit missing: %v", err)
 	}
 
-	// Retry with a different payload: must be a no-op (original kept).
-	h.emitSignalEvent(ctx, em, "alpha-team", "alpha-team", "", nil,
-		"teams/alpha-team/shared/projects/p1/meta.json", []byte(`{"status":"paused","retry":true}`),
+	// Emit-level retry: same post-write bytes (→ same fingerprint) with a
+	// different payload: must be a no-op (original kept).
+	h.emitSignalEvent(ctx, em, "alpha-team", "alpha-team", "p1", "", nil,
+		"teams/alpha-team/shared/projects/p1/meta.json", state,
 		map[string]any{"project_id": "p1", "note": "retry"})
 	data2, err := store.GetObject(ctx, key)
 	if err != nil {
@@ -391,5 +480,28 @@ func TestSignalEventIdempotent(t *testing.T) {
 	}
 	if !bytes.Equal(data1, data2) {
 		t.Fatalf("re-emit modified the stored event: %s vs %s", data1, data2)
+	}
+
+	// A later operation (the stored state advanced, e.g. a second pause
+	// after a resume): different post-write bytes → different key, and the
+	// first object must remain untouched.
+	state2 := []byte(`{"status":"paused","updated_at":"later"}`)
+	key2 := "teams/alpha-team/shared/events/alpha-team/" +
+		signalEventID("alpha-team", "p1", "", "", "SIG-DECISION", "project_paused", nil, testSignalFingerprint(state2), 0) + ".json"
+	if key2 == key {
+		t.Fatalf("second operation must use a different key, got the same: %s", key)
+	}
+	h.emitSignalEvent(ctx, em, "alpha-team", "alpha-team", "p1", "", nil,
+		"teams/alpha-team/shared/projects/p1/meta.json", state2,
+		map[string]any{"project_id": "p1"})
+	if _, err := store.GetObject(ctx, key2); err != nil {
+		t.Fatalf("second operation event missing at %s: %v", key2, err)
+	}
+	data3, err := store.GetObject(ctx, key)
+	if err != nil {
+		t.Fatalf("original event vanished after second operation: %v", err)
+	}
+	if !bytes.Equal(data1, data3) {
+		t.Fatalf("second operation modified the first event: %s vs %s", data1, data3)
 	}
 }
