@@ -40,7 +40,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from . import approval, chats, millforge, progress, runs
+from . import approval, chats, millforge, progress, qwen_status, runs
 from .endpoints import app_base
 from .registry import CLIS
 from .state import cli_home, prepare_cli_home, qwen_cli, state_dir
@@ -1233,12 +1233,35 @@ class DispatchService:
                                 pass
 
         pump = asyncio.ensure_future(_pump())
+        timeout_extensions = 0
         try:
             while True:
                 await asyncio.sleep(self._watch_interval)
                 if proc.returncode is not None:
                     break
                 if time.time() - started > timeout:
+                    # The timeout is a wall-clock guard, not a liveness signal.
+                    # QwenCode's own live indicator is authoritative: if this
+                    # session is still active, extend instead of killing it.
+                    busy = False
+                    try:
+                        busy = await qwen_status.session_busy(
+                            str(meta.get("cwd") or os.getcwd()),
+                            str(meta.get("session_id") or ""),
+                        )
+                    except Exception:
+                        busy = False
+                    if busy and timeout_extensions < 2:
+                        timeout_extensions += 1
+                        timeout += 600
+                        self._update_task(
+                            task_id,
+                            {
+                                "timeout_extensions": timeout_extensions,
+                                "timeout": timeout,
+                            },
+                        )
+                        continue
                     killed = True
                     await _close_stdin()
                     proc.kill()

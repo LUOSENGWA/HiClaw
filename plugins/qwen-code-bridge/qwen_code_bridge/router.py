@@ -357,6 +357,38 @@ async def get_dispatch_progress(
     }
 
 
+@router.get("/qwen/status")
+async def qwen_live_status(workspace: str = "") -> dict:
+    """Read QwenCode's live-status indicator (the console status light)."""
+    import os
+
+    from . import qwen_status
+
+    return await qwen_status.fetch_live_state(workspace or os.getcwd())
+
+
+@router.get("/dispatch/{task_id}/qwen-status")
+async def dispatch_qwen_status(
+    task_id: str,
+    service: DispatchService = Depends(_get_dispatch_service),
+) -> dict:
+    import os
+
+    from . import qwen_status
+
+    task = service.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    workspace = str(task.get("cwd") or os.getcwd())
+    state = await qwen_status.fetch_live_state(workspace)
+    session_id = str(task.get("session_id") or "")
+    for session in state.get("sessions") or []:
+        if str(session.get("sessionId") or "") == session_id:
+            state["session"] = session
+            break
+    return state
+
+
 @router.get("/dispatch/{task_id}/run")
 async def get_dispatch_run(
     task_id: str,
