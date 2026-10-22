@@ -123,6 +123,11 @@ SPAWN_ARG_TEMPLATE: tuple[str, ...] = (
 STREAM_INPUT_MODES: tuple[str, ...] = ("default", "auto-edit", "auto")
 
 
+#: One reaper per dispatch dir (module-level so it survives per-request
+#: service instances; the task itself survives a plugin/process restart).
+_REAPERS: dict[str, asyncio.Task] = {}
+
+
 def build_spawn_plan(
     mode: str,
     session_id: str,
@@ -130,6 +135,7 @@ def build_spawn_plan(
     max_wall_time: str | None = None,
     max_session_turns: int | None = None,
     allowed_tools: list[str] | None = None,
+    resume: bool = False,
 ) -> tuple[list[str], bool]:
     """Return ``(argv, prompt_via_stdin)`` for one dispatch.
 
@@ -145,6 +151,9 @@ def build_spawn_plan(
         extra += ["--max-session-turns", str(int(max_session_turns))]
     if allowed_tools:
         extra += ["--allowed-tools", ",".join(str(t) for t in allowed_tools if str(t))]
+    session_args = (
+        ["--resume", session_id] if resume else ["--session-id", session_id]
+    )
     if mode in STREAM_INPUT_MODES:
         return (
             [
@@ -155,8 +164,9 @@ def build_spawn_plan(
                 "-o",
                 "stream-json",
                 "--chat-recording",
-                "--session-id",
-                session_id,
+            ]
+            + session_args
+            + [
                 "--input-format",
                 "stream-json",
             ]
@@ -165,10 +175,13 @@ def build_spawn_plan(
         )
     args: list[str] = []
     for item in SPAWN_ARG_TEMPLATE:
-        if item == "{prompt}":
+        if item == "--session-id":
+            # Replaced by session_args (--session-id or --resume).
+            continue
+        if item == "{sid}":
+            args.extend(session_args)
+        elif item == "{prompt}":
             args.append(prompt)
-        elif item == "{sid}":
-            args.append(session_id)
         elif item == "{approval_mode}":
             args.append(mode)
         else:
@@ -586,6 +599,105 @@ class DispatchService:
             self._write_task(task)
         return task
 
+    def _ensure_reaper(self) -> None:
+        """Start the restart-recovery reaper once per dispatch dir.
+
+        The child watchdog dies with the plugin process; after a restart a
+        live pid has no watcher and a dead pid has no terminal writer. The
+        reaper scans on read and closes both cases (S6).
+        """
+        key = str(self._dispatch_dir)
+        existing = _REAPERS.get(key)
+        if existing is not None and not existing.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        _REAPERS[key] = loop.create_task(
+            self._reaper_loop(), name=f"coding-cli-reaper-{key}"
+        )
+
+    async def _reaper_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._watch_interval)
+            try:
+                for task in self._scan_once():
+                    await self._notify_external(task)
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    def _scan_once(self) -> list[dict[str, Any]]:
+        """Recover tasks orphaned by a process restart (sync, testable)."""
+        changed: list[dict[str, Any]] = []
+        for path in sorted(self._dispatch_dir.glob("*.json")):
+            try:
+                task = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if task.get("state") != "running":
+                continue
+            pid = task.get("pid")
+            if pid is None:
+                continue
+            age = time.time() - float(task.get("started_epoch") or 0)
+            if not self._pid_alive(pid):
+                if age > 60:
+                    changed.append(self._mark_stale(task))
+                continue
+            timeout = float(task.get("timeout") or 0)
+            if timeout and age > timeout + 60:
+                try:
+                    os.kill(int(pid), 9)
+                except OSError:
+                    pass
+                task.update(
+                    {
+                        "state": "timeout",
+                        "exit_code": None,
+                        "finished_at": _utcnow(),
+                        "updated_at": _utcnow(),
+                        "terminal_summary": [
+                            f"[{task.get('task')}] timeout · 进程超预算，由重启恢复器终止",
+                            "exit_code: unknown (not our child)",
+                            "下一步：重新派单或查看日志",
+                        ],
+                    }
+                )
+                self._write_task(task)
+                changed.append(task)
+        return changed
+
+    async def _notify_external(self, task: dict[str, Any]) -> None:
+        wake = task.get("wake") or {}
+        origin = task.get("origin") or {}
+        sid = str(origin.get("session_id") or wake.get("session_id") or "").strip()
+        if not sid:
+            return
+        text = self._wake_text(
+            task,
+            str(task.get("state") or ""),
+            task.get("exit_code"),
+            float(task.get("wall_s") or 0),
+        )
+        try:
+            await asyncio.to_thread(
+                self._wake_sender,
+                sid,
+                str(wake.get("agent_id") or ""),
+                str(wake.get("base_url") or ""),
+                text,
+                str(origin.get("channel") or wake.get("channel") or "console"),
+                str(origin.get("user_id") or wake.get("user_id") or "default"),
+                bool(wake.get("room_bell")),
+            )
+            self._update_task(task["task_id"], {"wake_status": "sent"})
+        except Exception as exc:
+            self._update_task(
+                task["task_id"],
+                {"wake_status": f"failed: {str(exc)[:120]}"},
+            )
+
     def running_task_named(self, task_name: str) -> dict[str, Any] | None:
         """Claim flag: a live ``running`` task file with the same task name."""
         for path in sorted(self._dispatch_dir.glob("*.json")):
@@ -603,6 +715,7 @@ class DispatchService:
         ``kill=True`` only removes nothing live: it is accepted for API
         symmetry; stale task files are kept for audit.
         """
+        self._ensure_reaper()
         stale: list[str] = []
         for path in sorted(self._dispatch_dir.glob("*.json")):
             try:
@@ -615,6 +728,7 @@ class DispatchService:
         return {"stale": stale, "count": len(stale), "kill": bool(kill)}
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
+        self._ensure_reaper()
         task = self._read_task(task_id)
         if task is None:
             return None
@@ -628,6 +742,7 @@ class DispatchService:
                 raw.append(json.loads(path.read_text(encoding="utf-8")))
             except (OSError, ValueError):
                 continue
+        self._ensure_reaper()
         raw = [self._mark_stale(t) for t in raw]
         raw.sort(key=lambda t: t.get("started_epoch") or 0.0, reverse=True)
         return [
@@ -679,6 +794,7 @@ class DispatchService:
         max_wall_time: str | None = None,
         max_session_turns: int | None = None,
         allowed_tools: list[str] | None = None,
+        resume_session_id: str | None = None,
     ) -> str:
         """Spawn a headless CLI run; returns the new task id.
 
@@ -718,7 +834,12 @@ class DispatchService:
             cwd = None
 
         task_id = uuid.uuid4().hex
-        session_id = str(uuid.uuid4())
+        session_id = (
+            str(resume_session_id).strip()
+            if resume_session_id and str(resume_session_id).strip()
+            else str(uuid.uuid4())
+        )
+        resumed_from = str(resume_session_id).strip() if resume_session_id else None
         task: dict[str, Any] = {
             "task_id": task_id,
             "task": task_name,
@@ -757,6 +878,7 @@ class DispatchService:
             "approvals": {"allowed": 0, "denied": 0, "escalated": 0},
             "progress": None,
             "evidence": str(evidence).upper() if evidence else None,
+            "resumed_from": resumed_from,
             "max_wall_time": max_wall_time,
             "max_session_turns": max_session_turns,
             "allowed_tools": list(allowed_tools or []),
@@ -772,6 +894,7 @@ class DispatchService:
             max_wall_time=max_wall_time,
             max_session_turns=max_session_turns,
             allowed_tools=allowed_tools,
+            resume=bool(resumed_from),
         )
         self._update_task(
             task_id,
@@ -806,6 +929,7 @@ class DispatchService:
             ) from exc
 
         self._update_task(task_id, {"pid": proc.pid})
+        self._ensure_reaper()
         if prompt_via_stdin and proc.stdin is not None:
             try:
                 proc.stdin.write(initialize_message().encode("utf-8"))

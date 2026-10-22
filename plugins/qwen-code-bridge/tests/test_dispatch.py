@@ -894,3 +894,30 @@ def test_build_spawn_plan_yolo_compat():
     assert via_stdin is False
     assert "-p" in args and "do it" in args
     assert "--input-format" not in args
+
+
+def test_build_spawn_plan_resume_uses_resume_flag():
+    from qwen_code_bridge.dispatch import build_spawn_plan
+
+    args, via_stdin = build_spawn_plan("yolo", "sid-9", "p", resume=True)
+    assert "--resume" in args and "sid-9" in args
+    assert "--session-id" not in args
+    args2, _ = build_spawn_plan("default", "sid-9", "p", resume=True)
+    assert "--resume" in args2 and "--input-format" in args2
+
+
+def test_scan_once_marks_orphan_stale(tmp_path, monkeypatch):
+    import json, time
+    from qwen_code_bridge.dispatch import DispatchService
+
+    svc = DispatchService(dispatch_dir=tmp_path, watch_interval=0.05)
+    tid = "d" * 32
+    (tmp_path / f"{tid}.json").write_text(json.dumps({
+        "task_id": tid, "task": "t", "state": "running", "pid": 424242,
+        "started_epoch": time.time() - 300, "timeout": 600,
+        "origin": {"session_id": "s"}, "wake": {},
+    }))
+    monkeypatch.setattr(svc, "_pid_alive", lambda pid: False)
+    changed = svc._scan_once()
+    assert [t["task_id"] for t in changed] == [tid]
+    assert changed[0]["state"] == "stale"

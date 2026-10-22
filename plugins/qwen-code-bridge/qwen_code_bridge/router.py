@@ -141,6 +141,10 @@ class DispatchRequest(BaseModel):
     )
     max_session_turns: int | None = Field(default=None, ge=0)
     allowed_tools: list[str] = Field(default_factory=list)
+    resume_session_id: str | None = Field(
+        default=None,
+        description="Existing CLI session id; re-dispatch with --resume so a kill+re-dispatch keeps context (steering).",
+    )
     approval_mode: str | None = Field(
         default=None,
         description=(
@@ -188,6 +192,7 @@ async def post_dispatch(
             max_wall_time=body.max_wall_time,
             max_session_turns=body.max_session_turns,
             allowed_tools=body.allowed_tools,
+            resume_session_id=body.resume_session_id,
         )
     except DispatchBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
