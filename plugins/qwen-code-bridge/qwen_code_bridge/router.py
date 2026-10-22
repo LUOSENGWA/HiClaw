@@ -261,6 +261,31 @@ async def mirror_run_event(
     return {"appended": ok, "session_id": f"qwen-code-bridge:{task_id}"}
 
 
+
+@router.get("/chat/{chat_id}")
+async def get_chat_meta(chat_id: str, request: Request) -> dict:
+    """Channel lookup for the console chat wrapper (server-side, no auth)."""
+    from qwenpaw.app.agent_context import get_agent_for_request
+
+    try:
+        workspace = await get_agent_for_request(request)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    manager = getattr(workspace, "chat_manager", None)
+    if manager is None:
+        raise HTTPException(status_code=503, detail="chat manager unavailable")
+    chat = await manager.get_chat(chat_id)
+    if chat is None:
+        raise HTTPException(status_code=404, detail="chat not found")
+    return {
+        "chat_id": chat.id,
+        "name": chat.name,
+        "channel": chat.channel,
+        "session_id": chat.session_id,
+        "group_id": chat.group_id,
+    }
+
+
 @router.get("/runs/{task_id}/stream")
 async def stream_run(task_id: str) -> StreamingResponse:
     """SSE: tail a dispatch run's transcript + state transitions."""

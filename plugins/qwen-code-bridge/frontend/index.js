@@ -119,37 +119,43 @@
   }
 
 
-  function authFetch(path) {
+  function authFetch(path, withAgent) {
     var headers = {};
     try {
       var token = HOST.getApiToken ? HOST.getApiToken() : null;
       if (token) headers.Authorization = "Bearer " + token;
     } catch (e) {}
-    try {
-      var agent = HOST.getSelectedAgentId ? HOST.getSelectedAgentId() : "";
-      if (agent) headers["X-Agent-Id"] = agent;
-    } catch (e) {}
+    if (withAgent) {
+      try {
+        var agent = HOST.getSelectedAgentId ? HOST.getSelectedAgentId() : "";
+        if (agent) headers["X-Agent-Id"] = agent;
+      } catch (e) {}
+    }
     var f = HOST.fetch ? HOST.fetch.bind(HOST) : window.fetch.bind(window);
     return f(path, { headers: headers });
   }
 
+  function listChats(withAgent) {
+    var base = (HOST.apiBaseUrl || "") + "/";
+    return authFetch(base + "api/chats", withAgent)
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .catch(function () { return null; });
+  }
+
+  function findChat(list, sessionId) {
+    for (var i = 0; list && i < list.length; i += 1) {
+      var c = list[i];
+      if (c && (c.id === sessionId || c.session_id === sessionId)) return c;
+    }
+    return null;
+  }
+
   function bridgeChatLookup(sessionId) {
     var base = (HOST.apiBaseUrl || "") + "/";
-    function get(path) {
-      return authFetch(path).then(function (r) { return r.ok ? r.json() : null; });
-    }
-    return get(base + "api/chats/" + encodeURIComponent(sessionId))
-      .catch(function () { return null; })
-      .then(function (chat) {
-        if (chat && chat.channel) return chat;
-        return get(base + "api/chats").then(function (list) {
-          for (var i = 0; list && i < list.length; i += 1) {
-            var c = list[i];
-            if (c.id === sessionId || c.session_id === sessionId) return c;
-          }
-          return null;
-        }).catch(function () { return null; });
-      });
+    return window
+      .fetch(base + "api/qwen-code-bridge/chat/" + encodeURIComponent(sessionId))
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .catch(function () { return null; });
   }
 
   function chatIdFromUrl() {
@@ -164,33 +170,35 @@
       var st = React.useState({ id: "", chat: null });
       var state = st[0];
       var setState = st[1];
+      var lastId = React.useRef("");
       React.useEffect(function () {
         var alive = true;
+        var timer = null;
         function tick() {
           var sid = chatIdFromUrl();
+          if (sid === lastId.current) return;
+          lastId.current = sid;
           if (!sid) {
             setState({ id: "", chat: null });
             return;
           }
-          if (sid === state.id) return;
           bridgeChatLookup(sid).then(function (found) {
-            if (alive) setState({ id: sid, chat: found || {} });
+            if (alive) setState({ id: sid, chat: found || null });
           });
         }
         tick();
-        var timer = setInterval(tick, 800);
+        timer = setInterval(tick, 800);
         return function () {
           alive = false;
-          clearInterval(timer);
+          if (timer) clearInterval(timer);
         };
-      }, [state.id]);
+      }, []);
       if (state.chat && state.chat.channel === "qwen-code-bridge") {
         return React.createElement(QwenCodePage);
       }
       return React.createElement(Inner);
     };
   }
-
   try {
     H.registerRoutes("qwen-code-bridge", [
       {
