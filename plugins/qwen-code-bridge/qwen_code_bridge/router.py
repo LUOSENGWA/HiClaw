@@ -358,7 +358,9 @@ def build_router() -> APIRouter:
         getattr(route, "path", "") == "/web/status"
         for route in router.routes
     ):
-        router.include_router(web_router)
+        # /web/* must match before the parameterized management routes
+        # (/{cli_id}/settings would otherwise swallow /web/settings).
+        router.routes = list(web_router.routes) + list(router.routes)
     return router
 
 

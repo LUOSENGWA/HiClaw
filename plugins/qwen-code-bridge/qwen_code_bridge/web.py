@@ -355,6 +355,13 @@ async def web_proxy(path: str, request: Request) -> Response:
                 params=dict(request.query_params),
             )
     except Exception as exc:  # report as data, don't break the HTTP layer
+        if dist is not None and "text/html" in request.headers.get("accept", "").lower():
+            # Browser navigation with the daemon down: boot the SPA anyway.
+            return Response(
+                content=_spa_index(dist),
+                status_code=200,
+                media_type="text/html; charset=utf-8",
+            )
         return JSONResponse(
             status_code=502,
             content={
@@ -376,6 +383,15 @@ async def web_proxy(path: str, request: Request) -> Response:
         pass
     media_type = upstream.headers.get("content-type", "application/octet-stream")
     content = upstream.content
+    wants_html = "text/html" in request.headers.get("accept", "").lower()
+    if dist is not None and wants_html and upstream.status_code >= 400:
+        # Browser navigation to a client-side route (/session/<id>, /threads, …):
+        # the daemon answers 404 JSON, the SPA must boot instead.
+        return Response(
+            content=_spa_index(dist),
+            status_code=200,
+            media_type="text/html; charset=utf-8",
+        )
     if "text/html" in media_type.lower():
         if dist is not None:
             content = _spa_index(dist)

@@ -179,3 +179,27 @@ def test_workspace_path_normalization() -> None:
         web._fix_workspace_path("workspaces/e9671acd244849c5/sessions")
         == "workspaces/e9671acd244849c5/sessions"
     )
+
+
+def test_client_routes_serve_spa_not_management_404(monkeypatch, tmp_path) -> None:
+    """/web/settings must not be swallowed by /{cli_id}/settings."""
+    state = tmp_path / "state"
+    dist = state / "web-shell" / "dist"
+    dist.mkdir(parents=True)
+    (dist / "index.html").write_text(
+        "<html><head></head><body>REBUILT</body></html>",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_STATE_DIR", str(state))
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_SERVE_AUTOSTART", "0")
+    monkeypatch.setenv(web.SERVE_URL_ENV, "http://127.0.0.1:9")
+    app = FastAPI()
+    app.include_router(build_router(), prefix="/api/qwen-code-bridge")
+    http = TestClient(app)
+    for path in ("/web/settings", "/web/session/abc", "/web/threads"):
+        resp = http.get(
+            "/api/qwen-code-bridge" + path,
+            headers={"Accept": "text/html"},
+        )
+        assert resp.status_code == 200, path
+        assert "REBUILT" in resp.text, path
