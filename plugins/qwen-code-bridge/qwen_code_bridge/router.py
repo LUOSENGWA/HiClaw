@@ -320,6 +320,13 @@ async def get_coding_cli_install(
 
 def build_router() -> APIRouter:
     """Router factory consumed by ``plugin.py``."""
+    from .web import router as web_router
+
+    if not any(
+        getattr(route, "path", "") == "/web/status"
+        for route in router.routes
+    ):
+        router.include_router(web_router)
     return router
 
 
