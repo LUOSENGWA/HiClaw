@@ -100,6 +100,20 @@ class WakeSpec(BaseModel):
     room_bell: bool = False
 
 
+class OriginSpec(BaseModel):
+    """Source session the task was dispatched from (channel-agnostic).
+
+    QwenPaw identifies a session by ``(session_id, user_id, channel)``
+    (``ChatManager.get_or_create_chat``). Recording the caller's own
+    triple lets the terminal wake replay it verbatim — no channel
+    inference, no cross-channel guessing.
+    """
+
+    session_id: str = ""
+    user_id: str = "default"
+    channel: str = "console"
+
+
 class DispatchRequest(BaseModel):
     """Gateless dispatch (10/22 ruling: no parallel/conflict gates).
 
@@ -124,6 +138,7 @@ class DispatchRequest(BaseModel):
             "'yolo' (#1379 parity)."
         ),
     )
+    origin: OriginSpec | None = None
     wake: WakeSpec | None = None
 
 
@@ -144,6 +159,7 @@ async def post_dispatch(
     400: ``cwd`` given but not a directory.
     """
     wake = body.wake.model_dump() if body.wake is not None else None
+    origin = body.origin.model_dump() if body.origin is not None else None
     try:
         task_id = await service.start(
             task_name=body.task,
@@ -152,6 +168,7 @@ async def post_dispatch(
             cli=body.cli,
             timeout=body.timeout,
             wake=wake,
+            origin=origin,
             approval_mode=body.approval_mode,
         )
     except DispatchBusyError as exc:

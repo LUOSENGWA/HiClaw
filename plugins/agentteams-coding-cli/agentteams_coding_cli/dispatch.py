@@ -471,6 +471,7 @@ class DispatchService:
         cli: str,
         timeout: float,
         wake: dict[str, Any] | None,
+        origin: dict[str, Any] | None = None,
         approval_mode: str | None = None,
     ) -> str:
         """Spawn a headless CLI run; returns the new task id.
@@ -528,6 +529,7 @@ class DispatchService:
             "wall_s": None,
             "log_tail": "",
             "approval_mode": mode,
+            "origin": dict(origin) if origin else None,
             "wake": dict(wake) if wake else None,
             "wake_status": None,
         }
@@ -651,7 +653,10 @@ class DispatchService:
 
         task = self._read_task(task_id) or {}
         wake = task.get("wake") or {}
-        wake_session_id = str(wake.get("session_id") or "").strip()
+        origin = task.get("origin") or {}
+        wake_session_id = str(
+            origin.get("session_id") or wake.get("session_id") or ""
+        ).strip()
         # Terminal write carries the wake status: "pending" until the
         # (best-effort) inject lands, "skipped" when there is no target.
         self._update_task(
@@ -676,8 +681,8 @@ class DispatchService:
                     str(wake.get("agent_id") or ""),
                     str(wake.get("base_url") or ""),
                     text,
-                    str(wake.get("channel") or "console"),
-                    str(wake.get("user_id") or "default"),
+                    str(origin.get("channel") or wake.get("channel") or "console"),
+                    str(origin.get("user_id") or wake.get("user_id") or "default"),
                     bool(wake.get("room_bell")),
                 )
                 wake_status = "sent"

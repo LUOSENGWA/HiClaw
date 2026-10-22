@@ -719,3 +719,37 @@ def test_room_bell_posts_to_messages_send(monkeypatch) -> None:
         "target_session": "matrix:!room:mx",
         "text": "l1\nl2\nl3",
     }
+
+
+@pytest.mark.asyncio
+async def test_origin_replays_source_session_identity(tmp_path) -> None:
+    """origin (session_id,user_id,channel) wins over wake — channel-agnostic."""
+    with Env(tmp_path) as env:
+        _make_bin(env.bin_dir, "fakeq", 'echo \'{"type":"result","result":"ok"}\'')
+        calls, sender = _wake_recorder()
+        service = DispatchService(wake_sender=sender)
+        task_id = await service.start(
+            task_name="t-origin",
+            prompt="do it",
+            cwd=None,
+            cli="fakeq",
+            timeout=30,
+            wake={"session_id": "fallback-sid", "channel": "console"},
+            origin={
+                "session_id": "matrix:!room:mx",
+                "user_id": "!room:mx",
+                "channel": "agentteams_matrix",
+            },
+        )
+        await _wait_terminal(service, task_id)
+        settled = await _wait_wake(service, task_id)
+        assert settled["wake_status"] == "sent"
+        assert calls, "wake not sent"
+        assert calls[0]["session_id"] == "matrix:!room:mx"
+        assert calls[0]["user_id"] == "!room:mx"
+        assert calls[0]["channel"] == "agentteams_matrix"
+        assert settled["origin"] == {
+            "session_id": "matrix:!room:mx",
+            "user_id": "!room:mx",
+            "channel": "agentteams_matrix",
+        }
