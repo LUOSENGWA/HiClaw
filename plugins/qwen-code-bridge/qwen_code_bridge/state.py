@@ -116,3 +116,25 @@ def prepare_cli_home(home: str) -> str:
         except OSError:
             pass
     return str(qdir)
+
+
+def qwen_cli() -> str:
+    """Persisted Qwen Code binary from env or state/config.json.
+
+    Empty means "resolve 'qwen' from PATH" (container layer; lost on rebuild).
+    """
+    import json as _json
+    import os as _os
+
+    raw = _os.environ.get("QWEN_CODE_BRIDGE_CLI", "").strip()
+    if raw:
+        return raw
+    try:
+        cfg = state_dir() / "config.json"
+        if cfg.exists():
+            data = _json.loads(cfg.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return str(data.get("qwen_cli") or "").strip()
+    except (OSError, ValueError):
+        pass
+    return ""

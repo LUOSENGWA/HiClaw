@@ -953,3 +953,15 @@ def test_prepare_cli_home_creates_qwen_dir(tmp_path):
     qdir = state.prepare_cli_home(str(home))
     assert qdir == str(home / ".qwen")
     assert (home / ".qwen").is_dir()
+
+
+def test_qwen_cli_env_and_config(tmp_path, monkeypatch):
+    from qwen_code_bridge import state
+
+    monkeypatch.setattr(state, "state_dir", lambda: tmp_path)
+    (tmp_path / "config.json").write_text(
+        '{"qwen_cli": "/app/working/.qwen-cli/bin/qwen"}', encoding="utf-8"
+    )
+    assert state.qwen_cli() == "/app/working/.qwen-cli/bin/qwen"
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_CLI", "/env/qwen")
+    assert state.qwen_cli() == "/env/qwen"

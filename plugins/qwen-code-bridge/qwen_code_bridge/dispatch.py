@@ -43,7 +43,7 @@ from typing import Any, Callable
 from . import approval, chats, millforge, progress, runs
 from .endpoints import app_base
 from .registry import CLIS
-from .state import cli_home, prepare_cli_home, state_dir
+from .state import cli_home, prepare_cli_home, qwen_cli, state_dir
 
 #: Task ids are ``uuid4().hex``; the check also keeps task file names
 #: safe against traversal via ``get_task`` / ``get_log`` input.
@@ -855,7 +855,15 @@ class DispatchService:
                 f"pid={running.get('pid')}); wait for it to finish or "
                 "remove its task file"
             )
-        bin_path = shutil.which(cli)
+        bin_path = None
+        if cli in ("qwen", ""):
+            try:
+                configured = qwen_cli()
+                if configured and os.path.exists(configured):
+                    bin_path = configured
+            except Exception:
+                bin_path = None
+        bin_path = bin_path or shutil.which(cli)
         if bin_path is None:
             raise CliNotFoundError(_install_hint(cli))
         cli_version = None
@@ -892,6 +900,7 @@ class DispatchService:
             "task_id": task_id,
             "task": task_name,
             "cli": cli,
+            "cli_path": bin_path,
             "prompt": prompt,
             "cwd": cwd,
             "session_id": session_id,

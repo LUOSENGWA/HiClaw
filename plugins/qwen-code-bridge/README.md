@@ -152,7 +152,10 @@ curl -X POST http://127.0.0.1:8088/api/qwen-code-bridge/dispatch \
 1. **qwen CLI 在容器重建后丢失**（上游镜像不带 CLI）→ `bash tools/qwen-setup/reinstall.sh`；
 2. **`qwen serve` 拒绝嵌套 `--workspace`**（例如同时传 `/tmp` 与 `/tmp/qcb-persist`）→ 进程秒退。插件已过滤嵌套 workspace；若再遇到看 `state/web-serve.log`（spawn 的 stderr 已落盘）。
 
-**会话持久化**：CLI 会话在 `$HOME/.qwen/projects/<dir>/chats/*.jsonl`（只设 `QWEN_HOME` 不够）。`state/config.json` 设 `{"cli_home": "/app/working/.cli-home"}` 后，serve 与 dispatch 都用该 HOME（首次自动播种 settings/token，git 配置用 `GIT_CONFIG_GLOBAL` 保留），**容器重建后会话仍在**。推荐同时用预装 CLI 的派生镜像 `qwenpaw:node`（`tools/qwenpaw001-image/Dockerfile.run-as-node`）。
+**持久化边界（QwenPaw 只持久化三个目录）**：`/app/working`（qwenpaw-data）、`/app/working.backups`、`/app/working.secret`；其余路径重建即丢。因此：
+- **CLI 二进制**：`npm_config_prefix=/app/working/.qwen-cli npm install -g @qwen-code/qwen-code@0.26.0`（161 MB，落在 qwenpaw-data）；`/usr/local/bin/qwen` 是指向它的 symlink（启动钩子会重建），插件配置 `qwen_cli` 用绝对路径，不依赖 PATH。
+- **CLI 数据**：`cli_home=/app/working/.cli-home`（HOME 覆盖；会话在 `$HOME/.qwen/projects/...`，settings/serve-token 首次自动播种；git 用 `GIT_CONFIG_GLOBAL` 保留）。
+- 应急/升级：`tools/qwen-setup/reinstall.sh` 已改为持久化安装（同上路径 + symlink + settings/token）；派生镜像 `qwenpaw:node` 仍可预装 CLI（更快）。
 
 **左栏 QwenCode 组**：`state/config.json` 写 `{"chat_sync": false}`（或环境变量 `QWEN_CODE_BRIDGE_CHAT_SYNC=0`）即**不再建组/运行卡**，`POST /sidebar` 变 no-op；`/q-code` 路由与 `/dispatch` 状态 API 不受影响。
 

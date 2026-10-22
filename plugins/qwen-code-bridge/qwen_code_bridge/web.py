@@ -277,8 +277,16 @@ async def ensure_serve() -> str:
     port = _free_port()
     token = serve_token() or secrets.token_urlsafe(16)
     url = f"http://127.0.0.1:{port}"
-    binary = os.environ.get("QWEN_CODE_BRIDGE_CLI", "").strip() or "qwen"
-    if shutil.which(binary) is None:
+    binary = os.environ.get("QWEN_CODE_BRIDGE_CLI", "").strip()
+    if not binary:
+        try:
+            from .state import qwen_cli
+
+            binary = qwen_cli()
+        except Exception:
+            binary = ""
+    binary = binary or "qwen"
+    if not (os.path.isabs(binary) and os.path.exists(binary)) and shutil.which(binary) is None:
         return ""
     try:
         from .state import state_dir
@@ -393,8 +401,16 @@ async def ensure_serve() -> str:
 @router.get("/web/status")
 async def web_status() -> dict:
     """Probe ``qwen serve`` reachability (never raises)."""
-    binary = os.environ.get("QWEN_CODE_BRIDGE_CLI", "").strip() or "qwen"
-    if shutil.which(binary) is None:
+    binary = os.environ.get("QWEN_CODE_BRIDGE_CLI", "").strip()
+    if not binary:
+        try:
+            from .state import qwen_cli
+
+            binary = qwen_cli()
+        except Exception:
+            binary = ""
+    binary = binary or "qwen"
+    if not (os.path.isabs(binary) and os.path.exists(binary)) and shutil.which(binary) is None:
         return {
             "reachable": False,
             "url": "",

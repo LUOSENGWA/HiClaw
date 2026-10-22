@@ -137,10 +137,33 @@ def _hook_owner(api: PluginApi, hooks, hook_name: str) -> str | None:
     return None
 
 
+def _ensure_qwen_link() -> None:
+    """Keep /usr/local/bin/qwen pointing at the persisted CLI (if configured)."""
+    from qwen_code_bridge.state import qwen_cli
+
+    target = qwen_cli()
+    if not target or not os.path.exists(target):
+        return
+    link = "/usr/local/bin/qwen"
+    try:
+        if os.path.islink(link) or not os.path.exists(link):
+            if os.path.realpath(link) == os.path.realpath(target):
+                return
+            if os.path.lexists(link):
+                os.unlink(link)
+            os.symlink(target, link)
+            logger.info("linked %s -> %s", link, target)
+        else:
+            logger.warning("%s exists and is not a symlink; leaving it", link)
+    except OSError as exc:
+        logger.warning("cannot link %s -> %s: %s", link, target, exc)
+
+
 def _ensure_state_dir() -> None:
     from qwen_code_bridge.state import state_dir
 
     state_dir().mkdir(parents=True, exist_ok=True)
+    _ensure_qwen_link()
 
 
 def _on_shutdown() -> None:
