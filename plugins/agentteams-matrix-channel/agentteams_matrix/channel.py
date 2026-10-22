@@ -353,6 +353,12 @@ class HistoryEntry:
     # models) to be included alongside the text history when the mention
     # arrives.
     media_parts: Optional[List[Any]] = None
+    # Canonical Matrix user id (full MXID) of the sender. ``sender`` holds a
+    # human-readable display name (best-effort, may fall back to the
+    # localpart), which is NOT a stable identity: the send alignment gate
+    # compares senders against the turn's trigger-sender MXID, so the
+    # comparison must use this canonical id, not the display name (#1386 P1).
+    sender_id: Optional[str] = None
 
 
 class AgentTeamsMatrixChannel(BaseChannel):
@@ -2187,6 +2193,7 @@ class AgentTeamsMatrixChannel(BaseChannel):
                 timestamp=getattr(event, "server_timestamp", None),
                 message_id=event.event_id,
                 media_parts=media_parts or None,
+                sender_id=sender_id,
             ),
         )
 
@@ -2390,6 +2397,7 @@ class AgentTeamsMatrixChannel(BaseChannel):
                         body=desc,
                         timestamp=getattr(event, "server_timestamp", None),
                         message_id=event.event_id,
+                        sender_id=sender_id,
                     ),
                 )
                 return
@@ -2832,6 +2840,7 @@ class AgentTeamsMatrixChannel(BaseChannel):
                         body=text,
                         timestamp=getattr(event, "server_timestamp", None),
                         message_id=event.event_id,
+                        sender_id=sender_id,
                     ),
                 )
                 return
@@ -4372,7 +4381,15 @@ class AgentTeamsMatrixChannel(BaseChannel):
         for record_idx, entry in self._room_event_log.get(room_id, []):
             if record_idx <= since_records:
                 continue
-            if trigger_sender and entry.sender == trigger_sender:
+            # Canonical identity comparison (#1386 P1): entry.sender is a
+            # display name (best-effort, may be the localpart fallback),
+            # while trigger_sender is the full MXID from the turn meta —
+            # compare the entry's canonical sender_id, never the display
+            # name, or an asker's un-@'d follow-up degrades to "note".
+            entry_sender = (getattr(entry, "sender_id", "") or "").strip()
+            if not entry_sender:
+                entry_sender = (entry.sender or "").strip()
+            if trigger_sender and entry_sender == trigger_sender:
                 return True
             if worker_name and self._text_mentions_worker(
                 entry.body, worker_name
