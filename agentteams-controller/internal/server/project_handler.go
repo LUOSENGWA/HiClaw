@@ -743,14 +743,6 @@ func (h *ProjectHandler) GetProjectWorkflow(w http.ResponseWriter, r *http.Reque
 		httputil.WriteError(w, http.StatusForbidden, err.Error())
 		return
 	}
-	// INT-8: freshness anchor for this read — best-effort StatMeta on the
-	// project meta object (audit.go idiom: a stat error degrades to "no
-	// anchor" and never fails the request).
-	var projectMtime time.Time
-	if m, serr := h.oss.StatMeta(r.Context(), match.key); serr == nil {
-		projectMtime = m.ModTime
-	}
-
 	if format == "mermaid" {
 		// Pure rendering of the same snapshot (buildWorkflow); per-task
 		// TaskMeta is not needed, so includeTasks is ignored.
@@ -774,28 +766,96 @@ func (h *ProjectHandler) GetProjectWorkflow(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// INT-8: ?consistency=strong = double-read for freshness. Re-stat the
-	// project meta after the first read; if the mirror advanced, rebuild the
-	// view from the new version (task metas are re-read inside buildWorkflow
-	// when includeTasks). No blocking wait: writes landing after the re-stat
-	// are still missed (documented; mirror lag itself is tracked as #1391).
-	resp := h.buildWorkflow(meta, team, includeTasks, projectMtime)
-	if r.URL.Query().Get("consistency") == "strong" && !projectMtime.IsZero() {
-		if m2, serr := h.oss.StatMeta(r.Context(), match.key); serr == nil && m2.ModTime.After(projectMtime) {
-			if data, gerr := h.oss.GetObject(r.Context(), match.key); gerr == nil {
-				var newMeta projectMeta
-				if uerr := json.Unmarshal(data, &newMeta); uerr == nil {
-					if newMeta.TeamID == "" {
-						newMeta.TeamID = team
-					}
-					resp = h.buildWorkflow(&newMeta, team, includeTasks, m2.ModTime)
-				}
+	// INT-8: freshness anchor bound to the snapshot actually read. The
+	// anchor stat samples the mirror AFTER the content read, so
+	// verifyProjectMetaSnapshot checks the object's current ETag against
+	// the read bytes (with one bounded re-read on mismatch) before the
+	// anchor — and anything derived from it, e.g. projection_age_ms — is
+	// used.
+	meta, mtime, servedETag, verified := h.verifyProjectMetaSnapshot(r.Context(), match)
+	resp := h.buildWorkflow(meta, team, includeTasks, mtime)
+	if r.URL.Query().Get("consistency") == "strong" {
+		// Close the bracket: the verifying stat only proves the snapshot
+		// was stable at its instant. When storage has moved on, one
+		// bounded re-read (verifyProjectMetaSnapshot) is attempted and the
+		// bracket checked once more. X-Consistency: strong is set only
+		// when a stat confirms storage still holds the exact bytes being
+		// served — a failed re-read or an advance racing the re-read
+		// serves the content at hand WITHOUT the claim.
+		strong := false
+		for i := 0; i < 2 && !strong && verified; i++ {
+			m2, serr := h.oss.StatMeta(r.Context(), match.key)
+			if serr != nil || m2.ETag != servedETag {
+				meta, mtime, servedETag, verified = h.verifyProjectMetaSnapshot(r.Context(), match)
+				resp = h.buildWorkflow(meta, team, includeTasks, mtime)
+				continue
 			}
+			strong = true
 		}
-		w.Header().Set("X-Consistency", "strong")
+		if strong {
+			w.Header().Set("X-Consistency", "strong")
+		}
 	}
 
 	httputil.WriteJSON(w, http.StatusOK, resp)
+}
+
+// verifyProjectMetaSnapshot binds the freshness anchor to the project meta
+// snapshot actually served.
+//
+// The anchor StatMeta samples the mirror AFTER resolveProjectMeta's
+// GetObject. A filesync mirror advance landing in between makes the anchor
+// describe a newer version than the bytes actually read — the round-2
+// advanceAt=1 repro: stale content served with a fresh anchor and, on the
+// ?consistency=strong path, an unverified X-Consistency: strong header.
+//
+// Binding the version token to the read itself: the object's current ETag
+// (content hash — MinIO single-part ETag == MD5 of content, as in the
+// in-memory fake) must equal the ETag computed from the bytes we read
+// (match.etag). When it does not, the held snapshot is superseded and one
+// bounded re-read is attempted under the same verification (the post-read
+// stat's ETag must equal the re-read bytes' own hash). A failed re-read, an
+// unparseable re-read, or an advance racing the re-read serves the content
+// at hand with NO anchor and verified=false: the response degrades rather
+// than claiming freshness it cannot prove — a failed re-read must never be
+// reported as strong. When a backend cannot report an ETag the held
+// snapshot is assumed current (no re-read), but callers must still obtain a
+// positive ETag match before claiming strong consistency.
+//
+// A stat error degrades to "no anchor" and never fails the request
+// (audit.go idiom).
+func (h *ProjectHandler) verifyProjectMetaSnapshot(ctx context.Context, match *projectMatch) (*projectMeta, time.Time, string, bool) {
+	m, serr := h.oss.StatMeta(ctx, match.key)
+	if serr != nil {
+		return match.meta, time.Time{}, match.etag, false
+	}
+	if m.ETag == "" || m.ETag == match.etag {
+		return match.meta, m.ModTime, match.etag, true
+	}
+	// The mirror advanced between the read and the anchor stat: the held
+	// snapshot is superseded. One bounded re-read, verified the same way.
+	data, gerr := h.oss.GetObject(ctx, match.key)
+	if gerr != nil {
+		return match.meta, time.Time{}, match.etag, false
+	}
+	var newMeta projectMeta
+	if uerr := json.Unmarshal(data, &newMeta); uerr != nil {
+		return match.meta, time.Time{}, match.etag, false
+	}
+	if newMeta.TeamID == "" {
+		newMeta.TeamID = match.team
+	}
+	reETag := contentETag(data)
+	m2, serr := h.oss.StatMeta(ctx, match.key)
+	if serr != nil {
+		return &newMeta, time.Time{}, reETag, false
+	}
+	if m2.ETag != "" && m2.ETag != reETag {
+		// An advance raced the re-read: serve the fresher re-read bytes,
+		// but no anchor can be bound to them.
+		return &newMeta, time.Time{}, reETag, false
+	}
+	return &newMeta, m2.ModTime, reETag, true
 }
 
 // buildWorkflow converts project meta into the LangGraph-aligned response.

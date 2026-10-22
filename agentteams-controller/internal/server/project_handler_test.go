@@ -5913,11 +5913,36 @@ type freshnessScriptedOSS struct {
 	advanceKey    string
 	advanceData   []byte
 	advanceAt     int // 1-based: fire on this Nth StatMeta call for advanceKey
+	// races + advanceDataRace model a mirror advance landing between the
+	// re-read GetObject and its verifying stat: after every non-first
+	// successful GetObject of advanceKey, put advanceDataRace (or
+	// advanceData when unset) into the store.
+	races           bool
+	advanceDataRace []byte
+	// failReGet fails the second and subsequent GetObject calls — the
+	// bounded re-read — to model a re-read storage failure.
+	failReGet bool
 }
 
 func (f *freshnessScriptedOSS) GetObject(ctx context.Context, key string) ([]byte, error) {
 	f.getCounts[key]++
-	return f.mcLikeOSS.GetObject(ctx, key)
+	if f.failReGet && f.getCounts[key] > 1 {
+		return nil, errors.New("oss re-read failed (scripted)")
+	}
+	data, err := f.mcLikeOSS.GetObject(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if f.races && key == f.advanceKey && f.getCounts[key] > 1 {
+		race := f.advanceDataRace
+		if len(race) == 0 {
+			race = f.advanceData
+		}
+		if err := f.Memory.PutObject(ctx, f.advanceKey, race); err != nil {
+			return nil, err
+		}
+	}
+	return data, nil
 }
 
 func (f *freshnessScriptedOSS) StatMeta(ctx context.Context, key string) (oss.ObjectMeta, error) {
@@ -6108,5 +6133,180 @@ func TestWorkflowDefaultSingleRead(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Consistency"); got != "" {
 		t.Fatalf("X-Consistency = %q, want empty (default path unchanged)", got)
+	}
+}
+
+// TestWorkflowStrongInterleaveBeforeAnchor covers the round-2 advanceAt=1
+// repro: a mirror advance landing BETWEEN the content read (inside
+// resolveProjectMeta) and the anchor stat used to produce a 200 carrying
+// the stale status plus an unverified X-Consistency: strong. The anchor's
+// ETag no longer matches the read bytes, so the handler performs the bounded
+// re-read and sets the strong claim only once the re-read is verified
+// against storage — the response reflects the advanced version.
+func TestWorkflowStrongInterleaveBeforeAnchor(t *testing.T) {
+	store := ossfake.NewMemory()
+	metaKey := "shared/projects/p1/meta.json"
+	v1, _ := json.Marshal(map[string]any{"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag"})
+	v2, _ := json.Marshal(map[string]any{"project_id": "p1", "title": "P1", "status": "paused", "plan_type": "dag"})
+	_ = store.PutObject(context.Background(), metaKey, v1)
+	getCounts := map[string]int{}
+	h := newProjectTestHandlerWithOSS(t, &freshnessScriptedOSS{
+		mcLikeOSS:   &mcLikeOSS{Memory: store},
+		getCounts:   getCounts,
+		advanceKey:  metaKey,
+		advanceData: v2,
+		advanceAt:   1, // mirror advances on the FIRST stat — after the content read
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow?consistency=strong", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if body["status"] != "paused" {
+		t.Fatalf("status = %v, want \"paused\" (stale snapshot must not be served with a strong claim)", body["status"])
+	}
+	if got := rec.Header().Get("X-Consistency"); got != "strong" {
+		t.Fatalf("X-Consistency = %q, want \"strong\" (verified re-read)", got)
+	}
+	if n := getCounts[metaKey]; n != 2 {
+		t.Fatalf("meta GetObject count = %d, want 2 (read + bounded re-read)", n)
+	}
+}
+
+// TestWorkflowDefaultInterleaveBeforeAnchor: the default (non-strong) path's
+// freshness token is bound to the served snapshot too — a superseded anchor
+// triggers the same bounded re-read, so projection_age_ms never describes a
+// newer version than the content served. The no-race default path still
+// reads exactly once (TestWorkflowDefaultSingleRead).
+func TestWorkflowDefaultInterleaveBeforeAnchor(t *testing.T) {
+	store := ossfake.NewMemory()
+	metaKey := "shared/projects/p1/meta.json"
+	v1, _ := json.Marshal(map[string]any{"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag"})
+	v2, _ := json.Marshal(map[string]any{"project_id": "p1", "title": "P1", "status": "paused", "plan_type": "dag"})
+	_ = store.PutObject(context.Background(), metaKey, v1)
+	getCounts := map[string]int{}
+	h := newProjectTestHandlerWithOSS(t, &freshnessScriptedOSS{
+		mcLikeOSS:   &mcLikeOSS{Memory: store},
+		getCounts:   getCounts,
+		advanceKey:  metaKey,
+		advanceData: v2,
+		advanceAt:   1,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if body["status"] != "paused" {
+		t.Fatalf("status = %v, want \"paused\" (superseded snapshot must be re-read)", body["status"])
+	}
+	if got := rec.Header().Get("X-Consistency"); got != "" {
+		t.Fatalf("X-Consistency = %q, want empty (default path never claims consistency)", got)
+	}
+	if n := getCounts[metaKey]; n != 2 {
+		t.Fatalf("meta GetObject count = %d, want 2 (read + bounded re-read)", n)
+	}
+}
+
+// TestWorkflowStrongRereadFailureNotStrong: when the mirror advance
+// invalidates the held snapshot and the bounded re-read FAILS, the response
+// still serves the content at hand (200) but must not claim
+// X-Consistency: strong — an unverified strong claim is exactly what the
+// round-2 review reproduced.
+func TestWorkflowStrongRereadFailureNotStrong(t *testing.T) {
+	store := ossfake.NewMemory()
+	metaKey := "shared/projects/p1/meta.json"
+	v1, _ := json.Marshal(map[string]any{"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag"})
+	v2, _ := json.Marshal(map[string]any{"project_id": "p1", "title": "P1", "status": "paused", "plan_type": "dag"})
+	_ = store.PutObject(context.Background(), metaKey, v1)
+	getCounts := map[string]int{}
+	h := newProjectTestHandlerWithOSS(t, &freshnessScriptedOSS{
+		mcLikeOSS:   &mcLikeOSS{Memory: store},
+		getCounts:   getCounts,
+		advanceKey:  metaKey,
+		advanceData: v2,
+		advanceAt:   1, // advance invalidates the held snapshot → re-read ...
+		failReGet:   true, // ... which then fails
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow?consistency=strong", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if body["status"] != "active" {
+		t.Fatalf("status = %v, want \"active\" (content at hand is served on re-read failure)", body["status"])
+	}
+	if got := rec.Header().Get("X-Consistency"); got != "" {
+		t.Fatalf("X-Consistency = %q, want empty (a failed re-read must never be reported as strong)", got)
+	}
+	if n := getCounts[metaKey]; n != 2 {
+		t.Fatalf("meta GetObject count = %d, want 2 (read + failed re-read)", n)
+	}
+}
+
+// TestWorkflowStrongRereadRacesAdvance: a second mirror advance landing
+// between the re-read GetObject and its verifying stat is caught by the
+// post-read ETag check. The fresher re-read bytes are served (still better
+// than the superseded snapshot) but the strong claim is withdrawn — no
+// anchor can be bound to the re-read bytes.
+func TestWorkflowStrongRereadRacesAdvance(t *testing.T) {
+	store := ossfake.NewMemory()
+	metaKey := "shared/projects/p1/meta.json"
+	v1, _ := json.Marshal(map[string]any{"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag"})
+	v2, _ := json.Marshal(map[string]any{"project_id": "p1", "title": "P1", "status": "paused", "plan_type": "dag"})
+	v3, _ := json.Marshal(map[string]any{"project_id": "p1", "title": "P1", "status": "cancelled", "plan_type": "dag"})
+	_ = store.PutObject(context.Background(), metaKey, v1)
+	getCounts := map[string]int{}
+	h := newProjectTestHandlerWithOSS(t, &freshnessScriptedOSS{
+		mcLikeOSS:       &mcLikeOSS{Memory: store},
+		getCounts:       getCounts,
+		advanceKey:      metaKey,
+		advanceData:     v2,
+		advanceAt:       1, // first advance: invalidates the held snapshot → re-read
+		races:           true, // second advance: lands after the re-read GetObject
+		advanceDataRace: v3,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/p1/workflow?consistency=strong", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.GetProjectWorkflow(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	if body["status"] != "paused" {
+		t.Fatalf("status = %v, want \"paused\" (v2 re-read bytes served, not the superseded v1)", body["status"])
+	}
+	if got := rec.Header().Get("X-Consistency"); got != "" {
+		t.Fatalf("X-Consistency = %q, want empty (an advance racing the re-read must withdraw the claim)", got)
 	}
 }
