@@ -175,6 +175,49 @@ async def test_spawn_done_wakes(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_spawn_args_match_production_adapter(tmp_path) -> None:
+    """Spawn argv must equal the production adapter ("qwen"."args").
+
+    The fake CLI records argv one-per-line; expected is the literal
+    from tools/dispatch_adapters.json with {sid}/{prompt} substituted
+    (10/22 ruling: yolo + CI + stream-json, not the simplified
+    "-o json" from the original task book).
+    """
+    with Env(tmp_path) as env:
+        args_file = env.tmp / "captured-args.txt"
+        body = (
+            'printf "%s\\n" "$@" > '
+            f"{args_file}; "
+            "echo '{\"type\":\"assistant\",\"text\":\"ok\"}'"
+        )
+        _make_bin(env.bin_dir, "fakeq", body)
+        service = DispatchService()
+        task_id = await service.start(
+            task_name="t-args",
+            prompt="do the thing",
+            cwd=None,
+            cli="fakeq",
+            timeout=30,
+            wake=None,
+        )
+        terminal = await _wait_terminal(service, task_id)
+        assert terminal["state"] == "done"
+        captured = args_file.read_text(encoding="utf-8").splitlines()
+        assert captured == [
+            "--approval-mode",
+            "yolo",
+            "--channel",
+            "CI",
+            "-o",
+            "stream-json",
+            "--session-id",
+            terminal["session_id"],
+            "-p",
+            "do the thing",
+        ]
+
+
+@pytest.mark.asyncio
 async def test_spawn_failed(tmp_path) -> None:
     """Non-zero exit -> terminal state failed + wake carries exit=1."""
     with Env(tmp_path) as env:

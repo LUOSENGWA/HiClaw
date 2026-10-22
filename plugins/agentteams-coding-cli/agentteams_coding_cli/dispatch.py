@@ -62,6 +62,22 @@ _DEFAULT_WAKE_URL = "http://127.0.0.1:8088"
 _WAKE_ENDPOINT = "/api/console/chat"
 _WAKE_ATTEMPTS = 3
 
+#: Headless spawn args, 1:1 with the production adapter.
+#: Authoritative source: ``tools/dispatch_adapters.json`` (entry "qwen",
+#: key "args"); ``{sid}`` / ``{prompt}`` are substituted in ``start()``.
+SPAWN_ARG_TEMPLATE: tuple[str, ...] = (
+    "--approval-mode",
+    "yolo",
+    "--channel",
+    "CI",
+    "-o",
+    "stream-json",
+    "--session-id",
+    "{sid}",
+    "-p",
+    "{prompt}",
+)
+
 
 class DispatchBusyError(RuntimeError):
     """Raised when a dispatch with the same task name is already running."""
@@ -275,9 +291,11 @@ class DispatchService:
     ) -> str:
         """Spawn a headless CLI run; returns the new task id.
 
-        The child is ``<cli> -p <prompt> -o json --session-id <uuid>``
-        (design §4.2) with ``QWENPAW_SESSION_ID`` set in its env — the
-        spawn path is plugin-controlled, so no middleware is involved.
+        The child is ``<cli> --approval-mode yolo --channel CI
+        -o stream-json --session-id <uuid> -p <prompt>`` (args 1:1 with
+        ``tools/dispatch_adapters.json``, design §4.2) with
+        ``QWENPAW_SESSION_ID`` set in its env — the spawn path is
+        plugin-controlled, so no middleware is involved.
 
         Raises:
             DispatchBusyError: same task name already running (claim flag).
@@ -329,15 +347,18 @@ class DispatchService:
 
         env = dict(os.environ)
         env["QWENPAW_SESSION_ID"] = session_id
+        spawn_args: list[str] = []
+        for item in SPAWN_ARG_TEMPLATE:
+            if item == "{prompt}":
+                spawn_args.append(prompt)
+            elif item == "{sid}":
+                spawn_args.append(session_id)
+            else:
+                spawn_args.append(item)
         try:
             proc = await asyncio.create_subprocess_exec(
                 bin_path,
-                "-p",
-                prompt,
-                "-o",
-                "json",
-                "--session-id",
-                session_id,
+                *spawn_args,
                 cwd=cwd,
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
@@ -476,6 +497,7 @@ class DispatchService:
 
 __all__ = [
     "DEFAULT_DISPATCH_TIMEOUT",
+    "SPAWN_ARG_TEMPLATE",
     "WATCH_INTERVAL_ENV",
     "CliNotFoundError",
     "DispatchBusyError",
