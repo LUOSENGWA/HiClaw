@@ -241,3 +241,12 @@ def test_client_route_falls_back_without_rebuilt_dist(monkeypatch, tmp_path, cli
         assert '{"detail"' not in resp.text
     finally:
         server.shutdown()
+
+
+def test_drop_nested_workspaces():
+    from qwen_code_bridge.web import _drop_nested_workspaces
+
+    assert _drop_nested_workspaces(
+        ["/tmp", "/tmp/qcb-persist", "/a", "/a/b", "/c", "/c"]
+    ) == ["/tmp", "/a", "/c"]
+    assert _drop_nested_workspaces(["/x/y", "/x"]) == ["/x"]

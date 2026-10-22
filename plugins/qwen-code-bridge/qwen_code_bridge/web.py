@@ -240,6 +240,33 @@ async def _probe(url: str) -> bool:
         return False
 
 
+def _drop_nested_workspaces(workspaces: list[str]) -> list[str]:
+    """Remove workspaces nested inside another (qwen serve rejects nesting).
+
+    Keeps the parent, preserves the caller's order for the survivors, and
+    dedupes by realpath. Primary-workspace ordering is preserved among the
+    survivors; a nested child is dropped because its parent covers it.
+    """
+    ordered = list(dict.fromkeys(workspaces))
+    real = {path: os.path.realpath(path) for path in ordered}
+    kept: list[str] = []
+    for path in sorted(ordered, key=lambda item: len(real[item])):
+        resolved = real[path]
+        if any(
+            resolved == parent or resolved.startswith(parent + os.sep)
+            for parent in kept
+        ):
+            continue
+        kept.append(resolved)
+    kept_set = set(kept)
+    out: list[str] = []
+    for path in ordered:
+        resolved = real[path]
+        if resolved in kept_set and resolved not in out:
+            out.append(resolved)
+    return out
+
+
 async def ensure_serve() -> str:
     """Return a reachable serve URL, starting one on a free port if needed."""
     url = serve_url()
@@ -286,6 +313,7 @@ async def ensure_serve() -> str:
         if state in workspaces:
             workspaces.remove(state)
         workspaces.append(state)
+        workspaces = _drop_nested_workspaces(workspaces)
         ws_args: list[str] = []
         for workspace in workspaces[:8]:
             ws_args += ["--workspace", workspace]
@@ -304,6 +332,15 @@ async def ensure_serve() -> str:
                     env.setdefault("GIT_CONFIG_GLOBAL", gitconfig)
         except Exception:
             pass
+        errlog = (state_dir() / "web-serve.log").open("ab")
+        errlog.write(
+            (
+                f"--- spawn {binary} serve port={port} "
+                f"home={env.get('HOME')} qwen_home={env.get('QWEN_HOME')} "
+                f"cwd={os.getcwd()}\n"
+            ).encode()
+        )
+        errlog.flush()
         proc = await asyncio.create_subprocess_exec(
             binary,
             "serve",
@@ -315,11 +352,31 @@ async def ensure_serve() -> str:
             token,
             *ws_args,
             env=env,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stdout=errlog,
+            stderr=errlog,
         )
-    except Exception:
+    except Exception as exc:
+        try:
+            from .state import state_dir
+
+            with (state_dir() / "web-serve.log").open("a", encoding="utf-8") as fh:
+                fh.write(
+                    f"spawn failed: {type(exc).__name__}: {exc}; "
+                    f"binary={binary} port={port} home={env.get('HOME')}\n"
+                )
+        except Exception:
+            pass
         return url
+    try:
+        from .state import state_dir
+
+        with (state_dir() / "web-serve.log").open("a", encoding="utf-8") as fh:
+            fh.write(
+                f"spawned pid={proc.pid} port={port} binary={binary} "
+                f"home={env.get('HOME')} qwen_home={env.get('QWEN_HOME')}\n"
+            )
+    except Exception:
+        pass
     for _ in range(20):
         await asyncio.sleep(0.5)
         if await _probe(url):
