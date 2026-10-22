@@ -27,3 +27,4 @@ python3 -m pytest plugins/tests/agentteams-matrix-channel/test_fake_completion_m
 python3 -m pytest plugins/tests/agentteams-matrix-channel/test_consume_error.py -q
 
 python3 -m pytest plugins/tests/agentteams-matrix-channel/test_show_thinking_gate.py -q
+python3 -m pytest plugins/tests/agentteams-matrix-channel/test_send_gate_retrigger_placeholder.py -q
