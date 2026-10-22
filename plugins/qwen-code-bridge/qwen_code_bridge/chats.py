@@ -23,6 +23,8 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from .endpoints import app_base
+
 DEFAULT_GROUP_NAME = "QwenCode"
 CHAT_CHANNEL = "qwen-code-bridge"
 _AGENT_ENV = "QWEN_CODE_BRIDGE_AGENT_ID"
@@ -30,11 +32,7 @@ _DEFAULT_URL = "http://127.0.0.1:8088"
 
 
 def resolve_root(base_url: str | None = None) -> str:
-    return (
-        base_url
-        or os.environ.get("QWENPAW_APP_URL", "").strip()
-        or _DEFAULT_URL
-    ).rstrip("/")
+    return app_base(base_url)
 
 
 def resolve_agent(agent_id: str | None = None) -> str:

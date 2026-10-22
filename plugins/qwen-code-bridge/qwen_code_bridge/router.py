@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .dispatch import (
@@ -150,6 +150,7 @@ class DispatchRequest(BaseModel):
 @router.post("/dispatch", status_code=202)
 async def post_dispatch(
     body: DispatchRequest,
+    request: Request,
     service: DispatchService = Depends(_get_dispatch_service),
 ) -> dict:
     """Spawn a gateless headless CLI run; returns the task id.
@@ -160,6 +161,8 @@ async def post_dispatch(
     """
     wake = body.wake.model_dump() if body.wake is not None else None
     origin = body.origin.model_dump() if body.origin is not None else None
+    if wake is not None and not str(wake.get("base_url") or "").strip():
+        wake["base_url"] = str(request.base_url).rstrip("/")
     try:
         task_id = await service.start(
             task_name=body.task,
@@ -189,17 +192,21 @@ class SidebarRequest(BaseModel):
 
 
 @router.post("/sidebar")
-async def post_sidebar(body: SidebarRequest | None = None) -> dict:
+async def post_sidebar(
+    request: Request,
+    body: SidebarRequest | None = None,
+) -> dict:
     """Ensure the pinned QwenCode group + the direct-chat session exist."""
     import asyncio
 
     from . import chats
+    from .endpoints import app_base
 
     agent = chats.resolve_agent(
         (body.agent_id if body else "")
         or None,
     )
-    root = chats.resolve_root(None)
+    root = app_base(None, request)
     group_id = await asyncio.to_thread(chats.ensure_group, root, agent)
     chat_id = await asyncio.to_thread(
         chats.ensure_direct_chat,

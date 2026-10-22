@@ -57,6 +57,30 @@ def _http_prefix_owner(api: PluginApi, prefix: str) -> str | None:
 
 
 
+
+def _register_runtime_hook(api: PluginApi) -> None:
+    """Register the PRE_DISPATCH bridge-chat hook (idempotent)."""
+    registry = _registry(api)
+    if registry is not None:
+        try:
+            if any(
+                hook.plugin_id == PLUGIN_ID
+                and "qwen_code_bridge_chat"
+                in str(getattr(hook, "hook_name", ""))
+                for hook in registry.get_startup_hooks()
+            ):
+                return
+        except Exception:
+            pass
+    try:
+        from qwen_code_bridge.runtime_hook import BridgeChatHook
+
+        api.register_runtime_hook(BridgeChatHook())
+        logger.info("runtime hook %s registered", BridgeChatHook.name)
+    except Exception as exc:  # framework setup incomplete
+        logger.warning("runtime hook registration skipped: %s", exc)
+
+
 def _register_slash(api: PluginApi) -> None:
     """Register ``/qcode`` (alias ``/qwen``); idempotent, best-effort."""
     registry = _registry(api)
@@ -142,6 +166,7 @@ class QwenCodeBridgePlugin:
             )
             api.register_middleware(session_middleware_factory, priority=50)
             _register_slash(api)
+            _register_runtime_hook(api)
             self._probe_new_framework(api)
             return
 
@@ -217,6 +242,7 @@ class QwenCodeBridgePlugin:
             api.register_middleware(session_middleware_factory, priority=50)
 
         _register_slash(api)
+        _register_runtime_hook(api)
         self._probe_new_framework(api)
         logger.info(
             "%s registered: management API at /api%s",

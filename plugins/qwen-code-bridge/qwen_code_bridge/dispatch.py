@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import chats
+from .endpoints import app_base
 from .registry import CLIS
 from .state import state_dir
 
@@ -60,7 +61,7 @@ WATCH_INTERVAL_ENV = "QWENPAW_DISPATCH_WATCH_INTERVAL"
 #: Default per-task wall-clock timeout (s).
 DEFAULT_DISPATCH_TIMEOUT = 3600.0
 
-_DEFAULT_WAKE_URL = "http://127.0.0.1:8088"
+_DEFAULT_WAKE_URL = ""  # resolved dynamically via endpoints.app_base
 _WAKE_ENDPOINT = "/api/console/chat"
 _WAKE_ATTEMPTS = 3
 
@@ -163,6 +164,17 @@ class SpawnFailedError(RuntimeError):
 WakeSender = Callable[..., None]
 
 
+def load_task(task_id: str) -> dict[str, Any] | None:
+    """Read one dispatch task file (read-only; used by the run-chat view)."""
+    if not _TASK_ID_RE.match(task_id or ""):
+        return None
+    try:
+        path = state_dir() / "dispatch" / f"{task_id}.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def _effective_approval_level(agent_id: str) -> str:
     """Read the effective QwenPaw tool-execution level for the wake turn.
 
@@ -190,11 +202,7 @@ def _pending_approval_line(base_url: str, session_id: str) -> str:
     (e.g. the shell command) and ``reasoning`` is why the guard flagged it.
     Resolved approvals are not queryable — the service keeps no history.
     """
-    root = (
-        base_url
-        or os.environ.get("QWENPAW_APP_URL", "").strip()
-        or _DEFAULT_WAKE_URL
-    ).rstrip("/")
+    root = app_base(base_url)
     url = (
         f"{root}/api/approval/list?session_id="
         + urllib.parse.quote(session_id, safe="")
@@ -305,11 +313,7 @@ def default_wake_sender(
     ``X-Agent-Id`` header; retries on 409/429/503 and transient errors
     (3 attempts). Raises ``RuntimeError`` on final failure.
     """
-    root = (
-        base_url
-        or os.environ.get("QWENPAW_APP_URL", "").strip()
-        or _DEFAULT_WAKE_URL
-    ).rstrip("/")
+    root = app_base(base_url)
     body = _wake_body(
         session_id,
         text,

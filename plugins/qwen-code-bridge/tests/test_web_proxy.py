@@ -50,7 +50,8 @@ def upstream(monkeypatch):
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_SERVE_AUTOSTART", "0")
     app = FastAPI()
     app.include_router(build_router(), prefix="/api/qwen-code-bridge")
     return TestClient(app)

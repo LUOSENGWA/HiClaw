@@ -15,8 +15,12 @@ All failures are reported as data, never raised into the caller's turn.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import secrets
+import socket
+import time
 from pathlib import Path
 
 import httpx
@@ -24,8 +28,9 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
 SERVE_URL_ENV = "QWEN_CODE_BRIDGE_SERVE_URL"
+SERVE_AUTOSTART_ENV = "QWEN_CODE_BRIDGE_SERVE_AUTOSTART"
 SERVE_TOKEN_ENV = "QWEN_CODE_BRIDGE_SERVE_TOKEN"
-DEFAULT_SERVE_URL = "http://127.0.0.1:8931"
+DEFAULT_SERVE_URL = ""  # resolved from env/serve.json; auto-start allocates a free port
 
 router = APIRouter(tags=["qwen-code-bridge"])
 
@@ -43,11 +48,13 @@ def _config() -> dict:
 
 
 def serve_url() -> str:
-    return (
+    explicit = (
         os.environ.get(SERVE_URL_ENV, "").strip()
         or str(_config().get("url") or "").strip()
-        or DEFAULT_SERVE_URL
-    ).rstrip("/")
+    )
+    if explicit:
+        return explicit.rstrip("/")
+    return ""
 
 
 def serve_token() -> str:
@@ -72,10 +79,84 @@ def _headers(request: Request | None = None) -> dict[str, str]:
     return headers
 
 
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _write_config(url: str, token: str) -> None:
+    try:
+        from .state import state_dir
+
+        path = state_dir() / "serve.json"
+        path.write_text(
+            json.dumps({"url": url, "token": token}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+async def _probe(url: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(url + "/health", headers=_headers())
+        return resp.status_code < 500
+    except Exception:
+        return False
+
+
+async def ensure_serve() -> str:
+    """Return a reachable serve URL, starting one on a free port if needed."""
+    url = serve_url()
+    if url and await _probe(url):
+        return url
+    if os.environ.get(SERVE_AUTOSTART_ENV, "1") == "0":
+        return url
+    port = _free_port()
+    token = serve_token() or secrets.token_urlsafe(16)
+    url = f"http://127.0.0.1:{port}"
+    binary = os.environ.get("QWEN_CODE_BRIDGE_CLI", "").strip() or "qwen"
+    try:
+        from .state import state_dir
+
+        workdir = str(state_dir())
+        proc = await asyncio.create_subprocess_exec(
+            binary,
+            "serve",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--token",
+            token,
+            "--workspace",
+            workdir,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except Exception:
+        return url
+    for _ in range(20):
+        await asyncio.sleep(0.5)
+        if await _probe(url):
+            _write_config(url, token)
+            os.environ[SERVE_URL_ENV] = url
+            os.environ[SERVE_TOKEN_ENV] = token
+            return url
+        if proc.returncode is not None:
+            break
+    _write_config(url, token)
+    return url
+
+
 @router.get("/web/status")
 async def web_status() -> dict:
     """Probe ``qwen serve`` reachability (never raises)."""
-    url = serve_url()
+    url = await ensure_serve()
+    if not url:
+        return {"reachable": False, "url": "", "error": "serve-url-unconfigured"}
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.get(url + "/health", headers=_headers())
@@ -98,7 +179,13 @@ async def web_status() -> dict:
 )
 async def web_proxy(path: str, request: Request) -> Response:
     """Reverse-proxy a request to the local ``qwen serve`` instance."""
-    url = f"{serve_url()}/{path}"
+    base = await ensure_serve()
+    if not base:
+        return JSONResponse(
+            status_code=502,
+            content={"error": "serve-url-unconfigured"},
+        )
+    url = f"{base}/{path}"
     body = await request.body()
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
