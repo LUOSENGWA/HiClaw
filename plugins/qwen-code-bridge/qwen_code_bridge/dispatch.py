@@ -1296,8 +1296,14 @@ class DispatchService:
         # Q3: AgentTeams coding-runs index (only when runs_dir is configured)
         try:
             log_text = await asyncio.to_thread(self.get_log, task_id) or ""
+            # Re-read AFTER the terminal update: the earlier snapshot still
+            # says "running" (status would map to failed, exit/finished None).
+            run_task = self._read_task(task_id) or task
             rec = await asyncio.to_thread(
-                runs.write_run_record, task, log_text, task.get("runs_dir")
+                runs.write_run_record,
+                run_task,
+                log_text,
+                run_task.get("runs_dir"),
             )
             if rec:
                 self._update_task(
