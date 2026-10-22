@@ -87,11 +87,31 @@
   // Look up a chat's channel server-side. This was referenced by the wrapper
   // but never defined — any chat render threw ReferenceError and took the
   // whole console down (React error boundary). Keep it total: never throw.
+  function selectedAgentId() {
+    try {
+      var raw =
+        sessionStorage.getItem("qwenpaw-agent-storage") ||
+        localStorage.getItem("qwenpaw-agent-storage");
+      if (!raw) return "";
+      var parsed = JSON.parse(raw);
+      return (parsed && parsed.state && parsed.state.selectedAgent) || "";
+    } catch (e) {
+      return "";
+    }
+  }
+
   function bridgeChatLookup(chatId) {
     try {
+      var headers = { Accept: "application/json" };
+      var agent = selectedAgentId();
+      if (agent) headers["X-Agent-Id"] = agent;
+      try {
+        var token = localStorage.getItem("qwenpaw_auth_token");
+        if (token) headers.Authorization = "Bearer " + token;
+      } catch (e) {}
       return fetch("/api/qwen-code-bridge/chat/" + encodeURIComponent(chatId), {
         credentials: "same-origin",
-        headers: { Accept: "application/json" },
+        headers: headers,
       })
         .then(function (resp) {
           return resp && resp.ok ? resp.json() : null;
@@ -116,8 +136,9 @@
         function tick() {
           try {
             var sid = chatIdFromUrl();
-            if (sid === lastId.current) return;
-            lastId.current = sid;
+            var key = sid + "|" + selectedAgentId();
+            if (key === lastId.current) return;
+            lastId.current = key;
             if (!sid) {
               setState({ id: "", chat: null });
               return;
