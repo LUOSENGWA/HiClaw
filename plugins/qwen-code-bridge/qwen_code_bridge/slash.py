@@ -28,7 +28,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .dispatch import resolve_approval_mode
+from .dispatch import _effective_approval_level, resolve_approval_mode
 from .state import state_dir
 
 CLI_ENV = "QWEN_CODE_BRIDGE_CLI"
@@ -113,6 +113,7 @@ async def run_cli(
     *,
     cwd: str | None = None,
     qwenpaw_session_id: str = "default",
+    agent_id: str = "",
 ) -> str:
     """Run one CLI turn; returns the answer text (errors as text)."""
     binary = os.environ.get(CLI_ENV, "").strip() or "qwen"
@@ -131,7 +132,7 @@ async def run_cli(
         workdir = os.getcwd()
 
     cli_session_id = load_cli_session(qwenpaw_session_id)
-    mode = resolve_approval_mode(None)
+    mode = resolve_approval_mode(None, _effective_approval_level(agent_id))
     base = [binary, "--approval-mode", mode, "--channel", "CI", "-o", "stream-json"]
     if cli_session_id:
         args = base + ["-r", cli_session_id, "-p", prompt]
@@ -258,6 +259,7 @@ def make_handler():
             prompt,
             cwd=workspace or None,
             qwenpaw_session_id=session_id,
+            agent_id=str(getattr(ctx, "agent_id", "") or ""),
         )
         await _persist_turn(ctx, prompt, answer)
         return Msg(

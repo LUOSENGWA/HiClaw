@@ -129,3 +129,24 @@ async def test_handler_persists_turn_into_session(stub, tmp_path) -> None:
     assert roles == ["user", "assistant"]
     assert value["context"][0]["content"][0]["text"] == "hello cli"
     assert value["context"][1]["content"][0]["text"] == "STUB-ANSWER"
+
+
+@pytest.mark.asyncio
+async def test_slash_uses_mapped_level(stub, tmp_path, monkeypatch) -> None:
+    """The slash turn runs the CLI with the mapped approval tier."""
+    import qwen_code_bridge.slash as slash_mod
+
+    monkeypatch.setattr(
+        slash_mod,
+        "_effective_approval_level",
+        lambda _agent: "STRICT",
+    )
+    answer = await slash.run_cli(
+        "x",
+        cwd=str(tmp_path),
+        qwenpaw_session_id="s-map",
+        agent_id="agent-x",
+    )
+    assert answer == "STUB-ANSWER"
+    argv = _argv(stub)
+    assert argv[argv.index("--approval-mode") + 1] == "plan"

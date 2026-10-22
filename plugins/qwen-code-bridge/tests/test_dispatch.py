@@ -187,7 +187,7 @@ async def test_spawn_done_wakes(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_spawn_args_match_production_adapter(tmp_path) -> None:
+async def test_spawn_args_match_production_adapter(tmp_path, monkeypatch) -> None:
     """Spawn argv must equal the production adapter ("qwen"."args").
 
     The fake CLI records argv one-per-line; expected is the literal
@@ -195,6 +195,9 @@ async def test_spawn_args_match_production_adapter(tmp_path) -> None:
     (10/22 ruling: yolo + CI + stream-json, not the simplified
     "-o json" from the original task book).
     """
+    import qwen_code_bridge.dispatch as dispatch_mod
+
+    monkeypatch.setattr(dispatch_mod, "_effective_approval_level", lambda _a: "")
     with Env(tmp_path) as env:
         args_file = env.tmp / "captured-args.txt"
         body = (
@@ -519,8 +522,11 @@ async def test_approval_mode_override_reaches_argv(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_approval_mode_default_yolo_and_invalid(tmp_path) -> None:
+async def test_approval_mode_default_yolo_and_invalid(tmp_path, monkeypatch) -> None:
     """No request/env -> yolo; unknown tier -> ValueError before spawn."""
+    import qwen_code_bridge.dispatch as dispatch_mod
+
+    monkeypatch.setattr(dispatch_mod, "_effective_approval_level", lambda _a: "")
     with Env(tmp_path) as env:
         _make_bin(env.bin_dir, "fakeq", 'echo \'{"type":"result","result":"ok"}\'')
         service = DispatchService()
@@ -802,3 +808,62 @@ async def test_dispatch_creates_and_renames_sidebar_chat(tmp_path, monkeypatch) 
     assert ("create", "t-sidebar · fakeq · running") in events
     assert ("rename", "t-sidebar · fakeq · done") in events
     assert service.get_task(task_id)["chat_id"] == "chat-1"
+
+
+def test_approval_level_mapping(monkeypatch) -> None:
+    """QwenPaw levels map 1:1 onto Qwen Code tiers."""
+    from qwen_code_bridge.dispatch import (
+        map_level_to_mode,
+        resolve_approval_mode,
+    )
+
+    assert map_level_to_mode("STRICT") == "plan"
+    assert map_level_to_mode("SMART") == "auto-edit"
+    assert map_level_to_mode("AUTO") == "auto"
+    assert map_level_to_mode("OFF") == "yolo"
+    assert map_level_to_mode("") == ""
+    assert map_level_to_mode(None) == ""
+    monkeypatch.delenv("QWEN_CODE_BRIDGE_APPROVAL_MODE", raising=False)
+    monkeypatch.delenv("AGENTTEAMS_CODING_CLI_APPROVAL_MODE", raising=False)
+    assert resolve_approval_mode(None, "AUTO") == "auto"
+    assert resolve_approval_mode("plan", "AUTO") == "plan"
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_APPROVAL_MODE", "yolo")
+    assert resolve_approval_mode(None, "STRICT") == "yolo"
+    monkeypatch.delenv("QWEN_CODE_BRIDGE_APPROVAL_MODE", raising=False)
+    assert resolve_approval_mode(None, None) == "yolo"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_uses_mapped_level_when_no_explicit_mode(
+    tmp_path, monkeypatch
+) -> None:
+    import qwen_code_bridge.dispatch as dispatch_mod
+
+    monkeypatch.setattr(
+        dispatch_mod,
+        "_effective_approval_level",
+        lambda _agent: "AUTO",
+    )
+    with Env(tmp_path) as env:
+        args_file = env.tmp / "argv.txt"
+        body = (
+            'printf "%s\\n" "$@" > '
+            f"{args_file}; "
+            'echo \'{"type":"result","result":"ok"}\''
+        )
+        _make_bin(env.bin_dir, "fakeq", body)
+        service = DispatchService()
+        task_id = await service.start(
+            task_name="t-map",
+            prompt="do it",
+            cwd=None,
+            cli="fakeq",
+            timeout=30,
+            wake={"agent_id": "agent-x"},
+        )
+        terminal = await _wait_terminal(service, task_id)
+        assert terminal["approval_level"] == "AUTO"
+        assert terminal["approval_mode"] == "auto"
+        assert terminal["approval_mode_source"] == "level-map"
+        argv = args_file.read_text(encoding="utf-8").splitlines()
+        assert argv[argv.index("--approval-mode") + 1] == "auto"

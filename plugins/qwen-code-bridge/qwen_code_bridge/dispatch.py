@@ -79,6 +79,24 @@ DEFAULT_APPROVAL_MODE = "yolo"
 
 #: Env override mirroring the runner's config fallback (#1379).
 APPROVAL_MODE_ENV = "QWEN_CODE_BRIDGE_APPROVAL_MODE"
+LEGACY_APPROVAL_MODE_ENV = "AGENTTEAMS_CODING_CLI_APPROVAL_MODE"
+
+#: QwenPaw tool-execution level -> Qwen Code approval tier.
+#: STRICT = everything needs approval -> plan (analyze only, never acts);
+#: SMART  = low-risk auto -> auto-edit (edits auto, shell still gated);
+#: AUTO   = only guarded tools -> auto (classifier blocks risky actions);
+#: OFF    = guard disabled -> yolo (everything approved).
+APPROVAL_LEVEL_MAP: dict[str, str] = {
+    "STRICT": "plan",
+    "SMART": "auto-edit",
+    "AUTO": "auto",
+    "OFF": "yolo",
+}
+
+
+def map_level_to_mode(level: str | None) -> str:
+    """Map a QwenPaw approval level to a Qwen Code approval tier."""
+    return APPROVAL_LEVEL_MAP.get(str(level or "").strip().upper(), "")
 
 #: Headless spawn args, 1:1 with the production adapter.
 #: Authoritative source: ``tools/dispatch_adapters.json`` (entry "qwen",
@@ -98,14 +116,21 @@ SPAWN_ARG_TEMPLATE: tuple[str, ...] = (
 )
 
 
-def resolve_approval_mode(requested: str | None = None) -> str:
+def resolve_approval_mode(
+    requested: str | None = None,
+    level: str | None = None,
+) -> str:
     """Resolve the per-run approval tier (flag > env > default "yolo").
 
     Mirrors ``run-coding-cli.sh`` (#1379). Raises ``ValueError`` on an
     unknown tier so the API answers 400 instead of spawning a CLI with
     an invalid flag.
     """
-    for raw in (requested, os.environ.get(APPROVAL_MODE_ENV, "")):
+    for raw in (
+        requested,
+        os.environ.get(APPROVAL_MODE_ENV, ""),
+        os.environ.get(LEGACY_APPROVAL_MODE_ENV, ""),
+    ):
         value = str(raw or "").strip()
         if not value:
             continue
@@ -115,6 +140,9 @@ def resolve_approval_mode(requested: str | None = None) -> str:
                 + ", ".join(APPROVAL_MODES),
             )
         return value
+    mapped = map_level_to_mode(level)
+    if mapped:
+        return mapped
     return DEFAULT_APPROVAL_MODE
 
 
@@ -491,7 +519,9 @@ class DispatchService:
                 ``approval_mode``.
             SpawnFailedError: the child process could not be started.
         """
-        mode = resolve_approval_mode(approval_mode)
+        _agent_hint = str((wake or {}).get("agent_id") or "")
+        _level = _effective_approval_level(_agent_hint)
+        mode = resolve_approval_mode(approval_mode, _level)
         running = self.running_task_named(task_name)
         if running is not None:
             raise DispatchBusyError(
@@ -530,6 +560,19 @@ class DispatchService:
             "wall_s": None,
             "log_tail": "",
             "approval_mode": mode,
+            "approval_level": _level or None,
+            "approval_mode_source": (
+                "request"
+                if str(approval_mode or "").strip()
+                else (
+                    "env"
+                    if (
+                        os.environ.get(APPROVAL_MODE_ENV, "").strip()
+                        or os.environ.get(LEGACY_APPROVAL_MODE_ENV, "").strip()
+                    )
+                    else ("level-map" if _level else "default")
+                )
+            ),
             "origin": dict(origin) if origin else None,
             "wake": dict(wake) if wake else None,
             "wake_status": None,
