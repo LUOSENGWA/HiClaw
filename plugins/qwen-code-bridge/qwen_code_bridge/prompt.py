@@ -11,7 +11,8 @@ from __future__ import annotations
 PROMPT_TEXT = (
     "## Qwen Code bridge\n"
     "- Bridge chats (channel `qwen-code-bridge`) bypass you: "
-    "`QwenCode \u00b7 直接对话` is answered by the local Qwen Code CLI, and "
+    "the bridge direct chat (session `qwen-code-bridge:direct`) is answered "
+    "by the local Qwen Code CLI, and "
     "`<task> \u00b7 <cli> \u00b7 <state>` chats render a read-only run card "
     "that links to the native Qwen Code console (`/qwen-code`).\n"
     "- Delegate coding work with `POST /api/qwen-code-bridge/dispatch` and "
