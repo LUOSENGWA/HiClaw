@@ -965,3 +965,11 @@ def test_qwen_cli_env_and_config(tmp_path, monkeypatch):
     assert state.qwen_cli() == "/app/working/.qwen-cli/bin/qwen"
     monkeypatch.setenv("QWEN_CODE_BRIDGE_CLI", "/env/qwen")
     assert state.qwen_cli() == "/env/qwen"
+
+
+def test_keep_running_after_timeout():
+    from qwen_code_bridge.dispatch import keep_running_after_timeout
+
+    assert keep_running_after_timeout(True, 10, 1800) is True
+    assert keep_running_after_timeout(True, 2000, 1800) is False
+    assert keep_running_after_timeout(False, 1, 1800) is False

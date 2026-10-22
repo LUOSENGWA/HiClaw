@@ -226,6 +226,18 @@ def user_message(session_id: str, prompt: str) -> str:
     )
 
 
+def keep_running_after_timeout(
+    busy: bool, progress_age: float, stall_after: float
+) -> bool:
+    """A wall-clock timeout must not kill a session that is still working.
+
+    Keep running while QwenCode reports the session busy **and** the event
+    stream has produced something within ``stall_after`` seconds. An idle
+    zombie or a session with no progress for the stall window is killed.
+    """
+    return bool(busy) and float(progress_age) <= float(stall_after)
+
+
 def chat_sync_enabled() -> bool:
     """Sidebar chat sync switch: env > state/config.json > default true."""
     if os.environ.get("QWEN_CODE_BRIDGE_CHAT_SYNC", "1") == "0":
@@ -1234,15 +1246,20 @@ class DispatchService:
 
         pump = asyncio.ensure_future(_pump())
         timeout_extensions = 0
+        stall_after = float(
+            os.environ.get("QWEN_CODE_BRIDGE_STALL_TIMEOUT", "1800") or 1800
+        )
         try:
             while True:
                 await asyncio.sleep(self._watch_interval)
                 if proc.returncode is not None:
                     break
                 if time.time() - started > timeout:
-                    # The timeout is a wall-clock guard, not a liveness signal.
-                    # QwenCode's own live indicator is authoritative: if this
-                    # session is still active, extend instead of killing it.
+                    # The wall clock is not a liveness signal. QwenCode's live
+                    # indicator + the event stream decide: while the session
+                    # is busy and events keep flowing, let it run to
+                    # completion (no extension cap). Kill only an idle zombie
+                    # or a session with no progress for the stall window.
                     busy = False
                     try:
                         busy = await qwen_status.session_busy(
@@ -1251,14 +1268,16 @@ class DispatchService:
                         )
                     except Exception:
                         busy = False
-                    if busy and timeout_extensions < 2:
+                    progress_age = time.time() - tracker.last_event
+                    if keep_running_after_timeout(busy, progress_age, stall_after):
                         timeout_extensions += 1
-                        timeout += 600
+                        timeout = (time.time() - started) + stall_after
                         self._update_task(
                             task_id,
                             {
                                 "timeout_extensions": timeout_extensions,
                                 "timeout": timeout,
+                                "stall_after": stall_after,
                             },
                         )
                         continue
