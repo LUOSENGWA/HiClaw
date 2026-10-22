@@ -214,7 +214,9 @@ Dir.mktmpdir("teamharness-transition-") do |dir|
     def must_fail(res, fragment, label):
         if res.get("ok"):
             raise AssertionError(f"{label}: expected failure but succeeded: {res!r}")
-        err = str(res.get("error", ""))
+        # INT-5 round 2: guard rejections are structured
+        # (error=illegal_transition + detail=old message); accept either field.
+        err = str(res.get("error", "")) + " " + str(res.get("detail", ""))
         if fragment not in err:
             raise AssertionError(f"{label}: error {err!r} missing {fragment!r}")
         return res

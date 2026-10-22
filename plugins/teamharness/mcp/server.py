@@ -5093,8 +5093,8 @@ def _require_task_mutable(
             to_status or terminal_status,
             action,
             (
-                f"illegal_transition: {action}: task is in terminal state "
-                f"{terminal_status} (immutable); cannot update"
+                f"{action} cannot update terminal task: {terminal_status} "
+                f"(task is in terminal state {terminal_status})"
             ),
             arguments=arguments,
             task_id=task_id,
@@ -6897,8 +6897,8 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     "cancelled",
                     "cancel_task",
                     (
-                        f"illegal_transition: cancel_task: task is in terminal state "
-                        f"{terminal_status} (immutable); cannot update"
+                        f"cannot cancel terminal task: {terminal_status} "
+                        f"(task is in terminal state {terminal_status})"
                     ),
                     arguments=arguments,
                     task_id=task_id,
