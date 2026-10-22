@@ -45,6 +45,7 @@ var f=window.fetch;if(f){window.fetch=function(u,o){return f.call(this,fix(u),o)
 var x=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){var a=[].slice.call(arguments);a[1]=fix(u);return x.apply(this,a)};
 var W=window.WebSocket;if(W){window.WebSocket=function(u,p){return new W(fix(u),p)};window.WebSocket.prototype=W.prototype;}
 var E=window.EventSource;if(E){window.EventSource=function(u,o){return new E(fix(u),o)};window.EventSource.prototype=E.prototype;}
+var WK=window.Worker;if(WK){window.Worker=function(u,o){try{if(String(u).indexOf("blob:")===0&&!(o&&o.type==="module")){var boot="var P="+JSON.stringify(P)+";var _f=self.fetch;self.fetch=function(u,o){try{if(typeof u==='string'&&u.charAt(0)==='/'&&u.indexOf(P+'/')!==0)u=P+u;}catch(e){}return _f(u,o)};if(self.XMLHttpRequest){var _o=self.XMLHttpRequest.prototype.open;self.XMLHttpRequest.prototype.open=function(m,u){var a=[].slice.call(arguments);try{if(typeof a[1]==='string'&&a[1].charAt(0)==='/'&&a[1].indexOf(P+'/')!==0)a[1]=P+a[1];}catch(e){}return _o.apply(this,a)}};importScripts("+JSON.stringify(String(u))+");";var wu=URL.createObjectURL(new Blob([boot],{type:"text/javascript"}));return new WK(wu,o);}}catch(e){}return new WK(u,o)};}
 })();</script>"""
 
 
