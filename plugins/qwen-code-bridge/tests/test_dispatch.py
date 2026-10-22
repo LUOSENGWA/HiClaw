@@ -868,3 +868,29 @@ async def test_dispatch_uses_mapped_level_when_no_explicit_mode(
         assert terminal["approval_mode_source"] == "level-map"
         argv = args_file.read_text(encoding="utf-8").splitlines()
         assert argv[argv.index("--approval-mode") + 1] == "auto"
+
+
+def test_build_spawn_plan_stream_mode():
+    from qwen_code_bridge.dispatch import build_spawn_plan, user_message
+
+    args, via_stdin = build_spawn_plan("default", "sid-1", "do it")
+    assert via_stdin is True
+    assert "--input-format" in args and "stream-json" in args
+    assert "-p" not in args and "do it" not in args
+    assert '--approval-mode' in args and 'default' in args
+    payload = user_message("sid-1", "do it")
+    assert payload.endswith("\n")
+    import json
+
+    msg = json.loads(payload)
+    assert msg["type"] == "user" and msg["session_id"] == "sid-1"
+    assert msg["message"]["role"] == "user"
+
+
+def test_build_spawn_plan_yolo_compat():
+    from qwen_code_bridge.dispatch import build_spawn_plan
+
+    args, via_stdin = build_spawn_plan("yolo", "sid-2", "do it")
+    assert via_stdin is False
+    assert "-p" in args and "do it" in args
+    assert "--input-format" not in args

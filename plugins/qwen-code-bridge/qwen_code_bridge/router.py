@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from .dispatch import (
@@ -249,10 +250,45 @@ async def get_chat_meta(chat_id: str, request: Request) -> dict:
 
 @router.get("/dispatch")
 async def list_dispatch(
+    format: str = "",
     service: DispatchService = Depends(_get_dispatch_service),
-) -> dict:
-    """List dispatch tasks (newest first)."""
-    return {"tasks": service.list_tasks()}
+):
+    """List dispatch tasks (newest first).
+
+    ``?format=table`` renders the one-table human view: state, phase,
+    elapsed, last tool, approvals and the terminal summary in three
+    columns per task (design §1.1 goal 6).
+    """
+    tasks = service.list_tasks()
+    if str(format or "").strip().lower() != "table":
+        return {"tasks": tasks}
+    lines = ["TASK | STATE | PHASE | ELAPSED | LAST | APPROVALS"]
+    for task in tasks:
+        prog = task.get("progress") or {}
+        el = prog.get("elapsed_s")
+        lines.append(
+            " | ".join(
+                [
+                    str(task.get("task") or ""),
+                    str(task.get("state") or ""),
+                    str(prog.get("phase") or "-"),
+                    f"{el}s" if isinstance(el, (int, float)) else "-",
+                    str(prog.get("last_tool") or "-"),
+                    _approval_cell(task.get("approvals")),
+                ]
+            )
+        )
+    return PlainTextResponse("\n".join(lines) + "\n")
+
+
+def _approval_cell(value) -> str:
+    if not isinstance(value, dict):
+        return "-"
+    return (
+        f"{int(value.get('allowed') or 0)}a/"
+        f"{int(value.get('denied') or 0)}d/"
+        f"{int(value.get('escalated') or 0)}e"
+    )
 
 
 @router.get("/dispatch/{task_id}")
@@ -265,6 +301,24 @@ async def get_dispatch(
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
+
+
+@router.get("/dispatch/{task_id}/progress")
+async def get_dispatch_progress(
+    task_id: str,
+    service: DispatchService = Depends(_get_dispatch_service),
+) -> dict:
+    """Derived live progress (phase/last tool/turns/tests/stalled)."""
+    task = service.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {
+        "task_id": task_id,
+        "state": task.get("state"),
+        "progress": task.get("progress"),
+        "approvals": task.get("approvals"),
+        "terminal_summary": task.get("terminal_summary"),
+    }
 
 
 @router.get("/dispatch/{task_id}/log")

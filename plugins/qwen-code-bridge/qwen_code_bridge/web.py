@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 
 SERVE_URL_ENV = "QWEN_CODE_BRIDGE_SERVE_URL"
@@ -149,7 +149,17 @@ def _inject_daemon_base(data: bytes) -> bytes:
         + ";</script>"
     )
     if "__QWEN_DAEMON_BASE__" not in html:
-        html = html.replace("<head>", "<head>" + inject, 1)
+        ws_shim = (
+            "<script>(function(){var P=window.__QWEN_DAEMON_BASE__||'';"
+            "var W=window.WebSocket;if(!W||!P)return;"
+            "function fix(u){try{var s=String(u);var o=location.origin"
+            ".replace('http://','ws://').replace('https://','wss://');"
+            "if(s.indexOf(o+'/')===0&&s.indexOf(o+P+'/')!==0)return o+P+s.slice(o.length);"
+            "if(s.charAt(0)==='/'&&s.indexOf(P+'/')!==0)return (o+P+s);}catch(e){}return u;}"
+            "window.WebSocket=function(u,p){return new W(fix(u),p)};"
+            "window.WebSocket.prototype=W.prototype;})();</script>"
+        )
+        html = html.replace("<head>", "<head>" + inject + ws_shim, 1)
     return html.encode("utf-8")
 
 
@@ -428,6 +438,90 @@ async def web_proxy(path: str, request: Request) -> Response:
         status_code=upstream.status_code,
         media_type=media_type,
     )
+
+
+
+_WS_ROUTE_REGISTERED = False
+
+
+def ensure_ws_route(app) -> None:
+    """Append the WebSocket bridge route to the root app once (lazy)."""
+    global _WS_ROUTE_REGISTERED
+    if _WS_ROUTE_REGISTERED or app is None:
+        return
+    from starlette.routing import WebSocketRoute
+
+    router_obj = getattr(app, "router", None)
+    if router_obj is None:
+        return
+    router_obj.routes.append(
+        WebSocketRoute("/api/qwen-code-bridge/web/{path:path}", web_ws)
+    )
+    _WS_ROUTE_REGISTERED = True
+
+
+@router.websocket("/web/{path:path}")
+async def web_ws(websocket: WebSocket, path: str) -> None:
+    """Bridge the shell's WebSocket streams (live-state, terminals, …)."""
+    import asyncio
+
+    import websockets
+
+    await websocket.accept()
+    base = serve_url()
+    if not base:
+        await websocket.close(code=1011)
+        return
+    fixed = _fix_workspace_path(path or "")
+    url = base.replace("http://", "ws://").replace("https://", "wss://")
+    target = f"{url.rstrip('/')}/{fixed}"
+    token = serve_token()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        async with websockets.connect(
+            target,
+            additional_headers=headers,
+            max_size=None,
+            open_timeout=10,
+            close_timeout=2,
+        ) as upstream:
+            async def client_to_upstream() -> None:
+                while True:
+                    message = await websocket.receive()
+                    if message.get("type") == "websocket.disconnect":
+                        return
+                    if message.get("text") is not None:
+                        await upstream.send(message["text"])
+                    elif message.get("bytes") is not None:
+                        await upstream.send(message["bytes"])
+
+            async def upstream_to_client() -> None:
+                async for message in upstream:
+                    if isinstance(message, bytes):
+                        await websocket.send_bytes(message)
+                    else:
+                        await websocket.send_text(message)
+
+            tasks = [
+                asyncio.create_task(client_to_upstream()),
+                asyncio.create_task(upstream_to_client()),
+            ]
+            done, pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+    except Exception:
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        return
+    try:
+        await websocket.close()
+    except Exception:
+        pass
 
 
 __all__ = ["router", "serve_url"]

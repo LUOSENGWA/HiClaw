@@ -39,7 +39,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from . import chats, millforge
+from . import approval, chats, millforge, progress
 from .endpoints import app_base
 from .registry import CLIS
 from .state import state_dir
@@ -116,6 +116,87 @@ SPAWN_ARG_TEMPLATE: tuple[str, ...] = (
     "-p",
     "{prompt}",
 )
+
+#: Tiers that need a live approver: the CLI is spawned with
+#: ``--input-format stream-json`` so the host can answer ``can_use_tool``
+#: control requests (worker 代审批). ``yolo``/``plan`` need no approver.
+STREAM_INPUT_MODES: tuple[str, ...] = ("default", "auto-edit", "auto")
+
+
+def build_spawn_plan(
+    mode: str, session_id: str, prompt: str
+) -> tuple[list[str], bool]:
+    """Return ``(argv, prompt_via_stdin)`` for one dispatch.
+
+    ``default``/``auto-edit``/``auto`` run in bidirectional stream-json
+    mode: no ``-p`` prompt, the first user turn is written to stdin and
+    the channel stays open for ``can_use_tool`` control responses.
+    ``yolo``/``plan`` keep the byte-compatible one-shot argv.
+    """
+    if mode in STREAM_INPUT_MODES:
+        return (
+            [
+                "--approval-mode",
+                mode,
+                "--channel",
+                "CI",
+                "-o",
+                "stream-json",
+                "--chat-recording",
+                "--session-id",
+                session_id,
+                "--input-format",
+                "stream-json",
+            ],
+            True,
+        )
+    args: list[str] = []
+    for item in SPAWN_ARG_TEMPLATE:
+        if item == "{prompt}":
+            args.append(prompt)
+        elif item == "{sid}":
+            args.append(session_id)
+        elif item == "{approval_mode}":
+            args.append(mode)
+        else:
+            args.append(item)
+    return args, False
+
+
+def initialize_message(can_use_tool_timeout: int = 600) -> str:
+    """SDK-mode handshake: the CLI enables its control system only after
+    the host sends this first ``initialize`` control request."""
+    return (
+        json.dumps(
+            {
+                "type": "control_request",
+                "request_id": uuid.uuid4().hex,
+                "request": {
+                    "subtype": "initialize",
+                    "hooks": None,
+                    "timeout": {"canUseTool": can_use_tool_timeout},
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
+
+
+def user_message(session_id: str, prompt: str) -> str:
+    """The initial stream-json user turn (one line, newline-terminated)."""
+    return (
+        json.dumps(
+            {
+                "type": "user",
+                "session_id": session_id,
+                "message": {"role": "user", "content": prompt},
+                "parent_tool_use_id": None,
+            },
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
 
 
 def resolve_approval_mode(
@@ -479,6 +560,10 @@ class DispatchService:
                     "started_at",
                     "finished_at",
                     "updated_at",
+                    "progress",
+                    "approvals",
+                    "escalations",
+                    "terminal_summary",
                 )
             }
             for task in raw
@@ -581,27 +666,30 @@ class DispatchService:
             "origin": dict(origin) if origin else None,
             "wake": dict(wake) if wake else None,
             "wake_status": None,
+            "input_format": "text",
+            "approvals": {"allowed": 0, "denied": 0, "escalated": 0},
+            "progress": None,
         }
         self._write_task(task)
 
         env = dict(os.environ)
         env["QWENPAW_SESSION_ID"] = session_id
-        spawn_args: list[str] = []
-        for item in SPAWN_ARG_TEMPLATE:
-            if item == "{prompt}":
-                spawn_args.append(prompt)
-            elif item == "{sid}":
-                spawn_args.append(session_id)
-            elif item == "{approval_mode}":
-                spawn_args.append(mode)
-            else:
-                spawn_args.append(item)
+        spawn_args, prompt_via_stdin = build_spawn_plan(mode, session_id, prompt)
+        self._update_task(
+            task_id,
+            {"input_format": "stream-json" if prompt_via_stdin else "text"},
+        )
         try:
             proc = await asyncio.create_subprocess_exec(
                 bin_path,
                 *spawn_args,
                 cwd=cwd,
                 env=env,
+                stdin=(
+                    asyncio.subprocess.PIPE
+                    if prompt_via_stdin
+                    else asyncio.subprocess.DEVNULL
+                ),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
@@ -620,6 +708,13 @@ class DispatchService:
             ) from exc
 
         self._update_task(task_id, {"pid": proc.pid})
+        if prompt_via_stdin and proc.stdin is not None:
+            try:
+                proc.stdin.write(initialize_message().encode("utf-8"))
+                proc.stdin.write(user_message(session_id, prompt).encode("utf-8"))
+                await proc.stdin.drain()
+            except Exception:  # the pump reports the run failure
+                pass
         asyncio.get_running_loop().create_task(
             self._watch(task_id, proc, timeout),
             name=f"coding-cli-dispatch-{task_id}",
@@ -659,13 +754,24 @@ class DispatchService:
         task: dict[str, Any], status: str, code: Any, wall: float
     ) -> str:
         """3-line terminal summary (dispatch_watch.py inbox semantics)."""
+        summary = task.get("terminal_summary") or []
+        head = (
+            str(summary[0])
+            if summary
+            else f"[dispatch] {task.get('task')} 终态={status} "
+            f"exit={code} wall={wall}s"
+        )
+        tail_line = (
+            str(summary[2])
+            if len(summary) > 2
+            else "下一步：按任务书验收（复跑门/抽查 diff/给推送命令）"
+        )
         return "\n".join(
             [
-                f"[dispatch] {task.get('task')} 终态={status} "
-                f"exit={code} wall={wall}s",
+                head,
                 f"日志: GET /api/qwen-code-bridge/dispatch/"
                 f"{task.get('task_id')}/log",
-                "下一步：按任务书验收（复跑门/抽查 diff/给推送命令）",
+                tail_line,
             ]
         )
 
@@ -681,6 +787,127 @@ class DispatchService:
         started = time.time()
         tail: list[str] = [""]
         killed = False
+        meta = self._read_task(task_id) or {}
+        stdin_mode = str(meta.get("input_format") or "") == "stream-json"
+        roots = [str(meta.get("cwd") or os.getcwd())]
+        tracker = progress.ProgressTracker(roots=roots)
+        progress_path = self._dispatch_dir / f"{task_id}.progress.json"
+        receipts_path = self._dispatch_dir / f"{task_id}.receipts.jsonl"
+        approvals = {"allowed": 0, "denied": 0, "escalated": 0}
+        escalations: list[dict[str, Any]] = []
+        flags = {"stdin_closed": False}
+        last_write = [0.0]
+
+        async def _write_stdin(payload: str) -> None:
+            if not stdin_mode or flags["stdin_closed"] or proc.stdin is None:
+                return
+            try:
+                proc.stdin.write(payload.encode("utf-8"))
+                await proc.stdin.drain()
+            except Exception:
+                pass
+
+        async def _close_stdin() -> None:
+            if (
+                stdin_mode
+                and not flags["stdin_closed"]
+                and proc.stdin is not None
+            ):
+                flags["stdin_closed"] = True
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+        def _persist_progress(state: str) -> None:
+            snap = tracker.snapshot(state)
+            try:
+                progress.write_progress(progress_path, snap)
+            except Exception:
+                pass
+            self._update_task(
+                task_id,
+                {"progress": snap, "updated_at": _utcnow()},
+            )
+
+        async def _handle_event(event: dict[str, Any]) -> None:
+            kind = str(event.get("type") or "")
+            if kind == "control_request":
+                request = event.get("request") or {}
+                request_id = str(event.get("request_id") or "")
+                if str(request.get("subtype") or "") == "can_use_tool":
+                    decision = approval.decide(
+                        str(request.get("tool_name") or ""),
+                        request.get("input"),
+                        roots=roots,
+                    )
+                    await _write_stdin(
+                        json.dumps(
+                            approval.control_response(request_id, decision),
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    if decision.get("behavior") == "allow":
+                        approvals["allowed"] += 1
+                    else:
+                        approvals["denied"] += 1
+                    if decision.get("requires_human"):
+                        approvals["escalated"] += 1
+                        escalations.append(
+                            {
+                                "tool": str(request.get("tool_name") or ""),
+                                "rule": decision.get("rule"),
+                                "reason": decision.get("reason"),
+                                "request_id": request_id,
+                            }
+                        )
+                    try:
+                        approval.append_receipt(
+                            receipts_path,
+                            approval.receipt_entry(
+                                task_id,
+                                str(request.get("tool_name") or ""),
+                                request.get("input"),
+                                decision,
+                                request_id,
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    self._update_task(
+                        task_id,
+                        {
+                            "approvals": dict(approvals),
+                            "escalations": list(escalations),
+                        },
+                    )
+                else:
+                    await _write_stdin(
+                        json.dumps(
+                            {
+                                "type": "control_response",
+                                "response": {
+                                    "subtype": "error",
+                                    "request_id": request_id,
+                                    "error": {
+                                        "message": "unsupported control request"
+                                    },
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                return
+            if kind in ("control_cancel_request", "control_response"):
+                return
+            tracker.feed(event)
+            now = time.time()
+            if now - last_write[0] >= 1.0:
+                last_write[0] = now
+                _persist_progress("running")
+            if kind == "result":
+                await _close_stdin()
 
         async def _pump() -> None:
             assert proc.stdout is not None
@@ -691,13 +918,23 @@ class DispatchService:
                         break
                     fh.write(line)
                     fh.flush()
-                    tail[0] = (
-                        tail[0] + line.decode("utf-8", "replace")
-                    )[-_LOG_TAIL_LIMIT:]
+                    text = line.decode("utf-8", "replace")
+                    tail[0] = (tail[0] + text)[-_LOG_TAIL_LIMIT:]
                     self._update_task(
                         task_id,
                         {"log_tail": tail[0], "updated_at": _utcnow()},
                     )
+                    stripped = text.strip()
+                    if stripped.startswith("{"):
+                        try:
+                            event = json.loads(stripped)
+                        except ValueError:
+                            event = None
+                        if isinstance(event, dict):
+                            try:
+                                await _handle_event(event)
+                            except Exception:
+                                pass
 
         pump = asyncio.ensure_future(_pump())
         try:
@@ -707,11 +944,25 @@ class DispatchService:
                     break
                 if time.time() - started > timeout:
                     killed = True
+                    await _close_stdin()
+                    proc.kill()
+                    break
+                # A finished turn (result seen) should not keep the process
+                # alive waiting on stdin; reap it after a short grace.
+                if (
+                    tracker.result is not None
+                    and time.time() - tracker.last_event > 10
+                ):
+                    await _close_stdin()
                     proc.kill()
                     break
             code = await proc.wait()
-            await pump
+            try:
+                await pump
+            except (asyncio.CancelledError, Exception):
+                pass
         finally:
+            await _close_stdin()
             if not pump.done():
                 pump.cancel()
                 try:
@@ -729,6 +980,34 @@ class DispatchService:
         now = _utcnow()
 
         task = self._read_task(task_id) or {}
+        snap = tracker.snapshot(status)
+        try:
+            progress.write_progress(progress_path, snap)
+        except Exception:
+            pass
+        terminal_summary = [
+            (
+                f"[{task.get('task')}] {status} · exit={code} · {wall}s · "
+                f"{snap['turns']} turns · {snap['tool_calls']} tools · "
+                f"approvals {approvals['allowed']}a/{approvals['denied']}d"
+                f"/{approvals['escalated']}e"
+            ),
+            (
+                f"tests {snap['tests']['passed']}p/{snap['tests']['failed']}f"
+                f" · last={snap['last_tool']} {snap['last_target']}"
+            ).strip(),
+            (
+                f"失败: {snap['last_error']}"
+                if snap.get("last_error")
+                else (
+                    f"需人工: {len(escalations)} 条"
+                    f"（首条 {escalations[0]['tool']}: "
+                    f"{escalations[0]['reason']}；见 receipts）"
+                    if escalations
+                    else "下一步：按任务书验收（复跑门/抽查 diff/给推送命令）"
+                )
+            ),
+        ]
         wake = task.get("wake") or {}
         origin = task.get("origin") or {}
         wake_session_id = str(
@@ -747,6 +1026,10 @@ class DispatchService:
                 "log_tail": tail[0],
                 "wake_status": "pending" if wake_session_id else "skipped",
                 "notify_tier": millforge.notify_tier(status),
+                "progress": snap,
+                "approvals": dict(approvals),
+                "escalations": list(escalations),
+                "terminal_summary": terminal_summary,
             },
         )
 

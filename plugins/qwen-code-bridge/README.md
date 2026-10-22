@@ -93,7 +93,8 @@ sh web-shell/build.sh <SC/qwen-code 源码目录> [qwenpaw working 目录]
 | 点任一派单会话 | 页面**整屏**变成原生 Qwen Code 控制台（无插件自建标题栏；`route.wrap("core.chat")` + 全屏 iframe） |
 | `QwenCode · 直接对话` | 原生控制台（整屏）；**不需要前缀**，直接打字即由 Qwen Code 回答（PRE_DISPATCH 短路，逐会话续聊） |
 | 任意聊天里 `/qcode <prompt>` | 零模型成本的直连回答（`--session-id` 首轮 / `-r` 续聊） |
-| 审批 | QwenPaw 等级 → CLI tier：`STRICT→plan / SMART→auto-edit / AUTO→auto / OFF→yolo`（请求/env 可覆盖） |
+| 审批等级 | QwenPaw 等级 → CLI tier：`STRICT→plan / SMART→auto-edit / AUTO→auto / OFF→yolo`（请求/env 可覆盖） |
+| **审批映射（worker 代审批）** | `default/auto-edit/auto` 走 `--input-format stream-json`；插件作为宿主回答 `can_use_tool`：工作区内写/测试 → 自动放行；出界写/凭据/危险命令 → 自动拒绝；未知 → 升级人工且 **fail-closed**；每次决策写 receipts |
 | 门铃（可选） | `room_bell`：终态 3 行摘要投到房间（需部署侧有消息频道） |
 
 派单 API：
@@ -108,7 +109,25 @@ curl -X POST http://127.0.0.1:8088/api/qwen-code-bridge/dispatch \
 
 - `origin` = **源会话三元组**（终态唤醒原样回放；与频道无关）
 - 无 gates：并发/冲突闸已按 10/22 定案删除（模型侧排队）
-- 观测：`GET /dispatch/{task}`（状态）、`/dispatch/{task}/log`（日志尾）、`<state>/web-proxy.log`（反代诊断，200 KB 上限）
+- 观测：`GET /dispatch/{task}`（状态）、`/dispatch/{task}/log`（日志）、`/dispatch/{task}/progress`（phase/工具/测试/停滞）、`/dispatch?format=table`（一张状态表）、`<state>/dispatch/<task>.receipts.jsonl`（审批审计）、`<state>/web-proxy.log`（反代诊断，200 KB 上限）
+
+### 审批映射（worker 代审批）
+
+`default / auto-edit / auto` 三种 tier 下，插件以 `--input-format stream-json` 启动 CLI，
+先发 `initialize` 控制请求（CLI 启用控制系统的前提），随后对每个 `can_use_tool` 请求按
+**确定性策略**答复：
+
+| 风险类 | 判据 | 决策 |
+|---|---|---|
+| R0 只读 | 读/搜索类工具 | 自动 allow |
+| R1 工作区内写 | `write_file/edit/...` 路径 ⊆ 本次运行根 | 自动 allow |
+| R2 工作区内执行 | 测试/构建/lint/只读 git 命令 | 自动 allow |
+| R3 出界/危险 | 路径越根、凭据文件、`git push`、`rm -rf /`、`sudo`、外网命令 | 自动 deny |
+| R4 未知/模糊 | 不在策略表、`ask_user_question`、MCP 工具 | escalate（默认 deny，`requires_human`，记 receipt） |
+
+- 超时/异常一律 **deny**（fail-closed）；`yolo` 不做审批，`plan` 只读
+- 终态 3 行摘要（源会话）：状态/轮次/工具/审批数 + 失败原因或"需人工 N 条"
+- 测试：`tests/test_approval_policy.py`（19 例）+ `tests/test_progress.py`（7 例）
 
 ## 维护
 
