@@ -179,9 +179,18 @@
       },
     ]);
     console.info("[plugin:qwen-code-bridge] route /qwen-code registered");
-    if (H.route && typeof H.route.wrap === "function") {
+    var disabled = false;
+    try {
+      disabled =
+        localStorage.getItem("qwen-code-bridge-disable-wrap") === "1";
+    } catch (e) {}
+    if (!disabled && H.route && typeof H.route.wrap === "function") {
       H.route.wrap("qwen-code-bridge", "core.chat", makeChatWrapper);
       console.info("[plugin:qwen-code-bridge] core.chat wrapped");
+    } else if (disabled) {
+      console.info(
+        "[plugin:qwen-code-bridge] chat wrapper disabled by localStorage",
+      );
     }
   } catch (err) {
     console.warn("[qwen-code-bridge] registerRoutes failed", err);
