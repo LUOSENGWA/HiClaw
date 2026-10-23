@@ -51,7 +51,7 @@ Add people one at a time; nothing is reinstalled and no mode is switched.
 Practical rules:
 
 - **One Human resource per person.** Display name, identity source and permission level live on that resource; the person's scope follows them.
-- **Isolation is structural.** A person's private memory and files live in their own namespace; team content stays inside the team's prefixes. People do not read each other's private data, and a person only sees the teams and workers they were granted.
+- **Access follows membership.** A person's work area lives in their own namespace and is shared by default with the teams they belong to; memory stays personal. Team content stays inside the team's prefixes, people do not read another person's area, and a person only sees the teams and workers they were granted.
 - **Teams scale independently of people.** Add a team when a group needs its own Leader and Workers; a person can belong to several teams.
 - **Rooms mirror membership.** Each team has its own room; a person joins the rooms of the teams they belong to.
 - **Removing a person** removes their membership and access. Deleting their stored data is a separate, explicit action — retention is not implied by removal.
@@ -74,7 +74,7 @@ Practical rules:
 | Human resources | More `Human` objects, each with its own level, teams and capabilities |
 | Team membership | More team rooms and more memberships; `humanMembers` and `accessibleTeams` grow |
 | Permission matrix | More principals to review; capabilities are granted per person |
-| Personal data | More per-human namespaces (files and memory), each isolated |
+| Personal data | More per-human work areas (shared with their teams) and memory anchors (personal) |
 
 ## The Manager in one-person and multi-person deployments
 
@@ -83,13 +83,14 @@ Practical rules:
 - **Its memory is operational memory.** What was created, incidents, operational history — stored in its own agent prefix and `manager/*`. It never owns or writes a person's memory.
 - **Removing it must not remove capability.** Point-and-click operations cover management in its absence; if you remove it, review the operational flows you relied on.
 
-## Personal memory and personal files
+## Personal work area and personal memory
 
 These follow the person, not the Manager:
 
-- Layout: `humans/<human>/files/` (personal files), `humans/<human>/memory/` and `humans/<human>/digest/` (long-term memory).
-- Writes: an agent serving the person submits entries through the **controller API**, which attributes them to the person's scope; the person reads and edits their own scope through the same API.
-- Isolation: no agent — including the Manager — is granted storage access to `humans/*`; scope is enforced by the API.
+- Layout: `humans/<human>/files/` (the **work area**), `humans/<human>/memory/` and `humans/<human>/digest/` (long-term memory).
+- Default access: the person and **the teams they belong to** (Leader and Workers) can read and write `files/**` — it is a shared work area, not a personal cloud drive. `memory/` and `digest/` stay personal.
+- Writes: an agent serving the person submits entries through the **controller API**, which attributes them to the person's scope; the person reads and edits their own scope through the same API, and teams write the work area with their team identity.
+- Isolation: no agent — including the Manager — is granted storage access to `humans/*`; scope is enforced by the API, and non-member teams get 404.
 
 > **Status.** The per-human file area and the per-human memory anchor are design proposals: see issue #1414 (personal file area and file API) and issue #1412 (memory anchors). Until they land, treat personal memory as not yet available rather than as something a Manager owns.
 
