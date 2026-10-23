@@ -4846,6 +4846,7 @@ def _signal_event_id(
     fingerprint: str,
     attempt: int = 0,
     audit_seq: int = 0,
+    discriminator: str = "",
 ) -> str:
     # Contract id_rule (v1.2): 'ev_' + sha256(team_id|project_id|task_id|
     # loop_id|event_type|source_event|iteration|fingerprint|attempt|
@@ -4859,20 +4860,31 @@ def _signal_event_id(
     # + same state bytes) re-lands on the same id (consumer dedupes).
     # Must stay byte-identical to the Go signalEventID (both test suites
     # pin the same fixed vector).
-    digest = hashlib.sha256(
-        "|".join([
-            team_id,
-            project_id,
-            task_id,
-            loop_id,
-            event_type,
-            source_event,
-            str(iteration) if iteration is not None else "",
-            fingerprint,
-            str(attempt),
-            str(audit_seq),
-        ]).encode("utf-8")
-    ).hexdigest()
+    #
+    # Rejection events (SIG-MISMATCH) append an extra final component: a
+    # rejection commits no state, so the ref bytes — and therefore the
+    # fingerprint — are identical across *different* rejected operations
+    # on the same task state. The rejection discriminator
+    # ``action|from|to`` is the logical-operation identity for this
+    # family: appending it keeps distinct rejections on distinct ids
+    # while a retry of the same rejection re-hashes identically. Events
+    # without a discriminator hash the fixed ten-field v1.2 input
+    # unchanged (the cross-language fixed vector is untouched).
+    parts = [
+        team_id,
+        project_id,
+        task_id,
+        loop_id,
+        event_type,
+        source_event,
+        str(iteration) if iteration is not None else "",
+        fingerprint,
+        str(attempt),
+        str(audit_seq),
+    ]
+    if discriminator:
+        parts.append(discriminator)
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
     return "ev_" + digest[:16]
 
 
@@ -4909,6 +4921,7 @@ def _emit_signal_event(
     ref_bytes: bytes = b"",
     payload: dict[str, Any] | None = None,
     audit_seq: int = 0,
+    discriminator: str = "",
 ) -> bool:
     """Append one S2 signal event object under shared/events/{team_id}/.
 
@@ -4923,6 +4936,12 @@ def _emit_signal_event(
     committed-operation revision — the operation instance identity that
     distinguishes two operations whose post-write state bytes would
     otherwise be identical; 0 when the project carries none.
+
+    discriminator (contract id_rule v1.2, rejection family): a rejection
+    commits no state, so the ref bytes do not differ between distinct
+    rejected operations. The ``action|from|to`` discriminator is appended
+    to the identity so distinct rejections get distinct ids while a retry
+    of the same rejection stays idempotent.
     """
     try:
         source_event, event_type, origin = _SIGNAL_EMITTERS[emitter]
@@ -4945,6 +4964,7 @@ def _emit_signal_event(
             fingerprint,
             0,
             audit_seq,
+            discriminator,
         )
         path = _workspace_dir(arguments) / "shared" / "events" / team_id / f"{event_id}.json"
         if path.exists():
@@ -5208,6 +5228,7 @@ def _assert_transition(
                 "to_status": to_status,
                 "action": action,
             },
+            discriminator=f"{action}|{from_status}|{to_status}",
         )
     raise IllegalTransitionError(from_status, to_status, action, message)
 
@@ -5244,6 +5265,7 @@ def _reject_task_transition(
                 "to_status": to_status,
                 "action": action,
             },
+            discriminator=f"{action}|{from_status}|{to_status}",
         )
     raise IllegalTransitionError(from_status, to_status, action, message)
 

@@ -202,6 +202,7 @@ def test_mismatch_signal_emitted(server: Any, tmp_path: Path, monkeypatch: Any) 
     fingerprint = hashlib.sha256(meta_bytes).hexdigest()
     expected_id = server._signal_event_id(
         team, "", task_id, "", "SIG-MISMATCH", "mismatch_recorded", None, fingerprint, 0, 0,
+        "delegate_task|in_progress|assigned",
     )
     events_dir = workspace / "shared" / "events" / team
     files = sorted(events_dir.glob("*.json"))
@@ -288,8 +289,20 @@ def test_status_write_coverage_audit() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _single_mismatch_event(workspace: Path, server: Any, task_id: str) -> dict[str, Any]:
-    """Exactly one event exists and it is the deterministic SIG-MISMATCH."""
+def _single_mismatch_event(
+    workspace: Path,
+    server: Any,
+    task_id: str,
+    action: str,
+    from_status: str,
+    to_status: str,
+) -> dict[str, Any]:
+    """Exactly one event exists and it is the deterministic SIG-MISMATCH.
+
+    The rejection discriminator (action|from|to) is part of the event
+    identity (id_rule v1.2 rejection family): a rejection commits no
+    state, so the ref bytes alone cannot distinguish two different
+    rejected operations on the same task."""
     team = _team(server)
     events_dir = workspace / "shared" / "events" / team
     files = sorted(events_dir.glob("*.json"))
@@ -297,6 +310,7 @@ def _single_mismatch_event(workspace: Path, server: Any, task_id: str) -> dict[s
     fingerprint = hashlib.sha256(meta_bytes).hexdigest()
     expected_id = server._signal_event_id(
         team, "", task_id, "", "SIG-MISMATCH", "mismatch_recorded", None, fingerprint, 0, 0,
+        f"{action}|{from_status}|{to_status}",
     )
     assert [f.name for f in files] == [f"{expected_id}.json"]
     return json.loads(files[0].read_text(encoding="utf-8"))
@@ -326,7 +340,7 @@ def test_ack_terminal_via_taskflow_is_structured(
     # State unchanged on disk.
     assert server._read_json(server._task_state_path(args, task_id))["status"] == "completed"
     # SIG-MISMATCH emitted for the rejection.
-    event = _single_mismatch_event(workspace, server, task_id)
+    event = _single_mismatch_event(workspace, server, task_id, "ack_task", "completed", "in_progress")
     assert event["event_type"] == "SIG-MISMATCH"
     assert event["payload"] == {
         "from_status": "completed",
@@ -362,7 +376,7 @@ def test_ack_planned_via_taskflow_is_structured(
     assert result["from"] == "planned"
     assert result["to"] == "in_progress"
     assert "ack_task: task is 'planned'; delegate_task it first" in result["detail"]
-    event = _single_mismatch_event(workspace, server, task_id)
+    event = _single_mismatch_event(workspace, server, task_id, "ack_task", "planned", "in_progress")
     assert event["payload"] == {
         "from_status": "planned",
         "to_status": "in_progress",
@@ -392,7 +406,7 @@ def test_submit_planned_via_taskflow_is_structured(
     assert result["from"] == "planned"
     assert result["to"] == "submitted"
     assert "submit_task: task is 'planned'; ack_task it first" in result["detail"]
-    event = _single_mismatch_event(workspace, server, task_id)
+    event = _single_mismatch_event(workspace, server, task_id, "submit_task", "planned", "submitted")
     assert event["payload"] == {
         "from_status": "planned",
         "to_status": "submitted",
@@ -419,7 +433,7 @@ def test_report_progress_planned_via_taskflow_is_structured(
     assert result["from"] == "planned"
     assert result["to"] == "planned"
     assert "report_progress: task is 'planned'; ack_task it first" in result["detail"]
-    event = _single_mismatch_event(workspace, server, task_id)
+    event = _single_mismatch_event(workspace, server, task_id, "report_progress", "planned", "planned")
     assert event["payload"] == {
         "from_status": "planned",
         "to_status": "planned",
@@ -468,7 +482,7 @@ def test_cancel_terminal_via_taskflow_is_structured(
     assert result["from"] == "completed"
     assert result["to"] == "cancelled"
     assert "terminal state completed" in result["detail"]
-    event = _single_mismatch_event(workspace, server, task_id)
+    event = _single_mismatch_event(workspace, server, task_id, "cancel_task", "completed", "cancelled")
     assert event["payload"] == {
         "from_status": "completed",
         "to_status": "cancelled",
@@ -503,9 +517,82 @@ def test_delegate_terminal_via_taskflow_is_structured(
     assert result["from"] == "completed"
     assert result["to"] == "assigned"
     assert "terminal state completed" in result["detail"]
-    event = _single_mismatch_event(workspace, server, task_id)
+    event = _single_mismatch_event(workspace, server, task_id, "delegate_task", "completed", "assigned")
     assert event["payload"] == {
         "from_status": "completed",
         "to_status": "assigned",
         "action": "delegate_task",
     }
+
+
+def test_distinct_rejections_keep_distinct_event_identities(
+    server: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """P2 regression (review 10/23): different rejected actions on the same
+    task state are distinct events (id_rule v1.2 rejection family).
+
+    A rejection commits no state, so the task bytes — and therefore the ref
+    fingerprint — are identical across ack/submit/report_progress on the
+    same planned task. The rejection discriminator (action|from|to) is what
+    keeps the three events apart; retrying one of them stays idempotent.
+    """
+    monkeypatch.setattr(server, "_filesync", FakeFilesync())
+    monkeypatch.setenv("AGENTTEAMS_AGENT_ROLE", "worker")
+    workspace = tmp_path / "agent"
+    task_id = "int5r2-distinct-rejections"
+    _write_task(workspace, task_id, {"task_id": task_id, "status": "planned", "project_id": ""})
+    meta_path = workspace / "shared" / "tasks" / task_id / "meta.json"
+
+    cases = [
+        ("ack_task", {}, ("ack_task", "planned", "in_progress")),
+        (
+            "submit_task",
+            {"status": "SUCCESS", "summary": "done"},
+            ("submit_task", "planned", "submitted"),
+        ),
+        ("report_progress", {"note": "halfway"}, ("report_progress", "planned", "planned")),
+    ]
+    for action, extra, _triple in cases:
+        args = _arguments(workspace, action, taskId=task_id, **extra)
+        result = server._taskflow(args)
+        assert result["ok"] is False
+        assert result["error"] == "illegal_transition"
+        assert result["action"] == action
+
+    # The first load normalises the task meta; from then on the bytes are
+    # frozen — no rejection writes state.
+    frozen = meta_path.read_bytes()
+    assert json.loads(frozen.decode("utf-8"))["status"] == "planned"
+
+    team = _team(server)
+    fingerprint = hashlib.sha256(frozen).hexdigest()
+    expected_ids = [
+        server._signal_event_id(
+            team,
+            "",
+            task_id,
+            "",
+            "SIG-MISMATCH",
+            "mismatch_recorded",
+            None,
+            fingerprint,
+            0,
+            0,
+            "|".join(triple),
+        )
+        for _action, _extra, triple in cases
+    ]
+
+    files = sorted((workspace / "shared" / "events" / team).glob("*.json"))
+    assert [f.name for f in files] == sorted(f"{i}.json" for i in expected_ids)
+    assert len(set(expected_ids)) == 3  # distinct rejections never share an id
+    payloads = [json.loads(f.read_text(encoding="utf-8"))["payload"] for f in files]
+    assert {p["action"] for p in payloads} == {"ack_task", "submit_task", "report_progress"}
+    assert meta_path.read_bytes() == frozen
+
+    # Retrying the first rejection re-lands on the same id: no fourth event.
+    args = _arguments(workspace, "ack_task", taskId=task_id)
+    assert server._taskflow(args)["error"] == "illegal_transition"
+    files2 = sorted((workspace / "shared" / "events" / team).glob("*.json"))
+    assert [f.name for f in files2] == [f.name for f in files]
+    assert meta_path.read_bytes() == frozen
