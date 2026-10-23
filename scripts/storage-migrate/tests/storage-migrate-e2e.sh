@@ -10,6 +10,10 @@
 set -uo pipefail
 
 if ! command -v mc >/dev/null; then echo "mc not found on PATH" >&2; exit 1; fi
+if ! mc --version >/dev/null 2>&1; then
+  echo "mc is on PATH but does not run (a 404 page saved as a binary?): $(command -v mc)" >&2
+  exit 1
+fi
 for c in jq curl docker; do
   command -v "$c" >/dev/null || { echo "$c not found on PATH" >&2; exit 1; }
 done

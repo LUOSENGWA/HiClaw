@@ -59,14 +59,21 @@ jobs:
     env:
       MINIO_IMG: higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/minio:20260216
       RUSTFS_IMG: rustfs/rustfs:1.0.3
+      MC_IMG: higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/mc:20260216
     steps:
       - uses: actions/checkout@v4
-      - name: Install mc (pinned to the tested release)
+      - name: Install mc from the bundled image (pinned release)
         run: |
-          curl -sSL -o /usr/local/bin/mc \
-            https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.RELEASE.2025-08-13T08-35-41Z
+          set -euo pipefail
+          # dl.min.io returns 410 (MinIO archived the downloads) and the GitHub
+          # release assets are gone, so the dependable source is the same mc
+          # binary the controller image bundles.
+          docker create --name mc-extract "$MC_IMG" >/dev/null
+          docker cp mc-extract:/usr/bin/mc /usr/local/bin/mc
+          docker rm -f mc-extract >/dev/null
           chmod +x /usr/local/bin/mc
-          mc --version | head -1
+          /usr/local/bin/mc --version
+          /usr/local/bin/mc --version | grep -q "RELEASE.2025-08-13T08-35-41Z"
       - name: Run the full-chain migration e2e
         run: |
           set -o pipefail
@@ -116,12 +123,15 @@ jobs:
           echo "src=$s dst=$d"
           [ "$s" = "200" ] && [ "$d" = "200" ]
 
-      - name: Install mc (the tool runs on the host and needs it on PATH)
+      - name: Install mc from the bundled image (pinned release)
         run: |
-          curl -sSL -o /usr/local/bin/mc \
-            https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.RELEASE.2025-08-13T08-35-41Z
+          set -euo pipefail
+          docker create --name mc-extract "$MC_IMG" >/dev/null
+          docker cp mc-extract:/usr/bin/mc /usr/local/bin/mc
+          docker rm -f mc-extract >/dev/null
           chmod +x /usr/local/bin/mc
-          mc --version | head -1
+          /usr/local/bin/mc --version
+          /usr/local/bin/mc --version | grep -q "RELEASE.2025-08-13T08-35-41Z"
 
       - name: Seed one bucket on the source
         run: |
