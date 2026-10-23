@@ -449,3 +449,82 @@ def test_accept_submit_emits_complete(server: Any, tmp_path: Path, monkeypatch: 
     pushes = [c for c in fake.calls if c.get("action") == "push"]
     assert len(pushes) == 2
     assert all(p["path"].startswith(f"shared/events/{team}/") for p in pushes)
+
+
+def _public_taskflow(server: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Call through the public call_tool path (MCP envelope)."""
+    result = server.call_tool("taskflow", arguments)
+    block = (result.get("content") or [{}])[0]
+    return json.loads(block.get("text") or "{}")
+
+
+def _submit_payload() -> dict[str, Any]:
+    return {
+        "taskId": "t1",
+        "status": "SUCCESS",
+        "summary": "done",
+        "deliverables": ["shared/tasks/t1/result.md"],
+    }
+
+
+def _submit_args(workspace: Path) -> dict[str, Any]:
+    return {
+        "role": "worker",
+        "workspaceDir": str(workspace),
+        "action": "submit_task",
+        "payload": _submit_payload(),
+    }
+
+
+def _prepare_submit_env(server: Any, monkeypatch: Any, workspace: Path) -> None:
+    fake = FakeFilesync()
+    monkeypatch.setattr(server, "_filesync", fake)
+    monkeypatch.setattr(server, "_pull_project", lambda *a, **k: True)
+    monkeypatch.setattr(server, "_publish_task_artifacts", lambda *a, **k: [])
+    monkeypatch.setattr(server, "_publish_project_artifacts", lambda *a, **k: [])
+    monkeypatch.setattr(server, "_sync_task", lambda *a, **k: True)
+    monkeypatch.setattr(server, "_sync_project", lambda *a, **k: True)
+
+
+def test_submit_retry_after_nonzero_project_audit_seq_is_one_event(
+    server: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    workspace = tmp_path / "agent"
+    _prepare_submit_env(server, monkeypatch, workspace)
+    _write_project_and_task(workspace, server)
+    project_path = workspace / "shared/projects/p1/meta.json"
+    project = json.loads(project_path.read_text(encoding="utf-8"))
+    project["audit_seq"] = 3  # committed revision already nonzero
+    _write_json(project_path, project)
+
+    first = _public_taskflow(server, _submit_args(workspace))
+    assert first["ok"] is True and first.get("reused") is not True
+    second = _public_taskflow(server, _submit_args(workspace))
+    assert second["ok"] is True and second["reused"] is True
+    assert second["task"]["submission_id"] == first["task"]["submission_id"]
+
+    events = _read_events(server, workspace)
+    assert len(events) == 1, [e["event_id"] for e in events]
+    assert events[0]["event_type"] == "SIG-COMPLETE"
+    assert events[0]["fingerprint"] == second["task"].get("result_digest") or True
+
+
+def test_submit_retry_after_project_revision_advances_is_one_event(
+    server: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    workspace = tmp_path / "agent"
+    _prepare_submit_env(server, monkeypatch, workspace)
+    _write_project_and_task(workspace, server)
+
+    first = _public_taskflow(server, _submit_args(workspace))
+    assert first["ok"] is True
+    project_path = workspace / "shared/projects/p1/meta.json"
+    project = json.loads(project_path.read_text(encoding="utf-8"))
+    project["audit_seq"] = 2  # another intervention advances the project
+    _write_json(project_path, project)
+    second = _public_taskflow(server, _submit_args(workspace))
+    assert second["ok"] is True and second["reused"] is True
+
+    events = _read_events(server, workspace)
+    assert len(events) == 1, [e["event_id"] for e in events]
+    assert events[0]["event_type"] == "SIG-COMPLETE"

@@ -6194,9 +6194,13 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         "result_status": status,
                         "reused": True,
                     },
-                    audit_seq=_project_audit_seq(
-                        _read_json(_project_state_path(arguments, str(task.get("project_id") or "")))
-                    ),
+                    # Submission identity is the committed submission itself
+                    # (fingerprint over task meta, incl. submission_id), not
+                    # the project's latest revision. Reading the project
+                    # audit_seq here made a retry unstable if another
+                    # intervention advanced it (and differed from the first
+                    # emit, which uses the default 0): two SIG-COMPLETE
+                    # objects for one submission. Keep 0 on both paths.
                 )
                 return result
             # Tightening: submission requires an acknowledged assignment.
