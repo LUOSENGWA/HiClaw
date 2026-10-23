@@ -218,6 +218,88 @@ for side in src dst; do
   expect_fail "${side}: admin user remove dup (absent user)" mca "${side}" admin user remove e2e${side} worker-e2e
 done
 
+echo "=== migration shadow regression (docs/design/storage-external-s3-backend.md) ==="
+# The migration guide used to finish with "mc mirror --overwrite src dst"
+# at cutover. Workers write to the TARGET during shadow (the source is
+# read-only), so that blanket copy reverts newer target-side data — the
+# review reproduced a stale state.txt overwriting the shadow version.
+# This regression pins the corrected procedure end to end:
+#   baseline manifest -> shadow writes on the target -> Gate A (source
+#   unchanged) -> cutover performs NO source->target copy -> shadow
+#   overwrite/create survive and the deletion is preserved -> reverse
+#   rollback (--remove) carries all three back to the source.
+MIG="shared/mig"
+mirror_mig() { # mirror_mig <from:src|dst> <to:src|dst> [--remove]
+  local from="$1" to="$2" extra="${3:-}"
+  local fep fak fsk tep tak tsk
+  case "${from}" in
+    src) fep="${SRC_ENDPOINT}"; fak="${SRC_AK}"; fsk="${SRC_SK}" ;;
+    dst) fep="${DST_ENDPOINT}"; fak="${DST_AK}"; fsk="${DST_SK}" ;;
+  esac
+  case "${to}" in
+    src) tep="${SRC_ENDPOINT}"; tak="${SRC_AK}"; tsk="${SRC_SK}" ;;
+    dst) tep="${DST_ENDPOINT}"; tak="${DST_AK}"; tsk="${DST_SK}" ;;
+  esac
+  docker run --rm --network host \
+    -v "${WORKDIR}/src":"${WORKDIR}/src" -v "${WORKDIR}/dst":"${WORKDIR}/dst" \
+    --entrypoint sh "${MC_IMG}" -c \
+    "mc -q alias set mfsrc '${fep}' '${fak}' '${fsk}' >/dev/null 2>&1 && \
+     mc -q alias set mfdst '${tep}' '${tak}' '${tsk}' >/dev/null 2>&1 && \
+     mc mirror --overwrite ${extra} mf${from}/${BUCKET}/${MIG} mf${to}/${BUCKET}/${MIG}"
+}
+
+# 1) baseline: three objects on the source, bulk-copied to the target
+printf 'v1\n'    > "${WORKDIR}/src/mig-state.txt"
+printf 'keep\n'  > "${WORKDIR}/src/mig-keep.txt"
+printf 'delete\n' > "${WORKDIR}/src/mig-del.txt"
+expect_ok "mig: seed source state" run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc cp "${WORKDIR}/src/mig-state.txt" "e2esrc/${BUCKET}/${MIG}/state.txt"
+expect_ok "mig: seed source keep"  run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc cp "${WORKDIR}/src/mig-keep.txt"  "e2esrc/${BUCKET}/${MIG}/keep.txt"
+expect_ok "mig: seed source del"   run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc cp "${WORKDIR}/src/mig-del.txt"   "e2esrc/${BUCKET}/${MIG}/del.txt"
+if mirror_mig src dst >/dev/null 2>&1; then pass "mig: bulk copy src->dst"; else fail "mig: bulk copy src->dst"; fi
+BASELINE=$(run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc ls --recursive --json "e2esrc/${BUCKET}/${MIG}" 2>/dev/null | sort)
+if [ -n "${BASELINE}" ]; then pass "mig: baseline manifest captured"; else fail "mig: baseline manifest empty"; fi
+
+# 2) shadow writes on the TARGET (workers point at it; source read-only)
+printf 'v2-shadow\n' > "${WORKDIR}/dst/mig-state-v2.txt"
+expect_ok "mig: shadow overwrite on target" run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst cp "${WORKDIR}/dst/mig-state-v2.txt" "e2edst/${BUCKET}/${MIG}/state.txt"
+expect_ok "mig: shadow delete on target"    run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst rm "e2edst/${BUCKET}/${MIG}/del.txt"
+printf 'new\n' > "${WORKDIR}/dst/mig-new.txt"
+expect_ok "mig: shadow create on target"    run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst cp "${WORKDIR}/dst/mig-new.txt" "e2edst/${BUCKET}/${MIG}/new.txt"
+
+# 3) Gate A: the source is unchanged since the baseline
+AFTER=$(run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc ls --recursive --json "e2esrc/${BUCKET}/${MIG}" 2>/dev/null | sort)
+if [ "${BASELINE}" = "${AFTER}" ]; then pass "mig: Gate A — source unchanged since baseline"; else fail "mig: Gate A — source drifted during shadow"; fi
+
+# 4) Gate B: every baseline key still exists on the target
+BASE_KEYS=$(printf '%s\n' "${BASELINE}" | sed -E 's/.*"key":"([^"]+)".*/\1/' | sort)
+MISSING=""
+for k in ${BASE_KEYS}; do
+  run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst stat "e2edst/${BUCKET}/${k}" >/dev/null 2>&1 || MISSING="${MISSING} ${k}"
+done
+if [ -z "${MISSING}" ]; then pass "mig: Gate B — baseline keys present on target"; else fail "mig: Gate B — missing on target:${MISSING}"; fi
+
+# 5) cutover performs NO source->target copy: shadow data must survive
+STATE=$(run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst cat "e2edst/${BUCKET}/${MIG}/state.txt" 2>/dev/null)
+if [ "${STATE}" = "v2-shadow" ]; then pass "mig: cutover preserves the shadow overwrite"; else fail "mig: cutover reverted the shadow overwrite (got '${STATE}')"; fi
+if run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst stat "e2edst/${BUCKET}/${MIG}/del.txt" >/dev/null 2>&1; then
+  fail "mig: cutover resurrected the deleted object"
+else
+  pass "mig: cutover preserves the deletion"
+fi
+expect_ok "mig: cutover keeps the shadow-created object" run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst stat "e2edst/${BUCKET}/${MIG}/new.txt"
+
+# 6) rollback: reverse sync must carry overwrite + create + deletion back
+if mirror_mig dst src --remove >/dev/null 2>&1; then pass "mig: rollback reverse sync (--remove)"; else fail "mig: rollback reverse sync"; fi
+STATE_SRC=$(run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc cat "e2esrc/${BUCKET}/${MIG}/state.txt" 2>/dev/null)
+if [ "${STATE_SRC}" = "v2-shadow" ]; then pass "mig: rollback preserves the shadow overwrite"; else fail "mig: rollback lost the shadow overwrite (got '${STATE_SRC}')"; fi
+if run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc stat "e2esrc/${BUCKET}/${MIG}/del.txt" >/dev/null 2>&1; then
+  fail "mig: rollback did not propagate the deletion"
+else
+  pass "mig: rollback propagates the deletion"
+fi
+expect_ok "mig: rollback imports the shadow-created object" run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc stat "e2esrc/${BUCKET}/${MIG}/new.txt"
+expect_ok "mig: rollback keeps untouched baseline objects"  run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc stat "e2esrc/${BUCKET}/${MIG}/keep.txt"
+
 echo "=== tested version matrix ==="
 echo "minio : $(docker run --rm --entrypoint minio "${MINIO_IMG}" --version 2>/dev/null | head -1)"
 echo "rustfs: $(docker run --rm --entrypoint /usr/bin/rustfs "${RUSTFS_IMG}" --version 2>/dev/null | head -1)"

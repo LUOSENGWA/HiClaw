@@ -95,14 +95,21 @@ Two reproducible layers:
 ### Phase overview
 
 ```
-0. freeze window        stop worker writes (scale down workers / maintenance mode)
-1. bulk copy            copy all objects source → target (mc mirror)
-2. IAM replay           recreate users/policies on target (mc admin)
-3. shadow               re-enable workers pointed at target; source frozen read-only
-4. final reconciliation  compare source vs target (count/size/checksum)
-5. cutover              flip AgentTeams to provider=s3 (endpoint switch)
-6. (if broken)          rollback — see below
+0. freeze window         stop worker writes (scale down workers / maintenance mode)
+1. bulk copy             copy all objects source → target (mc mirror); capture the baseline manifest
+2. IAM replay            recreate users/policies on target (mc admin)
+3. shadow                re-enable workers pointed at target; source stays read-only
+4. shadow reconciliation read-only: source unchanged vs baseline; target = baseline + shadow delta
+5. cutover               flip AgentTeams to provider=s3 — no blanket source → target copy
+6. (if broken)           rollback — see below
 ```
+
+**The one rule that matters:** once shadow starts, the target is the write
+authority and the source is read-only. A blanket `mc mirror --overwrite
+src dst` after that point is a data-loss operation — it reverts every
+object a worker wrote to the target back to the stale source content.
+Correctness is therefore measured against the **baseline manifest**
+captured right after the bulk copy, not against "source equals target".
 
 ### 1. Bulk copy
 
@@ -130,35 +137,69 @@ controller do it: after the endpoint switch, `EnsureUser`/`EnsurePolicy`
 recreate everything on first reconcile (idempotent on both engine
 behaviours). Pre-replaying gives you a verifiable target before cutover.
 
-### 3–4. Shadow + final data reconciliation
+### 3–4. Shadow + shadow reconciliation
 
 Run workers against the target while the source stays **read-only**.
-Reconcile with an independent comparison (not the copy tool):
+
+Immediately after the bulk copy, capture the **baseline manifest** — the
+reconciliation reference for every later step:
 
 ```sh
-# object counts and sizes per bucket
-mc ls --recursive --json src/agents | jq -r '[.size] | @csv' | sort > /tmp/src.csv
-mc ls --recursive --json dst/agents | jq -r '[.size] | @csv' | sort > /tmp/dst.csv
-diff /tmp/src.csv /tmp/dst.csv
+# per bucket, right after phase 1 (before shadow starts)
+mc ls --recursive --json src/<bucket> | sort > /tmp/baseline-<bucket>.jsonl
+```
 
-# checksum sampling (deterministic object set)
-mc ls --recursive src/agents | shuf -n 20 | awk '{print $NF}' | while read -r k; do
-  a=$(mc cat "src/agents/$k" | sha256sum | cut -d' ' -f1)
-  b=$(mc cat "dst/agents/$k" | sha256sum | cut -d' ' -f1)
+After shadow starts, source/target equality is **not** the gate (the
+target is expected to hold newer and additional objects). Two gates
+replace it:
+
+**Gate A — the source did not change.** The source must still match the
+baseline manifest exactly; any difference means the freeze was breached
+and those keys need an explicit, per-key reconciliation (see cutover
+step 3).
+
+```sh
+mc ls --recursive --json src/<bucket> | sort > /tmp/now-<bucket>.jsonl
+diff /tmp/baseline-<bucket>.jsonl /tmp/now-<bucket>.jsonl   # must be empty
+```
+
+**Gate B — the target still contains the baseline.** Every baseline key
+must exist on the target with the same size (checksum sampling for the
+objects that are not expected to have changed):
+
+```sh
+# baseline keys present on the target with identical size
+mc ls --recursive --json dst/<bucket> | sort > /tmp/dst-<bucket>.jsonl
+comm -23 <(jq -r .key /tmp/baseline-<bucket>.jsonl | sort) \
+         <(jq -r .key /tmp/dst-<bucket>.jsonl | sort)   # must be empty
+
+# checksum sampling of baseline objects that shadow should not have touched
+mc ls --recursive src/<bucket> | shuf -n 20 | awk '{print $NF}' | while read -r k; do
+  a=$(mc cat "src/<bucket>/$k" | sha256sum | cut -d' ' -f1)
+  b=$(mc cat "dst/<bucket>/$k" | sha256sum | cut -d' ' -f1)
   [ "$a" = "$b" ] || echo "MISMATCH $k"
 done
 ```
 
-Cutover gate: zero count/size diffs and zero checksum mismatches.
+Differences that are **expected** at this point: objects created on the
+target during shadow (absent from the baseline) and objects modified on
+the target during shadow (baseline key, different content). Record them
+as the shadow delta; do not "fix" them by copying the source over them.
 
 ### 5. Cutover
 
-1. Freeze writes again (short window).
-2. Delta sync: `mc mirror --overwrite src/<bucket> dst/<bucket>` (no `--remove`).
-3. Reconcile (phase 4 commands) — must be clean.
-4. Update the deployment: `storage.provider=s3`, `storage.s3.endpoint=...`,
+1. Freeze writes on the target (short window; scale the workers down).
+2. Re-check **Gate A** (source unchanged vs baseline) — read-only.
+3. Only if Gate A is non-empty (the freeze was breached and the source
+   did receive writes): reconcile **those listed keys one by one** into
+   the target, after confirming the source copy is newer. Never run a
+   whole-bucket `mc mirror --overwrite src → dst` — the target holds the
+   shadow-era writes, and a blanket copy reverts them.
+4. Re-check **Gate B** (baseline keys still present on the target) and
+   confirm the recorded shadow delta is intact.
+5. Update the deployment: `storage.provider=s3`, `storage.s3.endpoint=...`,
    credentials secret. `helm upgrade`.
-5. Verify: controller log shows `storage provider: s3 (external)`; one
+6. Verify: controller log shows `storage provider: s3 (external)`; one
    worker round-trips a file through MinIO.
 
 ### Rollback after writes have begun on the target
@@ -171,18 +212,26 @@ expires; RTO ≈ delta-sync time + cutover):
 
 1. **Stop writes on the target** (freeze workers; scale to zero).
 2. **Reverse delta sync** — copy everything the target has back to the
-   source. Since the source was frozen read-only during shadow, the
-   reverse set is exactly the objects created/modified on the target
-   after cutover:
+   source. Since the source was frozen read-only during shadow (Gate A),
+   the reverse set is exactly the objects created/modified **and the
+   deletions** the target saw after the bulk copy — shadow-era changes
+   included, not just post-cutover ones:
 
    ```sh
-   mc mirror --overwrite dst/<bucket> src/<bucket>   # per bucket
+   mc mirror --overwrite --remove dst/<bucket> src/<bucket>   # per bucket
    ```
+
+   `--remove` is what carries target-side deletions back to the source;
+   it is safe **only** under Gate A (the source gained nothing during
+   shadow). If Gate A is non-empty, drop `--remove`, mirror, and delete
+   the affected source keys explicitly after reconciling each one.
 
    (One-way import features such as RustFS on-demand-migration do not
    apply in reverse; `mc mirror` is the supported path here.)
-3. **Reconcile source** with the pre-cutover baseline (phase 4 commands,
-   source as reference) — confirm the reverse sync restored parity.
+3. **Reconcile source against the target** — after the reverse sync the
+   source must match the target object-for-object (counts/sizes/checksum
+   sampling). Differences versus the original baseline manifest are
+   expected: the shadow delta now lives on the source.
 4. **Flip back**: `storage.provider=minio`, `helm upgrade`, verify one
    worker round-trip.
 5. Keep the target frozen (read-only) for the investigation window;
