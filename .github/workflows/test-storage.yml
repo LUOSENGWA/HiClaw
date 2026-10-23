@@ -68,7 +68,23 @@ jobs:
           chmod +x /usr/local/bin/mc
           mc --version | head -1
       - name: Run the full-chain migration e2e
-        run: bash scripts/storage-migrate/tests/storage-migrate-e2e.sh
+        run: |
+          set -o pipefail
+          bash scripts/storage-migrate/tests/storage-migrate-e2e.sh 2>&1 | tee "$RUNNER_TEMP/migrate-e2e.log"
+      - name: Diagnose on failure
+        if: failure()
+        run: |
+          echo "--- engines ---"; docker ps -a --format '{{.Names}} {{.Status}}' | grep sm-e2e || true
+          echo "--- src log tail ---"; docker logs --tail 40 sm-e2e-src 2>&1 || true
+          echo "--- dst log tail ---"; docker logs --tail 40 sm-e2e-dst 2>&1 || true
+          echo "--- e2e output tail ---"; tail -60 "$RUNNER_TEMP/migrate-e2e.log" || true
+      - name: Upload the e2e log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-e2e-log
+          path: ${{ runner.temp }}/migrate-e2e.log
+          if-no-files-found: ignore
 
   migrate-dryrun:
     name: migration tool dry-run against real engines
@@ -100,6 +116,13 @@ jobs:
           echo "src=$s dst=$d"
           [ "$s" = "200" ] && [ "$d" = "200" ]
 
+      - name: Install mc (the tool runs on the host and needs it on PATH)
+        run: |
+          curl -sSL -o /usr/local/bin/mc \
+            https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.RELEASE.2025-08-13T08-35-41Z
+          chmod +x /usr/local/bin/mc
+          mc --version | head -1
+
       - name: Seed one bucket on the source
         run: |
           docker run --rm --network host --entrypoint sh "$MC_IMG" -c '
@@ -121,6 +144,13 @@ jobs:
           test -s "$RUNNER_TEMP/sm-state/dryrun-plan.json"
           jq -e '.run' "$RUNNER_TEMP/sm-state/dryrun-plan.json" >/dev/null
           ! grep -q "FAIL: P" "$RUNNER_TEMP/dryrun.log"
+
+      - name: Diagnose on failure
+        if: failure()
+        run: |
+          echo "--- engines ---"; docker ps -a --format '{{.Names}} {{.Status}}' | grep -E 'sm-src|sm-dst' || true
+          echo "--- dry-run log tail ---"; tail -60 "$RUNNER_TEMP/dryrun.log" || true
+          echo "--- state dir ---"; ls -la "$RUNNER_TEMP/sm-state" 2>/dev/null || true
 
       - name: Upload dry-run artifacts
         if: always()
