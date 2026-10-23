@@ -30,8 +30,8 @@ The first three are deployment concerns. Humans and the Manager are additions yo
 
 1. Install AgentTeams as usual (local or Kubernetes) and keep the default Leader/Worker topology.
 2. Create the person:
-   - the **administrator (L1)** identity administers the deployment;
-   - a **team member (L2)** identity authenticates through Matrix and is scoped to the teams listed in `accessibleTeams`.
+   - the **administrator (L1)** identity administers the deployment. L1 humans have Matrix accounts like everyone else; their administrative API operations use the admin credential, while L2/L3 humans authenticate with their own Matrix token;
+   - a **team member (L2)** identity is scoped to the teams listed in `accessibleTeams`.
 3. Add the person to the team that should do the work (team membership and `humanMembers`).
 4. Work through the team room: the human states a goal, the Leader decomposes and assigns it, Workers execute, and the human follows and intervenes in the same room.
 5. Optionally install a Manager if the administrator wants conversational operations on the admin DM.

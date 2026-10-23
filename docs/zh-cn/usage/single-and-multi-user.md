@@ -30,8 +30,8 @@
 
 1. 照常安装 AgentTeams（本地或 Kubernetes），保持默认的 Leader/Worker 拓扑。
 2. 创建这个人：
-   - **管理员（L1）**身份负责管理部署；
-   - **团队成员（L2）**身份经 Matrix 认证，作用域是 `accessibleTeams` 中列出的团队。
+   - **管理员（L1）**身份负责管理部署。L1 真人与其他人一样拥有 Matrix 账号；其管理类 API 操作使用 admin 凭据，而 L2/L3 真人用自己的 Matrix token 认证；
+   - **团队成员（L2）**身份的作用域是 `accessibleTeams` 中列出的团队。
 3. 把这个人加入要干活的团队（团队成员关系与 `humanMembers`）。
 4. 在团队房间里协作：真人提出目标，Leader 拆解并分配，Worker 执行，真人在同一个房间里跟踪并介入。
 5. 如果管理员需要对话式运维，再按需安装 Manager。
