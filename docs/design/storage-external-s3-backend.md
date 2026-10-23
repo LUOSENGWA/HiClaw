@@ -165,14 +165,18 @@ jq -r .key /tmp/baseline-<bucket>.jsonl | sort > /tmp/base-keys-<bucket>.txt
 mc ls --recursive --json dst/<bucket> | jq -r .key | sort > /tmp/dst-keys-<bucket>.txt
 comm -13 /tmp/base-keys-<bucket>.txt /tmp/dst-keys-<bucket>.txt > /tmp/shadow-created-<bucket>.txt
 comm -23 /tmp/base-keys-<bucket>.txt /tmp/dst-keys-<bucket>.txt > /tmp/shadow-deleted-<bucket>.txt
-# updated: baseline keys still present but with different content
+# updated: baseline keys still present but with different bytes.
+# Capture both sides into files and cmp them: never compare through
+# $(mc cat ...), which strips trailing newlines (b"keep\n" == b"keep").
 : > /tmp/shadow-updated-<bucket>.txt
 while read -r k; do
   grep -qxF -- "$k" /tmp/shadow-deleted-<bucket>.txt && continue
-  diff -q <(mc cat "src/<bucket>/$k") <(mc cat "dst/<bucket>/$k") >/dev/null 2>&1 && continue
+  mc cat "src/<bucket>/$k" > /tmp/cmp-src.bin || { echo "UNREADABLE-SRC $k"; continue; }
+  mc cat "dst/<bucket>/$k" > /tmp/cmp-dst.bin || { echo "UNREADABLE-DST $k"; continue; }
+  cmp -s /tmp/cmp-src.bin /tmp/cmp-dst.bin && continue
   echo "$k" >> /tmp/shadow-updated-<bucket>.txt
   mkdir -p "/tmp/shadow-value-<bucket>/$(dirname "$k")"
-  mc cat "dst/<bucket>/$k" > "/tmp/shadow-value-<bucket>/$k"
+  cp /tmp/cmp-dst.bin "/tmp/shadow-value-<bucket>/$k"   # raw bytes, no normalisation
 done < /tmp/base-keys-<bucket>.txt
 ```
 
@@ -207,19 +211,25 @@ jq -r .key /tmp/dst-<bucket>.jsonl      | sort > /tmp/dst-keys-<bucket>.txt
 comm -23 /tmp/base-keys-<bucket>.txt /tmp/shadow-deleted-<bucket>.txt \
   | comm -23 - /tmp/dst-keys-<bucket>.txt          # must be empty
 
-# 2. untouched baseline objects are byte-identical on both sides
+# 2. untouched baseline objects are byte-identical on both sides.
+#    Capture raw bytes into files, then cmp — a failed read must fail the
+#    gate (and $(mc cat ...) would strip the trailing newline before any
+#    comparison, so b"keep\n" and b"keep" would look identical).
 comm -23 /tmp/base-keys-<bucket>.txt \
          <(cat /tmp/shadow-updated-<bucket>.txt /tmp/shadow-deleted-<bucket>.txt | sort) \
   | while read -r k; do
-      a=$(mc cat "src/<bucket>/$k" | sha256sum | cut -d' ' -f1)
-      b=$(mc cat "dst/<bucket>/$k" | sha256sum | cut -d' ' -f1)
-      [ "$a" = "$b" ] || echo "MISMATCH $k"
+      mc cat "src/<bucket>/$k" > /tmp/cmp-src.bin || { echo "UNREADABLE-SRC $k"; continue; }
+      mc cat "dst/<bucket>/$k" > /tmp/cmp-dst.bin || { echo "UNREADABLE-DST $k"; continue; }
+      cmp -s /tmp/cmp-src.bin /tmp/cmp-dst.bin || echo "MISMATCH $k"
     done                                           # must print nothing
 
 # 3. the recorded delta holds: creates exist, updates carry the shadow
 #    content, deletions stay absent (never resurrected from the source)
 while read -r k; do mc stat "dst/<bucket>/$k" >/dev/null 2>&1 || echo "MISSING CREATE $k"; done < /tmp/shadow-created-<bucket>.txt
-while read -r k; do [ "$(mc cat "dst/<bucket>/$k")" = "$(cat "/tmp/shadow-value-<bucket>/$k")" ] || echo "UPDATE LOST $k"; done < /tmp/shadow-updated-<bucket>.txt
+while read -r k; do
+  mc cat "dst/<bucket>/$k" > /tmp/cmp-dst.bin || { echo "UPDATE UNREADABLE $k"; continue; }
+  cmp -s /tmp/cmp-dst.bin "/tmp/shadow-value-<bucket>/$k" || echo "UPDATE LOST $k"
+done < /tmp/shadow-updated-<bucket>.txt          # must print nothing
 while read -r k; do mc stat "dst/<bucket>/$k" >/dev/null 2>&1 && echo "RESURRECTED $k"; done < /tmp/shadow-deleted-<bucket>.txt   # must print nothing
 
 # 4. nothing outside baseline ∪ created appeared on the target

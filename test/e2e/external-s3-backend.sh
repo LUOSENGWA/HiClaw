@@ -53,6 +53,42 @@ expect_fail() { # expect_fail <desc> <cmd...>
   if "$@" >/dev/null 2>&1; then fail "$desc (expected failure)"; else pass "$desc"; fi
 }
 
+# fetch_obj <ak> <sk> <endpoint> <alias> <object> <outfile>
+# Captures the raw object bytes into <outfile> and returns mc's exit code.
+# Never compare object bytes through ``$(mc cat ...)``: command substitution
+# strips trailing newlines, so b"keep\n" and b"keep" would compare equal
+# (review P2). Capture to a file, then cmp/hash the file.
+fetch_obj() {
+  local ak="$1" sk="$2" ep="$3" alias="$4" obj="$5" out="$6"
+  run_mc "${ak}" "${sk}" "${ep}" "${alias}" cat "${obj}" >"${out}" 2>/dev/null
+}
+
+# _cmp_obj <ak> <sk> <endpoint> <alias> <object> <expected-file>
+# Silent byte comparison: 0 = identical, 1 = bytes differ, 2 = read failure.
+_cmp_obj() {
+  local ak="$1" sk="$2" ep="$3" alias="$4" obj="$5" want="$6" got rc
+  got="${WORKDIR}/cmp-object.bin"
+  if ! fetch_obj "${ak}" "${sk}" "${ep}" "${alias}" "${obj}" "${got}"; then
+    return 2
+  fi
+  if cmp -s "${got}" "${want}"; then rc=0; else rc=1; fi
+  rm -f "${got}"
+  return "${rc}"
+}
+
+# obj_equals_file <desc> <ak> <sk> <endpoint> <alias> <object> <expected-file>
+# Asserting wrapper around _cmp_obj (raw bytes, read failure is a failure).
+obj_equals_file() {
+  local desc="$1"
+  shift
+  _cmp_obj "$@"
+  case $? in
+    0) pass "${desc}" ;;
+    1) fail "${desc} (bytes differ from the recorded value)" ;;
+    *) fail "${desc} (object unreadable)" ;;
+  esac
+}
+
 # mc invocation against a live engine via the same mc image the controller
 # bundles. The alias set and the command run in ONE container (a throwaway
 # container would lose the alias otherwise).
@@ -134,12 +170,13 @@ for side in src dst; do
   expect_ok "${side}: ls"            run_mc "${AK}" "${SK}" "${EP}" "${AL}" ls --recursive "${AL}/${BUCKET}"
   expect_ok "${side}: stat"          run_mc "${AK}" "${SK}" "${EP}" "${AL}" stat "${AL}/${BUCKET}/agents/w1/blob.bin"
   local_src=$(sha256sum "${WORKDIR}/${side}/blob.bin" | cut -d" " -f1)
-  local_dst=$(run_mc "${AK}" "${SK}" "${EP}" "${AL}" cat "${AL}/${BUCKET}/agents/w1/blob.bin" \
-      2>/dev/null | sha256sum | cut -d" " -f1)
-  if [ -n "${local_dst}" ] && [ "${local_src}" = "${local_dst}" ]; then
-    pass "${side}: cat roundtrip (sha256 match)"
+  if ! fetch_obj "${AK}" "${SK}" "${EP}" "${AL}" "${AL}/${BUCKET}/agents/w1/blob.bin" "${WORKDIR}/${side}/blob.back"; then
+    fail "${side}: cat roundtrip (object unreadable)"
+  elif cmp -s "${WORKDIR}/${side}/blob.bin" "${WORKDIR}/${side}/blob.back"; then
+    local_dst=$(sha256sum "${WORKDIR}/${side}/blob.back" | cut -d" " -f1)
+    pass "${side}: cat roundtrip (byte-identical, sha256 ${local_dst:0:12}… = ${local_src:0:12}…)"
   else
-    fail "${side}: cat roundtrip (sha256 differ)"
+    fail "${side}: cat roundtrip (bytes differ)"
   fi
   expect_ok "${side}: du"            run_mc "${AK}" "${SK}" "${EP}" "${AL}" du "${AL}/${BUCKET}"
   # cross-engine mirror (src -> dst) is covered once below; rm here
@@ -303,36 +340,55 @@ else
   pass "mig: Gate B — recorded deletion preserved"
 fi
 
-# 4c) untouched baseline objects are byte-identical on both sides.
-#     Compare captured *contents* (not `cat | sha256sum` of a failed read:
-#     hashing empty input yields the same digest on both sides and would
-#     silently pass when the object is missing).
-GATE_B_DRIFT=""
-for k in ${BASE_KEYS}; do
-  case "${k##*/}" in "${DELTA_UPDATE}" | "${DELTA_DELETE}") continue ;; esac
-  if ! a=$(run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc cat "e2esrc/${BUCKET}/${k}" 2>/dev/null); then
-    GATE_B_DRIFT="${GATE_B_DRIFT} ${k}(unreadable-on-source)"; continue
+# gate_b_content_probe [<key>...]
+# Byte-integrity probe for untouched baseline objects (default key set = the
+# non-delta baseline keys; explicit keys let the control tests exercise the
+# same code path). 0 = all identical and readable; otherwise prints
+# "<key>(<reason>)" items and returns 1.
+gate_b_content_probe() {
+  local bad="" k keys=""
+  if [ "$#" -gt 0 ]; then
+    keys="$*"
+  else
+    for k in ${BASE_KEYS}; do
+      case "${k##*/}" in "${DELTA_UPDATE}" | "${DELTA_DELETE}") continue ;; esac
+      keys="${keys} ${k}"
+    done
   fi
-  if ! b=$(run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst cat "e2edst/${BUCKET}/${k}" 2>/dev/null); then
-    GATE_B_DRIFT="${GATE_B_DRIFT} ${k}(missing-on-target)"; continue
-  fi
-  a=$(printf '%s' "${a}" | sha256sum | cut -d' ' -f1)
-  b=$(printf '%s' "${b}" | sha256sum | cut -d' ' -f1)
-  [ "${a}" = "${b}" ] || GATE_B_DRIFT="${GATE_B_DRIFT} ${k}(content)"
-done
-if [ -z "${GATE_B_DRIFT}" ]; then pass "mig: Gate B — untouched baseline objects byte-identical"; else fail "mig: Gate B — content drift:${GATE_B_DRIFT}"; fi
+  for k in ${keys}; do
+    if ! fetch_obj "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc "e2esrc/${BUCKET}/${k}" "${WORKDIR}/probe-src.bin"; then
+      bad="${bad} ${k}(unreadable-on-source)"; continue
+    fi
+    if ! fetch_obj "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst "e2edst/${BUCKET}/${k}" "${WORKDIR}/probe-dst.bin"; then
+      bad="${bad} ${k}(missing-on-target)"; continue
+    fi
+    cmp -s "${WORKDIR}/probe-src.bin" "${WORKDIR}/probe-dst.bin" || bad="${bad} ${k}(content)"
+  done
+  if [ -z "${bad}" ]; then return 0; fi
+  printf '%s' "${bad}"
+  return 1
+}
 
-# 4d) the recorded update holds the shadow content on the target
-STATE_TGT=$(run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst cat "e2edst/${BUCKET}/${MIG}/${DELTA_UPDATE}" 2>/dev/null)
-if [ "${STATE_TGT}" = "v2-shadow" ]; then pass "mig: Gate B — recorded update intact"; else fail "mig: Gate B — recorded update lost (got '${STATE_TGT}')"; fi
+# 4c) untouched baseline objects are byte-identical on both sides.
+#     Raw bytes are captured into files and compared with cmp: `$(mc cat)`
+#     strips trailing newlines (b"keep\n" vs b"keep" would compare equal —
+#     review P2) and hashing a failed read compares empty against empty.
+if GATE_B_DRIFT=$(gate_b_content_probe); then
+  pass "mig: Gate B — untouched baseline objects byte-identical"
+else
+  fail "mig: Gate B — content drift:${GATE_B_DRIFT}"
+fi
+
+# 4d) the recorded update holds the shadow content on the target — compared
+#     as raw bytes against the exact file uploaded during shadow
+obj_equals_file "mig: Gate B — recorded update intact" "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst "e2edst/${BUCKET}/${MIG}/${DELTA_UPDATE}" "${WORKDIR}/dst/mig-state-v2.txt"
 
 # 4e) no keys outside baseline ∪ recorded-create appear on the target
 EXTRA_KEYS=$(comm -13 <(printf '%s\n' "${BASE_KEYS}") <(printf '%s\n' "${TGT_KEYS}") | sed '/^$/d' | tr '\n' ' ' | sed 's/ *$//')
 if [ "${EXTRA_KEYS}" = "${MIG}/${DELTA_CREATE}" ]; then pass "mig: Gate B — target keys = baseline + recorded create"; else fail "mig: Gate B — unexpected target keys: '${EXTRA_KEYS}'"; fi
 
 # 5) cutover performs NO source->target copy: shadow data must survive
-STATE=$(run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst cat "e2edst/${BUCKET}/${MIG}/state.txt" 2>/dev/null)
-if [ "${STATE}" = "v2-shadow" ]; then pass "mig: cutover preserves the shadow overwrite"; else fail "mig: cutover reverted the shadow overwrite (got '${STATE}')"; fi
+obj_equals_file "mig: cutover preserves the shadow overwrite" "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst "e2edst/${BUCKET}/${MIG}/state.txt" "${WORKDIR}/dst/mig-state-v2.txt"
 if run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst stat "e2edst/${BUCKET}/${MIG}/del.txt" >/dev/null 2>&1; then
   fail "mig: cutover resurrected the deleted object"
 else
@@ -342,8 +398,8 @@ expect_ok "mig: cutover keeps the shadow-created object" run_mc "${DST_AK}" "${D
 
 # 6) rollback: reverse sync must carry overwrite + create + deletion back
 if mirror_mig dst src --remove >/dev/null 2>&1; then pass "mig: rollback reverse sync (--remove)"; else fail "mig: rollback reverse sync"; fi
-STATE_SRC=$(run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc cat "e2esrc/${BUCKET}/${MIG}/state.txt" 2>/dev/null)
-if [ "${STATE_SRC}" = "v2-shadow" ]; then pass "mig: rollback preserves the shadow overwrite"; else fail "mig: rollback lost the shadow overwrite (got '${STATE_SRC}')"; fi
+STATE_SRC_DESC="mig: rollback preserves the shadow overwrite"
+obj_equals_file "${STATE_SRC_DESC}" "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc "e2esrc/${BUCKET}/${MIG}/state.txt" "${WORKDIR}/dst/mig-state-v2.txt"
 if run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc stat "e2esrc/${BUCKET}/${MIG}/del.txt" >/dev/null 2>&1; then
   fail "mig: rollback did not propagate the deletion"
 else
@@ -356,13 +412,49 @@ expect_ok "mig: rollback keeps untouched baseline objects"  run_mc "${SRC_AK}" "
 #     state. These assertions are what catch a reversed helper: the bug where
 #     the "rollback" copies source->target reverts the shadow overwrite,
 #     deletes the shadow-created object and resurrects the shadow deletion.
-STATE_TGT_AFTER=$(run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst cat "e2edst/${BUCKET}/${MIG}/${DELTA_UPDATE}" 2>/dev/null)
-if [ "${STATE_TGT_AFTER}" = "v2-shadow" ]; then pass "mig: rollback left the target's shadow overwrite intact"; else fail "mig: rollback reverted the target's shadow overwrite (got '${STATE_TGT_AFTER}')"; fi
+obj_equals_file "mig: rollback left the target's shadow overwrite intact" "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst "e2edst/${BUCKET}/${MIG}/${DELTA_UPDATE}" "${WORKDIR}/dst/mig-state-v2.txt"
 expect_ok "mig: rollback left the target's shadow-created object intact" run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst stat "e2edst/${BUCKET}/${MIG}/${DELTA_CREATE}"
 if run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst stat "e2edst/${BUCKET}/${MIG}/${DELTA_DELETE}" >/dev/null 2>&1; then
   fail "mig: rollback resurrected the target's deletion"
 else
   pass "mig: rollback left the target's deletion intact"
+fi
+
+echo "=== byte-integrity control tests (the probes must reject divergences) ==="
+# N1) trailing-newline-only divergence: b"keep" vs b"keep\n". This is the
+#     exact normalisation gap the review reproduced: through $(mc cat ...)
+#     both sides become "keep" and the gate passes.
+printf 'keep' > "${WORKDIR}/dst/neg-keep-nonl.txt"
+expect_ok "ctrl: seed a trailing-newline-only divergence on the target" run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst cp "${WORKDIR}/dst/neg-keep-nonl.txt" "e2edst/${BUCKET}/${MIG}/keep.txt"
+if gate_b_content_probe >/dev/null; then
+  fail "ctrl: probe accepted a trailing-newline-only divergence"
+else
+  pass "ctrl: probe rejects a trailing-newline-only divergence"
+fi
+expect_ok "ctrl: restore keep.txt with its recorded bytes" run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst cp "${WORKDIR}/src/mig-keep.txt" "e2edst/${BUCKET}/${MIG}/keep.txt"
+if gate_b_content_probe >/dev/null; then pass "ctrl: probe green again after restore"; else fail "ctrl: probe still red after restore"; fi
+
+# N2) binary single-byte difference
+printf '\x00\x01\x02\x03\x04\xff\xfe\x80\x7f\x00' > "${WORKDIR}/src/neg-bin.bin"
+printf '\x00\x01\x02\x03\x04\xff\xfe\x80\x7f\x01' > "${WORKDIR}/dst/neg-bin-flip.bin"
+expect_ok "ctrl: seed a binary object on the source" run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc cp "${WORKDIR}/src/neg-bin.bin" "e2esrc/${BUCKET}/${MIG}/neg-bin.bin"
+expect_ok "ctrl: seed the identical binary object on the target" run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst cp "${WORKDIR}/src/neg-bin.bin" "e2edst/${BUCKET}/${MIG}/neg-bin.bin"
+if gate_b_content_probe "${MIG}/neg-bin.bin" >/dev/null; then pass "ctrl: probe green on identical binary objects"; else fail "ctrl: probe red on identical binary objects"; fi
+expect_ok "ctrl: flip one byte on the target" run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst cp "${WORKDIR}/dst/neg-bin-flip.bin" "e2edst/${BUCKET}/${MIG}/neg-bin.bin"
+if gate_b_content_probe "${MIG}/neg-bin.bin" >/dev/null; then fail "ctrl: probe accepted a one-byte binary difference"; else pass "ctrl: probe rejects a one-byte binary difference"; fi
+
+# N3) an unreadable object must fail the probe (never "empty == empty")
+expect_ok "ctrl: delete the target copy" run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst rm "e2edst/${BUCKET}/${MIG}/neg-bin.bin"
+if gate_b_content_probe "${MIG}/neg-bin.bin" >/dev/null; then fail "ctrl: probe passed with an unreadable target object"; else pass "ctrl: probe fails on an unreadable target object"; fi
+expect_ok "ctrl: cleanup the binary fixture on the source" run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc rm "e2esrc/${BUCKET}/${MIG}/neg-bin.bin"
+
+# N4) the recorded-value check must fail on a read error even when the
+#     recorded value file is empty (empty == empty is not a match)
+: > "${WORKDIR}/neg-empty.txt"
+if _cmp_obj "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst "e2edst/${BUCKET}/${MIG}/does-not-exist.bin" "${WORKDIR}/neg-empty.txt"; then
+  fail "ctrl: value check passed on a missing object with an empty expected file"
+else
+  pass "ctrl: value check fails on a missing object (empty expected file included)"
 fi
 
 echo "=== tested version matrix ==="
