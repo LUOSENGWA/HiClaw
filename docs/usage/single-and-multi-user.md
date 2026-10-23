@@ -91,6 +91,7 @@ These follow the person, not the Manager:
 - Default access: the person and **the teams they belong to** (Leader and Workers) can read and write `files/**` — it is a shared work area, not a personal cloud drive. `memory/` and `digest/` stay personal.
 - Writes: an agent serving the person submits entries through the **controller API**, which attributes them to the person's scope; the person reads and edits their own scope through the same API, and teams write the work area with their team identity.
 - Isolation: no agent — including the Manager — is granted storage access to `humans/*`; scope is enforced by the API, and non-member teams get 404.
+- Deletions go to a **remote recycle bin** (restorable, default retention 30 days); sync is switched on per device and scoped to the folders the user selects.
 
 > **Status.** The per-human file area and the per-human memory anchor are design proposals: see issue #1414 (personal file area and file API) and issue #1412 (memory anchors). Until they land, treat personal memory as not yet available rather than as something a Manager owns.
 
