@@ -230,21 +230,22 @@ echo "=== migration shadow regression (docs/design/storage-external-s3-backend.m
 #   rollback (--remove) carries all three back to the source.
 MIG="shared/mig"
 mirror_mig() { # mirror_mig <from:src|dst> <to:src|dst> [--remove]
+  # Alias NAMES are fixed to their actual endpoints: mfsrc = source,
+  # mfdst = target. Only the operands move (mf${from} -> mf${to}).
+  # Binding the aliases to the dynamic from/to endpoints and then using
+  # mf${from}/mf${to} reverses the direction twice: the rollback
+  # (mirror_mig dst src --remove) then copied source->target instead of
+  # target->source — clobbering the shadow update, deleting the
+  # shadow-created object and resurrecting the shadow deletion it was
+  # meant to carry back to the source.
   local from="$1" to="$2" extra="${3:-}"
-  local fep fak fsk tep tak tsk
-  case "${from}" in
-    src) fep="${SRC_ENDPOINT}"; fak="${SRC_AK}"; fsk="${SRC_SK}" ;;
-    dst) fep="${DST_ENDPOINT}"; fak="${DST_AK}"; fsk="${DST_SK}" ;;
-  esac
-  case "${to}" in
-    src) tep="${SRC_ENDPOINT}"; tak="${SRC_AK}"; tsk="${SRC_SK}" ;;
-    dst) tep="${DST_ENDPOINT}"; tak="${DST_AK}"; tsk="${DST_SK}" ;;
-  esac
+  case "${from}" in src | dst) ;; *) echo "mirror_mig: bad from '${from}'" >&2; return 2 ;; esac
+  case "${to}" in src | dst) ;; *) echo "mirror_mig: bad to '${to}'" >&2; return 2 ;; esac
   docker run --rm --network host \
     -v "${WORKDIR}/src":"${WORKDIR}/src" -v "${WORKDIR}/dst":"${WORKDIR}/dst" \
     --entrypoint sh "${MC_IMG}" -c \
-    "mc -q alias set mfsrc '${fep}' '${fak}' '${fsk}' >/dev/null 2>&1 && \
-     mc -q alias set mfdst '${tep}' '${tak}' '${tsk}' >/dev/null 2>&1 && \
+    "mc -q alias set mfsrc '${SRC_ENDPOINT}' '${SRC_AK}' '${SRC_SK}' >/dev/null 2>&1 && \
+     mc -q alias set mfdst '${DST_ENDPOINT}' '${DST_AK}' '${DST_SK}' >/dev/null 2>&1 && \
      mc mirror --overwrite ${extra} mf${from}/${BUCKET}/${MIG} mf${to}/${BUCKET}/${MIG}"
 }
 
@@ -270,13 +271,64 @@ expect_ok "mig: shadow create on target"    run_mc "${DST_AK}" "${DST_SK}" "${DS
 AFTER=$(run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc ls --recursive --json "e2esrc/${BUCKET}/${MIG}" 2>/dev/null | sort)
 if [ "${BASELINE}" = "${AFTER}" ]; then pass "mig: Gate A — source unchanged since baseline"; else fail "mig: Gate A — source drifted during shadow"; fi
 
-# 4) Gate B: every baseline key still exists on the target
-BASE_KEYS=$(printf '%s\n' "${BASELINE}" | sed -E 's/.*"key":"([^"]+)".*/\1/' | sort)
-MISSING=""
+# 4) Gate B: the target holds the baseline plus the *recorded* shadow delta.
+#    A deletion during shadow is intended state, not a gate failure — the
+#    old "every baseline key present" check failed on the very deletion this
+#    regression performs (and its "same size" wording also failed on the
+#    intended overwrite). The delta is recorded explicitly:
+#      update state.txt -> "v2-shadow" / delete del.txt / create new.txt
+DELTA_UPDATE="state.txt"
+DELTA_DELETE="del.txt"
+DELTA_CREATE="new.txt"
+# mc ls --recursive --json <alias>/<bucket>/<prefix> returns keys relative
+# to <prefix>; re-attach it so every downstream object path is unambiguous.
+# (Idempotent: keys that already carry the prefix pass through unchanged.)
+key_rel() { sed -E 's/.*"key":"([^"]+)".*/\1/' | awk -v p="${MIG}/" 'index($0, p) == 1 { print; next } { print p $0 }'; }
+TGT_MANIFEST=$(run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst ls --recursive --json "e2edst/${BUCKET}/${MIG}" 2>/dev/null | sort)
+TGT_KEYS=$(printf '%s\n' "${TGT_MANIFEST}" | key_rel | sort)
+BASE_KEYS=$(printf '%s\n' "${BASELINE}" | key_rel | sort)
+
+# 4a) every baseline key the shadow did not delete is still on the target
+GATE_B_MISSING=""
 for k in ${BASE_KEYS}; do
-  run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst stat "e2edst/${BUCKET}/${k}" >/dev/null 2>&1 || MISSING="${MISSING} ${k}"
+  [ "${k##*/}" = "${DELTA_DELETE}" ] && continue
+  printf '%s\n' "${TGT_KEYS}" | grep -qxF -- "${k}" || GATE_B_MISSING="${GATE_B_MISSING} ${k}"
 done
-if [ -z "${MISSING}" ]; then pass "mig: Gate B — baseline keys present on target"; else fail "mig: Gate B — missing on target:${MISSING}"; fi
+if [ -z "${GATE_B_MISSING}" ]; then pass "mig: Gate B — non-deleted baseline keys present on target"; else fail "mig: Gate B — missing on target:${GATE_B_MISSING}"; fi
+
+# 4b) the recorded deletion is preserved on the target (not resurrected)
+if run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst stat "e2edst/${BUCKET}/${MIG}/${DELTA_DELETE}" >/dev/null 2>&1; then
+  fail "mig: Gate B — recorded deletion was resurrected on the target"
+else
+  pass "mig: Gate B — recorded deletion preserved"
+fi
+
+# 4c) untouched baseline objects are byte-identical on both sides.
+#     Compare captured *contents* (not `cat | sha256sum` of a failed read:
+#     hashing empty input yields the same digest on both sides and would
+#     silently pass when the object is missing).
+GATE_B_DRIFT=""
+for k in ${BASE_KEYS}; do
+  case "${k##*/}" in "${DELTA_UPDATE}" | "${DELTA_DELETE}") continue ;; esac
+  if ! a=$(run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc cat "e2esrc/${BUCKET}/${k}" 2>/dev/null); then
+    GATE_B_DRIFT="${GATE_B_DRIFT} ${k}(unreadable-on-source)"; continue
+  fi
+  if ! b=$(run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst cat "e2edst/${BUCKET}/${k}" 2>/dev/null); then
+    GATE_B_DRIFT="${GATE_B_DRIFT} ${k}(missing-on-target)"; continue
+  fi
+  a=$(printf '%s' "${a}" | sha256sum | cut -d' ' -f1)
+  b=$(printf '%s' "${b}" | sha256sum | cut -d' ' -f1)
+  [ "${a}" = "${b}" ] || GATE_B_DRIFT="${GATE_B_DRIFT} ${k}(content)"
+done
+if [ -z "${GATE_B_DRIFT}" ]; then pass "mig: Gate B — untouched baseline objects byte-identical"; else fail "mig: Gate B — content drift:${GATE_B_DRIFT}"; fi
+
+# 4d) the recorded update holds the shadow content on the target
+STATE_TGT=$(run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst cat "e2edst/${BUCKET}/${MIG}/${DELTA_UPDATE}" 2>/dev/null)
+if [ "${STATE_TGT}" = "v2-shadow" ]; then pass "mig: Gate B — recorded update intact"; else fail "mig: Gate B — recorded update lost (got '${STATE_TGT}')"; fi
+
+# 4e) no keys outside baseline ∪ recorded-create appear on the target
+EXTRA_KEYS=$(comm -13 <(printf '%s\n' "${BASE_KEYS}") <(printf '%s\n' "${TGT_KEYS}") | sed '/^$/d' | tr '\n' ' ' | sed 's/ *$//')
+if [ "${EXTRA_KEYS}" = "${MIG}/${DELTA_CREATE}" ]; then pass "mig: Gate B — target keys = baseline + recorded create"; else fail "mig: Gate B — unexpected target keys: '${EXTRA_KEYS}'"; fi
 
 # 5) cutover performs NO source->target copy: shadow data must survive
 STATE=$(run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst cat "e2edst/${BUCKET}/${MIG}/state.txt" 2>/dev/null)
@@ -299,6 +351,19 @@ else
 fi
 expect_ok "mig: rollback imports the shadow-created object" run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc stat "e2esrc/${BUCKET}/${MIG}/new.txt"
 expect_ok "mig: rollback keeps untouched baseline objects"  run_mc "${SRC_AK}" "${SRC_SK}" "${SRC_ENDPOINT}" e2esrc stat "e2esrc/${BUCKET}/${MIG}/keep.txt"
+
+# 6b) the reverse sync must not touch the target — it still holds the shadow
+#     state. These assertions are what catch a reversed helper: the bug where
+#     the "rollback" copies source->target reverts the shadow overwrite,
+#     deletes the shadow-created object and resurrects the shadow deletion.
+STATE_TGT_AFTER=$(run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst cat "e2edst/${BUCKET}/${MIG}/${DELTA_UPDATE}" 2>/dev/null)
+if [ "${STATE_TGT_AFTER}" = "v2-shadow" ]; then pass "mig: rollback left the target's shadow overwrite intact"; else fail "mig: rollback reverted the target's shadow overwrite (got '${STATE_TGT_AFTER}')"; fi
+expect_ok "mig: rollback left the target's shadow-created object intact" run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst stat "e2edst/${BUCKET}/${MIG}/${DELTA_CREATE}"
+if run_mc "${DST_AK}" "${DST_SK}" "${DST_ENDPOINT}" e2edst stat "e2edst/${BUCKET}/${MIG}/${DELTA_DELETE}" >/dev/null 2>&1; then
+  fail "mig: rollback resurrected the target's deletion"
+else
+  pass "mig: rollback left the target's deletion intact"
+fi
 
 echo "=== tested version matrix ==="
 echo "minio : $(docker run --rm --entrypoint minio "${MINIO_IMG}" --version 2>/dev/null | head -1)"

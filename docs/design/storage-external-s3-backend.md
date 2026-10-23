@@ -146,7 +146,34 @@ reconciliation reference for every later step:
 
 ```sh
 # per bucket, right after phase 1 (before shadow starts)
+# List the whole bucket: `mc ls --recursive --json` returns keys relative to
+# the path you list (listing a prefix yields prefix-relative keys).
 mc ls --recursive --json src/<bucket> | sort > /tmp/baseline-<bucket>.jsonl
+```
+
+While shadow runs, record the **shadow delta** — it is the acceptance
+reference for Gate B, the cutover check and the rollback check:
+
+- **created** — keys on the target that are absent from the baseline;
+- **updated** — baseline keys whose content changed on the target (keep
+  the new value; size alone is not enough to prove content);
+- **deleted** — baseline keys that are absent from the target (an intended
+  deletion during shadow, not a gate failure).
+
+```sh
+jq -r .key /tmp/baseline-<bucket>.jsonl | sort > /tmp/base-keys-<bucket>.txt
+mc ls --recursive --json dst/<bucket> | jq -r .key | sort > /tmp/dst-keys-<bucket>.txt
+comm -13 /tmp/base-keys-<bucket>.txt /tmp/dst-keys-<bucket>.txt > /tmp/shadow-created-<bucket>.txt
+comm -23 /tmp/base-keys-<bucket>.txt /tmp/dst-keys-<bucket>.txt > /tmp/shadow-deleted-<bucket>.txt
+# updated: baseline keys still present but with different content
+: > /tmp/shadow-updated-<bucket>.txt
+while read -r k; do
+  grep -qxF -- "$k" /tmp/shadow-deleted-<bucket>.txt && continue
+  diff -q <(mc cat "src/<bucket>/$k") <(mc cat "dst/<bucket>/$k") >/dev/null 2>&1 && continue
+  echo "$k" >> /tmp/shadow-updated-<bucket>.txt
+  mkdir -p "/tmp/shadow-value-<bucket>/$(dirname "$k")"
+  mc cat "dst/<bucket>/$k" > "/tmp/shadow-value-<bucket>/$k"
+done < /tmp/base-keys-<bucket>.txt
 ```
 
 After shadow starts, source/target equality is **not** the gate (the
@@ -163,28 +190,49 @@ mc ls --recursive --json src/<bucket> | sort > /tmp/now-<bucket>.jsonl
 diff /tmp/baseline-<bucket>.jsonl /tmp/now-<bucket>.jsonl   # must be empty
 ```
 
-**Gate B — the target still contains the baseline.** Every baseline key
-must exist on the target with the same size (checksum sampling for the
-objects that are not expected to have changed):
+**Gate B — the target holds exactly the baseline plus the recorded shadow
+delta.** Do **not** require "every baseline key still exists with its old
+size": a deletion performed during shadow is intended state, and an updated
+key legitimately has new content and a new size. Record the delta as shadow
+happens — `created`, `updated` (with the new value), `deleted`, one key per
+line — and gate against that record:
 
 ```sh
-# baseline keys present on the target with identical size
+# per bucket, after shadow
 mc ls --recursive --json dst/<bucket> | sort > /tmp/dst-<bucket>.jsonl
-comm -23 <(jq -r .key /tmp/baseline-<bucket>.jsonl | sort) \
-         <(jq -r .key /tmp/dst-<bucket>.jsonl | sort)   # must be empty
+jq -r .key /tmp/baseline-<bucket>.jsonl | sort > /tmp/base-keys-<bucket>.txt
+jq -r .key /tmp/dst-<bucket>.jsonl      | sort > /tmp/dst-keys-<bucket>.txt
 
-# checksum sampling of baseline objects that shadow should not have touched
-mc ls --recursive src/<bucket> | shuf -n 20 | awk '{print $NF}' | while read -r k; do
-  a=$(mc cat "src/<bucket>/$k" | sha256sum | cut -d' ' -f1)
-  b=$(mc cat "dst/<bucket>/$k" | sha256sum | cut -d' ' -f1)
-  [ "$a" = "$b" ] || echo "MISMATCH $k"
-done
+# 1. every baseline key that shadow did NOT delete is still on the target
+comm -23 /tmp/base-keys-<bucket>.txt /tmp/shadow-deleted-<bucket>.txt \
+  | comm -23 - /tmp/dst-keys-<bucket>.txt          # must be empty
+
+# 2. untouched baseline objects are byte-identical on both sides
+comm -23 /tmp/base-keys-<bucket>.txt \
+         <(cat /tmp/shadow-updated-<bucket>.txt /tmp/shadow-deleted-<bucket>.txt | sort) \
+  | while read -r k; do
+      a=$(mc cat "src/<bucket>/$k" | sha256sum | cut -d' ' -f1)
+      b=$(mc cat "dst/<bucket>/$k" | sha256sum | cut -d' ' -f1)
+      [ "$a" = "$b" ] || echo "MISMATCH $k"
+    done                                           # must print nothing
+
+# 3. the recorded delta holds: creates exist, updates carry the shadow
+#    content, deletions stay absent (never resurrected from the source)
+while read -r k; do mc stat "dst/<bucket>/$k" >/dev/null 2>&1 || echo "MISSING CREATE $k"; done < /tmp/shadow-created-<bucket>.txt
+while read -r k; do [ "$(mc cat "dst/<bucket>/$k")" = "$(cat "/tmp/shadow-value-<bucket>/$k")" ] || echo "UPDATE LOST $k"; done < /tmp/shadow-updated-<bucket>.txt
+while read -r k; do mc stat "dst/<bucket>/$k" >/dev/null 2>&1 && echo "RESURRECTED $k"; done < /tmp/shadow-deleted-<bucket>.txt   # must print nothing
+
+# 4. nothing outside baseline ∪ created appeared on the target
+comm -13 /tmp/base-keys-<bucket>.txt /tmp/dst-keys-<bucket>.txt   # == created keys only
 ```
 
 Differences that are **expected** at this point: objects created on the
-target during shadow (absent from the baseline) and objects modified on
-the target during shadow (baseline key, different content). Record them
-as the shadow delta; do not "fix" them by copying the source over them.
+target during shadow (absent from the baseline), objects modified on the
+target during shadow (baseline key, new content and size) **and objects
+deleted on the target during shadow (baseline key, now absent)**. Record
+all three as the shadow delta; do not "fix" them by copying the source
+over them — re-copying a shadow deletion from the source is exactly the
+data resurrection Gate B forbids.
 
 ### 5. Cutover
 
@@ -195,8 +243,9 @@ as the shadow delta; do not "fix" them by copying the source over them.
    the target, after confirming the source copy is newer. Never run a
    whole-bucket `mc mirror --overwrite src → dst` — the target holds the
    shadow-era writes, and a blanket copy reverts them.
-4. Re-check **Gate B** (baseline keys still present on the target) and
-   confirm the recorded shadow delta is intact.
+4. Re-check **Gate B** (untouched baseline keys intact, the recorded
+   shadow delta — creates, updates **and deletions** — still holding, and
+   no key outside baseline ∪ created on the target).
 5. Update the deployment: `storage.provider=s3`, `storage.s3.endpoint=...`,
    credentials secret. `helm upgrade`.
 6. Verify: controller log shows `storage provider: s3 (external)`; one
