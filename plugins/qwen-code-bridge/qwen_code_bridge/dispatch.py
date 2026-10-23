@@ -40,7 +40,16 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from . import approval, chats, millforge, progress, qwen_status, runs
+from . import (
+    approval,
+    chats,
+    interaction,
+    millforge,
+    notify,
+    progress,
+    qwen_status,
+    runs,
+)
 from .endpoints import app_base
 from .registry import CLIS
 from .state import cli_home, prepare_cli_home, qwen_cli, state_dir
@@ -226,16 +235,129 @@ def user_message(session_id: str, prompt: str) -> str:
     )
 
 
-def keep_running_after_timeout(
-    busy: bool, progress_age: float, stall_after: float
-) -> bool:
-    """A wall-clock timeout must not kill a session that is still working.
+#: Liveness decisions for a dispatch child (see ``decide_liveness``).
+LIVENESS_KEEP = "keep"
+LIVENESS_KILL = "kill"
+LIVENESS_FINALIZE = "finalize"
 
-    Keep running while QwenCode reports the session busy **and** the event
-    stream has produced something within ``stall_after`` seconds. An idle
-    zombie or a session with no progress for the stall window is killed.
+#: A stale task whose pid is gone but whose watchdog may still be
+#: draining is not marked stale until the task file has been quiet this
+#: long (the stale mark races the watchdog finalize otherwise).
+STALE_FRESH_SECONDS = 120.0
+
+
+def decide_liveness(
+    *,
+    proc_alive: bool,
+    progress_age: float,
+    busy: bool | None,
+    stall_after: float,
+    silent_extensions: int = 0,
+    hard_cap_left: bool = True,
+) -> str:
+    """Decide what to do with a dispatch child that reached its deadline.
+
+    ``busy`` is three-state: ``True`` / ``False`` / ``None`` (probe
+    unreachable — *unknown*, which must never be treated as idle).
+
+    - child already exited -> finalize (never kill);
+    - hard cap exhausted -> kill regardless of progress;
+    - progress within the stall window -> keep (busy is irrelevant: the
+      local event stream is the ground truth);
+    - silent past the stall window -> one grace window when the probe is
+      busy/unknown (long silent tool, transient probe failure), then kill;
+      an explicit ``busy is False`` kills immediately.
     """
-    return bool(busy) and float(progress_age) <= float(stall_after)
+    if not proc_alive:
+        return LIVENESS_FINALIZE
+    if not hard_cap_left:
+        return LIVENESS_KILL
+    if float(progress_age) <= float(stall_after):
+        return LIVENESS_KEEP
+    if busy is False:
+        return LIVENESS_KILL
+    # busy is True or None (unknown): allow exactly one silent window.
+    if silent_extensions < 1:
+        return LIVENESS_KEEP
+    return LIVENESS_KILL
+
+
+def keep_running_after_timeout(
+    busy: bool | None, progress_age: float, stall_after: float
+) -> bool:
+    """Backward-compatible wrapper over :func:`decide_liveness`."""
+    return (
+        decide_liveness(
+            proc_alive=True,
+            progress_age=progress_age,
+            busy=busy,
+            stall_after=stall_after,
+        )
+        == LIVENESS_KEEP
+    )
+
+
+def git_dirty_summary(cwd: str | None, limit: int = 3) -> str:
+    """``N 个未提交改动 (a, b, c)`` for the wake; "" when clean/not a repo."""
+    if not cwd or not os.path.isdir(cwd):
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    lines = [line for line in (proc.stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    paths = [line[3:].strip() for line in lines[:limit]]
+    suffix = ", ".join(paths)
+    more = "" if len(lines) <= limit else " …"
+    return f"{len(lines)} 个未提交改动（{suffix}{more}）"
+
+
+def ensure_dispatch_goals_disabled() -> bool:
+    """Idempotently set ``goals.modelProposed=disabled`` for dispatch runs.
+
+    The QwenCode setting is consent-affecting, so only the User / System /
+    SystemDefaults scopes are honoured — workspace values are ignored.
+    The dispatch home is the plugin's own ``cli_home``, so this writes the
+    User scope there and preserves every other key.
+    """
+    try:
+        import json as _json
+
+        qdir = Path(prepare_cli_home(cli_home()))
+        path = qdir / "settings.json"
+        data: dict[str, Any] = {}
+        if path.exists():
+            try:
+                loaded = _json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (OSError, ValueError):
+                data = {}
+        goals = data.get("goals")
+        if not isinstance(goals, dict):
+            goals = {}
+        if goals.get("modelProposed") == "disabled":
+            return True
+        goals["modelProposed"] = "disabled"
+        data["goals"] = goals
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
+            _json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
 
 
 def chat_sync_enabled() -> bool:
@@ -503,8 +625,30 @@ def default_wake_sender(
     raise RuntimeError(f"wake inject failed: {last}")
 
 
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var, falling back to ``default`` on any error."""
+    try:
+        raw = os.environ.get(name, "")
+        return float(raw) if str(raw).strip() else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _utcnow() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _parse_epoch(value: Any) -> float:
+    """Parse an RFC3339 ``Z`` timestamp (task ``updated_at``) to epoch."""
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        import calendar
+
+        return float(calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")))
+    except (ValueError, TypeError):
+        return 0.0
 
 
 def _install_hint(cli: str) -> str:
@@ -598,12 +742,22 @@ class DispatchService:
         except OSError:
             return False
 
-    def _mark_stale(self, task: dict[str, Any]) -> dict[str, Any]:
+    def _mark_stale(
+        self,
+        task: dict[str, Any],
+        reason: str = "crash_or_restart",
+    ) -> dict[str, Any]:
         """A ``running`` task whose pid is gone can never finish by itself.
 
-        The age guard keeps the spawn window (pid not written yet) and
-        short-lived test doubles from being reaped; a real crashed task
-        stops updating and crosses the threshold.
+        Guards against the watchdog-finalize race (10/23 incident):
+
+        - a ``terminating`` marker means the watchdog killed the child and
+          is writing the authoritative terminal state — never call that a
+          crash;
+        - a task file touched within ``STALE_FRESH_SECONDS`` may still be
+          mid-finalize;
+        - the age guard keeps the spawn window (pid not written yet) and
+          short-lived test doubles from being reaped.
         """
         age = time.time() - float(
             task.get("started_epoch") or 0.0
@@ -611,20 +765,29 @@ class DispatchService:
         stale_after = float(
             os.environ.get("QWENPAW_DISPATCH_STALE_AFTER", "60") or 60
         )
+        updated_epoch = _parse_epoch(task.get("updated_at")) or 0.0
+        fresh = (time.time() - updated_epoch) < STALE_FRESH_SECONDS
         if (
             task.get("state") == "running"
             and task.get("pid") is not None
             and age > stale_after
+            and not task.get("terminating")
+            and not fresh
             and not self._pid_alive(task.get("pid"))
         ):
+            reason_text = {
+                "plugin_restart": "插件重启（原 watchdog 已退出，无终态记录）",
+                "crash_or_restart": "进程已消失（崩溃或重启，无终态记录）",
+            }.get(reason, "进程已消失（无终态记录）")
             task.update(
                 {
                     "state": "stale",
                     "exit_code": None,
+                    "death_reason": reason,
                     "finished_at": task.get("finished_at") or _utcnow(),
                     "updated_at": _utcnow(),
                     "terminal_summary": [
-                        f"[{task.get('task')}] stale · 进程已消失（重启/崩溃）",
+                        f"[{task.get('task')}] stale · {reason_text}",
                         "none: 无终态记录（原 watchdog 已随进程退出）",
                         "下一步：重新派单，或 POST /dispatch/cleanup 清理",
                     ],
@@ -662,8 +825,21 @@ class DispatchService:
                 pass
 
     def _scan_once(self) -> list[dict[str, Any]]:
-        """Recover tasks orphaned by a process restart (sync, testable)."""
+        """Recover tasks orphaned by a process restart (sync, testable).
+
+        Never races a live watchdog and never kills a child whose event
+        stream is still moving:
+
+        - ``terminating`` / a fresh ``updated_at`` / a live ``watchdog_pid``
+          all mean "someone else owns the terminal state";
+        - a dead pid is stale only after the freshness guard;
+        - a live pid is killed only when the progress file stopped moving
+          past the stall window *and* the wall budget is spent.
+        """
         changed: list[dict[str, Any]] = []
+        stall_after = float(
+            os.environ.get("QWEN_CODE_BRIDGE_STALL_TIMEOUT", "1800") or 1800
+        )
         for path in sorted(self._dispatch_dir.glob("*.json")):
             try:
                 task = json.loads(path.read_text(encoding="utf-8"))
@@ -674,32 +850,50 @@ class DispatchService:
             pid = task.get("pid")
             if pid is None:
                 continue
+            if task.get("terminating"):
+                continue  # the watchdog killed it and is finalizing
             age = time.time() - float(task.get("started_epoch") or 0)
+            updated_epoch = _parse_epoch(task.get("updated_at")) or 0.0
+            fresh = (time.time() - updated_epoch) < STALE_FRESH_SECONDS
             if not self._pid_alive(pid):
-                if age > 60:
-                    changed.append(self._mark_stale(task))
+                if age > 60 and not fresh:
+                    changed.append(self._mark_stale(task, "crash_or_restart"))
                 continue
+            watchdog_pid = task.get("watchdog_pid")
+            if watchdog_pid and self._pid_alive(watchdog_pid):
+                continue  # a live watchdog owns this task
             timeout = float(task.get("timeout") or 0)
-            if timeout and age > timeout + 60:
-                try:
-                    os.kill(int(pid), 9)
-                except OSError:
-                    pass
-                task.update(
-                    {
-                        "state": "timeout",
-                        "exit_code": None,
-                        "finished_at": _utcnow(),
-                        "updated_at": _utcnow(),
-                        "terminal_summary": [
-                            f"[{task.get('task')}] timeout · 进程超预算，由重启恢复器终止",
-                            "exit_code: unknown (not our child)",
-                            "下一步：重新派单或查看日志",
-                        ],
-                    }
-                )
-                self._write_task(task)
-                changed.append(task)
+            if not timeout or age <= timeout + 60:
+                continue
+            # Wall budget spent: kill only when the event stream is also
+            # silent for the stall window (progress file mtime).
+            progress_path = self._dispatch_dir / f"{task['task_id']}.progress.json"
+            try:
+                progress_age = time.time() - progress_path.stat().st_mtime
+            except OSError:
+                progress_age = float("inf")
+            if progress_age <= stall_after:
+                continue
+            try:
+                os.kill(int(pid), 9)
+            except OSError:
+                pass
+            task.update(
+                {
+                    "state": "timeout",
+                    "exit_code": None,
+                    "death_reason": "timeout_killed_by_reaper",
+                    "finished_at": _utcnow(),
+                    "updated_at": _utcnow(),
+                    "terminal_summary": [
+                        f"[{task.get('task')}] timeout · 进程超预算且无进展，由重启恢复器终止",
+                        f"无事件 {int(progress_age)}s · 超过 stall 窗口 {int(stall_after)}s",
+                        "下一步：重新派单或查看日志",
+                    ],
+                }
+            )
+            self._write_task(task)
+            changed.append(task)
         return changed
 
     async def _notify_external(self, task: dict[str, Any]) -> None:
@@ -721,6 +915,17 @@ class DispatchService:
         sid = str(origin.get("session_id") or wake.get("session_id") or "").strip()
         if not sid:
             return
+        # Wake is single-writer: the watchdog owns the terminal write and
+        # sets "pending" before sending. The reaper must never send a
+        # second wake for a task that already has one (10/23 incident:
+        # stale wake + timeout wake for the same task).
+        current = self._read_task(str(task.get("task_id") or "")) or {}
+        if str(current.get("wake_status") or "") in ("sent", "pending"):
+            return
+        self._update_task(
+            task["task_id"],
+            {"wake_status": "pending", "updated_at": _utcnow()},
+        )
         text = self._wake_text(
             task,
             str(task.get("state") or ""),
@@ -770,10 +975,33 @@ class DispatchService:
                 task = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if task.get("state") == "running" and not self._pid_alive(task.get("pid")):
+            if task.get("state") != "running":
+                continue
+            if task.get("terminating"):
+                continue
+            updated_epoch = _parse_epoch(task.get("updated_at")) or 0.0
+            if (time.time() - updated_epoch) < STALE_FRESH_SECONDS:
+                continue
+            if not self._pid_alive(task.get("pid")):
                 task = self._mark_stale(task)
                 stale.append(str(task.get("task_id")))
         return {"stale": stale, "count": len(stale), "kill": bool(kill)}
+
+    def answer_question(
+        self,
+        task_id: str,
+        request_id: str,
+        answers: dict[str, Any],
+        by: str = "human",
+    ) -> bool:
+        """Resolve one pending interaction request (answer endpoint)."""
+        return interaction.store_for(str(self._dispatch_dir)).answer(
+            task_id, request_id, answers, by
+        )
+
+    def pending_questions(self, task_id: str) -> list[dict[str, Any]]:
+        """Open interaction requests for one task (poll endpoint)."""
+        return interaction.store_for(str(self._dispatch_dir)).pending(task_id)
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         self._ensure_reaper()
@@ -865,6 +1093,11 @@ class DispatchService:
             SpawnFailedError: the child process could not be started.
         """
         _agent_hint = str((wake or {}).get("agent_id") or "")
+        # Consent-affecting QwenCode setting: dispatch runs have no human
+        # sitting in front of the propose_goal dialog, so the tool is
+        # removed at the User scope of the dispatch CLI home (workspace
+        # values are ignored by the CLI). Idempotent, best-effort.
+        ensure_dispatch_goals_disabled()
         _level = (
             str(approval_level or "").strip().upper()
             or _effective_approval_level(_agent_hint)
@@ -963,6 +1196,8 @@ class DispatchService:
             "input_format": "text",
             "approvals": {"allowed": 0, "denied": 0, "escalated": 0},
             "progress": None,
+            "interaction_pending": 0,
+            "death_reason": None,
             "evidence": str(evidence).upper() if evidence else None,
             "resumed_from": resumed_from,
             "runs_dir": runs_dir or None,
@@ -1112,25 +1347,171 @@ class DispatchService:
         started = time.time()
         tail: list[str] = [""]
         killed = False
+        killed_reason = "timeout_killed"
         meta = self._read_task(task_id) or {}
         stdin_mode = str(meta.get("input_format") or "") == "stream-json"
         roots = [str(meta.get("cwd") or os.getcwd())]
-        tracker = progress.ProgressTracker(roots=roots)
+        stall_after = float(
+            os.environ.get("QWEN_CODE_BRIDGE_STALL_TIMEOUT", "1800") or 1800
+        )
+        silent_extensions = 0
+        # Safety net only: "let a live session finish" must still have an
+        # upper bound so a hung-but-chatty session cannot run forever.
+        hard_cap = max(3.0 * float(timeout or 0.0), 7200.0)
+        try:
+            wrapup_seconds = float(
+                os.environ.get("QWEN_CODE_BRIDGE_WRAPUP", "0") or 0
+            )
+        except ValueError:
+            wrapup_seconds = 0.0
+        wrapup_injected = False
+        # The reaper must not touch a task that still has a live watchdog.
+        self._update_task(task_id, {"watchdog_pid": os.getpid()})
+        tracker = progress.ProgressTracker(roots=roots, stall_after=stall_after)
         progress_path = self._dispatch_dir / f"{task_id}.progress.json"
         receipts_path = self._dispatch_dir / f"{task_id}.receipts.jsonl"
         approvals = {"allowed": 0, "denied": 0, "escalated": 0}
         escalations: list[dict[str, Any]] = []
         flags = {"stdin_closed": False}
         last_write = [0.0]
+        stdin_lock = asyncio.Lock()
+
+        async def _resolve_interaction(
+            question: "interaction.PendingQuestion", request_id: str
+        ) -> None:
+            """Human -> agent -> default answer ladder for one question."""
+            hold = _env_float(
+                "QWEN_CODE_BRIDGE_HOLD_SECONDS",
+                interaction.DEFAULT_HOLD_SECONDS,
+            )
+            grace = _env_float(
+                "QWEN_CODE_BRIDGE_AGENT_GRACE",
+                interaction.DEFAULT_AGENT_GRACE_SECONDS,
+            )
+            answers = await question.wait(hold)
+            answered_by = "human"
+            if answers is None:
+                wake = meta.get("wake") or {}
+                origin = meta.get("origin") or {}
+                sid = str(
+                    origin.get("session_id") or wake.get("session_id") or ""
+                ).strip()
+                await notify.notify_human(
+                    task=meta,
+                    title=f"[{meta.get('task')}] 人工未答，转为 agent 代答",
+                    body=question.question_text,
+                    payload={
+                        "task_id": task_id,
+                        "request_id": request_id,
+                        "tool_name": question.tool_name,
+                    },
+                    event_type="needs_agent_answer",
+                )
+                if sid:
+                    try:
+                        await asyncio.to_thread(
+                            self._wake_sender,
+                            sid,
+                            str(wake.get("agent_id") or ""),
+                            str(wake.get("base_url") or ""),
+                            (
+                                f"[{meta.get('task')}] 人工未回答，请代答：\n"
+                                f"{question.question_text}\n"
+                                f"回填: POST /api/qwen-code-bridge/dispatch/"
+                                f"{task_id}/answer "
+                                f'{{"request_id":"{request_id}","choice":"..."}}'
+                            ),
+                            str(
+                                origin.get("channel")
+                                or wake.get("channel")
+                                or "console"
+                            ),
+                            str(
+                                origin.get("user_id")
+                                or wake.get("user_id")
+                                or "default"
+                            ),
+                            False,
+                        )
+                    except Exception:
+                        pass
+                answers = await question.wait(grace)
+                answered_by = "agent"
+            if answers:
+                decision: dict[str, Any] = {
+                    "behavior": "allow",
+                    "message": "",
+                    "updated_input": {
+                        **(
+                            question.tool_input
+                            if isinstance(question.tool_input, dict)
+                            else {}
+                        ),
+                        "answers": answers,
+                    },
+                }
+                approvals["allowed"] += 1
+            else:
+                decision = {
+                    "behavior": "deny",
+                    "message": (
+                        "headless run: no human answer within the window. "
+                        "Make the most reasonable assumption, continue the "
+                        "task, and record the assumption in the final report."
+                    ),
+                    "requires_human": True,
+                }
+                approvals["denied"] += 1
+                escalations.append(
+                    {
+                        "tool": question.tool_name,
+                        "rule": "interaction-timeout",
+                        "reason": "no human or agent answer within the window",
+                        "request_id": request_id,
+                    }
+                )
+            await _write_stdin(
+                json.dumps(
+                    approval.control_response(request_id, decision),
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            try:
+                approval.append_receipt(
+                    receipts_path,
+                    approval.receipt_entry(
+                        task_id,
+                        question.tool_name,
+                        question.tool_input,
+                        decision,
+                        request_id,
+                    ),
+                )
+            except Exception:
+                pass
+            self._update_task(
+                task_id,
+                {
+                    "approvals": dict(approvals),
+                    "escalations": list(escalations),
+                    "interaction_pending": len(
+                        interaction.store_for(
+                            str(self._dispatch_dir)
+                        ).pending(task_id)
+                    ),
+                },
+            )
 
         async def _write_stdin(payload: str) -> None:
             if not stdin_mode or flags["stdin_closed"] or proc.stdin is None:
                 return
-            try:
-                proc.stdin.write(payload.encode("utf-8"))
-                await proc.stdin.drain()
-            except Exception:
-                pass
+            async with stdin_lock:
+                try:
+                    proc.stdin.write(payload.encode("utf-8"))
+                    await proc.stdin.drain()
+                except Exception:
+                    pass
 
         async def _close_stdin() -> None:
             if (
@@ -1161,9 +1542,51 @@ class DispatchService:
                 request = event.get("request") or {}
                 request_id = str(event.get("request_id") or "")
                 if str(request.get("subtype") or "") == "can_use_tool":
+                    tool_name = str(request.get("tool_name") or "")
+                    tool_input = request.get("input")
+                    if tool_name in interaction.INTERACTION_TOOLS:
+                        # Human-first interaction: notify the host surface,
+                        # hold for the human, then hand the question to the
+                        # dispatch owner (the agent), then default. Runs in
+                        # the background so the event pump keeps flowing
+                        # while the CLI waits for the control response.
+                        question = interaction.store_for(
+                            str(self._dispatch_dir)
+                        ).create(
+                            task_id=task_id,
+                            request_id=request_id,
+                            tool_name=tool_name,
+                            tool_input=tool_input,
+                        )
+                        try:
+                            surface = await notify.notify_human(
+                                task=meta,
+                                title=(
+                                    f"[{meta.get('task')}] 需要你回答"
+                                    f"（{tool_name}）"
+                                ),
+                                body=(
+                                    question.question_text
+                                    + "\n（3 分钟内无人回答将由 agent 代答）"
+                                ),
+                                payload={
+                                    "task_id": task_id,
+                                    "request_id": request_id,
+                                    "tool_name": tool_name,
+                                    "questions": question.questions,
+                                },
+                            )
+                            question.notifications["human"] = surface
+                            question.notified_at = time.time()
+                        except Exception:
+                            pass
+                        asyncio.ensure_future(
+                            _resolve_interaction(question, request_id)
+                        )
+                        return
                     decision = approval.decide(
-                        str(request.get("tool_name") or ""),
-                        request.get("input"),
+                        tool_name,
+                        tool_input,
                         roots=roots,
                     )
                     await _write_stdin(
@@ -1263,45 +1686,96 @@ class DispatchService:
 
         pump = asyncio.ensure_future(_pump())
         timeout_extensions = 0
-        stall_after = float(
-            os.environ.get("QWEN_CODE_BRIDGE_STALL_TIMEOUT", "1800") or 1800
-        )
         try:
             while True:
                 await asyncio.sleep(self._watch_interval)
                 if proc.returncode is not None:
                     break
                 if time.time() - started > timeout:
-                    # The wall clock is not a liveness signal. QwenCode's live
-                    # indicator + the event stream decide: while the session
-                    # is busy and events keep flowing, let it run to
-                    # completion (no extension cap). Kill only an idle zombie
-                    # or a session with no progress for the stall window.
-                    busy = False
+                    # The wall clock is not a liveness signal: the local
+                    # event stream decides, with the CLI's live indicator
+                    # only as a tie-breaker (three-state: unknown != idle).
+                    elapsed = time.time() - started
+                    busy: bool | None
                     try:
                         busy = await qwen_status.session_busy(
                             str(meta.get("cwd") or os.getcwd()),
                             str(meta.get("session_id") or ""),
                         )
                     except Exception:
-                        busy = False
+                        busy = None
                     progress_age = time.time() - tracker.last_event
-                    if keep_running_after_timeout(busy, progress_age, stall_after):
+                    decision = decide_liveness(
+                        proc_alive=True,
+                        progress_age=progress_age,
+                        busy=busy,
+                        stall_after=stall_after,
+                        silent_extensions=silent_extensions,
+                        hard_cap_left=elapsed < hard_cap,
+                    )
+                    if decision == LIVENESS_KEEP:
                         timeout_extensions += 1
-                        timeout = (time.time() - started) + stall_after
+                        if progress_age > stall_after:
+                            silent_extensions += 1
+                        timeout = elapsed + stall_after
                         self._update_task(
                             task_id,
                             {
                                 "timeout_extensions": timeout_extensions,
+                                "silent_extensions": silent_extensions,
                                 "timeout": timeout,
                                 "stall_after": stall_after,
+                                "busy_probe": busy,
                             },
                         )
                         continue
                     killed = True
+                    killed_reason = (
+                        "timeout_killed"
+                        if elapsed < hard_cap
+                        else "hard_cap_killed"
+                    )
+                    # Tell the reaper this kill is intentional: it must not
+                    # classify the dead pid as a crash and send a second,
+                    # misleading wake (10/23 incident).
+                    self._update_task(
+                        task_id,
+                        {"terminating": True, "updated_at": _utcnow()},
+                    )
                     await _close_stdin()
                     proc.kill()
                     break
+                # Optional wrap-up window: ask the model to commit and
+                # finish before the deadline (off unless the env is set).
+                if (
+                    wrapup_seconds > 0
+                    and not wrapup_injected
+                    and stdin_mode
+                    and (timeout - (time.time() - started)) <= wrapup_seconds
+                ):
+                    wrapup_injected = True
+                    self._update_task(
+                        task_id,
+                        {"wrapup_injected_at": _utcnow()},
+                    )
+                    await _write_stdin(
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "message": {
+                                    "role": "user",
+                                    "content": (
+                                        "收尾提醒：时间预算即将用尽。请立即停止新工作，"
+                                        "先把已完成的改动 commit（显式 pathspec），"
+                                        "再输出最终报告。"
+                                    ),
+                                },
+                                "parent_tool_use_id": None,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
                 # A finished turn (result seen) should not keep the process
                 # alive waiting on stdin; reap it after a short grace.
                 if (
@@ -1340,6 +1814,20 @@ class DispatchService:
             progress.write_progress(progress_path, snap)
         except Exception:
             pass
+        dirty = git_dirty_summary(str(task.get("cwd") or ""))
+        tail_line = (
+            f"失败: {snap['last_error']}"
+            if snap.get("last_error")
+            else (
+                f"需人工: {len(escalations)} 条"
+                f"（首条 {escalations[0]['tool']}: "
+                f"{escalations[0]['reason']}；见 receipts）"
+                if escalations
+                else "下一步：按任务书验收（复跑门/抽查 diff/给推送命令）"
+            )
+        )
+        if dirty:
+            tail_line = f"{tail_line} · 工作树：{dirty}"
         terminal_summary = [
             (
                 f"[{task.get('task')}] {status} · exit={code} · {wall}s · "
@@ -1351,17 +1839,7 @@ class DispatchService:
                 f"tests {snap['tests']['passed']}p/{snap['tests']['failed']}f"
                 f" · last={snap['last_tool']} {snap['last_target']}"
             ).strip(),
-            (
-                f"失败: {snap['last_error']}"
-                if snap.get("last_error")
-                else (
-                    f"需人工: {len(escalations)} 条"
-                    f"（首条 {escalations[0]['tool']}: "
-                    f"{escalations[0]['reason']}；见 receipts）"
-                    if escalations
-                    else "下一步：按任务书验收（复跑门/抽查 diff/给推送命令）"
-                )
-            ),
+            tail_line,
         ]
         wake = task.get("wake") or {}
         origin = task.get("origin") or {}
@@ -1379,6 +1857,12 @@ class DispatchService:
                 "finished_at": now,
                 "updated_at": now,
                 "log_tail": tail[0],
+                "death_reason": (
+                    killed_reason
+                    if killed
+                    else ("completed" if code == 0 else "failed")
+                ),
+                "terminating": False,
                 "wake_status": "pending" if wake_session_id else "skipped",
                 "notify_tier": millforge.notify_tier(status),
                 "progress": snap,

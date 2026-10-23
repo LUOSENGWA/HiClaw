@@ -366,6 +366,74 @@ async def get_dispatch_progress(
     }
 
 
+@router.get("/dispatch/{task_id}/pending")
+async def get_dispatch_pending(
+    task_id: str,
+    service: DispatchService = Depends(_get_dispatch_service),
+) -> dict:
+    """Open human-interaction requests for one task (poll fallback).
+
+    A wake can be lost when the origin session is busy (HTTP 409); the
+    dispatch owner polls this endpoint instead of relying on the wake.
+    """
+    task = service.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    pending = service.pending_questions(task_id)
+    return {"task_id": task_id, "pending": pending, "count": len(pending)}
+
+
+class AnswerRequest(BaseModel):
+    request_id: str
+    answers: dict | None = None
+    choice: str | int | None = None
+    by: str = "human"
+
+
+@router.post("/dispatch/{task_id}/answer")
+async def post_dispatch_answer(
+    task_id: str,
+    body: AnswerRequest,
+    service: DispatchService = Depends(_get_dispatch_service),
+) -> dict:
+    """Answer a pending ``ask_user_question`` request.
+
+    The answer is delivered to the CLI as ``updatedInput.answers`` (the
+    shape AskUserQuestionTool consumes); ``choice`` may be an option
+    index/label or free text for the first question.
+    """
+    from . import interaction
+
+    task = service.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    pending = {q["request_id"]: q for q in service.pending_questions(task_id)}
+    question = pending.get(body.request_id)
+    if question is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No open question with that request_id",
+        )
+    answers = interaction.normalise_answers(
+        question.get("questions") or [],
+        {"answers": body.answers, "choice": body.choice},
+    )
+    if not answers:
+        raise HTTPException(
+            status_code=400,
+            detail="answers or choice is required",
+        )
+    ok = service.answer_question(
+        task_id, body.request_id, answers, by=body.by
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail="Question already answered",
+        )
+    return {"task_id": task_id, "request_id": body.request_id, "answers": answers}
+
+
 @router.get("/qwen/status")
 async def qwen_live_status(workspace: str = "") -> dict:
     """Read QwenCode's live-status indicator (the console status light)."""

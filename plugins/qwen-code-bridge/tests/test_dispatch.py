@@ -69,6 +69,7 @@ class Env:
         os.environ[WATCH_INTERVAL_ENV] = "0.1"
         os.environ["PATH"] = f"{self.bin_dir}:/usr/bin:/bin"
         os.environ["QWEN_CODE_BRIDGE_CHAT_SYNC"] = "0"
+        os.environ["QWEN_CODE_BRIDGE_CLI_HOME"] = str(self.tmp / "cli-home")
         return self
 
     def __exit__(self, *exc_info: Any) -> None:
@@ -267,8 +268,15 @@ async def test_spawn_failed(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_timeout_kills(tmp_path) -> None:
-    """timeout=1s + a sleeping CLI -> killed, terminal state timeout."""
+async def test_timeout_kills(tmp_path, monkeypatch) -> None:
+    """timeout=1s + a sleeping CLI (no events) -> killed once the stall
+    window is exhausted, terminal state timeout.
+
+    The wall clock alone no longer kills: the child is kept while the
+    event stream is fresh, so this test pins a short stall window to
+    reach the kill path.
+    """
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_STALL_TIMEOUT", "2")
     with Env(tmp_path) as env:
         _make_bin(env.bin_dir, "fakesleep", "exec sleep 30")
         service = DispatchService(wake_sender=lambda *a: None)
@@ -284,7 +292,8 @@ async def test_timeout_kills(tmp_path) -> None:
         assert terminal["state"] == "timeout"
         assert terminal["exit_code"] == -9
         assert terminal["wall_s"] is not None
-        assert terminal["wall_s"] < 10
+        assert terminal["wall_s"] < 20
+        assert terminal["death_reason"] == "timeout_killed"
         assert terminal["wake_status"] == "skipped"
 
 
@@ -1070,8 +1079,328 @@ def test_qwen_cli_env_and_config(tmp_path, monkeypatch):
 
 
 def test_keep_running_after_timeout():
-    from qwen_code_bridge.dispatch import keep_running_after_timeout
+    """Liveness table: progress first, three-state probe as tie-breaker."""
+    from qwen_code_bridge.dispatch import (
+        LIVENESS_FINALIZE,
+        LIVENESS_KEEP,
+        LIVENESS_KILL,
+        decide_liveness,
+        keep_running_after_timeout,
+    )
 
+    # child exited -> finalize (never kill)
+    assert (
+        decide_liveness(
+            proc_alive=False, progress_age=0, busy=None, stall_after=1800
+        )
+        == LIVENESS_FINALIZE
+    )
+    # fresh progress keeps running regardless of the probe
     assert keep_running_after_timeout(True, 10, 1800) is True
-    assert keep_running_after_timeout(True, 2000, 1800) is False
-    assert keep_running_after_timeout(False, 1, 1800) is False
+    assert keep_running_after_timeout(False, 10, 1800) is True
+    assert keep_running_after_timeout(None, 10, 1800) is True
+    # silent + probe says idle -> kill immediately
+    assert keep_running_after_timeout(False, 2000, 1800) is False
+    # silent + probe unknown -> one grace window, then kill
+    assert (
+        decide_liveness(
+            proc_alive=True,
+            progress_age=2000,
+            busy=None,
+            stall_after=1800,
+            silent_extensions=0,
+        )
+        == LIVENESS_KEEP
+    )
+    assert (
+        decide_liveness(
+            proc_alive=True,
+            progress_age=2000,
+            busy=None,
+            stall_after=1800,
+            silent_extensions=1,
+        )
+        == LIVENESS_KILL
+    )
+    # hard cap wins over progress
+    assert (
+        decide_liveness(
+            proc_alive=True,
+            progress_age=1,
+            busy=True,
+            stall_after=1800,
+            hard_cap_left=False,
+        )
+        == LIVENESS_KILL
+    )
+
+
+# ---------------------------------------------------------------------------
+# 10/23 review round: liveness, stale-race, interaction, notification routing
+# ---------------------------------------------------------------------------
+
+
+def _write_task_file(tmp_path, task: dict) -> None:
+    (tmp_path / f"{task['task_id']}.json").write_text(
+        json.dumps(task), encoding="utf-8"
+    )
+
+
+def test_reaper_skips_terminating_task(tmp_path, monkeypatch):
+    svc = DispatchService(dispatch_dir=tmp_path, watch_interval=0.05)
+    tid = "a" * 32
+    _write_task_file(tmp_path, {
+        "task_id": tid, "task": "t", "state": "running", "pid": 424242,
+        "started_epoch": time.time() - 300, "timeout": 600,
+        "terminating": True, "origin": {"session_id": "s"}, "wake": {},
+    })
+    monkeypatch.setattr(svc, "_pid_alive", lambda pid: False)
+    assert svc._scan_once() == []
+
+
+def test_reaper_skips_recently_updated_task(tmp_path, monkeypatch):
+    from qwen_code_bridge.dispatch import _utcnow
+    svc = DispatchService(dispatch_dir=tmp_path, watch_interval=0.05)
+    tid = "b" * 32
+    _write_task_file(tmp_path, {
+        "task_id": tid, "task": "t", "state": "running", "pid": 424242,
+        "started_epoch": time.time() - 300, "timeout": 600,
+        "updated_at": _utcnow(), "origin": {"session_id": "s"}, "wake": {},
+    })
+    monkeypatch.setattr(svc, "_pid_alive", lambda pid: False)
+    assert svc._scan_once() == []
+
+
+def test_stale_death_reason_recorded(tmp_path, monkeypatch):
+    svc = DispatchService(dispatch_dir=tmp_path, watch_interval=0.05)
+    tid = "c" * 32
+    _write_task_file(tmp_path, {
+        "task_id": tid, "task": "t", "state": "running", "pid": 424242,
+        "started_epoch": time.time() - 300, "timeout": 600,
+        "updated_at": "2026-01-01T00:00:00Z",
+        "origin": {"session_id": "s"}, "wake": {},
+    })
+    monkeypatch.setattr(svc, "_pid_alive", lambda pid: False)
+    changed = svc._scan_once()
+    assert [t["task_id"] for t in changed] == [tid]
+    assert changed[0]["state"] == "stale"
+    assert changed[0]["death_reason"] == "crash_or_restart"
+    assert "崩溃或重启" in changed[0]["terminal_summary"][0]
+
+
+def test_wake_is_single_writer(tmp_path):
+    import asyncio as _asyncio
+    from qwen_code_bridge.dispatch import _utcnow
+
+    calls: list[str] = []
+
+    def sender(session_id, agent_id, base_url, text, *a, **k):
+        calls.append(text)
+
+    svc = DispatchService(dispatch_dir=tmp_path, wake_sender=sender)
+    tid = "d" * 32
+    _write_task_file(tmp_path, {
+        "task_id": tid, "task": "t", "state": "timeout",
+        "wake_status": "sent", "updated_at": _utcnow(),
+        "origin": {"session_id": "s"}, "wake": {}, "wall_s": 1,
+    })
+    task = json.loads((tmp_path / f"{tid}.json").read_text())
+    _asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        svc._notify_external(task)
+    )
+    assert calls == []  # already sent -> never a second wake
+
+
+def test_git_dirty_summary(tmp_path):
+    from qwen_code_bridge.dispatch import git_dirty_summary
+
+    assert git_dirty_summary(None) == ""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    os.system(f"git -C {repo} init -q")
+    assert git_dirty_summary(str(repo)) == ""
+    (repo / "a.txt").write_text("x", encoding="utf-8")
+    summary = git_dirty_summary(str(repo))
+    assert summary.startswith("1 个未提交改动")
+    assert "a.txt" in summary
+
+
+def test_notify_target_routing(monkeypatch):
+    from qwen_code_bridge import notify
+
+    monkeypatch.delenv(notify.NOTIFY_ENV, raising=False)
+    assert notify.notify_target({"channel": "console"}) == "inbox"
+    assert notify.notify_target({"channel": "matrix"}) == "room"
+    monkeypatch.setenv(notify.NOTIFY_ENV, "inbox")
+    assert notify.notify_target({"channel": "matrix"}) == "inbox"
+    monkeypatch.setenv(notify.NOTIFY_ENV, "room")
+    assert notify.notify_target({"channel": "console"}) == "room"
+
+
+def test_goals_disabled_written_once(tmp_path, monkeypatch):
+    from qwen_code_bridge import dispatch as d
+
+    home = tmp_path / "home"
+    (home / ".qwen").mkdir(parents=True)
+    settings = home / ".qwen" / "settings.json"
+    settings.write_text('{"model": {"name": "x"}}', encoding="utf-8")
+    monkeypatch.setattr(d, "cli_home", lambda: str(home))
+    monkeypatch.setattr(d, "prepare_cli_home", lambda h: str(home / ".qwen"))
+    assert d.ensure_dispatch_goals_disabled() is True
+    data = json.loads(settings.read_text())
+    assert data["goals"]["modelProposed"] == "disabled"
+    assert data["model"]["name"] == "x"  # other keys preserved
+    before = settings.read_text()
+    assert d.ensure_dispatch_goals_disabled() is True  # idempotent
+    assert settings.read_text() == before
+
+
+def _ask_cli(bin_dir: Path, stdin_log: Path) -> None:
+    payload = {
+        "type": "control_request",
+        "request_id": "r1",
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": "ask_user_question",
+            "input": {
+                "questions": [
+                    {
+                        "header": "H",
+                        "question": "Pick one",
+                        "options": [
+                            {"label": "A", "description": "a"},
+                            {"label": "B", "description": "b"},
+                        ],
+                    }
+                ]
+            },
+        },
+    }
+    script = (
+        "#!/bin/sh\n"
+        f"echo '{json.dumps(payload)}'\n"
+        f'while IFS= read -r line; do printf "%s\\n" "$line" >> "{stdin_log}"; done\n'
+    )
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    path = bin_dir / "fakeask"
+    path.write_text(script, encoding="utf-8")
+    path.chmod(0o755)
+
+
+async def _wait_pending(service, task_id, tries=200):
+    for _ in range(tries):
+        pending = service.pending_questions(task_id)
+        if pending:
+            return pending
+        await asyncio.sleep(0.05)
+    raise AssertionError("question never became pending")
+
+
+async def _wait_stdin(stdin_log: Path, needle: str, tries=200) -> str:
+    text = ""
+    for _ in range(tries):
+        text = stdin_log.read_text(errors="replace") if stdin_log.exists() else ""
+        if needle in text:
+            return text
+        await asyncio.sleep(0.05)
+    return text
+
+
+@pytest.mark.asyncio
+async def test_ask_user_question_notifies_and_answer_resolves(tmp_path, monkeypatch):
+    from qwen_code_bridge import notify as notify_mod
+
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_HOLD_SECONDS", "10")
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_AGENT_GRACE", "5")
+    notified: list[dict] = []
+
+    async def fake_notify(**kwargs):
+        notified.append(kwargs)
+        return "inbox"
+
+    monkeypatch.setattr(notify_mod, "notify_human", fake_notify)
+    with Env(tmp_path) as env:
+        stdin_log = tmp_path / "stdin.log"
+        _ask_cli(env.bin_dir, stdin_log)
+        service = DispatchService(wake_sender=lambda *a, **k: None)
+        task_id = await service.start(
+            task_name="t-ask", prompt="x", cwd=None, cli="fakeask",
+            timeout=30, wake=dict(WAKE), approval_mode="default",
+        )
+        pending = await _wait_pending(service, task_id)
+        assert pending[0]["tool_name"] == "ask_user_question"
+        assert "Pick one" in pending[0]["question"]
+        assert notified and notified[0]["title"]
+        assert service.answer_question(task_id, "r1", {"0": "A"}, by="human")
+        text = await _wait_stdin(stdin_log, "updatedInput")
+        assert "updatedInput" in text and '"A"' in text
+        assert service.pending_questions(task_id) == []
+
+
+@pytest.mark.asyncio
+async def test_ask_user_question_timeout_falls_back_to_default_deny(
+    tmp_path, monkeypatch
+):
+    from qwen_code_bridge import notify as notify_mod
+
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_HOLD_SECONDS", "0.2")
+    monkeypatch.setenv("QWEN_CODE_BRIDGE_AGENT_GRACE", "0.2")
+
+    async def fake_notify(**kwargs):
+        return "inbox"
+
+    monkeypatch.setattr(notify_mod, "notify_human", fake_notify)
+    with Env(tmp_path) as env:
+        stdin_log = tmp_path / "stdin.log"
+        _ask_cli(env.bin_dir, stdin_log)
+        service = DispatchService(wake_sender=lambda *a, **k: None)
+        task_id = await service.start(
+            task_name="t-ask-timeout", prompt="x", cwd=None, cli="fakeask",
+            timeout=30, wake=dict(WAKE), approval_mode="default",
+        )
+        await _wait_pending(service, task_id)
+        text = await _wait_stdin(stdin_log, "most reasonable assumption")
+        assert "most reasonable assumption" in text
+        assert '"behavior": "deny"' in text or '"behavior":"deny"' in text
+
+
+def test_pending_and_answer_endpoints(tmp_path):
+    from qwen_code_bridge import interaction
+
+    with Env(tmp_path) as env:
+        app = FastAPI()
+        app.include_router(build_router(), prefix=API)
+        client = TestClient(app)
+        tid = "e" * 32
+        dispatch_dir = env.state_dir / "dispatch"
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        _write_task_file(dispatch_dir, {
+            "task_id": tid, "task": "t", "state": "running", "pid": 1,
+            "started_epoch": time.time(), "timeout": 60,
+            "updated_at": "2026-01-01T00:00:00Z",
+            "origin": {"session_id": "s"}, "wake": {},
+        })
+        store = interaction.store_for(str(dispatch_dir))
+        store.create(
+            task_id=tid,
+            request_id="r1",
+            tool_name="ask_user_question",
+            tool_input={"questions": [{"header": "H", "question": "Q?",
+                                       "options": [{"label": "A"},
+                                                   {"label": "B"}]}]},
+        )
+        resp = client.get(f"{API}/dispatch/{tid}/pending")
+        assert resp.status_code == 200
+        assert resp.json()["count"] == 1
+        resp = client.post(
+            f"{API}/dispatch/{tid}/answer",
+            json={"request_id": "r1", "choice": "2"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["answers"] == {"0": "B"}
+        assert client.get(f"{API}/dispatch/{tid}/pending").json()["count"] == 0
+        resp = client.post(
+            f"{API}/dispatch/{tid}/answer",
+            json={"request_id": "r1", "choice": "A"},
+        )
+        assert resp.status_code == 404

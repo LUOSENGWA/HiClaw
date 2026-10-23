@@ -86,10 +86,20 @@ async def fetch_live_state(workspace: str) -> dict[str, Any]:
         }
 
 
-async def session_busy(workspace: str, session_id: str) -> bool:
+async def session_busy(workspace: str, session_id: str) -> bool | None:
+    """Three-state liveness probe for one CLI session.
+
+    ``True``  — the session reports active work (prompt/background/
+                 permission/question/non-idle work state);
+    ``False`` — the endpoint answered and the session is genuinely idle;
+    ``None``  — the probe is unreachable/unknown. Callers must treat
+                 *unknown* as "possibly alive", never as idle: a transient
+                 serve hiccup must not kill a working session (10/23
+                 incident: ``False`` here killed a live run).
+    """
     state = await fetch_live_state(workspace)
     if not state.get("reachable"):
-        return False
+        return None
     for session in state.get("sessions") or []:
         if str(session.get("sessionId") or "") == str(session_id):
             return bool(
@@ -99,4 +109,6 @@ async def session_busy(workspace: str, session_id: str) -> bool:
                 or session.get("isWaitingForUserQuestion")
                 or str(session.get("activeWorkState") or "idle") != "idle"
             )
-    return False
+    # Reachable but the session is not registered (e.g. a resumed/foreign
+    # session): the probe cannot speak for it — unknown, not idle.
+    return None

@@ -284,6 +284,12 @@ def control_response(request_id: str, decision: dict[str, Any]) -> dict[str, Any
     """Build the stream-json ``control_response`` for one approval request."""
     if decision.get("behavior") == "allow":
         payload: dict[str, Any] = {"behavior": "allow"}
+        updated_input = decision.get("updated_input")
+        if isinstance(updated_input, dict) and updated_input:
+            # AskUserQuestionTool consumes ``updatedInput.answers`` (answerKey
+            # = question index as a string). Passing the human's answer here
+            # is how the tool receives it in SDK/stream-json mode.
+            payload["updatedInput"] = updated_input
     else:
         payload = {
             "behavior": "deny",
