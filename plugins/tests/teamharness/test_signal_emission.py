@@ -499,6 +499,16 @@ def test_submit_retry_after_nonzero_project_audit_seq_is_one_event(
 
     first = _public_taskflow(server, _submit_args(workspace))
     assert first["ok"] is True and first.get("reused") is not True
+
+    # Capture what the first submit committed, before the retry: the raw
+    # task meta bytes (the input the event fingerprint hashes) and the raw
+    # bytes of the single event object on disk.
+    task_meta_path = workspace / "shared" / "tasks" / "t1" / "meta.json"
+    task_meta_bytes = task_meta_path.read_bytes()
+    event_files = sorted(_events_dir(server, workspace).glob("*.json"))
+    assert len(event_files) == 1, [f.name for f in event_files]
+    event_bytes = event_files[0].read_bytes()
+
     second = _public_taskflow(server, _submit_args(workspace))
     assert second["ok"] is True and second["reused"] is True
     assert second["task"]["submission_id"] == first["task"]["submission_id"]
@@ -506,7 +516,17 @@ def test_submit_retry_after_nonzero_project_audit_seq_is_one_event(
     events = _read_events(server, workspace)
     assert len(events) == 1, [e["event_id"] for e in events]
     assert events[0]["event_type"] == "SIG-COMPLETE"
-    assert events[0]["fingerprint"] == second["task"].get("result_digest") or True
+    # The fingerprint is the sha256 of the committed task meta bytes.
+    assert events[0]["fingerprint"] == hashlib.sha256(task_meta_bytes).hexdigest()
+    # result_digest hashes the canonical task-result payload instead — a
+    # different input, so it can never equal the event fingerprint.
+    assert second["task"].get("result_digest")
+    assert events[0]["fingerprint"] != second["task"].get("result_digest")
+    # The retry changed nothing on disk: same task meta bytes, and the
+    # single SIG-COMPLETE event object byte-identical.
+    assert task_meta_path.read_bytes() == task_meta_bytes
+    assert [p.name for p in sorted(_events_dir(server, workspace).glob("*.json"))] == [event_files[0].name]
+    assert event_files[0].read_bytes() == event_bytes
 
 
 def test_submit_retry_after_project_revision_advances_is_one_event(
