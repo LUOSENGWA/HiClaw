@@ -87,6 +87,7 @@ def _wake_recorder() -> tuple[list[dict[str, str]], Any]:
         channel: str = "console",
         user_id: str = "default",
         room_bell: bool = False,
+        approval_level: str = "",
     ) -> None:
         calls.append(
             {
@@ -97,6 +98,7 @@ def _wake_recorder() -> tuple[list[dict[str, str]], Any]:
                 "channel": channel,
                 "user_id": user_id,
                 "room_bell": room_bell,
+                "approval_level": approval_level,
             }
         )
 
@@ -584,6 +586,106 @@ def test_wake_body_pins_approval_level() -> None:
         "session_id": "sid-2",
         "input": [{"content": [{"type": "text", "text": "t"}], "metadata": {}}],
     }
+
+
+@pytest.mark.asyncio
+async def test_wake_reuses_dispatch_session_level(tmp_path, monkeypatch) -> None:
+    """The wake turn is pinned to the level the dispatch ran under.
+
+    A request-level ``approval_level`` wins over the agent profile: it
+    maps the CLI tier (STRICT -> plan), is recorded on the task, and is
+    what the wake sender receives — the wake must not re-read the
+    profile and drift away from the dispatch session's level.
+    """
+    import qwen_code_bridge.dispatch as dispatch_mod
+
+    monkeypatch.setattr(dispatch_mod, "_effective_approval_level", lambda _a: "AUTO")
+    with Env(tmp_path) as env:
+        _make_bin(env.bin_dir, "fakeq", "echo ok")
+        calls, sender = _wake_recorder()
+        service = DispatchService(wake_sender=sender)
+        task_id = await service.start(
+            task_name="t-level",
+            prompt="do",
+            cwd=None,
+            cli="fakeq",
+            timeout=30,
+            wake=dict(WAKE),
+            approval_level="STRICT",
+        )
+        task = service.get_task(task_id)
+        assert task is not None
+        assert task["approval_level"] == "STRICT"
+        assert task["approval_mode"] == "plan"
+        assert task["approval_mode_source"] == "level-request"
+
+        terminal = await _wait_terminal(service, task_id)
+        assert terminal["state"] == "done"
+        settled = await _wait_wake(service, task_id)
+        assert settled["wake_status"] == "sent"
+        assert len(calls) == 1
+        assert calls[0]["approval_level"] == "STRICT"
+
+
+@pytest.mark.asyncio
+async def test_wake_level_defaults_to_recorded_profile_level(tmp_path, monkeypatch) -> None:
+    """Without a request level the recorded profile level still rides the wake."""
+    import qwen_code_bridge.dispatch as dispatch_mod
+
+    monkeypatch.setattr(dispatch_mod, "_effective_approval_level", lambda _a: "AUTO")
+    with Env(tmp_path) as env:
+        _make_bin(env.bin_dir, "fakeq", "echo ok")
+        calls, sender = _wake_recorder()
+        service = DispatchService(wake_sender=sender)
+        task_id = await service.start(
+            task_name="t-level-default",
+            prompt="do",
+            cwd=None,
+            cli="fakeq",
+            timeout=30,
+            wake=dict(WAKE),
+        )
+        task = service.get_task(task_id)
+        assert task is not None
+        assert task["approval_level"] == "AUTO"
+        assert task["approval_mode_source"] == "level-map"
+        await _wait_terminal(service, task_id)
+        settled = await _wait_wake(service, task_id)
+        assert settled["wake_status"] == "sent"
+        assert calls[0]["approval_level"] == "AUTO"
+
+
+def test_default_wake_sender_explicit_level_overrides_profile(monkeypatch) -> None:
+    """``default_wake_sender(approval_level=...)`` pins the wake body level."""
+    import qwen_code_bridge.dispatch as dispatch_mod
+
+    monkeypatch.setattr(dispatch_mod, "_effective_approval_level", lambda _a: "AUTO")
+    monkeypatch.setattr(dispatch_mod, "_pending_approval_line", lambda _b, _s: "")
+    captured: list[dict] = []
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, _n: int = -1) -> bytes:
+            return b'{"ok":true}'
+
+    def fake_urlopen(req, timeout=0):  # noqa: ARG001
+        captured.append(json.loads(req.data.decode("utf-8")))
+        return _Resp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    dispatch_mod.default_wake_sender(
+        "sid-lvl", "AgentTeamGuide", "", "done", approval_level="SMART"
+    )
+    assert captured[0]["request_context"] == {"approval_level": "SMART"}
+
+    captured.clear()
+    dispatch_mod.default_wake_sender("sid-lvl", "AgentTeamGuide", "", "done")
+    assert captured[0]["request_context"] == {"approval_level": "AUTO"}
 
 
 def test_default_wake_sender_carries_level_and_pending(monkeypatch) -> None:

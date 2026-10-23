@@ -296,7 +296,9 @@ class SpawnFailedError(RuntimeError):
 
 
 #: ``wake_sender(session_id, agent_id, base_url, text) -> None``;
-#: returns on success, raises on final failure.
+#: returns on success, raises on final failure. Senders accept an
+#: ``approval_level`` keyword argument (empty string = fall back to the
+#: agent profile's level).
 WakeSender = Callable[..., None]
 
 
@@ -442,18 +444,22 @@ def default_wake_sender(
     channel: str = "console",
     user_id: str = "default",
     room_bell: bool = False,
+    approval_level: str = "",
 ) -> None:
     """Real-HTTP session inject (dispatch_notify.py default backend).
 
     POSTs the terminal summary to ``<base>/api/console/chat`` with the
     ``X-Agent-Id`` header; retries on 409/429/503 and transient errors
     (3 attempts). Raises ``RuntimeError`` on final failure.
+
+    ``approval_level`` is the dispatch session's recorded level; when
+    empty the agent profile's effective level is read (legacy fallback).
     """
     root = app_base(base_url)
     body = _wake_body(
         session_id,
         text,
-        _effective_approval_level(agent_id),
+        approval_level or _effective_approval_level(agent_id),
         channel,
         user_id,
     )
@@ -731,6 +737,7 @@ class DispatchService:
                 str(origin.get("channel") or wake.get("channel") or "console"),
                 str(origin.get("user_id") or wake.get("user_id") or "default"),
                 bool(wake.get("room_bell")),
+                approval_level=str(task.get("approval_level") or ""),
             )
             self._update_task(task["task_id"], {"wake_status": "sent"})
         except Exception as exc:
@@ -831,6 +838,7 @@ class DispatchService:
         wake: dict[str, Any] | None,
         origin: dict[str, Any] | None = None,
         approval_mode: str | None = None,
+        approval_level: str | None = None,
         evidence: str | None = None,
         max_wall_time: str | None = None,
         max_session_turns: int | None = None,
@@ -857,7 +865,10 @@ class DispatchService:
             SpawnFailedError: the child process could not be started.
         """
         _agent_hint = str((wake or {}).get("agent_id") or "")
-        _level = _effective_approval_level(_agent_hint)
+        _level = (
+            str(approval_level or "").strip().upper()
+            or _effective_approval_level(_agent_hint)
+        )
         mode = resolve_approval_mode(approval_mode, _level)
         running = self.running_task_named(task_name)
         if running is not None:
@@ -932,12 +943,18 @@ class DispatchService:
                 "request"
                 if str(approval_mode or "").strip()
                 else (
-                    "env"
-                    if (
-                        os.environ.get(APPROVAL_MODE_ENV, "").strip()
-                        or os.environ.get(LEGACY_APPROVAL_MODE_ENV, "").strip()
+                    "level-request"
+                    if str(approval_level or "").strip()
+                    else (
+                        "env"
+                        if (
+                            os.environ.get(APPROVAL_MODE_ENV, "").strip()
+                            or os.environ.get(
+                                LEGACY_APPROVAL_MODE_ENV, ""
+                            ).strip()
+                        )
+                        else ("level-map" if _level else "default")
                     )
-                    else ("level-map" if _level else "default")
                 )
             ),
             "origin": dict(origin) if origin else None,
@@ -1425,6 +1442,7 @@ class DispatchService:
                     str(origin.get("channel") or wake.get("channel") or "console"),
                     str(origin.get("user_id") or wake.get("user_id") or "default"),
                     bool(wake.get("room_bell")),
+                    approval_level=str(task.get("approval_level") or ""),
                 )
                 wake_status = "sent"
             except Exception as exc:  # wake is best-effort; state stands

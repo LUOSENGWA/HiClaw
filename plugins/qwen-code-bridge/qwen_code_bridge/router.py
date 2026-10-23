@@ -163,6 +163,14 @@ class DispatchRequest(BaseModel):
             "'yolo' (#1379 parity)."
         ),
     )
+    approval_level: str | None = Field(
+        default=None,
+        description=(
+            "Calling session's QwenPaw tool-execution level (STRICT/SMART/AUTO/OFF); "
+            "pins both the CLI tier mapping and the wake turn's approval_level. "
+            "Resolution: request > agent profile."
+        ),
+    )
     origin: OriginSpec | None = None
     wake: WakeSpec | None = None
 
@@ -198,6 +206,7 @@ async def post_dispatch(
             wake=wake,
             origin=origin,
             approval_mode=body.approval_mode,
+            approval_level=body.approval_level,
             evidence=body.evidence,
             max_wall_time=body.max_wall_time,
             max_session_turns=body.max_session_turns,
