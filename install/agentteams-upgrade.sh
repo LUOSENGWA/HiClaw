@@ -173,6 +173,38 @@ mounts_count() {
     inspect_fmt '{{len .Mounts}}' "${CONTROLLER_NAME}"
 }
 
+mount_lines() {
+    inspect_fmt '{{range .Mounts}}{{.Type}}|{{.Name}}|{{.Source}}|{{.Destination}}|{{.RW}}|{{.Propagation}}|{{.Driver}}{{println}}{{end}}' "${CONTROLLER_NAME}"
+}
+
+fs_type_of() {
+    local path="$1" fs=""
+    if command -v findmnt >/dev/null 2>&1; then
+        fs="$(findmnt -T "${path}" -o FSTYPE -n 2>/dev/null | head -n 1 || true)"
+    fi
+    if [ -z "${fs}" ] && command -v stat >/dev/null 2>&1; then
+        fs="$(stat -f -c %T "${path}" 2>/dev/null || true)"
+    fi
+    printf '%s' "${fs}"
+}
+
+is_remote_fs() {
+    case "$1" in
+        nfs|nfs4|cifs|smb|smb3|sshfs|fuse.sshfs|glusterfs|ceph|9p|virtiofs|afs|lustre|gpfs) return 0 ;;
+        fuse.*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+mount_json() {
+    local mtype="$1" mname="$2" msrc="$3" mdst="$4" mrw="$5" mprop="$6" mdriver="$7" mfs="$8" mremote="$9"
+    local rw="false"
+    [ "${mrw}" = "true" ] && rw="true"
+    printf '{"type":"%s","name":"%s","source":"%s","destination":"%s","rw":%s,"propagation":"%s","driver":"%s","fs_type":"%s","remote":%s}' \
+        "$(json_escape "${mtype}")" "$(json_escape "${mname}")" "$(json_escape "${msrc}")" "$(json_escape "${mdst}")" \
+        "${rw}" "$(json_escape "${mprop}")" "$(json_escape "${mdriver}")" "$(json_escape "${mfs}")" "${mremote}"
+}
+
 container_running() {
     local v
     v="$(inspect_fmt '{{.State.Running}}' "${CONTROLLER_NAME}")"
@@ -289,6 +321,48 @@ cmd_preflight() {
         fi
     fi
 
+    local mount_items="" mounts_json="[]" data_model="volume"
+    local has_volume=0 has_bind=0 has_remote=0
+    local mtype mname msrc mdst mrw mprop mdriver mfs mremote
+    while IFS='|' read -r mtype mname msrc mdst mrw mprop mdriver; do
+        [ -n "${mdst}" ] || continue
+        mfs=""
+        mremote="false"
+        if [ "${mtype}" = "bind" ]; then
+            mfs="$(fs_type_of "${msrc}")"
+        elif [ "${mtype}" = "volume" ] && [ -d "${msrc}" ]; then
+            mfs="$(fs_type_of "${msrc}")"
+        fi
+        if [ -n "${mfs}" ] && is_remote_fs "${mfs}"; then
+            mremote="true"
+            warn "mount ${mdst} uses remote fs ${mfs}; preserved as-is (latency/locking may differ)"
+        fi
+        case "${mtype}" in
+            volume) has_volume=1 ;;
+            bind) has_bind=1 ;;
+            tmpfs) ;;
+            *) warn "unknown mount type ${mtype} at ${mdst}" ;;
+        esac
+        [ "${mremote}" = "true" ] && has_remote=1
+        mount_items="${mount_items}${mount_items:+,}$(mount_json "${mtype}" "${mname}" "${msrc}" "${mdst}" "${mrw}" "${mprop}" "${mdriver}" "${mfs}" "${mremote}")"
+    done < <(mount_lines)
+    mounts_json="[${mount_items}]"
+    if [ "${has_remote}" = "1" ]; then
+        data_model="remote"
+    elif [ "${has_volume}" = "1" ] && [ "${has_bind}" = "1" ]; then
+        data_model="mixed"
+    elif [ "${has_bind}" = "1" ]; then
+        data_model="bind"
+    else
+        data_model="volume"
+    fi
+
+    local s3_configured="false" s3_bucket=""
+    s3_bucket="$(read_env AGENTTEAMS_FS_BUCKET)"
+    [ -n "${s3_bucket}" ] || s3_bucket="$(read_env AGENTTEAMS_MINIO_BUCKET)"
+    [ -n "${s3_bucket}" ] && s3_configured="true"
+    [ "${s3_configured}" = "true" ] || warn "S3 bucket not found in env; worker state may rely on local mounts"
+
     local free_kb=0 kine_kb=0 free_bytes=0 kine_bytes=0
     local check_dir="${BACKUP_DIR}"
     while [ ! -d "${check_dir}" ] && [ "${check_dir}" != "/" ]; do
@@ -334,10 +408,11 @@ cmd_preflight() {
         local warnings_json errors_json
         if [ "${#WARN_LIST[@]}" -gt 0 ]; then warnings_json="$(json_list "${WARN_LIST[@]}")"; else warnings_json="[]"; fi
         if [ "${#ERR_LIST[@]}" -gt 0 ]; then errors_json="$(json_list "${ERR_LIST[@]}")"; else errors_json="[]"; fi
-        printf '{"ok":%s,"env_file":"%s","data_dir":"%s","data_dir_source":"%s","controller":{"name":"%s","exists":%s,"image":"%s","ports":%s,"mounts":%s,"entrypoint":"%s","network":"%s","restart":"%s","running":%s},"docker":{"cmd":"%s"},"disk_free_bytes":%s,"kine_bytes":%s,"workers":{"total":%s,"soul_set":%s,"soul_missing":%s},"teams":%s,"warnings":%s,"errors":%s}\n' \
+        printf '{"ok":%s,"env_file":"%s","data_dir":"%s","data_dir_source":"%s","controller":{"name":"%s","exists":%s,"image":"%s","ports":%s,"mounts":%s,"entrypoint":"%s","network":"%s","restart":"%s","running":%s},"data_model":"%s","mounts":%s,"s3":{"configured":%s,"bucket":"%s"},"docker":{"cmd":"%s"},"disk_free_bytes":%s,"kine_bytes":%s,"workers":{"total":%s,"soul_set":%s,"soul_missing":%s},"teams":%s,"warnings":%s,"errors":%s}\n' \
             "${ok}" "$(json_escape "${ENV_FILE}")" "$(json_escape "${data_dir}")" "${data_source}" \
             "${CONTROLLER_NAME}" "${ctrl_exists}" "$(json_escape "${image}")" "${ports}" "${mounts}" \
             "$(json_escape "${entry}")" "$(json_escape "${net}")" "$(json_escape "${restart}")" "${running}" \
+            "${data_model}" "${mounts_json}" "${s3_configured}" "$(json_escape "${s3_bucket}")" \
             "${DOCKER_CMD}" "${free_bytes}" "${kine_bytes}" "${workers}" "${soul_set}" "${soul_missing}" "${teams}" \
             "${warnings_json}" "${errors_json}"
     else
@@ -456,17 +531,33 @@ build_run_args() {
         fi
     done < <(inspect_fmt '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}{{println $p .HostIp .HostPort}}{{end}}{{end}}' "${CONTROLLER_NAME}")
 
-    local mtype mname msrc mdst mrw src
-    while read -r mtype mname msrc mdst mrw; do
+    local mtype mname msrc mdst mrw mprop mdriver spec
+    while IFS='|' read -r mtype mname msrc mdst mrw mprop mdriver; do
         [ -n "${mdst}" ] || continue
-        src="${msrc}"
-        [ "${mtype}" = "volume" ] && src="${mname}"
-        if [ "${mrw}" = "false" ]; then
-            RUN_ARGS+=(-v "${src}:${mdst}:ro")
-        else
-            RUN_ARGS+=(-v "${src}:${mdst}")
-        fi
-    done < <(inspect_fmt '{{range .Mounts}}{{println .Type .Name .Source .Destination .RW}}{{end}}' "${CONTROLLER_NAME}")
+        case "${mtype}" in
+            volume)
+                spec="type=volume,src=${mname},dst=${mdst}"
+                [ "${mrw}" = "false" ] && spec="${spec},readonly"
+                [ -n "${mdriver}" ] && spec="${spec},volume-driver=${mdriver}"
+                RUN_ARGS+=(--mount "${spec}")
+                ;;
+            bind)
+                case "${msrc}" in
+                    *,*) die "bind mount source contains a comma; run the controller step manually: ${msrc}" "${EXIT_GATE}" ;;
+                esac
+                spec="type=bind,src=${msrc},dst=${mdst}"
+                [ "${mrw}" = "false" ] && spec="${spec},readonly"
+                [ -n "${mprop}" ] && spec="${spec},bind-propagation=${mprop}"
+                RUN_ARGS+=(--mount "${spec}")
+                ;;
+            tmpfs)
+                RUN_ARGS+=(--mount "type=tmpfs,dst=${mdst}")
+                ;;
+            *)
+                die "unsupported mount type: ${mtype} at ${mdst}" "${EXIT_GATE}"
+                ;;
+        esac
+    done < <(mount_lines)
 
     RUN_ARGS+=("${CONTROLLER_IMAGE}")
 }

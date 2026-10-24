@@ -134,6 +134,8 @@ big-bang in-place flow of `agentteams-install.sh`.
 ./install/agentteams-upgrade.sh status
 ```
 
+No remote mount is required: Docker volumes work out of the box. Bind and remote mounts are detected and preserved as-is; remote filesystems are reported as warnings, not failures.
+
 Add `--dry-run` to any mutating command to print the exact steps first. P1
 covers `preflight`/`backup`/`controller`/`status`; workers (canary), manager,
 dashboard and memory are follow-ups. See the upgrade design issue for the full design.

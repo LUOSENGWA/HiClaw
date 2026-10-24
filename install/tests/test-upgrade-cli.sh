@@ -41,7 +41,7 @@ case "$1" in
             *PortBindings*) printf '8080/tcp 0.0.0.0 18080\n9090/tcp 0.0.0.0 19090\n' ;;
             *"len .Mounts"*) echo 4 ;;
             *"/data"*) echo "agentteams-data" ;;
-            *".Mounts"*) printf 'volume agentteams-data /var/lib/docker/volumes/agentteams-data/_data /data true\nbind  /host/config /config true\n' ;;
+            *".Mounts"*) printf 'volume|agentteams-data|/var/lib/docker/volumes/agentteams-data/_data|/data|true|rprivate|local\nbind||/host/config|/config|true|rprivate|\n' ;;
             *Entrypoint*) echo '["/entrypoint.sh"]' ;;
             *NetworkMode*) echo "agentteams-net" ;;
             *RestartPolicy.Name*) echo "unless-stopped" ;;
