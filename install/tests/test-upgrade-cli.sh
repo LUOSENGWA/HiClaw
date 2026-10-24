@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# ============================================================================
+# test-upgrade-cli.sh — regression suite for install/agentteams-upgrade.sh (P1)
+#
+# Pure bash + coreutils. No real docker, no network: a stub `docker` is
+# PATH-prepended and answers inspect/exec/logs/cp/stop/start/rename/run.
+# ============================================================================
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+UPGRADE="${REPO_ROOT}/install/agentteams-upgrade.sh"
+
+if [ ! -f "${UPGRADE}" ]; then
+    echo "FAIL setup: ${UPGRADE} not found"
+    exit 1
+fi
+
+TMP="$(mktemp -d)"
+cleanup() {
+    rm -rf "${TMP}"
+}
+trap cleanup EXIT
+
+BIN="${TMP}/bin"
+mkdir -p "${BIN}"
+REC="${TMP}/rec"
+export REC
+
+cat > "${BIN}/docker" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${REC}"
+case "$1" in
+    info)
+        exit 0
+        ;;
+    inspect)
+        fmt="$3"
+        case "$fmt" in
+            *"len .HostConfig.PortBindings"*) echo 4 ;;
+            *PortBindings*) printf '8080/tcp 0.0.0.0 18080\n9090/tcp 0.0.0.0 19090\n' ;;
+            *"len .Mounts"*) echo 4 ;;
+            *"/data"*) echo "agentteams-data" ;;
+            *".Mounts"*) printf 'volume agentteams-data /var/lib/docker/volumes/agentteams-data/_data /data true\nbind  /host/config /config true\n' ;;
+            *Entrypoint*) echo '["/entrypoint.sh"]' ;;
+            *NetworkMode*) echo "agentteams-net" ;;
+            *RestartPolicy.Name*) echo "unless-stopped" ;;
+            *Config.Image*) echo "example/controller:old" ;;
+            *State.Running*) echo "true" ;;
+            *RepoDigests*) echo "example/controller@sha256:old" ;;
+            *".Id"*) echo "sha256:old" ;;
+            *) echo "" ;;
+        esac
+        ;;
+    exec)
+        case "$*" in
+            *healthz*) [ "${STUB_SCENARIO:-ok}" = "health_fail" ] && exit 1 || exit 0 ;;
+            *"agt get workers -o json"*) echo '{"workers":[{"name":"w1","soul":"full"}]}' ;;
+            *"agt get teams"*) echo "team-a" ;;
+            *"agt get workers"*) echo "worker-a" ;;
+            *du*) echo "1024" ;;
+            *) exit 0 ;;
+        esac
+        ;;
+    logs)
+        [ "${STUB_SCENARIO:-ok}" = "log_panic" ] && echo "panic: boom" || true
+        ;;
+    stop|start|rename|cp|run|rm)
+        exit 0
+        ;;
+    ps)
+        echo "agentteams-controller"
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+STUB
+chmod +x "${BIN}/docker"
+export PATH="${BIN}:${PATH}"
+
+RC=0
+OUT="${TMP}/out"
+
+run_case() {
+    local scenario="$1"
+    shift
+    : > "${REC}"
+    STUB_SCENARIO="${scenario}" bash "${UPGRADE}" "$@" > "${OUT}" 2>&1
+    RC=$?
+}
+
+assert_eq() {
+    if [ "$1" != "$2" ]; then
+        echo "FAIL $3: expected [$2], got [$1]"
+        echo "--- output ---"
+        cat "${OUT}"
+        exit 1
+    fi
+}
+
+assert_contains() {
+    if ! grep -q "$1" "$2"; then
+        echo "FAIL $3: [$1] not found in $2"
+        echo "--- output ---"
+        cat "${OUT}"
+        exit 1
+    fi
+}
+
+assert_not_contains() {
+    if grep -q "$1" "$2"; then
+        echo "FAIL $3: [$1] unexpectedly found in $2"
+        echo "--- output ---"
+        cat "${OUT}"
+        exit 1
+    fi
+}
+
+ENV_FILE="${TMP}/agentteams-manager.env"
+cat > "${ENV_FILE}" <<'EOF'
+AGENTTEAMS_DATA_DIR=agentteams-data
+AGENTTEAMS_VERSION=v1.2.5
+EOF
+
+# 1. preflight happy path
+run_case ok preflight --env-file "${ENV_FILE}" --backup-dir "${TMP}/b1" --json
+assert_eq "${RC}" "0" "preflight happy rc"
+assert_contains '"ok":true' "${OUT}" "preflight happy ok"
+assert_contains '"ports":4' "${OUT}" "preflight happy ports"
+assert_contains '"mounts":4' "${OUT}" "preflight happy mounts"
+
+# 2. missing env
+run_case ok preflight --env-file "${TMP}/missing.env" --backup-dir "${TMP}/b2" --json
+assert_eq "${RC}" "3" "preflight missing env rc"
+assert_contains 'env file not found' "${OUT}" "preflight missing env message"
+
+# 3. data-dir mismatch
+cat > "${TMP}/mismatch.env" <<'EOF'
+AGENTTEAMS_DATA_DIR=custom-vol
+EOF
+run_case ok preflight --env-file "${TMP}/mismatch.env" --backup-dir "${TMP}/b3" --json
+assert_eq "${RC}" "3" "preflight mismatch rc"
+assert_contains 'mismatch' "${OUT}" "preflight mismatch message"
+
+# 4. backup dry-run: no stop/cp
+run_case ok backup --dry-run --env-file "${ENV_FILE}" --backup-dir "${TMP}/b4"
+assert_eq "${RC}" "0" "backup dry rc"
+assert_not_contains '^stop ' "${REC}" "backup dry no stop"
+assert_not_contains '^cp ' "${REC}" "backup dry no cp"
+
+# 5. backup --yes: stop + cp + state
+run_case ok backup --yes --env-file "${ENV_FILE}" --backup-dir "${TMP}/b5" --state-file "${TMP}/b5/state.json"
+assert_eq "${RC}" "0" "backup yes rc"
+assert_contains '^stop ' "${REC}" "backup yes stop"
+assert_contains '^cp ' "${REC}" "backup yes cp"
+[ -f "${TMP}/b5/state.json" ] || { echo "FAIL backup yes: state.json missing"; cat "${OUT}"; exit 1; }
+assert_contains '"status":"done"' "${TMP}/b5/state.json" "backup yes state"
+
+# 6. controller dry-run: no run/rename
+run_case ok controller --dry-run --controller-image example/controller:new --env-file "${ENV_FILE}" --backup-dir "${TMP}/b6"
+assert_eq "${RC}" "0" "controller dry rc"
+assert_not_contains '^run ' "${REC}" "controller dry no run"
+assert_not_contains '^rename ' "${REC}" "controller dry no rename"
+
+# 7. controller health failure: auto rollback
+run_case health_fail controller --yes --controller-image example/controller:new --env-file "${ENV_FILE}" --backup-dir "${TMP}/b7" --state-file "${TMP}/b7/state.json" --timeout 4
+[ "${RC}" = "3" ] || [ "${RC}" = "4" ] || { echo "FAIL controller fail rc: expected 3/4, got ${RC}"; cat "${OUT}"; exit 1; }
+assert_contains '^rename ' "${REC}" "controller fail rollback rename"
+if ! grep -qE '"status":"(rolled_back|rollback_failed)"' "${TMP}/b7/state.json"; then
+    echo "FAIL controller fail state"
+    cat "${TMP}/b7/state.json"
+    exit 1
+fi
+
+# 8. status --json
+run_case ok status --state-file "${TMP}/b5/state.json" --json
+assert_eq "${RC}" "0" "status json rc"
+assert_contains '"step"' "${OUT}" "status json step"
+
+echo "PASS test-upgrade-cli (8 scenarios)"

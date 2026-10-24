@@ -114,6 +114,30 @@ Workers are created by the Manager Agent through conversation. The Manager provi
 .\agentteams-install.ps1 uninstall
 ```
 
+### Upgrade (safe orchestrator, P1)
+
+`install/agentteams-upgrade.sh` upgrades the **controller as a separate step**,
+with a cold kine backup, a health gate and a rollback path. It does not use the
+big-bang in-place flow of `agentteams-install.sh`.
+
+```bash
+# 1. inspect (read-only, JSON)
+./install/agentteams-upgrade.sh preflight --json
+
+# 2. back up kine + env + image IDs (stop/start the controller)
+./install/agentteams-upgrade.sh backup --yes
+
+# 3. upgrade the controller only; the old container is kept for rollback
+./install/agentteams-upgrade.sh controller --yes --controller-image <image>
+
+# 4. inspect the last state
+./install/agentteams-upgrade.sh status
+```
+
+Add `--dry-run` to any mutating command to print the exact steps first. P1
+covers `preflight`/`backup`/`controller`/`status`; workers (canary), manager,
+dashboard and memory are follow-ups. See the upgrade design issue for the full design.
+
 ## Non-Interactive Mode (Automation)
 
 Set environment variables to skip prompts:
