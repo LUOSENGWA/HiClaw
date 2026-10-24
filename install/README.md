@@ -136,6 +136,8 @@ big-bang in-place flow of `agentteams-install.sh`.
 
 No remote mount is required: Docker volumes work out of the box. Bind and remote mounts are detected and preserved as-is; remote filesystems are reported as warnings, not failures.
 
+> **Gateway note:** if the controller embeds the Higress gateway, a controller upgrade can leave `healthz` green while the data plane is down (Wasm plugin version mismatch). Verify `http://127.0.0.1:8080/v1/models` after the controller step; plugin files are container-layer and may need a backfill after each rebuild.
+
 Add `--dry-run` to any mutating command to print the exact steps first. P1
 covers `preflight`/`backup`/`controller`/`status`; workers (canary), manager,
 dashboard and memory are follow-ups. See the upgrade design issue for the full design.
