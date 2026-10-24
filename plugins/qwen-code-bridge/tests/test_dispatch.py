@@ -1146,16 +1146,85 @@ def _write_task_file(tmp_path, task: dict) -> None:
     )
 
 
-def test_reaper_skips_terminating_task(tmp_path, monkeypatch):
+def test_reaper_recovers_terminating_task_with_dead_child(tmp_path, monkeypatch):
+    """#914: terminating + dead pid must be recovered, never skipped.
+
+    The watchdog marks `terminating` before it kills the child; if it dies
+    (or the plugin restarts) before writing the terminal state, the marker
+    used to exempt the task forever and it stayed `running` for hours.
+    """
     svc = DispatchService(dispatch_dir=tmp_path, watch_interval=0.05)
     tid = "a" * 32
     _write_task_file(tmp_path, {
         "task_id": tid, "task": "t", "state": "running", "pid": 424242,
         "started_epoch": time.time() - 300, "timeout": 600,
-        "terminating": True, "origin": {"session_id": "s"}, "wake": {},
+        "terminating": True, "updated_at": "2026-01-01T00:00:00Z",
+        "watchdog_pid": 4243, "origin": {"session_id": "s"}, "wake": {},
     })
     monkeypatch.setattr(svc, "_pid_alive", lambda pid: False)
-    assert svc._scan_once() == []
+    changed = svc._scan_once()
+    assert [t["task_id"] for t in changed] == [tid]
+    assert changed[0]["state"] == "stale"
+    assert changed[0]["death_reason"] == "timeout_killed_watchdog_lost"
+
+
+def test_reaper_does_not_trust_watchdog_pid_without_freshness(tmp_path, monkeypatch):
+    """A live watchdog_pid alone must not exempt a task forever.
+
+    After a container/plugin restart the recorded pid is routinely reused
+    by the new app process; the old guard skipped those tasks forever.
+    """
+    from qwen_code_bridge.dispatch import _utcnow
+
+    svc = DispatchService(dispatch_dir=tmp_path, watch_interval=0.05)
+    tid = "b" * 32
+    _write_task_file(tmp_path, {
+        "task_id": tid, "task": "t", "state": "running", "pid": 424242,
+        "started_epoch": time.time() - 300, "timeout": 600,
+        "updated_at": "2026-01-01T00:00:00Z",  # stale file
+        "watchdog_pid": 4243, "origin": {"session_id": "s"}, "wake": {},
+    })
+    # child alive, "watchdog" alive (reused pid) but the file is stale ->
+    # the reaper must not skip on the watchdog pid alone.
+    monkeypatch.setattr(svc, "_pid_alive", lambda pid: int(pid) == 424242)
+    changed = svc._scan_once()
+    assert changed == []  # age 300s < timeout+60 -> nothing to kill yet
+    # and it must NOT have been skipped silently: the wall/timeout path ran
+    # (proven by it reaching the kill branch for an over-budget task)
+    _write_task_file(tmp_path, {
+        "task_id": tid, "task": "t", "state": "running", "pid": 424242,
+        "started_epoch": time.time() - 700, "timeout": 600,
+        "updated_at": "2026-01-01T00:00:00Z",
+        "watchdog_pid": 4243, "origin": {"session_id": "s"}, "wake": {},
+    })
+    changed = svc._scan_once()
+    assert [t["task_id"] for t in changed] == [tid]
+    assert changed[0]["death_reason"] == "timeout_killed_by_reaper"
+
+
+def test_pid_alive_treats_zombie_as_dead(tmp_path):
+    """A zombie keeps the pid and answers os.kill(pid, 0); it is dead."""
+    import subprocess as _sp
+
+    proc = _sp.Popen(["/bin/sh", "-c", "exit 0"])
+    try:
+        time.sleep(0.3)  # exits; not reaped -> zombie
+        assert DispatchService._pid_alive(proc.pid) is False
+    finally:
+        proc.wait()
+
+
+def test_pid_alive_detects_live_process(tmp_path):
+    import subprocess as _sp
+
+    proc = _sp.Popen(["/bin/sh", "-c", "sleep 30"])
+    try:
+        time.sleep(0.1)
+        assert DispatchService._pid_alive(proc.pid) is True
+    finally:
+        proc.kill()
+        proc.wait()
+    assert DispatchService._pid_alive(proc.pid) is False
 
 
 def test_reaper_skips_recently_updated_task(tmp_path, monkeypatch):

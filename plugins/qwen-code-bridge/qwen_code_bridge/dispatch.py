@@ -730,17 +730,44 @@ class DispatchService:
 
     @staticmethod
     def _pid_alive(pid: Any) -> bool:
+        """Alive = /proc and ``ps`` both say the pid exists and is not dead.
+
+        ``os.kill(pid, 0)`` alone is not enough: a **zombie** (process
+        exited, parent has not reaped it) keeps the pid and still answers
+        0, so a dead dispatch looked alive forever and neither the reaper
+        nor ``cleanup`` could close it (#914). Read the ``/proc`` state
+        and cross-check ``ps``; Z (zombie) / X (dead) mean gone.
+        """
         try:
             value = int(pid)
         except (TypeError, ValueError):
             return False
         if value <= 0:
             return False
+        proc_alive = False
         try:
-            os.kill(value, 0)
-            return True
-        except OSError:
-            return False
+            stat = Path(f"/proc/{value}/stat").read_text(encoding="utf-8")
+            proc_state = stat.rsplit(")", 1)[1].split()[0]
+            proc_alive = proc_state not in {"Z", "z", "X", "x"}
+        except (OSError, IndexError, ValueError):
+            proc_alive = False
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(value)],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+        except Exception:
+            # ps unavailable: trust /proc alone rather than guessing alive.
+            return proc_alive
+        ps_state = (result.stdout or "").strip()
+        ps_alive = (
+            result.returncode == 0
+            and bool(ps_state)
+            and not ps_state.startswith("Z")
+        )
+        return proc_alive and ps_alive
 
     def _mark_stale(
         self,
@@ -771,13 +798,15 @@ class DispatchService:
             task.get("state") == "running"
             and task.get("pid") is not None
             and age > stale_after
-            and not task.get("terminating")
             and not fresh
             and not self._pid_alive(task.get("pid"))
         ):
             reason_text = {
                 "plugin_restart": "插件重启（原 watchdog 已退出，无终态记录）",
                 "crash_or_restart": "进程已消失（崩溃或重启，无终态记录）",
+                "timeout_killed_watchdog_lost": (
+                    "超时已被看门狗终止，但终态未写入（看门狗丢失）"
+                ),
             }.get(reason, "进程已消失（无终态记录）")
             task.update(
                 {
@@ -850,18 +879,30 @@ class DispatchService:
             pid = task.get("pid")
             if pid is None:
                 continue
-            if task.get("terminating"):
-                continue  # the watchdog killed it and is finalizing
             age = time.time() - float(task.get("started_epoch") or 0)
             updated_epoch = _parse_epoch(task.get("updated_at")) or 0.0
             fresh = (time.time() - updated_epoch) < STALE_FRESH_SECONDS
             if not self._pid_alive(pid):
                 if age > 60 and not fresh:
-                    changed.append(self._mark_stale(task, "crash_or_restart"))
+                    # `terminating` means the watchdog killed the child but
+                    # never wrote the terminal state (it died or the plugin
+                    # restarted). Recover it instead of skipping it forever
+                    # (#914: four dispatches stayed `running` for hours).
+                    reason = (
+                        "timeout_killed_watchdog_lost"
+                        if task.get("terminating")
+                        else "crash_or_restart"
+                    )
+                    changed.append(self._mark_stale(task, reason))
                 continue
+            # A live child is owned by its watchdog only while the task file
+            # is fresh. `watchdog_pid` is NOT a liveness signal by itself:
+            # after a plugin/container restart the recorded pid is routinely
+            # reused by the new app process, which made the reaper skip a
+            # dead dispatch forever (#914).
             watchdog_pid = task.get("watchdog_pid")
-            if watchdog_pid and self._pid_alive(watchdog_pid):
-                continue  # a live watchdog owns this task
+            if watchdog_pid and fresh and self._pid_alive(watchdog_pid):
+                continue
             timeout = float(task.get("timeout") or 0)
             if not timeout or age <= timeout + 60:
                 continue
@@ -878,6 +919,15 @@ class DispatchService:
                 os.kill(int(pid), 9)
             except OSError:
                 pass
+            # No progress file means "no observable progress" (inf); it must
+            # not crash the display formatting — an OverflowError here used
+            # to be swallowed by the reaper loop, leaving the task running
+            # forever (#914 second root cause).
+            progress_age_text = (
+                f"{int(progress_age)}s"
+                if progress_age != float("inf")
+                else "unknown"
+            )
             task.update(
                 {
                     "state": "timeout",
@@ -887,7 +937,7 @@ class DispatchService:
                     "updated_at": _utcnow(),
                     "terminal_summary": [
                         f"[{task.get('task')}] timeout · 进程超预算且无进展，由重启恢复器终止",
-                        f"无事件 {int(progress_age)}s · 超过 stall 窗口 {int(stall_after)}s",
+                        f"无事件 {progress_age_text} · 超过 stall 窗口 {int(stall_after)}s",
                         "下一步：重新派单或查看日志",
                     ],
                 }
@@ -976,8 +1026,6 @@ class DispatchService:
             except (OSError, ValueError):
                 continue
             if task.get("state") != "running":
-                continue
-            if task.get("terminating"):
                 continue
             updated_epoch = _parse_epoch(task.get("updated_at")) or 0.0
             if (time.time() - updated_epoch) < STALE_FRESH_SECONDS:
