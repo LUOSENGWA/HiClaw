@@ -41,8 +41,10 @@ CONTROLLER_NAME="agentteams-controller"
 OLD_NAME=""
 ENV_FROM_CONTAINER=0
 ALLOW_ENV_DRIFT=0
+KEEP_FAILED=0
 EFFECTIVE_ENV_FILE=""
 ENV_SOURCE="file"
+OLD_IMAGE=""
 
 WARN_LIST=()
 ERR_LIST=()
@@ -111,6 +113,7 @@ Options:
   --env-file PATH          default: \${AGENTTEAMS_ENV_FILE:-\$HOME/agentteams-manager.env}
   --env-from-container     use the running controller's env for the new container (recommended)
   --allow-env-drift        proceed even if the env-file key set differs from the container
+  --keep-failed            keep the failed new controller (stopped) for log inspection
   --backup-dir DIR         default: \$HOME/agentteams-upgrade-backups/<UTC>
   --state-file PATH        default: <backup-dir>/state.json
   --target VERSION         target version (recorded in the plan/state)
@@ -246,15 +249,19 @@ write_state() {
 # Health gate
 # ---------------------------------------------------------------------------
 healthz_ok() {
-    "${DOCKER_CMD}" exec "${CONTROLLER_NAME}" sh -c '
-        if command -v curl >/dev/null 2>&1; then
-            curl -fsS http://127.0.0.1:8080/healthz
-        elif command -v wget >/dev/null 2>&1; then
-            wget -qO- http://127.0.0.1:8080/healthz
-        else
-            agt get teams >/dev/null 2>&1
-        fi
-    ' >/dev/null 2>&1
+    local url
+    if "${DOCKER_CMD}" exec "${CONTROLLER_NAME}" sh -c 'command -v curl >/dev/null 2>&1'; then
+        for url in \
+            http://127.0.0.1:8090/healthz \
+            http://127.0.0.1:8001/healthz \
+            http://127.0.0.1:8080/healthz; do
+            if "${DOCKER_CMD}" exec "${CONTROLLER_NAME}" curl -fsS "${url}" >/dev/null 2>&1; then
+                return 0
+            fi
+        done
+        return 1
+    fi
+    "${DOCKER_CMD}" exec "${CONTROLLER_NAME}" agt get teams >/dev/null 2>&1
 }
 
 agt_ok() {
@@ -263,15 +270,23 @@ agt_ok() {
 }
 
 logs_ok() {
-    local n
-    n="$("${DOCKER_CMD}" logs --tail 200 "${CONTROLLER_NAME}" 2>&1 | grep -cE 'panic|fatal' || true)"
+    local n since
+    since="$(inspect_fmt '{{.State.StartedAt}}' "${CONTROLLER_NAME}")"
+    if [ -n "${since}" ]; then
+        n="$("${DOCKER_CMD}" logs --since "${since}" "${CONTROLLER_NAME}" 2>&1 | grep -cE 'panic|fatal' || true)"
+    else
+        n="$("${DOCKER_CMD}" logs --tail 200 "${CONTROLLER_NAME}" 2>&1 | grep -cE 'panic|fatal' || true)"
+    fi
     [ "${n}" = "0" ]
 }
 
 wait_health() {
     local waited=0
     while [ "${waited}" -lt "${TIMEOUT}" ]; do
-        if healthz_ok && agt_ok && logs_ok; then
+        if healthz_ok && agt_ok; then
+            if ! logs_ok; then
+                warn "controller logs contain panic|fatal; healthz and agt are OK, continuing"
+            fi
             return 0
         fi
         sleep 2
@@ -607,23 +622,60 @@ build_run_args() {
         esac
     done < <(mount_lines)
 
+    local ep_first="" ep_item
+    local ep_rest=()
+    local cmd_args=()
+    while IFS= read -r ep_item; do
+        [ -n "${ep_item}" ] || continue
+        if [ -z "${ep_first}" ]; then
+            ep_first="${ep_item}"
+        else
+            ep_rest+=("${ep_item}")
+        fi
+    done < <(inspect_fmt '{{range .Config.Entrypoint}}{{println .}}{{end}}' "${CONTROLLER_NAME}")
+    while IFS= read -r ep_item; do
+        [ -n "${ep_item}" ] && cmd_args+=("${ep_item}")
+    done < <(inspect_fmt '{{range .Config.Cmd}}{{println .}}{{end}}' "${CONTROLLER_NAME}")
+
+    if [ -n "${ep_first}" ]; then
+        RUN_ARGS+=(--entrypoint "${ep_first}")
+    fi
     RUN_ARGS+=("${CONTROLLER_IMAGE}")
+    if [ "${#ep_rest[@]}" -gt 0 ]; then
+        RUN_ARGS+=("${ep_rest[@]}")
+    fi
+    if [ "${#cmd_args[@]}" -gt 0 ]; then
+        RUN_ARGS+=("${cmd_args[@]}")
+    fi
 }
 
 rollback_controller() {
     log "rolling back controller"
-    "${DOCKER_CMD}" stop "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
-    "${DOCKER_CMD}" rm "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
+    if [ "${KEEP_FAILED}" = "1" ]; then
+        "${DOCKER_CMD}" stop "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
+        local failed="agentteams-controller-failed-$(date -u +%Y%m%dT%H%M%SZ)"
+        if "${DOCKER_CMD}" rename "${CONTROLLER_NAME}" "${failed}" >/dev/null 2>&1; then
+            log "kept failed controller as ${failed}"
+        else
+            "${DOCKER_CMD}" rm "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
+        fi
+    else
+        "${DOCKER_CMD}" stop "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
+        "${DOCKER_CMD}" rm "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
+    fi
     if ! "${DOCKER_CMD}" rename "${OLD_NAME}" "${CONTROLLER_NAME}" >/dev/null 2>&1; then
+        CONTROLLER_IMAGE="${OLD_IMAGE:-${CONTROLLER_IMAGE}}"
         write_state "controller" "rollback_failed"
         die "rollback failed: cannot rename ${OLD_NAME} back" "${EXIT_ROLLBACK}"
     fi
     "${DOCKER_CMD}" start "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
     if wait_health; then
+        CONTROLLER_IMAGE="${OLD_IMAGE:-${CONTROLLER_IMAGE}}"
         write_state "controller" "rolled_back"
         log "rollback done: old controller is healthy"
         exit "${EXIT_GATE}"
     fi
+    CONTROLLER_IMAGE="${OLD_IMAGE:-${CONTROLLER_IMAGE}}"
     write_state "controller" "rollback_failed"
     die "rollback failed: old controller did not pass the health gate" "${EXIT_ROLLBACK}"
 }
@@ -639,12 +691,14 @@ cmd_controller() {
     else
         EFFECTIVE_ENV_FILE="${ENV_FILE}"
         ENV_SOURCE="file"
+OLD_IMAGE=""
         [ -f "${ENV_FILE}" ] || die "env file not found: ${ENV_FILE}" "${EXIT_GATE}"
     fi
     container_exists "${CONTROLLER_NAME}" || die "controller container not found: ${CONTROLLER_NAME}" "${EXIT_GATE}"
 
     local old_image ports mounts
     old_image="$(inspect_fmt '{{.Config.Image}}' "${CONTROLLER_NAME}")"
+    OLD_IMAGE="${old_image}"
     ports="$(ports_count)"
     mounts="$(mounts_count)"
     case "${ports}" in ''|*[!0-9]*) ports=0 ;; esac
@@ -737,6 +791,7 @@ while [ $# -gt 0 ]; do
         --env-file) ENV_FILE="$2"; shift 2 ;;
         --env-from-container) ENV_FROM_CONTAINER=1; shift ;;
         --allow-env-drift) ALLOW_ENV_DRIFT=1; shift ;;
+        --keep-failed) KEEP_FAILED=1; shift ;;
         --backup-dir) BACKUP_DIR="$2"; shift 2 ;;
         --state-file) STATE_FILE="$2"; shift 2 ;;
         --target) TARGET="$2"; shift 2 ;;

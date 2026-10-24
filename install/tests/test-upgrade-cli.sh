@@ -42,7 +42,9 @@ case "$1" in
             *"len .Mounts"*) echo 4 ;;
             *"/data"*) echo "agentteams-data" ;;
             *".Mounts"*) printf 'volume|agentteams-data|/var/lib/docker/volumes/agentteams-data/_data|/data|true|rprivate|local\nbind||/host/config|/config|true|rprivate|\n' ;;
-            *Entrypoint*) echo '["/entrypoint.sh"]' ;;
+            *"json .Config.Entrypoint"*) echo '["/entrypoint.sh"]' ;;
+            *Config.Entrypoint*) echo "/entrypoint.sh" ;;
+            *Config.Cmd*) printf 'arg1\n' ;;
             *NetworkMode*) echo "agentteams-net" ;;
             *RestartPolicy.Name*) echo "unless-stopped" ;;
             *"len .Config.Env"*) echo 2 ;;
@@ -102,7 +104,7 @@ assert_eq() {
 }
 
 assert_contains() {
-    if ! grep -q "$1" "$2"; then
+    if ! grep -q -- "$1" "$2"; then
         echo "FAIL $3: [$1] not found in $2"
         echo "--- output ---"
         cat "${OUT}"
@@ -111,7 +113,7 @@ assert_contains() {
 }
 
 assert_not_contains() {
-    if grep -q "$1" "$2"; then
+    if grep -q -- "$1" "$2"; then
         echo "FAIL $3: [$1] unexpectedly found in $2"
         echo "--- output ---"
         cat "${OUT}"
@@ -194,6 +196,7 @@ run_case ok controller --dry-run --controller-image example/controller:new --env
 assert_eq "${RC}" "0" "controller dry rc"
 assert_not_contains '^run ' "${REC}" "controller dry no run"
 assert_not_contains '^rename ' "${REC}" "controller dry no rename"
+assert_contains '--entrypoint /entrypoint.sh' "${OUT}" "controller dry entrypoint"
 
 # 7. controller health failure: auto rollback
 run_case health_fail controller --yes --controller-image example/controller:new --env-file "${ENV_FILE}" --backup-dir "${TMP}/b7" --state-file "${TMP}/b7/state.json" --timeout 4
@@ -204,6 +207,7 @@ if ! grep -qE '"status":"(rolled_back|rollback_failed)"' "${TMP}/b7/state.json";
     cat "${TMP}/b7/state.json"
     exit 1
 fi
+assert_contains '"controller_image":"example/controller:old"' "${TMP}/b7/state.json" "controller fail restored image"
 
 # 7.5 env drift: controller must fail closed without --env-from-container
 cat > "${TMP}/drift.env" <<'EOF'
@@ -223,6 +227,12 @@ assert_eq "${RC}" "0" "controller env-from-container dry rc"
 assert_contains 'controller.env' "${OUT}" "controller env-from-container path"
 assert_not_contains 'A=1' "${OUT}" "controller env-from-container no values"
 
+# 7.7 logs panic but healthz/agt OK: warn, do not roll back
+run_case log_panic controller --yes --controller-image example/controller:new --env-file "${ENV_FILE}" --backup-dir "${TMP}/b77" --state-file "${TMP}/b77/state.json" --timeout 4
+assert_eq "${RC}" "0" "controller log-panic rc"
+assert_contains 'logs contain panic|fatal' "${OUT}" "controller log-panic warning"
+assert_contains '"status":"done"' "${TMP}/b77/state.json" "controller log-panic state"
+
 # 8. status --json
 run_case ok status --state-file "${TMP}/b5/state.json" --json
 assert_eq "${RC}" "0" "status json rc"
@@ -236,4 +246,4 @@ first="$(head -c 1 "${TMP}/json.out")"
 assert_eq "${first}" "{" "preflight json purity first char"
 assert_not_contains 'No such file' "${TMP}/json.err" "preflight json no log-dir noise"
 
-echo "PASS test-upgrade-cli (14 scenarios)"
+echo "PASS test-upgrade-cli (15 scenarios)"
