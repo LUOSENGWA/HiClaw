@@ -45,6 +45,8 @@ case "$1" in
             *Entrypoint*) echo '["/entrypoint.sh"]' ;;
             *NetworkMode*) echo "agentteams-net" ;;
             *RestartPolicy.Name*) echo "unless-stopped" ;;
+            *"len .Config.Env"*) echo 2 ;;
+            *Config.Env*) printf 'A=1\nB=2\n' ;;
             *Config.Image*) echo "example/controller:old" ;;
             *State.Running*) echo "true" ;;
             *RepoDigests*) echo "example/controller@sha256:old" ;;
@@ -203,6 +205,24 @@ if ! grep -qE '"status":"(rolled_back|rollback_failed)"' "${TMP}/b7/state.json";
     exit 1
 fi
 
+# 7.5 env drift: controller must fail closed without --env-from-container
+cat > "${TMP}/drift.env" <<'EOF'
+AGENTTEAMS_DATA_DIR=agentteams-data
+AGENTTEAMS_VERSION=v1.2.5
+AGENTTEAMS_EXTRA=1
+EOF
+run_case ok controller --yes --controller-image example/controller:new --env-file "${TMP}/drift.env" --backup-dir "${TMP}/b75" --timeout 2
+assert_eq "${RC}" "3" "controller env drift rc"
+assert_contains 'env drift' "${OUT}" "controller env drift message"
+assert_not_contains '^run ' "${REC}" "controller env drift no run"
+assert_not_contains '^rename ' "${REC}" "controller env drift no rename"
+
+# 7.6 --env-from-container dry-run: print controller.env, no values
+run_case ok controller --dry-run --env-from-container --controller-image example/controller:new --env-file "${TMP}/drift.env" --backup-dir "${TMP}/b76" --timeout 2
+assert_eq "${RC}" "0" "controller env-from-container dry rc"
+assert_contains 'controller.env' "${OUT}" "controller env-from-container path"
+assert_not_contains 'A=1' "${OUT}" "controller env-from-container no values"
+
 # 8. status --json
 run_case ok status --state-file "${TMP}/b5/state.json" --json
 assert_eq "${RC}" "0" "status json rc"
@@ -216,4 +236,4 @@ first="$(head -c 1 "${TMP}/json.out")"
 assert_eq "${first}" "{" "preflight json purity first char"
 assert_not_contains 'No such file' "${TMP}/json.err" "preflight json no log-dir noise"
 
-echo "PASS test-upgrade-cli (12 scenarios)"
+echo "PASS test-upgrade-cli (14 scenarios)"

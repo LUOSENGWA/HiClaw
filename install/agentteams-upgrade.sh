@@ -39,6 +39,10 @@ LOG_FILE=""
 DOCKER_CMD=""
 CONTROLLER_NAME="agentteams-controller"
 OLD_NAME=""
+ENV_FROM_CONTAINER=0
+ALLOW_ENV_DRIFT=0
+EFFECTIVE_ENV_FILE=""
+ENV_SOURCE="file"
 
 WARN_LIST=()
 ERR_LIST=()
@@ -105,6 +109,8 @@ Commands:
 
 Options:
   --env-file PATH          default: \${AGENTTEAMS_ENV_FILE:-\$HOME/agentteams-manager.env}
+  --env-from-container     use the running controller's env for the new container (recommended)
+  --allow-env-drift        proceed even if the env-file key set differs from the container
   --backup-dir DIR         default: \$HOME/agentteams-upgrade-backups/<UTC>
   --state-file PATH        default: <backup-dir>/state.json
   --target VERSION         target version (recorded in the plan/state)
@@ -228,10 +234,11 @@ write_state() {
         echo "UPDATED_AT=${now}"
         echo "BACKUP_DIR=${BACKUP_DIR}"
         echo "CONTROLLER_IMAGE=${CONTROLLER_IMAGE}"
+        echo "ENV_SOURCE=${ENV_SOURCE}"
     } > "${STATE_FILE%.json}.env"
-    printf '{"step":"%s","status":"%s","updated_at":"%s","backup_dir":"%s","controller_image":"%s"}\n' \
+    printf '{"step":"%s","status":"%s","updated_at":"%s","backup_dir":"%s","controller_image":"%s","env_source":"%s"}\n' \
         "${step}" "${status}" "${now}" \
-        "$(json_escape "${BACKUP_DIR}")" "$(json_escape "${CONTROLLER_IMAGE}")" \
+        "$(json_escape "${BACKUP_DIR}")" "$(json_escape "${CONTROLLER_IMAGE}")" "$(json_escape "${ENV_SOURCE}")" \
         > "${STATE_FILE}"
 }
 
@@ -314,14 +321,15 @@ cmd_preflight() {
         err "controller container not found: ${CONTROLLER_NAME}"
     fi
 
-    local old_env_count=0 file_env_count=0
+    local old_env_count=0 file_env_count=0 env_drift="false"
     if [ "${ctrl_exists}" = "true" ]; then
         old_env_count="$(inspect_fmt '{{len .Config.Env}}' "${CONTROLLER_NAME}")"
         case "${old_env_count}" in ''|*[!0-9]*) old_env_count=0 ;; esac
         file_env_count="$(grep -c '^[A-Za-z_][A-Za-z0-9_]*=' "${ENV_FILE}" 2>/dev/null || true)"
         case "${file_env_count}" in ''|*[!0-9]*) file_env_count=0 ;; esac
         if [ "${old_env_count}" -gt 0 ] && [ "${file_env_count}" -gt 0 ] && [ "${old_env_count}" -ne "${file_env_count}" ]; then
-            warn "env count differs: container=${old_env_count} env-file=${file_env_count}; verify --env-file"
+            env_drift="true"
+            warn "env drift: container=${old_env_count} env-file=${file_env_count}; use --env-from-container (recommended) or --allow-env-drift"
         fi
     fi
 
@@ -439,10 +447,10 @@ cmd_preflight() {
         local warnings_json errors_json
         if [ "${#WARN_LIST[@]}" -gt 0 ]; then warnings_json="$(json_list "${WARN_LIST[@]}")"; else warnings_json="[]"; fi
         if [ "${#ERR_LIST[@]}" -gt 0 ]; then errors_json="$(json_list "${ERR_LIST[@]}")"; else errors_json="[]"; fi
-        printf '{"ok":%s,"env_file":"%s","data_dir":"%s","data_dir_source":"%s","controller":{"name":"%s","exists":%s,"image":"%s","ports":%s,"mounts":%s,"entrypoint":"%s","network":"%s","restart":"%s","running":%s},"data_model":"%s","mounts":%s,"s3":{"backend":"%s","configured":%s,"bucket":"%s","data_minio_mount":%s},"docker":{"cmd":"%s"},"disk_free_bytes":%s,"kine_bytes":%s,"workers":{"total":%s,"soul_set":%s,"soul_missing":%s},"teams":%s,"warnings":%s,"errors":%s}\n' \
+        printf '{"ok":%s,"env_file":"%s","data_dir":"%s","data_dir_source":"%s","controller":{"name":"%s","exists":%s,"image":"%s","ports":%s,"mounts":%s,"entrypoint":"%s","network":"%s","restart":"%s","running":%s},"env_drift":%s,"data_model":"%s","mounts":%s,"s3":{"backend":"%s","configured":%s,"bucket":"%s","data_minio_mount":%s},"docker":{"cmd":"%s"},"disk_free_bytes":%s,"kine_bytes":%s,"workers":{"total":%s,"soul_set":%s,"soul_missing":%s},"teams":%s,"warnings":%s,"errors":%s}\n' \
             "${ok}" "$(json_escape "${ENV_FILE}")" "$(json_escape "${data_dir}")" "${data_source}" \
             "${CONTROLLER_NAME}" "${ctrl_exists}" "$(json_escape "${image}")" "${ports}" "${mounts}" \
-            "$(json_escape "${entry}")" "$(json_escape "${net}")" "$(json_escape "${restart}")" "${running}" \
+            "$(json_escape "${entry}")" "$(json_escape "${net}")" "$(json_escape "${restart}")" "${running}" "${env_drift}" \
             "${data_model}" "${mounts_json}" "${s3_backend}" "${s3_configured}" "$(json_escape "${s3_bucket}")" "$([ "${has_data_minio}" = "1" ] && echo true || echo false)" \
             "${DOCKER_CMD}" "${free_bytes}" "${kine_bytes}" "${workers}" "${soul_set}" "${soul_missing}" "${teams}" \
             "${warnings_json}" "${errors_json}"
@@ -500,6 +508,7 @@ cmd_backup() {
     if [ "${DRY_RUN}" = "1" ]; then
         log "[dry-run] mkdir -p ${BACKUP_DIR} && chmod 700 ${BACKUP_DIR}"
         log "[dry-run] cp ${ENV_FILE} ${BACKUP_DIR}/agentteams-manager.env"
+        log "[dry-run] export container env -> ${BACKUP_DIR}/controller.env (0600)"
         log "[dry-run] ${DOCKER_CMD} stop ${CONTROLLER_NAME}"
         log "[dry-run] ${DOCKER_CMD} cp ${CONTROLLER_NAME}:/data/agentteams-controller/. ${BACKUP_DIR}/kine/"
         log "[dry-run] record image IDs/digests to ${BACKUP_DIR}/images.txt"
@@ -511,6 +520,12 @@ cmd_backup() {
 
     mkdir -p "${BACKUP_DIR}" && chmod 700 "${BACKUP_DIR}" || die "cannot create ${BACKUP_DIR}" "${EXIT_GATE}"
     cp "${ENV_FILE}" "${BACKUP_DIR}/agentteams-manager.env" 2>/dev/null || warn "could not copy env file"
+    umask 077
+    if "${DOCKER_CMD}" inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${CONTROLLER_NAME}" > "${BACKUP_DIR}/controller.env" 2>/dev/null; then
+        chmod 600 "${BACKUP_DIR}/controller.env"
+    else
+        warn "could not export the controller env to ${BACKUP_DIR}/controller.env"
+    fi
 
     local was_running=0
     if container_running; then
@@ -548,7 +563,9 @@ build_run_args() {
     restart="$(inspect_fmt '{{.HostConfig.RestartPolicy.Name}}' "${CONTROLLER_NAME}")"
     [ -n "${net}" ] && RUN_ARGS+=(--network "${net}")
     [ -n "${restart}" ] && RUN_ARGS+=(--restart "${restart}")
-    [ -f "${ENV_FILE}" ] && RUN_ARGS+=(--env-file "${ENV_FILE}")
+    if [ -n "${EFFECTIVE_ENV_FILE}" ] && { [ -f "${EFFECTIVE_ENV_FILE}" ] || [ "${ENV_FROM_CONTAINER}" = "1" ]; }; then
+        RUN_ARGS+=(--env-file "${EFFECTIVE_ENV_FILE}")
+    fi
 
     local p hostip hostport
     while read -r p hostip hostport; do
@@ -616,7 +633,14 @@ cmd_controller() {
     resolve_paths
 
     [ -n "${CONTROLLER_IMAGE}" ] || die "--controller-image is required" "${EXIT_USAGE}"
-    [ -f "${ENV_FILE}" ] || die "env file not found: ${ENV_FILE}" "${EXIT_GATE}"
+    if [ "${ENV_FROM_CONTAINER}" = "1" ]; then
+        EFFECTIVE_ENV_FILE="${BACKUP_DIR}/controller.env"
+        ENV_SOURCE="container"
+    else
+        EFFECTIVE_ENV_FILE="${ENV_FILE}"
+        ENV_SOURCE="file"
+        [ -f "${ENV_FILE}" ] || die "env file not found: ${ENV_FILE}" "${EXIT_GATE}"
+    fi
     container_exists "${CONTROLLER_NAME}" || die "controller container not found: ${CONTROLLER_NAME}" "${EXIT_GATE}"
 
     local old_image ports mounts
@@ -630,6 +654,27 @@ cmd_controller() {
     fi
     if [ "${mounts}" -eq 0 ]; then
         die "unsupported controller shape: no mounts; run the controller step manually" "${EXIT_GATE}"
+    fi
+
+    if [ "${ENV_FROM_CONTAINER}" = "1" ]; then
+        if [ "${DRY_RUN}" = "1" ]; then
+            log "[dry-run] export container env -> ${EFFECTIVE_ENV_FILE} (0600)"
+        else
+            mkdir -p "${BACKUP_DIR}" && chmod 700 "${BACKUP_DIR}" || die "cannot create ${BACKUP_DIR}" "${EXIT_GATE}"
+            umask 077
+            "${DOCKER_CMD}" inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${CONTROLLER_NAME}" > "${EFFECTIVE_ENV_FILE}" 2>/dev/null \
+                || die "cannot export the controller env" "${EXIT_GATE}"
+            chmod 600 "${EFFECTIVE_ENV_FILE}"
+        fi
+    elif [ "${ALLOW_ENV_DRIFT}" != "1" ]; then
+        local ck fk
+        ck="$(inspect_fmt '{{len .Config.Env}}' "${CONTROLLER_NAME}")"
+        case "${ck}" in ''|*[!0-9]*) ck=0 ;; esac
+        fk="$(grep -c '^[A-Za-z_][A-Za-z0-9_]*=' "${ENV_FILE}" 2>/dev/null || true)"
+        case "${fk}" in ''|*[!0-9]*) fk=0 ;; esac
+        if [ "${ck}" -gt 0 ] && [ "${fk}" -gt 0 ] && [ "${ck}" -ne "${fk}" ]; then
+            die "env drift: container=${ck} env-file=${fk}; use --env-from-container (recommended) or --allow-env-drift" "${EXIT_GATE}"
+        fi
     fi
 
     build_run_args
@@ -690,6 +735,8 @@ COMMAND="${1:-help}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --env-file) ENV_FILE="$2"; shift 2 ;;
+        --env-from-container) ENV_FROM_CONTAINER=1; shift ;;
+        --allow-env-drift) ALLOW_ENV_DRIFT=1; shift ;;
         --backup-dir) BACKUP_DIR="$2"; shift 2 ;;
         --state-file) STATE_FILE="$2"; shift 2 ;;
         --target) TARGET="$2"; shift 2 ;;
