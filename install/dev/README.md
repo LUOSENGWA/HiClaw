@@ -37,6 +37,6 @@ Then run the upgrade script with `--controller-image <tag>` (and `--higress-back
 
 - **Pi: no build.** The Pi is a deployment/test node; build off-Pi.
 - The QwenPaw container used for development has no Docker; run this on a host with Docker.
-- `pi-jt-s3` is a branch image with external S3 support; `main` may not include #1387. Use `--ref` to point at a ref that contains the required backend.
+- `main` includes #1387 (merge `e2d62b0e`); use `--ref origin/main`. The Pi image `pi-jt-s3` already contains the same external-S3 feature; a fresh `origin/main` build is optional for final verification.
 - Runtime version upgrades are an image field / online upgrade, not an AgentTeams build.
 - Manager/worker/dashboard are separate images; build only when their code changes.
