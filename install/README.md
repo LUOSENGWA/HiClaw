@@ -135,6 +135,7 @@ big-bang in-place flow of `agentteams-install.sh`.
 ```
 
 No remote mount is required: Docker volumes work out of the box. Bind and remote mounts are detected and preserved as-is; remote filesystems are reported as warnings, not failures.
+The preflight also detects the storage backend (embedded MinIO vs external S3/RustFS) from the endpoint, bucket and `/data/minio` mount, and warns if a storage migration window looks mixed. Storage migration itself is a separate runbook; do not combine it with a controller upgrade.
 
 > **Gateway note:** if the controller embeds the Higress gateway, a controller upgrade can leave `healthz` green while the data plane is down (Wasm plugin version mismatch). Verify `http://127.0.0.1:8080/v1/models` after the controller step; plugin files are container-layer and may need a backfill after each rebuild.
 

@@ -129,6 +129,7 @@ assert_eq "${RC}" "0" "preflight happy rc"
 assert_contains '"ok":true' "${OUT}" "preflight happy ok"
 assert_contains '"ports":4' "${OUT}" "preflight happy ports"
 assert_contains '"mounts":4' "${OUT}" "preflight happy mounts"
+assert_contains '"backend":"unknown"' "${OUT}" "preflight happy storage backend"
 
 # 2. missing env
 run_case ok preflight --env-file "${TMP}/missing.env" --backup-dir "${TMP}/b2" --json
@@ -142,6 +143,26 @@ EOF
 run_case ok preflight --env-file "${TMP}/mismatch.env" --backup-dir "${TMP}/b3" --json
 assert_eq "${RC}" "3" "preflight mismatch rc"
 assert_contains 'mismatch' "${OUT}" "preflight mismatch message"
+
+# 3.5 external S3 / RustFS backend
+cat > "${TMP}/external.env" <<'EOF'
+AGENTTEAMS_DATA_DIR=agentteams-data
+AGENTTEAMS_FS_BUCKET=agentteams-storage
+AGENTTEAMS_FS_ENDPOINT=https://s3.example.com
+EOF
+run_case ok preflight --env-file "${TMP}/external.env" --backup-dir "${TMP}/b3e" --json
+assert_eq "${RC}" "0" "preflight external rc"
+assert_contains '"backend":"external-s3"' "${OUT}" "preflight external backend"
+
+# 3.6 embedded MinIO backend
+cat > "${TMP}/embedded.env" <<'EOF'
+AGENTTEAMS_DATA_DIR=agentteams-data
+AGENTTEAMS_FS_BUCKET=agentteams-storage
+AGENTTEAMS_FS_ENDPOINT=http://agentteams-controller:9000
+EOF
+run_case ok preflight --env-file "${TMP}/embedded.env" --backup-dir "${TMP}/b3i" --json
+assert_eq "${RC}" "0" "preflight embedded rc"
+assert_contains '"backend":"embedded-minio"' "${OUT}" "preflight embedded backend"
 
 # 4. backup dry-run: no stop/cp
 run_case ok backup --dry-run --env-file "${ENV_FILE}" --backup-dir "${TMP}/b4"
@@ -178,4 +199,11 @@ run_case ok status --state-file "${TMP}/b5/state.json" --json
 assert_eq "${RC}" "0" "status json rc"
 assert_contains '"step"' "${OUT}" "status json step"
 
-echo "PASS test-upgrade-cli (8 scenarios)"
+# 9. --json purity: stdout is pure JSON; warnings go to stderr
+STUB_SCENARIO=ok bash "${UPGRADE}" preflight --env-file "${ENV_FILE}" --backup-dir "${TMP}/b9" --json > "${TMP}/json.out" 2> "${TMP}/json.err"
+RC=$?
+assert_eq "${RC}" "0" "preflight json purity rc"
+first="$(head -c 1 "${TMP}/json.out")"
+assert_eq "${first}" "{" "preflight json purity first char"
+
+echo "PASS test-upgrade-cli (11 scenarios)"

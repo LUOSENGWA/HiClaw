@@ -48,7 +48,11 @@ ERR_LIST=()
 # ---------------------------------------------------------------------------
 log() {
     local msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
-    printf '%s\n' "$msg"
+    if [ "${JSON}" = "1" ]; then
+        printf '%s\n' "$msg" >&2
+    else
+        printf '%s\n' "$msg"
+    fi
     if [ -n "${LOG_FILE}" ]; then
         printf '%s\n' "$msg" >> "${LOG_FILE}" 2>/dev/null || true
     fi
@@ -357,10 +361,29 @@ cmd_preflight() {
         data_model="volume"
     fi
 
-    local s3_configured="false" s3_bucket=""
+    local s3_configured="false" s3_bucket="" s3_endpoint="" s3_backend="unknown" has_data_minio=0
     s3_bucket="$(read_env AGENTTEAMS_FS_BUCKET)"
     [ -n "${s3_bucket}" ] || s3_bucket="$(read_env AGENTTEAMS_MINIO_BUCKET)"
     [ -n "${s3_bucket}" ] && s3_configured="true"
+    s3_endpoint="$(read_env AGENTTEAMS_FS_ENDPOINT)"
+    [ -n "${s3_endpoint}" ] || s3_endpoint="$(read_env AGENTTEAMS_MINIO_ENDPOINT)"
+    if mount_lines | cut -d'|' -f4 | grep -qx "/data/minio"; then
+        has_data_minio=1
+    fi
+    case "${s3_endpoint}" in
+        *"127.0.0.1:9000"*|*"localhost:9000"*|*"agentteams-controller:9000"*) s3_backend="embedded-minio" ;;
+        "")
+            if [ "${has_data_minio}" = "1" ]; then s3_backend="embedded-minio"; else s3_backend="unknown"; fi
+            ;;
+        *) s3_backend="external-s3" ;;
+    esac
+    if [ "${s3_backend}" = "external-s3" ] && [ "${has_data_minio}" = "1" ]; then
+        warn "external S3 endpoint but /data/minio mount is present; verify the storage migration state"
+    fi
+    if [ "${s3_backend}" = "embedded-minio" ] && [ "${has_data_minio}" = "0" ]; then
+        warn "embedded MinIO endpoint but no /data/minio mount; verify the data model"
+    fi
+    [ "${s3_backend}" = "unknown" ] && warn "storage backend unknown; set AGENTTEAMS_FS_ENDPOINT or check /data/minio"
     [ "${s3_configured}" = "true" ] || warn "S3 bucket not found in env; worker state may rely on local mounts"
 
     local free_kb=0 kine_kb=0 free_bytes=0 kine_bytes=0
@@ -408,11 +431,11 @@ cmd_preflight() {
         local warnings_json errors_json
         if [ "${#WARN_LIST[@]}" -gt 0 ]; then warnings_json="$(json_list "${WARN_LIST[@]}")"; else warnings_json="[]"; fi
         if [ "${#ERR_LIST[@]}" -gt 0 ]; then errors_json="$(json_list "${ERR_LIST[@]}")"; else errors_json="[]"; fi
-        printf '{"ok":%s,"env_file":"%s","data_dir":"%s","data_dir_source":"%s","controller":{"name":"%s","exists":%s,"image":"%s","ports":%s,"mounts":%s,"entrypoint":"%s","network":"%s","restart":"%s","running":%s},"data_model":"%s","mounts":%s,"s3":{"configured":%s,"bucket":"%s"},"docker":{"cmd":"%s"},"disk_free_bytes":%s,"kine_bytes":%s,"workers":{"total":%s,"soul_set":%s,"soul_missing":%s},"teams":%s,"warnings":%s,"errors":%s}\n' \
+        printf '{"ok":%s,"env_file":"%s","data_dir":"%s","data_dir_source":"%s","controller":{"name":"%s","exists":%s,"image":"%s","ports":%s,"mounts":%s,"entrypoint":"%s","network":"%s","restart":"%s","running":%s},"data_model":"%s","mounts":%s,"s3":{"backend":"%s","configured":%s,"bucket":"%s","data_minio_mount":%s},"docker":{"cmd":"%s"},"disk_free_bytes":%s,"kine_bytes":%s,"workers":{"total":%s,"soul_set":%s,"soul_missing":%s},"teams":%s,"warnings":%s,"errors":%s}\n' \
             "${ok}" "$(json_escape "${ENV_FILE}")" "$(json_escape "${data_dir}")" "${data_source}" \
             "${CONTROLLER_NAME}" "${ctrl_exists}" "$(json_escape "${image}")" "${ports}" "${mounts}" \
             "$(json_escape "${entry}")" "$(json_escape "${net}")" "$(json_escape "${restart}")" "${running}" \
-            "${data_model}" "${mounts_json}" "${s3_configured}" "$(json_escape "${s3_bucket}")" \
+            "${data_model}" "${mounts_json}" "${s3_backend}" "${s3_configured}" "$(json_escape "${s3_bucket}")" "$([ "${has_data_minio}" = "1" ] && echo true || echo false)" \
             "${DOCKER_CMD}" "${free_bytes}" "${kine_bytes}" "${workers}" "${soul_set}" "${soul_missing}" "${teams}" \
             "${warnings_json}" "${errors_json}"
     else
