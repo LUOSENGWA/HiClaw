@@ -60,26 +60,35 @@ case "$1" in
         case "$*" in
             *"printenv AGENTTEAMS_FS_ENDPOINT"*)
                 case "$*" in
-                    *"agentteams-manager"*)
-                        [ "${STUB_SCENARIO:-ok}" = "storage_split" ] && echo "http://agentteams-controller:9000" || echo "http://rustfs.example:9000"
+                    *"agentteams-manager"*) echo "http://agentteams-controller:9000" ;;
+                    *)
+                        [ "${STUB_SCENARIO:-ok}" = "storage_embedded" ] && echo "http://127.0.0.1:9000" || echo "http://rustfs.example:9000"
                         ;;
-                    *) echo "http://rustfs.example:9000" ;;
                 esac
                 ;;
             *"printenv AGENTTEAMS_STORAGE_PROVIDER"*)
                 case "$*" in
-                    *"agentteams-manager"*)
-                        [ "${STUB_SCENARIO:-ok}" = "storage_split" ] && echo "minio" || echo "s3"
-                        ;;
-                    *) echo "s3" ;;
+                    *"agentteams-manager"*) echo "minio" ;;
+                    *) [ "${STUB_SCENARIO:-ok}" = "storage_embedded" ] && echo "" || echo "s3" ;;
                 esac
                 ;;
-            *"printenv AGENTTEAMS_FS_BUCKET"*) echo "agentteams-storage" ;;
+            *"printenv AGENTTEAMS_FS_BUCKET"*)
+                case "$*" in
+                    *"agentteams-manager"*) echo "agentteams-storage" ;;
+                    *) [ "${STUB_SCENARIO:-ok}" = "storage_embedded" ] && echo "" || echo "agentteams-storage" ;;
+                esac
+                ;;
             *"8080/v1/models"*) [ "${STUB_SCENARIO:-ok}" = "gateway_down" ] && echo "000" || echo "200" ;;
             *healthz*) [ "${STUB_SCENARIO:-ok}" = "health_fail" ] && exit 1 || exit 0 ;;
-            *"agt get workers -o json"*) echo '{"workers":[{"name":"w1","soul":"full"}]}' ;;
-            *"agt get teams"*) echo "team-a" ;;
-            *"agt get workers"*) echo "worker-a" ;;
+            *"agt get workers -o json"*)
+                [ "${STUB_SCENARIO:-ok}" = "storage_embedded" ] && echo '{"workers":[]}' || echo '{"workers":[{"name":"w1","soul":"full"}]}'
+                ;;
+            *"agt get teams"*)
+                [ "${STUB_SCENARIO:-ok}" = "storage_embedded" ] && echo "No teams found." || echo "team-a"
+                ;;
+            *"agt get workers"*)
+                [ "${STUB_SCENARIO:-ok}" = "storage_embedded" ] && echo "No workers found." || echo "worker-a"
+                ;;
             *du*) echo "1024" ;;
             *) exit 0 ;;
         esac
@@ -92,7 +101,7 @@ case "$1" in
         ;;
     ps)
         echo "agentteams-controller"
-        [ "${STUB_SCENARIO:-ok}" = "storage_split" ] && echo "agentteams-manager"
+        case "${STUB_SCENARIO:-ok}" in storage_split|storage_embedded) echo "agentteams-manager" ;; esac
         ;;
     *)
         exit 0
@@ -213,6 +222,13 @@ run_case storage_split preflight --env-file "${TMP}/external.env" --backup-dir "
 assert_eq "${RC}" "0" "preflight storage split allow rc"
 assert_contains '"consistent":false' "${OUT}" "preflight storage split allow flag"
 assert_contains 'continuing because --allow-storage-split' "${OUT}" "preflight storage split allow message"
+# 3.11 fresh embedded MinIO via two endpoint aliases + empty cluster
+run_case storage_embedded preflight --env-file "${TMP}/embedded.env" --backup-dir "${TMP}/b3s4" --json
+assert_eq "${RC}" "0" "preflight embedded aliases rc"
+assert_contains '"consistent":true' "${OUT}" "preflight embedded aliases flag"
+assert_contains '"teams":0' "${OUT}" "preflight empty teams count"
+assert_contains '"workers":{"total":0' "${OUT}" "preflight empty workers count"
+assert_contains 'returned no rows (fresh install?)' "${OUT}" "preflight empty cluster warning"
 
 # 4. backup dry-run: no stop/cp
 run_case ok backup --dry-run --env-file "${ENV_FILE}" --backup-dir "${TMP}/b4"
@@ -304,4 +320,4 @@ first="$(head -c 1 "${TMP}/json.out")"
 assert_eq "${first}" "{" "preflight json purity first char"
 assert_not_contains 'No such file' "${TMP}/json.err" "preflight json no log-dir noise"
 
-echo "PASS test-upgrade-cli (21 scenarios)"
+echo "PASS test-upgrade-cli (22 scenarios)"

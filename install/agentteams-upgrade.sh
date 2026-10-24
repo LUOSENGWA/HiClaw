@@ -466,7 +466,21 @@ cmd_preflight() {
         ep="${ep%/}"
         comp="{\"name\":\"$(json_escape "${c}")\",\"endpoint\":\"$(json_escape "${ep}")\",\"provider\":\"$(json_escape "${provider}")\",\"bucket\":\"$(json_escape "${bucket}")\"}"
         storage_components="${storage_components}${storage_components:+,}${comp}"
+        # The controller may expose the embedded MinIO as 127.0.0.1:9000
+        # while the Manager reaches the same engine as agentteams-controller:9000.
+        # Normalize only the embedded aliases; an explicit external provider
+        # (s3/external-s3) is never folded into embedded-minio.
         ckey="${ep}|${provider}"
+        case "${provider}" in
+            s3|external-s3) ;;
+            *)
+                case "${ep}" in
+                    *"127.0.0.1:9000"*|*"localhost:9000"*|*"agentteams-controller:9000"*)
+                        ckey="embedded-minio"
+                        ;;
+                esac
+                ;;
+        esac
         if [ -z "${storage_ref}" ]; then
             storage_ref="${ckey}"
         elif [ "${ckey}" != "${storage_ref}" ]; then
@@ -530,14 +544,33 @@ cmd_preflight() {
         warn "controller is not running; kine size and agt checks are skipped"
     fi
 
-    local teams=0 workers=0
+    local teams=0 workers=0 teams_out="" workers_out=""
     if [ "${running}" = "true" ]; then
-        teams="$("${DOCKER_CMD}" exec "${CONTROLLER_NAME}" agt get teams 2>/dev/null | wc -l | tr -d ' ' || true)"
-        workers="$("${DOCKER_CMD}" exec "${CONTROLLER_NAME}" agt get workers 2>/dev/null | wc -l | tr -d ' ' || true)"
+        if ! teams_out="$("${DOCKER_CMD}" exec "${CONTROLLER_NAME}" agt get teams 2>/dev/null)"; then
+            err "agt get teams failed"
+            teams_out=""
+        fi
+        if ! workers_out="$("${DOCKER_CMD}" exec "${CONTROLLER_NAME}" agt get workers 2>/dev/null)"; then
+            err "agt get workers failed"
+            workers_out=""
+        fi
+        # A fresh install has no teams/workers yet; the CLI prints a
+        # human-readable sentinel instead of an empty list. Count real rows,
+        # and treat zero as a valid fresh-install state (warn, not fail).
+        if [ -z "${teams_out}" ] || printf '%s\n' "${teams_out}" | grep -qx 'No teams found\.'; then
+            teams=0
+        else
+            teams="$(printf '%s\n' "${teams_out}" | wc -l | tr -d ' ')"
+        fi
+        if [ -z "${workers_out}" ] || printf '%s\n' "${workers_out}" | grep -qx 'No workers found\.'; then
+            workers=0
+        else
+            workers="$(printf '%s\n' "${workers_out}" | wc -l | tr -d ' ')"
+        fi
         case "${teams}" in ''|*[!0-9]*) teams=0 ;; esac
         case "${workers}" in ''|*[!0-9]*) workers=0 ;; esac
-        [ "${teams}" -gt 0 ] || err "agt get teams returned no rows"
-        [ "${workers}" -gt 0 ] || err "agt get workers returned no rows"
+        [ "${teams}" -gt 0 ] || warn "agt get teams returned no rows (fresh install?)"
+        [ "${workers}" -gt 0 ] || warn "agt get workers returned no rows (fresh install?)"
     fi
 
     local soul_set=-1 soul_missing=-1 workers_json=""
