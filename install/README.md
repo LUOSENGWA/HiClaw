@@ -135,7 +135,7 @@ big-bang in-place flow of `agentteams-install.sh`.
 ```
 
 No remote mount is required: Docker volumes work out of the box. Bind and remote mounts are detected and preserved as-is; remote filesystems are reported as warnings, not failures.
-The preflight also detects the storage backend (embedded MinIO vs external S3/RustFS) from the endpoint, bucket and `/data/minio` mount, and warns if a storage migration window looks mixed. Storage migration itself is a separate runbook; do not combine it with a controller upgrade.
+The preflight also detects the storage backend (embedded MinIO vs external S3/RustFS) from the endpoint, bucket and `/data/minio` mount, and compares the **live** `AGENTTEAMS_FS_ENDPOINT` / `AGENTTEAMS_STORAGE_PROVIDER` / bucket reported by the controller, Manager and Workers. A split — for example, the controller on RustFS while a Manager or Worker still points at MinIO — fails closed with `storage split-brain`; `--allow-storage-split` is an explicit migration-window override, not a normal upgrade flag. Storage migration itself is a separate runbook; do not combine it with a controller upgrade.
 
 > **Gateway note:** if the controller embeds the Higress gateway, a controller upgrade can leave `healthz` green while the data plane is down (Wasm plugin version mismatch). Verify `http://127.0.0.1:8080/v1/models` after the controller step; plugin files are container-layer and may need a backfill after each rebuild.
 

@@ -43,6 +43,7 @@ ENV_FROM_CONTAINER=0
 ALLOW_ENV_DRIFT=0
 KEEP_FAILED=0
 ALLOW_GATEWAY_DOWN=0
+ALLOW_STORAGE_SPLIT=0
 HIGRESS_BACKFILL_DIR=""
 EFFECTIVE_ENV_FILE=""
 ENV_SOURCE="file"
@@ -117,6 +118,8 @@ Options:
   --allow-env-drift        proceed even if the env-file key set differs from the container
   --keep-failed            keep the failed new controller (stopped) for log inspection
   --allow-gateway-down     continue even if 8080/v1/models is 000 (default: fail/rollback)
+  --allow-storage-split    continue even if live components use different storage endpoints/providers
+                           (migration-window override; default: fail closed)
   --higress-backfill-dir DIR  copy plugin files into the new controller and restart it (Wasm version backfill)
   --backup-dir DIR         default: \$HOME/agentteams-upgrade-backups/<UTC>
   --state-file PATH        default: <backup-dir>/state.json
@@ -447,6 +450,50 @@ cmd_preflight() {
     [ "${s3_configured}" = "true" ] || warn "S3 endpoint/bucket not found in env; worker state may rely on local mounts"
     [ -z "${s3_bucket}" ] && [ -n "${s3_endpoint}" ] && warn "S3 bucket not in env; verify AGENTTEAMS_FS_BUCKET (default may be agentteams-storage)"
 
+    # The env file describes the intended backend; it cannot prove what the
+    # running components actually use. Compare the live endpoint/provider/
+    # bucket across the controller, Manager and Workers. A split here means
+    # one component still writes to the old engine, which is exactly the
+    # state an upgrade/migration must not silently accept.
+    local storage_components="" storage_consistent="true" storage_ref="" storage_bucket_ref="" c ep provider bucket comp ckey
+    while IFS= read -r c; do
+        [ -n "${c}" ] || continue
+        case "${c}" in rustfs*|minio*|*minio*|agentteams-dashboard|agentteams-docker-proxy|*dashboard*|*proxy*) continue ;; esac
+        ep="$("${DOCKER_CMD}" exec "${c}" printenv AGENTTEAMS_FS_ENDPOINT 2>/dev/null || true)"
+        [ -n "${ep}" ] || continue
+        provider="$("${DOCKER_CMD}" exec "${c}" printenv AGENTTEAMS_STORAGE_PROVIDER 2>/dev/null || true)"
+        bucket="$("${DOCKER_CMD}" exec "${c}" printenv AGENTTEAMS_FS_BUCKET 2>/dev/null || true)"
+        ep="${ep%/}"
+        comp="{\"name\":\"$(json_escape "${c}")\",\"endpoint\":\"$(json_escape "${ep}")\",\"provider\":\"$(json_escape "${provider}")\",\"bucket\":\"$(json_escape "${bucket}")\"}"
+        storage_components="${storage_components}${storage_components:+,}${comp}"
+        ckey="${ep}|${provider}"
+        if [ -z "${storage_ref}" ]; then
+            storage_ref="${ckey}"
+        elif [ "${ckey}" != "${storage_ref}" ]; then
+            storage_consistent="false"
+        fi
+        # An empty bucket means the component did not expose the env name;
+        # compare only when both sides actually name a bucket.
+        if [ -n "${bucket}" ]; then
+            if [ -z "${storage_bucket_ref}" ]; then
+                storage_bucket_ref="${bucket}"
+            elif [ "${bucket}" != "${storage_bucket_ref}" ]; then
+                storage_consistent="false"
+            fi
+        fi
+    done < <("${DOCKER_CMD}" ps --format '{{.Names}}' 2>/dev/null || true)
+    storage_components="[${storage_components}]"
+    if [ "${storage_components}" = "[]" ]; then
+        warn "no live component storage env found; storage consistency not verified"
+    fi
+    if [ "${storage_consistent}" = "false" ]; then
+        if [ "${ALLOW_STORAGE_SPLIT}" = "1" ]; then
+            warn "storage split-brain: live components use different endpoints/providers; continuing because --allow-storage-split"
+        else
+            err "storage split-brain: live components use different storage endpoints/providers; complete the migration or pass --allow-storage-split"
+        fi
+    fi
+
     local gw_code gw_ok="false"
     gw_code="$(gateway_http)"
     if [ "${gw_code}" != "000" ]; then
@@ -509,16 +556,18 @@ cmd_preflight() {
         local warnings_json errors_json
         if [ "${#WARN_LIST[@]}" -gt 0 ]; then warnings_json="$(json_list "${WARN_LIST[@]}")"; else warnings_json="[]"; fi
         if [ "${#ERR_LIST[@]}" -gt 0 ]; then errors_json="$(json_list "${ERR_LIST[@]}")"; else errors_json="[]"; fi
-        printf '{"ok":%s,"env_file":"%s","data_dir":"%s","data_dir_source":"%s","controller":{"name":"%s","exists":%s,"image":"%s","ports":%s,"mounts":%s,"entrypoint":"%s","network":"%s","restart":"%s","running":%s},"env_drift":%s,"data_model":"%s","mounts":%s,"s3":{"backend":"%s","configured":%s,"bucket":"%s","data_minio_mount":%s},"gateway":{"http_code":"%s","ok":%s,"plugin_missing":%s},"docker":{"cmd":"%s"},"disk_free_bytes":%s,"kine_bytes":%s,"workers":{"total":%s,"soul_set":%s,"soul_missing":%s},"teams":%s,"warnings":%s,"errors":%s}\n' \
+        printf '{"ok":%s,"env_file":"%s","data_dir":"%s","data_dir_source":"%s","controller":{"name":"%s","exists":%s,"image":"%s","ports":%s,"mounts":%s,"entrypoint":"%s","network":"%s","restart":"%s","running":%s},"env_drift":%s,"data_model":"%s","mounts":%s,"s3":{"backend":"%s","configured":%s,"bucket":"%s","data_minio_mount":%s,"components":%s,"consistent":%s},"gateway":{"http_code":"%s","ok":%s,"plugin_missing":%s},"docker":{"cmd":"%s"},"disk_free_bytes":%s,"kine_bytes":%s,"workers":{"total":%s,"soul_set":%s,"soul_missing":%s},"teams":%s,"warnings":%s,"errors":%s}\n' \
             "${ok}" "$(json_escape "${ENV_FILE}")" "$(json_escape "${data_dir}")" "${data_source}" \
             "${CONTROLLER_NAME}" "${ctrl_exists}" "$(json_escape "${image}")" "${ports}" "${mounts}" \
             "$(json_escape "${entry}")" "$(json_escape "${net}")" "$(json_escape "${restart}")" "${running}" "${env_drift}" \
             "${data_model}" "${mounts_json}" "${s3_backend}" "${s3_configured}" "$(json_escape "${s3_bucket}")" "$([ "${has_data_minio}" = "1" ] && echo true || echo false)" \
+            "${storage_components}" "${storage_consistent}" \
             "${gw_code}" "${gw_ok}" "${plugin_missing}" "${DOCKER_CMD}" "${free_bytes}" "${kine_bytes}" "${workers}" "${soul_set}" "${soul_missing}" "${teams}" \
             "${warnings_json}" "${errors_json}"
     else
         log "preflight: env=${ENV_FILE} data_dir=${data_dir} (${data_source})"
         log "controller: exists=${ctrl_exists} running=${running} image=${image} ports=${ports} mounts=${mounts}"
+        log "storage: backend=${s3_backend} consistent=${storage_consistent} components=${storage_components}"
         log "docker: ${DOCKER_CMD}; teams=${teams} workers=${workers}"
     fi
 
@@ -877,6 +926,7 @@ while [ $# -gt 0 ]; do
         --allow-env-drift) ALLOW_ENV_DRIFT=1; shift ;;
         --keep-failed) KEEP_FAILED=1; shift ;;
         --allow-gateway-down) ALLOW_GATEWAY_DOWN=1; shift ;;
+        --allow-storage-split) ALLOW_STORAGE_SPLIT=1; shift ;;
         --higress-backfill-dir) HIGRESS_BACKFILL_DIR="$2"; shift 2 ;;
         --backup-dir) BACKUP_DIR="$2"; shift 2 ;;
         --state-file) STATE_FILE="$2"; shift 2 ;;

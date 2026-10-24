@@ -58,6 +58,23 @@ case "$1" in
         ;;
     exec)
         case "$*" in
+            *"printenv AGENTTEAMS_FS_ENDPOINT"*)
+                case "$*" in
+                    *"agentteams-manager"*)
+                        [ "${STUB_SCENARIO:-ok}" = "storage_split" ] && echo "http://agentteams-controller:9000" || echo "http://rustfs.example:9000"
+                        ;;
+                    *) echo "http://rustfs.example:9000" ;;
+                esac
+                ;;
+            *"printenv AGENTTEAMS_STORAGE_PROVIDER"*)
+                case "$*" in
+                    *"agentteams-manager"*)
+                        [ "${STUB_SCENARIO:-ok}" = "storage_split" ] && echo "minio" || echo "s3"
+                        ;;
+                    *) echo "s3" ;;
+                esac
+                ;;
+            *"printenv AGENTTEAMS_FS_BUCKET"*) echo "agentteams-storage" ;;
             *"8080/v1/models"*) [ "${STUB_SCENARIO:-ok}" = "gateway_down" ] && echo "000" || echo "200" ;;
             *healthz*) [ "${STUB_SCENARIO:-ok}" = "health_fail" ] && exit 1 || exit 0 ;;
             *"agt get workers -o json"*) echo '{"workers":[{"name":"w1","soul":"full"}]}' ;;
@@ -75,6 +92,7 @@ case "$1" in
         ;;
     ps)
         echo "agentteams-controller"
+        [ "${STUB_SCENARIO:-ok}" = "storage_split" ] && echo "agentteams-manager"
         ;;
     *)
         exit 0
@@ -178,6 +196,24 @@ run_case ok preflight --env-file "${TMP}/domain.env" --backup-dir "${TMP}/b3d" -
 assert_eq "${RC}" "0" "preflight domain rc"
 assert_contains '"backend":"external-s3"' "${OUT}" "preflight domain backend"
 
+# 3.8 live storage components are consistent (controller only in the stub)
+run_case ok preflight --env-file "${TMP}/external.env" --backup-dir "${TMP}/b3s1" --json
+assert_eq "${RC}" "0" "preflight storage consistent rc"
+assert_contains '"consistent":true' "${OUT}" "preflight storage consistent flag"
+assert_contains '"components":' "${OUT}" "preflight storage components array"
+
+# 3.9 live split-brain fails closed
+run_case storage_split preflight --env-file "${TMP}/external.env" --backup-dir "${TMP}/b3s2" --json
+assert_eq "${RC}" "3" "preflight storage split rc"
+assert_contains '"consistent":false' "${OUT}" "preflight storage split flag"
+assert_contains 'storage split-brain' "${OUT}" "preflight storage split message"
+
+# 3.10 explicit migration-window override
+run_case storage_split preflight --env-file "${TMP}/external.env" --backup-dir "${TMP}/b3s3" --allow-storage-split --json
+assert_eq "${RC}" "0" "preflight storage split allow rc"
+assert_contains '"consistent":false' "${OUT}" "preflight storage split allow flag"
+assert_contains 'continuing because --allow-storage-split' "${OUT}" "preflight storage split allow message"
+
 # 4. backup dry-run: no stop/cp
 run_case ok backup --dry-run --env-file "${ENV_FILE}" --backup-dir "${TMP}/b4"
 assert_eq "${RC}" "0" "backup dry rc"
@@ -268,4 +304,4 @@ first="$(head -c 1 "${TMP}/json.out")"
 assert_eq "${first}" "{" "preflight json purity first char"
 assert_not_contains 'No such file' "${TMP}/json.err" "preflight json no log-dir noise"
 
-echo "PASS test-upgrade-cli (18 scenarios)"
+echo "PASS test-upgrade-cli (21 scenarios)"
