@@ -33,6 +33,17 @@ cat agentteams-embedded_pr-1428-<sha>.tar | ssh swrp51@192.168.31.8 'docker load
 
 Then run the upgrade script with `--controller-image <tag>` (and `--higress-backfill-dir` if the gateway plugin set is missing).
 
+## Cross-platform builds need QEMU binfmt
+
+On an x86 host, `--platform linux/arm64` fails with `exec format error` until arm64 emulation is registered:
+
+```bash
+docker run --privileged --rm tonistiigi/binfmt --install arm64
+docker run --rm --platform linux/arm64 alpine uname -m   # aarch64
+```
+
+The build script checks this before the long build and prints the commands if it is missing.
+
 ## Constraints
 
 - **Pi: no build.** The Pi is a deployment/test node; build off-Pi.

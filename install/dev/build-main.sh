@@ -65,6 +65,24 @@ command -v make >/dev/null 2>&1 || { echo "ERROR: make not found" >&2; exit 3; }
 command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found (run this on a Docker host, not the Pi/container)" >&2; exit 3; }
 docker info >/dev/null 2>&1 || { echo "ERROR: docker daemon is not running" >&2; exit 3; }
 
+HOST_ARCH="$(uname -m)"
+HOST_PLATFORM=""
+case "$HOST_ARCH" in
+    x86_64|amd64) HOST_PLATFORM="linux/amd64" ;;
+    aarch64|arm64) HOST_PLATFORM="linux/arm64" ;;
+esac
+if [ -n "$HOST_PLATFORM" ] && [ "$PLATFORM" != "$HOST_PLATFORM" ]; then
+    echo "NOTE: cross-building $PLATFORM on $HOST_ARCH; checking QEMU binfmt..."
+    if ! docker run --rm --platform "$PLATFORM" alpine uname -m >/dev/null 2>&1; then
+        echo "ERROR: cannot run $PLATFORM binaries on this host (exec format error)." >&2
+        echo "Install QEMU binfmt:" >&2
+        echo "  docker run --privileged --rm tonistiigi/binfmt --install arm64" >&2
+        echo "Then verify:" >&2
+        echo "  docker run --rm --platform $PLATFORM alpine uname -m" >&2
+        exit 3
+    fi
+fi
+
 if ! git rev-parse --verify "$REF" >/dev/null 2>&1; then
     git fetch origin >/dev/null 2>&1 || true
 fi
