@@ -1473,3 +1473,21 @@ def test_pending_and_answer_endpoints(tmp_path):
             json={"request_id": "r1", "choice": "A"},
         )
         assert resp.status_code == 404
+
+
+def test_cleanup_maps_terminating_to_watchdog_lost(tmp_path, monkeypatch):
+    """#914: cleanup must report the watchdog-lost reason, not a crash."""
+    svc = DispatchService(dispatch_dir=tmp_path, watch_interval=0.05)
+    tid = "f" * 32
+    _write_task_file(tmp_path, {
+        "task_id": tid, "task": "t", "state": "running", "pid": 424242,
+        "started_epoch": time.time() - 300, "timeout": 600,
+        "terminating": True, "updated_at": "2026-01-01T00:00:00Z",
+        "origin": {"session_id": "s"}, "wake": {},
+    })
+    monkeypatch.setattr(svc, "_pid_alive", lambda pid: False)
+    result = svc.cleanup()
+    assert result["count"] == 1
+    task = json.loads((tmp_path / f"{tid}.json").read_text())
+    assert task["state"] == "stale"
+    assert task["death_reason"] == "timeout_killed_watchdog_lost"

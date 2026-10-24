@@ -1031,7 +1031,15 @@ class DispatchService:
             if (time.time() - updated_epoch) < STALE_FRESH_SECONDS:
                 continue
             if not self._pid_alive(task.get("pid")):
-                task = self._mark_stale(task)
+                # Same reason mapping as the reaper: a terminating task was
+                # killed by its watchdog, which never wrote the terminal
+                # state — that is not a crash (#914).
+                reason = (
+                    "timeout_killed_watchdog_lost"
+                    if task.get("terminating")
+                    else "crash_or_restart"
+                )
+                task = self._mark_stale(task, reason)
                 stale.append(str(task.get("task_id")))
         return {"stale": stale, "count": len(stale), "kill": bool(kill)}
 
