@@ -164,6 +164,15 @@ run_case ok preflight --env-file "${TMP}/embedded.env" --backup-dir "${TMP}/b3i"
 assert_eq "${RC}" "0" "preflight embedded rc"
 assert_contains '"backend":"embedded-minio"' "${OUT}" "preflight embedded backend"
 
+# 3.7 external RustFS via AGENTTEAMS_FS_DOMAIN
+cat > "${TMP}/domain.env" <<'EOF'
+AGENTTEAMS_DATA_DIR=agentteams-data
+AGENTTEAMS_FS_DOMAIN=rustfs-poc
+EOF
+run_case ok preflight --env-file "${TMP}/domain.env" --backup-dir "${TMP}/b3d" --json
+assert_eq "${RC}" "0" "preflight domain rc"
+assert_contains '"backend":"external-s3"' "${OUT}" "preflight domain backend"
+
 # 4. backup dry-run: no stop/cp
 run_case ok backup --dry-run --env-file "${ENV_FILE}" --backup-dir "${TMP}/b4"
 assert_eq "${RC}" "0" "backup dry rc"
@@ -205,5 +214,6 @@ RC=$?
 assert_eq "${RC}" "0" "preflight json purity rc"
 first="$(head -c 1 "${TMP}/json.out")"
 assert_eq "${first}" "{" "preflight json purity first char"
+assert_not_contains 'No such file' "${TMP}/json.err" "preflight json no log-dir noise"
 
-echo "PASS test-upgrade-cli (11 scenarios)"
+echo "PASS test-upgrade-cli (12 scenarios)"

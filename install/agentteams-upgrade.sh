@@ -53,7 +53,7 @@ log() {
     else
         printf '%s\n' "$msg"
     fi
-    if [ -n "${LOG_FILE}" ]; then
+    if [ -n "${LOG_FILE}" ] && [ -d "$(dirname "${LOG_FILE}")" ]; then
         printf '%s\n' "$msg" >> "${LOG_FILE}" 2>/dev/null || true
     fi
 }
@@ -367,6 +367,7 @@ cmd_preflight() {
     [ -n "${s3_bucket}" ] && s3_configured="true"
     s3_endpoint="$(read_env AGENTTEAMS_FS_ENDPOINT)"
     [ -n "${s3_endpoint}" ] || s3_endpoint="$(read_env AGENTTEAMS_MINIO_ENDPOINT)"
+    [ -n "${s3_endpoint}" ] || s3_endpoint="$(read_env AGENTTEAMS_FS_DOMAIN)"
     if mount_lines | cut -d'|' -f4 | grep -qx "/data/minio"; then
         has_data_minio=1
     fi
@@ -384,7 +385,9 @@ cmd_preflight() {
         warn "embedded MinIO endpoint but no /data/minio mount; verify the data model"
     fi
     [ "${s3_backend}" = "unknown" ] && warn "storage backend unknown; set AGENTTEAMS_FS_ENDPOINT or check /data/minio"
-    [ "${s3_configured}" = "true" ] || warn "S3 bucket not found in env; worker state may rely on local mounts"
+    [ -n "${s3_endpoint}" ] && s3_configured="true"
+    [ "${s3_configured}" = "true" ] || warn "S3 endpoint/bucket not found in env; worker state may rely on local mounts"
+    [ -z "${s3_bucket}" ] && [ -n "${s3_endpoint}" ] && warn "S3 bucket not in env; verify AGENTTEAMS_FS_BUCKET (default may be agentteams-storage)"
 
     local free_kb=0 kine_kb=0 free_bytes=0 kine_bytes=0
     local check_dir="${BACKUP_DIR}"
@@ -394,6 +397,11 @@ cmd_preflight() {
     free_kb="$(df -Pk "${check_dir}" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
     case "${free_kb}" in ''|*[!0-9]*) free_kb=0 ;; esac
     free_bytes=$((free_kb * 1024))
+    local backup_fs
+    backup_fs="$(fs_type_of "${check_dir}")"
+    if [ "${backup_fs}" = "tmpfs" ]; then
+        warn "backup dir is on tmpfs (${check_dir}); choose a persistent filesystem for kine backups"
+    fi
     if [ "${running}" = "true" ]; then
         kine_kb="$("${DOCKER_CMD}" exec "${CONTROLLER_NAME}" du -sk /data/agentteams-controller 2>/dev/null | awk '{print $1}' || true)"
         case "${kine_kb}" in ''|*[!0-9]*) kine_kb=0 ;; esac
