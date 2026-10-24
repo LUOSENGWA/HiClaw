@@ -58,8 +58,20 @@ done
 echo "engines ready"
 
 echo "=== seed the source ==="
-mc alias set smsrc "$SRC" "$SAK" "$SSK" >/dev/null
-mc alias set smdst "$DST" "$DAK" "$DSK" >/dev/null
+# RustFS can accept health probes before its storage quorum is ready. Do not
+# make the seed depend on a stale alias from a previous run: retry the alias
+# creation explicitly and fail the test if it never becomes usable.
+set_alias() { # <alias> <endpoint> <ak> <sk>
+  local i
+  for i in $(seq 1 30); do
+    mc alias set "$1" "$2" "$3" "$4" >/dev/null 2>&1 && return 0
+    [ "$i" -lt 30 ] && sleep 1
+  done
+  echo "FAIL: could not set mc alias $1 after 30 attempts" >&2
+  return 1
+}
+set_alias smsrc "$SRC" "$SAK" "$SSK" || exit 1
+set_alias smdst "$DST" "$DAK" "$DSK" || exit 1
 mc mb --ignore-existing "smsrc/$BKT" >/dev/null
 printf 'hello world\n' > "$WORK/a.txt"
 head -c 65536 /dev/urandom > "$WORK/b.bin"

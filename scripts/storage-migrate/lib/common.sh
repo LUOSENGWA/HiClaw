@@ -189,7 +189,21 @@ mc_admin_policy_names() {
 # ---------- mc wrapper (isolated config dir; never touches ~/.mc) ----------
 mc_raw() { MC_CONFIG_DIR="$MC_CONFIG_DIR" mc "$@"; }
 mc_alias() { # <name> <endpoint> <ak> <sk>
-  mc_raw alias set "$1" "$2" "$3" "$4" >/dev/null
+  # RustFS can briefly answer health probes before its storage quorum is
+  # ready; mc then returns "Service not ready: waiting for storage_quorum".
+  # Retry the alias setup instead of treating that startup race as a fatal
+  # preflight failure. Secrets never appear in the retry log.
+  local name="$1" endpoint="$2" ak="$3" sk="$4"
+  local attempts="${STORAGE_MIGRATE_ALIAS_RETRIES:-30}" i
+  case "$attempts" in ''|*[!0-9]*|0) attempts=30 ;; esac
+  for ((i = 1; i <= attempts; i++)); do
+    if mc_raw alias set "$name" "$endpoint" "$ak" "$sk" >/dev/null 2>&1; then
+      return 0
+    fi
+    [ "$i" -lt "$attempts" ] && sleep 1
+  done
+  echo "mc alias set failed after ${attempts} attempts (endpoint ${endpoint})" >&2
+  return 1
 }
 mc_admin() { mc_raw admin "$@"; }
 mc_get()   { mc_raw cat "$@"; }

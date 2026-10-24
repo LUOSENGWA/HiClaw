@@ -32,6 +32,11 @@ until the checklist has been executed.
 `bash >= 4`, `mc` (`RELEASE.2025-08-13` or newer), `curl` (8.x for `--aws-sigv4`),
 `jq`, `flock`. The dependency gate checks versions, not just presence.
 
+Alias creation retries for up to 30 seconds by default: RustFS can answer
+health probes before its storage quorum is ready and return
+`Service not ready: waiting for storage_quorum`. Override the retry budget
+with `STORAGE_MIGRATE_ALIAS_RETRIES=<n>` when a slower target needs it.
+
 ## Usage
 
 ```bash
