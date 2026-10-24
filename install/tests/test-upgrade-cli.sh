@@ -58,6 +58,7 @@ case "$1" in
         ;;
     exec)
         case "$*" in
+            *"8080/v1/models"*) [ "${STUB_SCENARIO:-ok}" = "gateway_down" ] && echo "000" || echo "200" ;;
             *healthz*) [ "${STUB_SCENARIO:-ok}" = "health_fail" ] && exit 1 || exit 0 ;;
             *"agt get workers -o json"*) echo '{"workers":[{"name":"w1","soul":"full"}]}' ;;
             *"agt get teams"*) echo "team-a" ;;
@@ -233,6 +234,27 @@ assert_eq "${RC}" "0" "controller log-panic rc"
 assert_contains 'logs contain panic|fatal' "${OUT}" "controller log-panic warning"
 assert_contains '"status":"done"' "${TMP}/b77/state.json" "controller log-panic state"
 
+# 7.8 gateway down: default fail/rollback
+run_case gateway_down controller --yes --controller-image example/controller:new --env-file "${ENV_FILE}" --backup-dir "${TMP}/b78" --state-file "${TMP}/b78/state.json" --timeout 4
+[ "${RC}" = "3" ] || [ "${RC}" = "4" ] || { echo "FAIL gateway down rc: ${RC}"; cat "${OUT}"; exit 1; }
+assert_contains 'gateway data plane' "${OUT}" "gateway down message"
+assert_contains '"status":"rolled_back"' "${TMP}/b78/state.json" "gateway down rolled back"
+
+# 7.9 gateway down + --allow-gateway-down: proceed with warning
+run_case gateway_down controller --yes --allow-gateway-down --controller-image example/controller:new --env-file "${ENV_FILE}" --backup-dir "${TMP}/b79" --state-file "${TMP}/b79/state.json" --timeout 4
+assert_eq "${RC}" "0" "gateway allow rc"
+assert_contains 'continuing because --allow-gateway-down' "${OUT}" "gateway allow warning"
+assert_contains '"status":"done"' "${TMP}/b79/state.json" "gateway allow state"
+
+# 7.10 Higress backfill dir: copy + restart, allow gateway down
+mkdir -p "${TMP}/backfill/ai-statistics/1.0.0"
+: > "${TMP}/backfill/ai-statistics/1.0.0/plugin.wasm"
+run_case gateway_down controller --yes --allow-gateway-down --higress-backfill-dir "${TMP}/backfill" --controller-image example/controller:new --env-file "${ENV_FILE}" --backup-dir "${TMP}/b710" --state-file "${TMP}/b710/state.json" --timeout 4
+assert_eq "${RC}" "0" "backfill controller rc"
+assert_contains 'backfill applied' "${OUT}" "backfill message"
+assert_contains '^cp ' "${REC}" "backfill cp"
+assert_contains '^restart ' "${REC}" "backfill restart"
+
 # 8. status --json
 run_case ok status --state-file "${TMP}/b5/state.json" --json
 assert_eq "${RC}" "0" "status json rc"
@@ -246,4 +268,4 @@ first="$(head -c 1 "${TMP}/json.out")"
 assert_eq "${first}" "{" "preflight json purity first char"
 assert_not_contains 'No such file' "${TMP}/json.err" "preflight json no log-dir noise"
 
-echo "PASS test-upgrade-cli (15 scenarios)"
+echo "PASS test-upgrade-cli (18 scenarios)"

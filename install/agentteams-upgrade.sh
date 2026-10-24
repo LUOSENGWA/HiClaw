@@ -42,6 +42,8 @@ OLD_NAME=""
 ENV_FROM_CONTAINER=0
 ALLOW_ENV_DRIFT=0
 KEEP_FAILED=0
+ALLOW_GATEWAY_DOWN=0
+HIGRESS_BACKFILL_DIR=""
 EFFECTIVE_ENV_FILE=""
 ENV_SOURCE="file"
 OLD_IMAGE=""
@@ -114,6 +116,8 @@ Options:
   --env-from-container     use the running controller's env for the new container (recommended)
   --allow-env-drift        proceed even if the env-file key set differs from the container
   --keep-failed            keep the failed new controller (stopped) for log inspection
+  --allow-gateway-down     continue even if 8080/v1/models is 000 (default: fail/rollback)
+  --higress-backfill-dir DIR  copy plugin files into the new controller and restart it (Wasm version backfill)
   --backup-dir DIR         default: \$HOME/agentteams-upgrade-backups/<UTC>
   --state-file PATH        default: <backup-dir>/state.json
   --target VERSION         target version (recorded in the plan/state)
@@ -280,6 +284,37 @@ logs_ok() {
     [ "${n}" = "0" ]
 }
 
+gateway_http() {
+    local code
+    code="$("${DOCKER_CMD}" exec "${CONTROLLER_NAME}" curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/v1/models 2>/dev/null || true)"
+    [ -n "${code}" ] || code="000"
+    printf '%s' "${code}"
+}
+
+wait_gateway() {
+    local waited=0 code
+    while [ "${waited}" -lt "${TIMEOUT}" ]; do
+        code="$(gateway_http)"
+        [ "${code}" != "000" ] && return 0
+        sleep 2
+        waited=$((waited + 2))
+    done
+    return 1
+}
+
+higress_plugin_check() {
+    local refs ref path missing=0
+    refs="$("${DOCKER_CMD}" exec "${CONTROLLER_NAME}" sh -c 'grep -Rho "plugins/[a-z-]*/[0-9.]*/plugin.wasm" /data 2>/dev/null | sort -u' 2>/dev/null || true)"
+    for ref in ${refs}; do
+        path="/usr/share/nginx/html/${ref}"
+        if ! "${DOCKER_CMD}" exec "${CONTROLLER_NAME}" test -f "${path}" >/dev/null 2>&1; then
+            missing=$((missing + 1))
+            warn "Higress plugin missing in image: ${ref}"
+        fi
+    done
+    printf '%s' "${missing}"
+}
+
 wait_health() {
     local waited=0
     while [ "${waited}" -lt "${TIMEOUT}" ]; do
@@ -412,6 +447,18 @@ cmd_preflight() {
     [ "${s3_configured}" = "true" ] || warn "S3 endpoint/bucket not found in env; worker state may rely on local mounts"
     [ -z "${s3_bucket}" ] && [ -n "${s3_endpoint}" ] && warn "S3 bucket not in env; verify AGENTTEAMS_FS_BUCKET (default may be agentteams-storage)"
 
+    local gw_code gw_ok="false"
+    gw_code="$(gateway_http)"
+    if [ "${gw_code}" != "000" ]; then
+        gw_ok="true"
+    else
+        warn "gateway data plane 8080/v1/models=000; Higress plugin/data-plane may be down"
+    fi
+
+    local plugin_missing
+    plugin_missing="$(higress_plugin_check)"
+    [ "${plugin_missing}" -gt 0 ] && warn "Higress plugin refs missing from image: ${plugin_missing} (backfill may be needed)"
+
     local free_kb=0 kine_kb=0 free_bytes=0 kine_bytes=0
     local check_dir="${BACKUP_DIR}"
     while [ ! -d "${check_dir}" ] && [ "${check_dir}" != "/" ]; do
@@ -462,12 +509,12 @@ cmd_preflight() {
         local warnings_json errors_json
         if [ "${#WARN_LIST[@]}" -gt 0 ]; then warnings_json="$(json_list "${WARN_LIST[@]}")"; else warnings_json="[]"; fi
         if [ "${#ERR_LIST[@]}" -gt 0 ]; then errors_json="$(json_list "${ERR_LIST[@]}")"; else errors_json="[]"; fi
-        printf '{"ok":%s,"env_file":"%s","data_dir":"%s","data_dir_source":"%s","controller":{"name":"%s","exists":%s,"image":"%s","ports":%s,"mounts":%s,"entrypoint":"%s","network":"%s","restart":"%s","running":%s},"env_drift":%s,"data_model":"%s","mounts":%s,"s3":{"backend":"%s","configured":%s,"bucket":"%s","data_minio_mount":%s},"docker":{"cmd":"%s"},"disk_free_bytes":%s,"kine_bytes":%s,"workers":{"total":%s,"soul_set":%s,"soul_missing":%s},"teams":%s,"warnings":%s,"errors":%s}\n' \
+        printf '{"ok":%s,"env_file":"%s","data_dir":"%s","data_dir_source":"%s","controller":{"name":"%s","exists":%s,"image":"%s","ports":%s,"mounts":%s,"entrypoint":"%s","network":"%s","restart":"%s","running":%s},"env_drift":%s,"data_model":"%s","mounts":%s,"s3":{"backend":"%s","configured":%s,"bucket":"%s","data_minio_mount":%s},"gateway":{"http_code":"%s","ok":%s,"plugin_missing":%s},"docker":{"cmd":"%s"},"disk_free_bytes":%s,"kine_bytes":%s,"workers":{"total":%s,"soul_set":%s,"soul_missing":%s},"teams":%s,"warnings":%s,"errors":%s}\n' \
             "${ok}" "$(json_escape "${ENV_FILE}")" "$(json_escape "${data_dir}")" "${data_source}" \
             "${CONTROLLER_NAME}" "${ctrl_exists}" "$(json_escape "${image}")" "${ports}" "${mounts}" \
             "$(json_escape "${entry}")" "$(json_escape "${net}")" "$(json_escape "${restart}")" "${running}" "${env_drift}" \
             "${data_model}" "${mounts_json}" "${s3_backend}" "${s3_configured}" "$(json_escape "${s3_bucket}")" "$([ "${has_data_minio}" = "1" ] && echo true || echo false)" \
-            "${DOCKER_CMD}" "${free_bytes}" "${kine_bytes}" "${workers}" "${soul_set}" "${soul_missing}" "${teams}" \
+            "${gw_code}" "${gw_ok}" "${plugin_missing}" "${DOCKER_CMD}" "${free_bytes}" "${kine_bytes}" "${workers}" "${soul_set}" "${soul_missing}" "${teams}" \
             "${warnings_json}" "${errors_json}"
     else
         log "preflight: env=${ENV_FILE} data_dir=${data_dir} (${data_source})"
@@ -685,6 +732,12 @@ cmd_controller() {
     resolve_paths
 
     [ -n "${CONTROLLER_IMAGE}" ] || die "--controller-image is required" "${EXIT_USAGE}"
+    if [ -n "${HIGRESS_BACKFILL_DIR}" ]; then
+        [ -d "${HIGRESS_BACKFILL_DIR}" ] || die "higress backfill dir not found: ${HIGRESS_BACKFILL_DIR}" "${EXIT_GATE}"
+        if ! find "${HIGRESS_BACKFILL_DIR}" -name plugin.wasm 2>/dev/null | grep -q .; then
+            die "higress backfill dir contains no plugin.wasm: ${HIGRESS_BACKFILL_DIR}" "${EXIT_GATE}"
+        fi
+    fi
     if [ "${ENV_FROM_CONTAINER}" = "1" ]; then
         EFFECTIVE_ENV_FILE="${BACKUP_DIR}/controller.env"
         ENV_SOURCE="container"
@@ -710,6 +763,12 @@ OLD_IMAGE=""
         die "unsupported controller shape: no mounts; run the controller step manually" "${EXIT_GATE}"
     fi
 
+    if [ -n "${HIGRESS_BACKFILL_DIR}" ]; then
+        [ -d "${HIGRESS_BACKFILL_DIR}" ] || die "higress backfill dir not found: ${HIGRESS_BACKFILL_DIR}" "${EXIT_GATE}"
+        if ! find "${HIGRESS_BACKFILL_DIR}" -name plugin.wasm 2>/dev/null | grep -q .; then
+            die "higress backfill dir contains no plugin.wasm: ${HIGRESS_BACKFILL_DIR}" "${EXIT_GATE}"
+        fi
+    fi
     if [ "${ENV_FROM_CONTAINER}" = "1" ]; then
         if [ "${DRY_RUN}" = "1" ]; then
             log "[dry-run] export container env -> ${EFFECTIVE_ENV_FILE} (0600)"
@@ -737,6 +796,10 @@ OLD_IMAGE=""
         log "[dry-run] ${DOCKER_CMD} stop ${CONTROLLER_NAME}"
         log "[dry-run] ${DOCKER_CMD} rename ${CONTROLLER_NAME} agentteams-controller-<old>-old"
         log "[dry-run] ${DOCKER_CMD} run ${RUN_ARGS[*]}"
+        if [ -n "${HIGRESS_BACKFILL_DIR}" ]; then
+            log "[dry-run] docker cp ${HIGRESS_BACKFILL_DIR}/. ${CONTROLLER_NAME}:/usr/share/nginx/html/plugins/"
+            log "[dry-run] docker exec ${CONTROLLER_NAME} pkill envoy; docker restart ${CONTROLLER_NAME}"
+        fi
         log "[dry-run] health gate: healthz + agt get teams/workers + logs panic|fatal=0"
         log "[dry-run] on failure: stop/rm new, rename old back, start, health-gate old"
         return "${EXIT_OK}"
@@ -757,10 +820,31 @@ OLD_IMAGE=""
     if ! "${DOCKER_CMD}" run "${RUN_ARGS[@]}"; then
         rollback_controller
     fi
+    if [ -n "${HIGRESS_BACKFILL_DIR}" ]; then
+        if ! "${DOCKER_CMD}" cp "${HIGRESS_BACKFILL_DIR}/." "${CONTROLLER_NAME}:/usr/share/nginx/html/plugins/" >/dev/null 2>&1; then
+            warn "Higress plugin backfill copy failed"
+            rollback_controller
+        fi
+        "${DOCKER_CMD}" exec "${CONTROLLER_NAME}" pkill envoy >/dev/null 2>&1 || true
+        "${DOCKER_CMD}" restart "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
+        log "Higress plugin backfill applied from ${HIGRESS_BACKFILL_DIR}; controller restarted"
+    fi
     if wait_health; then
-        write_state "controller" "done"
-        log "controller upgraded: ${CONTROLLER_IMAGE}; old container kept as ${OLD_NAME}"
-        return "${EXIT_OK}"
+        if [ "${ALLOW_GATEWAY_DOWN}" = "1" ]; then
+            local gw_code
+            gw_code="$(gateway_http)"
+            [ "${gw_code}" = "000" ] && warn "gateway data plane 8080/v1/models=000; continuing because --allow-gateway-down"
+            write_state "controller" "done"
+            log "controller upgraded: ${CONTROLLER_IMAGE}; old container kept as ${OLD_NAME}"
+            return "${EXIT_OK}"
+        fi
+        if wait_gateway; then
+            write_state "controller" "done"
+            log "controller upgraded: ${CONTROLLER_IMAGE}; old container kept as ${OLD_NAME}"
+            return "${EXIT_OK}"
+        fi
+        warn "gateway data plane 8080/v1/models=000; rolling back (use --allow-gateway-down to override)"
+        rollback_controller
     fi
     rollback_controller
 }
@@ -792,6 +876,8 @@ while [ $# -gt 0 ]; do
         --env-from-container) ENV_FROM_CONTAINER=1; shift ;;
         --allow-env-drift) ALLOW_ENV_DRIFT=1; shift ;;
         --keep-failed) KEEP_FAILED=1; shift ;;
+        --allow-gateway-down) ALLOW_GATEWAY_DOWN=1; shift ;;
+        --higress-backfill-dir) HIGRESS_BACKFILL_DIR="$2"; shift 2 ;;
         --backup-dir) BACKUP_DIR="$2"; shift 2 ;;
         --state-file) STATE_FILE="$2"; shift 2 ;;
         --target) TARGET="$2"; shift 2 ;;
