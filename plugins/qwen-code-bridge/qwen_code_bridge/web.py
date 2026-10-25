@@ -267,9 +267,27 @@ def _drop_nested_workspaces(workspaces: list[str]) -> list[str]:
     return out
 
 
+_ensure_lock: asyncio.Lock | None = None
+
+
 async def ensure_serve() -> str:
-    """Return a reachable serve URL, starting one on a free port if needed."""
-    url = serve_url()
+    """Return a reachable serve URL, starting one on a free port if needed.
+
+    Single-flight: the web shell fires many requests on first load. Without
+    this lock every concurrent caller spawned its own daemon; six daemons then
+    raced for the Conversations runtime, and every one of them served 503 for
+    ``/standalone`` because the ownership state could not be verified.
+    """
+    global _ensure_lock
+    if _ensure_lock is None:
+        _ensure_lock = asyncio.Lock()
+    async with _ensure_lock:
+        return await _ensure_serve_locked()
+
+
+async def _ensure_serve_locked() -> str:
+    previous = serve_url()
+    url = previous
     if url and await _probe(url):
         return url
     if os.environ.get(SERVE_AUTOSTART_ENV, "1") == "0":
@@ -340,6 +358,13 @@ async def ensure_serve() -> str:
                     env.setdefault("GIT_CONFIG_GLOBAL", gitconfig)
         except Exception:
             pass
+        # NOTE: the daemon stays at the app's uid (root in this deployment).
+        # The Conversations runtime's ownership check requires <home>/.qwen to
+        # be owned by the same uid, and root can also read the session files
+        # written by root-run dispatches; dropping to the home owner made
+        # root-owned settings.json unreadable (EACCES).
+        spawn_user = None
+        spawn_group = None
         errlog = (state_dir() / "web-serve.log").open("ab")
         errlog.write(
             (
@@ -360,6 +385,8 @@ async def ensure_serve() -> str:
             token,
             *ws_args,
             env=env,
+            user=spawn_user,
+            group=spawn_group,
             stdout=errlog,
             stderr=errlog,
         )
@@ -374,14 +401,15 @@ async def ensure_serve() -> str:
                 )
         except Exception:
             pass
-        return url
+        return previous
     try:
         from .state import state_dir
 
         with (state_dir() / "web-serve.log").open("a", encoding="utf-8") as fh:
             fh.write(
                 f"spawned pid={proc.pid} port={port} binary={binary} "
-                f"home={env.get('HOME')} qwen_home={env.get('QWEN_HOME')}\n"
+                f"home={env.get('HOME')} qwen_home={env.get('QWEN_HOME')} "
+                f"uid={spawn_user}\n"
             )
     except Exception:
         pass
@@ -394,8 +422,13 @@ async def ensure_serve() -> str:
             return url
         if proc.returncode is not None:
             break
-    _write_config(url, token)
-    return url
+    # Never poison serve.json with an unreachable port: stop the half-booted
+    # daemon and keep the previous URL (possibly empty).
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    return previous
 
 
 @router.get("/web/status")
