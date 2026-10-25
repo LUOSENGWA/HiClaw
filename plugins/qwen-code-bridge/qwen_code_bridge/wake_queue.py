@@ -32,9 +32,13 @@ import json
 import logging
 import os
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from .endpoints import app_base
 from .state import state_dir
 
 logger = logging.getLogger(__name__)
@@ -46,6 +50,9 @@ BACKOFF_S = (5, 15, 30, 60, 120, 300, 600)
 MAX_AGE_S = 24 * 3600.0
 #: Loop tick: how often due records are checked.
 TICK_S = 5.0
+#: While the chat is running we do not attempt the POST at all; re-check
+#: this often instead (the run usually ends within minutes).
+BUSY_RETRY_S = 15.0
 
 _lock: Optional[asyncio.Lock] = None
 _loop_task: Optional[asyncio.Task] = None
@@ -140,6 +147,37 @@ def pending() -> list[dict[str, Any]]:
     return load()
 
 
+def chat_is_busy(base_url: str, agent_id: str, chat_id: str) -> bool:
+    """True when the chat still has a running turn.
+
+    Mirrors the console frontend's queue semantics
+    (``waitForChatIdle`` polls ``GET /api/chats/{id}`` and only sends on
+    ``status == "idle"``).  Any probe failure returns False: the POST
+    keeps its own atomic ``attach_or_start`` guard (409), so "unknown"
+    must fall through rather than delay a wake forever.
+    """
+    if not chat_id or not base_url:
+        return False
+    try:
+        url = (
+            app_base(base_url)
+            + "/api/chats/"
+            + urllib.parse.quote(str(chat_id), safe="")
+            + "/status"
+        )
+        req = urllib.request.Request(
+            url,
+            headers={"X-Agent-Id": agent_id or "AgentTeamGuide"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read(4096)
+        data = json.loads(raw.decode("utf-8") or "{}")
+        status = str((data or {}).get("status") or "").strip().lower()
+        return bool(status) and status != "idle"
+    except Exception:
+        return False
+
+
 def _due(now: float) -> list[dict[str, Any]]:
     return [
         r for r in load() if float(r.get("next_at") or 0.0) <= now
@@ -148,6 +186,21 @@ def _due(now: float) -> list[dict[str, Any]]:
 
 def _remove(task_id: str) -> None:
     _save([r for r in load() if r.get("task_id") != task_id])
+
+
+def _reschedule_busy(record: dict[str, Any], now: float) -> None:
+    """Chat still running: retry soon, do not burn the failure backoff."""
+    record["busy_retries"] = int(record.get("busy_retries") or 0) + 1
+    record["next_at"] = now + BUSY_RETRY_S
+    record["last_busy_at"] = now
+    records = load()
+    for idx, item in enumerate(records):
+        if item.get("task_id") == record.get("task_id"):
+            records[idx] = record
+            break
+    else:
+        records.append(record)
+    _save(records)
 
 
 def _reschedule(record: dict[str, Any], now: float, error: str) -> None:
@@ -169,7 +222,7 @@ def _reschedule(record: dict[str, Any], now: float, error: str) -> None:
 
 async def drain_once(sender: Callable[..., None] | None = None) -> dict[str, int]:
     """Try every due record once; returns counters (mostly for tests)."""
-    stats = {"sent": 0, "failed": 0, "dropped": 0}
+    stats = {"sent": 0, "failed": 0, "dropped": 0, "busy": 0}
     now = time.time()
     due = _due(now)
     if not due:
@@ -185,6 +238,21 @@ async def drain_once(sender: Callable[..., None] | None = None) -> dict[str, int
                 _remove(task_id)
                 stats["dropped"] += 1
                 logger.warning("wake dropped after 24h: task=%s", task_id)
+                continue
+            busy = await asyncio.to_thread(
+                chat_is_busy,
+                str(record.get("base_url") or ""),
+                str(record.get("agent_id") or ""),
+                str(record.get("chat_id") or ""),
+            )
+            if busy:
+                _reschedule_busy(record, time.time())
+                stats["busy"] += 1
+                logger.debug(
+                    "wake deferred (chat busy): task=%s busy_retries=%s",
+                    task_id,
+                    record.get("busy_retries"),
+                )
                 continue
             try:
                 await asyncio.to_thread(

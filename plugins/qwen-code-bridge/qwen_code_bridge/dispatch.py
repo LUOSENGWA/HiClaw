@@ -461,6 +461,36 @@ def mark_wake_delivered(task_id: str) -> None:
         pass
 
 
+def _queue_wake(
+    task: dict[str, Any],
+    wake: dict[str, Any],
+    origin: dict[str, Any],
+    text: str,
+    session_id: str,
+    error: str,
+) -> None:
+    """Persist one wake into the durable queue (shared by both call sites)."""
+    wake_queue.enqueue(
+        {
+            "task_id": str(task.get("task_id") or ""),
+            "text": text,
+            "session_id": session_id,
+            "chat_id": str(task.get("chat_id") or ""),
+            "agent_id": str(wake.get("agent_id") or ""),
+            "base_url": str(wake.get("base_url") or ""),
+            "channel": str(
+                origin.get("channel") or wake.get("channel") or "console"
+            ),
+            "user_id": str(
+                origin.get("user_id") or wake.get("user_id") or "default"
+            ),
+            "room_bell": bool(wake.get("room_bell")),
+            "approval_level": str(task.get("approval_level") or ""),
+            "last_error": str(error)[:120],
+        }
+    )
+
+
 def _effective_approval_level(agent_id: str) -> str:
     """Read the effective QwenPaw tool-execution level for the wake turn.
 
@@ -1015,6 +1045,22 @@ class DispatchService:
             task.get("exit_code"),
             float(task.get("wall_s") or 0),
         )
+        # Queue semantics: never POST while the chat is running
+        # (``/api/chats/{id}/status`` is exactly what the console frontend
+        # polls before sending).  The POST's 409 stays as the last resort.
+        busy = await asyncio.to_thread(
+            wake_queue.chat_is_busy,
+            str(wake.get("base_url") or ""),
+            str(wake.get("agent_id") or ""),
+            str(task.get("chat_id") or ""),
+        )
+        if busy:
+            _queue_wake(task, wake, origin, text, sid, "chat busy")
+            self._update_task(
+                task["task_id"],
+                {"wake_status": "queued: chat busy"},
+            )
+            return
         try:
             await asyncio.to_thread(
                 self._wake_sender,
@@ -1030,28 +1076,7 @@ class DispatchService:
             wake_queue.discard(str(task["task_id"]))
             self._update_task(task["task_id"], {"wake_status": "sent"})
         except Exception as exc:
-            wake_queue.enqueue(
-                {
-                    "task_id": str(task["task_id"]),
-                    "text": text,
-                    "session_id": sid,
-                    "agent_id": str(wake.get("agent_id") or ""),
-                    "base_url": str(wake.get("base_url") or ""),
-                    "channel": str(
-                        origin.get("channel")
-                        or wake.get("channel")
-                        or "console"
-                    ),
-                    "user_id": str(
-                        origin.get("user_id")
-                        or wake.get("user_id")
-                        or "default"
-                    ),
-                    "room_bell": bool(wake.get("room_bell")),
-                    "approval_level": str(task.get("approval_level") or ""),
-                    "last_error": str(exc)[:120],
-                }
-            )
+            _queue_wake(task, wake, origin, text, sid, str(exc))
             self._update_task(
                 task["task_id"],
                 {"wake_status": f"queued: {str(exc)[:100]}"},
@@ -2028,6 +2053,22 @@ class DispatchService:
 
         if wake_session_id:
             text = self._wake_text(task, status, code, wall)
+            busy = await asyncio.to_thread(
+                wake_queue.chat_is_busy,
+                str(wake.get("base_url") or ""),
+                str(wake.get("agent_id") or ""),
+                str(task.get("chat_id") or ""),
+            )
+            if busy:
+                wake_status = "queued: chat busy"
+                _queue_wake(
+                    task, wake, origin, text, wake_session_id, "chat busy"
+                )
+                self._update_task(
+                    task_id,
+                    {"wake_status": wake_status, "updated_at": _utcnow()},
+                )
+                return
             try:
                 await asyncio.to_thread(
                     self._wake_sender,
@@ -2044,29 +2085,8 @@ class DispatchService:
                 wake_queue.discard(str(task_id))
             except Exception as exc:  # wake is best-effort; state stands
                 wake_status = f"queued: {str(exc)[:100]}"
-                wake_queue.enqueue(
-                    {
-                        "task_id": str(task_id),
-                        "text": text,
-                        "session_id": wake_session_id,
-                        "agent_id": str(wake.get("agent_id") or ""),
-                        "base_url": str(wake.get("base_url") or ""),
-                        "channel": str(
-                            origin.get("channel")
-                            or wake.get("channel")
-                            or "console"
-                        ),
-                        "user_id": str(
-                            origin.get("user_id")
-                            or wake.get("user_id")
-                            or "default"
-                        ),
-                        "room_bell": bool(wake.get("room_bell")),
-                        "approval_level": str(
-                            task.get("approval_level") or ""
-                        ),
-                        "last_error": str(exc)[:120],
-                    }
+                _queue_wake(
+                    task, wake, origin, text, wake_session_id, str(exc)
                 )
             self._update_task(
                 task_id, {"wake_status": wake_status, "updated_at": _utcnow()}

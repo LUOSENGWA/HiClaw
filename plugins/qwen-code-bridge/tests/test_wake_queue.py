@@ -52,7 +52,7 @@ def test_drain_success_removes_and_calls_callback() -> None:
 
     stats = asyncio.run(wake_queue.drain_once(sender))
 
-    assert stats == {"sent": 1, "failed": 0, "dropped": 0}
+    assert stats == {"sent": 1, "failed": 0, "dropped": 0, "busy": 0}
     assert wake_queue.load() == []
     assert delivered == [_task("b")]
     assert calls and calls[0][2] == "AUTO"
@@ -67,7 +67,7 @@ def test_drain_failure_reschedules_with_backoff() -> None:
 
     stats = asyncio.run(wake_queue.drain_once(sender))
 
-    assert stats == {"sent": 0, "failed": 1, "dropped": 0}
+    assert stats == {"sent": 0, "failed": 1, "dropped": 0, "busy": 0}
     records = wake_queue.load()
     assert len(records) == 1
     record = records[0]
@@ -87,7 +87,7 @@ def test_drain_drops_after_max_age() -> None:
         wake_queue.drain_once(lambda *a, **k: called.append(a))
     )
 
-    assert stats == {"sent": 0, "failed": 0, "dropped": 1}
+    assert stats == {"sent": 0, "failed": 0, "dropped": 1, "busy": 0}
     assert wake_queue.load() == []
     assert called == []
 
@@ -97,3 +97,34 @@ def test_discard_removes_only_target() -> None:
     wake_queue.enqueue({"task_id": _task("f"), "text": "y", "session_id": "s"})
     wake_queue.discard(_task("e"))
     assert [r["task_id"] for r in wake_queue.load()] == [_task("f")]
+
+def test_drain_defers_while_chat_busy(monkeypatch) -> None:
+    monkeypatch.setattr(wake_queue, "chat_is_busy", lambda *a: True)
+    wake_queue.enqueue(
+        {
+            "task_id": _task("g"),
+            "text": "done",
+            "session_id": "s",
+            "chat_id": "chat-1",
+            "base_url": "http://127.0.0.1:1",
+        }
+    )
+
+    sent = []
+    before = time.time()
+    stats = asyncio.run(
+        wake_queue.drain_once(lambda *a, **k: sent.append(a))
+    )
+
+    assert stats == {"sent": 0, "failed": 0, "dropped": 0, "busy": 1}
+    assert sent == []
+    record = wake_queue.load()[0]
+    assert record["attempts"] == 0          # busy is not a failure
+    assert record["busy_retries"] == 1
+    assert record["next_at"] >= before + wake_queue.BUSY_RETRY_S
+
+
+def test_chat_is_busy_probe_failure_falls_through(monkeypatch) -> None:
+    # No base_url -> never considered busy (POST keeps its 409 guard).
+    assert wake_queue.chat_is_busy("", "a", "c") is False
+    assert wake_queue.chat_is_busy("http://127.0.0.1:1", "a", "") is False
