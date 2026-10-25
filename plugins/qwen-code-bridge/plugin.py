@@ -31,6 +31,7 @@ PLUGIN_ID = "qwen-code-bridge"
 HTTP_PREFIX = "/qwen-code-bridge"
 STARTUP_HOOK_NAME = "qwen_code_bridge.ensure_state_dir"
 SHUTDOWN_HOOK_NAME = "qwen_code_bridge.shutdown"
+WAKE_QUEUE_HOOK_NAME = "qwen_code_bridge.wake_queue"
 
 _PLUGIN_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 
@@ -166,7 +167,28 @@ def _ensure_state_dir() -> None:
     _ensure_qwen_link()
 
 
+async def _start_wake_queue() -> None:
+    """Drain persisted terminal wakes (409-safe) as soon as the app is up.
+
+    Startup hooks are awaited per plugin load, so a hot reload also resumes
+    any wakes queued by the previous process.
+    """
+    from qwen_code_bridge import wake_queue
+    from qwen_code_bridge.dispatch import mark_wake_delivered
+
+    wake_queue.ensure_running(on_delivered=mark_wake_delivered)
+    logger.info(
+        "wake queue started (pending=%d)", len(wake_queue.pending())
+    )
+
+
 def _on_shutdown() -> None:
+    try:
+        from qwen_code_bridge import wake_queue
+
+        wake_queue.stop()
+    except Exception:
+        pass
     logger.info(
         "%s shutdown (no persistent state to release in P1)",
         PLUGIN_ID,
@@ -198,6 +220,11 @@ class QwenCodeBridgePlugin:
                 STARTUP_HOOK_NAME,
                 _ensure_state_dir,
                 priority=200,
+            )
+            api.register_startup_hook(
+                WAKE_QUEUE_HOOK_NAME,
+                _start_wake_queue,
+                priority=210,
             )
             api.register_shutdown_hook(
                 SHUTDOWN_HOOK_NAME,
@@ -247,6 +274,26 @@ class QwenCodeBridgePlugin:
         else:
             raise RuntimeError(
                 f"startup hook {STARTUP_HOOK_NAME!r} is owned by plugin "
+                f"{owner!r}",
+            )
+
+        owner = _hook_owner(
+            api, registry.get_startup_hooks(), WAKE_QUEUE_HOOK_NAME
+        )
+        if owner is None:
+            api.register_startup_hook(
+                WAKE_QUEUE_HOOK_NAME,
+                _start_wake_queue,
+                priority=210,
+            )
+        elif owner == PLUGIN_ID:
+            logger.debug(
+                "startup hook %s already registered; skipping",
+                WAKE_QUEUE_HOOK_NAME,
+            )
+        else:
+            raise RuntimeError(
+                f"startup hook {WAKE_QUEUE_HOOK_NAME!r} is owned by plugin "
                 f"{owner!r}",
             )
 

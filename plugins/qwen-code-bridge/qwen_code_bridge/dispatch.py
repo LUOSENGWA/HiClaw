@@ -49,6 +49,7 @@ from . import (
     progress,
     qwen_status,
     runs,
+    wake_queue,
 )
 from .endpoints import app_base
 from .registry import CLIS
@@ -433,6 +434,31 @@ def load_task(task_id: str) -> dict[str, Any] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def mark_wake_delivered(task_id: str) -> None:
+    """Queue callback: flip a task's ``wake_status`` to ``sent``.
+
+    Called from the durable wake queue after a delayed delivery; the task
+    file is written with the same tmp+rename atomicity as the service.
+    """
+    task = load_task(task_id)
+    if not task:
+        return
+    if str(task.get("wake_status") or "") == "sent":
+        return
+    task["wake_status"] = "sent"
+    task["wake_delivered_at"] = _utcnow()
+    try:
+        path = state_dir() / "dispatch" / f"{task_id}.json"
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(task, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    except Exception:
+        pass
 
 
 def _effective_approval_level(agent_id: str) -> str:
@@ -970,7 +996,14 @@ class DispatchService:
         # second wake for a task that already has one (10/23 incident:
         # stale wake + timeout wake for the same task).
         current = self._read_task(str(task.get("task_id") or "")) or {}
-        if str(current.get("wake_status") or "") in ("sent", "pending"):
+        current_wake = str(current.get("wake_status") or "")
+        # "queued: ..." = already failed once and sits in the durable queue;
+        # treat it as "has a wake" so the reaper never sends a duplicate.
+        if (
+            current_wake == "sent"
+            or current_wake.startswith("pending")
+            or current_wake.startswith("queued")
+        ):
             return
         self._update_task(
             task["task_id"],
@@ -994,11 +1027,34 @@ class DispatchService:
                 bool(wake.get("room_bell")),
                 approval_level=str(task.get("approval_level") or ""),
             )
+            wake_queue.discard(str(task["task_id"]))
             self._update_task(task["task_id"], {"wake_status": "sent"})
         except Exception as exc:
+            wake_queue.enqueue(
+                {
+                    "task_id": str(task["task_id"]),
+                    "text": text,
+                    "session_id": sid,
+                    "agent_id": str(wake.get("agent_id") or ""),
+                    "base_url": str(wake.get("base_url") or ""),
+                    "channel": str(
+                        origin.get("channel")
+                        or wake.get("channel")
+                        or "console"
+                    ),
+                    "user_id": str(
+                        origin.get("user_id")
+                        or wake.get("user_id")
+                        or "default"
+                    ),
+                    "room_bell": bool(wake.get("room_bell")),
+                    "approval_level": str(task.get("approval_level") or ""),
+                    "last_error": str(exc)[:120],
+                }
+            )
             self._update_task(
                 task["task_id"],
-                {"wake_status": f"failed: {str(exc)[:120]}"},
+                {"wake_status": f"queued: {str(exc)[:100]}"},
             )
 
     def running_task_named(self, task_name: str) -> dict[str, Any] | None:
@@ -1985,8 +2041,33 @@ class DispatchService:
                     approval_level=str(task.get("approval_level") or ""),
                 )
                 wake_status = "sent"
+                wake_queue.discard(str(task_id))
             except Exception as exc:  # wake is best-effort; state stands
-                wake_status = f"failed: {str(exc)[:120]}"
+                wake_status = f"queued: {str(exc)[:100]}"
+                wake_queue.enqueue(
+                    {
+                        "task_id": str(task_id),
+                        "text": text,
+                        "session_id": wake_session_id,
+                        "agent_id": str(wake.get("agent_id") or ""),
+                        "base_url": str(wake.get("base_url") or ""),
+                        "channel": str(
+                            origin.get("channel")
+                            or wake.get("channel")
+                            or "console"
+                        ),
+                        "user_id": str(
+                            origin.get("user_id")
+                            or wake.get("user_id")
+                            or "default"
+                        ),
+                        "room_bell": bool(wake.get("room_bell")),
+                        "approval_level": str(
+                            task.get("approval_level") or ""
+                        ),
+                        "last_error": str(exc)[:120],
+                    }
+                )
             self._update_task(
                 task_id, {"wake_status": wake_status, "updated_at": _utcnow()}
             )
