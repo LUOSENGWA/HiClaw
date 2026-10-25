@@ -630,14 +630,26 @@ def default_wake_sender(
     ``X-Agent-Id`` header; retries on 409/429/503 and transient errors
     (3 attempts). Raises ``RuntimeError`` on final failure.
 
-    ``approval_level`` is the dispatch session's recorded level; when
-    empty the agent profile's effective level is read (legacy fallback).
+    ``approval_level`` is the dispatch-time capture and is only a last
+    resort: the chat-level switch is client state, so the wake first uses
+    the level last observed on that session (middleware recording), then
+    the live agent profile, and only then the stale capture.
     """
     root = app_base(base_url)
+    observed = ""
+    try:
+        from .session_levels import last_level
+
+        observed = last_level(session_id)
+    except Exception:
+        observed = ""
+    effective_level = (
+        observed or _effective_approval_level(agent_id) or approval_level
+    )
     body = _wake_body(
         session_id,
         text,
-        approval_level or _effective_approval_level(agent_id),
+        effective_level,
         channel,
         user_id,
     )

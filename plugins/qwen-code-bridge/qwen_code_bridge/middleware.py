@@ -112,6 +112,21 @@ def session_middleware_factory(
     session_id = getattr(ctx, "session_id", "") or ""
     if not session_id:
         return None
+    # The chat-level approval switch is client state in QwenPaw (request_context
+    # only); record it here so a later wake turn can reuse the freshest level
+    # the server can observe instead of a stale dispatch-time capture.
+    try:
+        request = getattr(ctx, "request", None)
+        request_context = getattr(request, "request_context", None) or {}
+        level = ""
+        if isinstance(request_context, dict):
+            level = str(request_context.get("approval_level") or "").strip()
+        if level:
+            from .session_levels import record as _record_level
+
+            _record_level(session_id, level)
+    except Exception:  # never let bookkeeping break the turn
+        pass
     return SessionEnvMiddleware(ctx)
 
 

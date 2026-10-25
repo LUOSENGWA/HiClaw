@@ -664,10 +664,12 @@ async def test_wake_level_defaults_to_recorded_profile_level(tmp_path, monkeypat
         assert calls[0]["approval_level"] == "AUTO"
 
 
-def test_default_wake_sender_explicit_level_overrides_profile(monkeypatch) -> None:
-    """``default_wake_sender(approval_level=...)`` pins the wake body level."""
+def test_default_wake_sender_prefers_observed_session_level(monkeypatch) -> None:
+    """The level last seen on the session beats the dispatch-time capture."""
     import qwen_code_bridge.dispatch as dispatch_mod
+    import qwen_code_bridge.session_levels as levels_mod
 
+    monkeypatch.setattr(levels_mod, "last_level", lambda _s: "OFF")
     monkeypatch.setattr(dispatch_mod, "_effective_approval_level", lambda _a: "AUTO")
     monkeypatch.setattr(dispatch_mod, "_pending_approval_line", lambda _b, _s: "")
     captured: list[dict] = []
@@ -690,11 +692,22 @@ def test_default_wake_sender_explicit_level_overrides_profile(monkeypatch) -> No
     dispatch_mod.default_wake_sender(
         "sid-lvl", "AgentTeamGuide", "", "done", approval_level="SMART"
     )
-    assert captured[0]["request_context"] == {"approval_level": "SMART"}
+    assert captured[0]["request_context"] == {"approval_level": "OFF"}
+
+    # No observation -> live profile; capture only when the profile is unknown.
+    monkeypatch.setattr(levels_mod, "last_level", lambda _s: "")
+    captured.clear()
+    dispatch_mod.default_wake_sender(
+        "sid-lvl", "AgentTeamGuide", "", "done", approval_level="SMART"
+    )
+    assert captured[0]["request_context"] == {"approval_level": "AUTO"}
 
     captured.clear()
-    dispatch_mod.default_wake_sender("sid-lvl", "AgentTeamGuide", "", "done")
-    assert captured[0]["request_context"] == {"approval_level": "AUTO"}
+    monkeypatch.setattr(dispatch_mod, "_effective_approval_level", lambda _a: "")
+    dispatch_mod.default_wake_sender(
+        "sid-lvl", "AgentTeamGuide", "", "done", approval_level="SMART"
+    )
+    assert captured[0]["request_context"] == {"approval_level": "SMART"}
 
 
 def test_default_wake_sender_carries_level_and_pending(monkeypatch) -> None:
