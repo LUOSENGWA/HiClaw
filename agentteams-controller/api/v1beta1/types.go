@@ -402,6 +402,16 @@ type ChannelPolicySpec struct {
 
 type ChannelsSpec struct {
 	DingTalk *DingTalkChannelSpec `json:"dingtalk,omitempty"`
+	Matrix   *MatrixChannelSpec   `json:"matrix,omitempty"`
+}
+
+// MatrixChannelSpec holds display flags for the worker's Matrix channel.
+// When the whole matrix section is omitted, the worker keeps its historical
+// default (thinking and tool output shown). When the section is present,
+// unset flags default to false (hidden), mirroring DingTalk semantics.
+type MatrixChannelSpec struct {
+	ShowThinking  bool `json:"showThinking,omitempty"`
+	ShowToolCalls bool `json:"showToolCalls,omitempty"`
 }
 
 type DingTalkChannelSpec struct {

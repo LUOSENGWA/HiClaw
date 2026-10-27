@@ -661,6 +661,70 @@ def test_runtime_updater_maps_dingtalk_visibility_and_preserves_empty_secret(
     assert updater.api_client.channel_events == ["dingtalk"]
 
 
+def test_runtime_updater_matrix_channel_visibility_follows_filters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENTTEAMS_MATRIX_URL", "http://matrix.example.com")
+    monkeypatch.setenv("AGENTTEAMS_WORKER_MATRIX_TOKEN", "matrix-token")
+    updater = _runtime_updater(
+        config=_config(tmp_path),
+        package_manager=_NoopPackageManager(),
+    )
+
+    def apply(desired: dict) -> None:
+        updater.apply_once(
+            runtime_config=MemberRuntimeConfig(
+                path=updater.config.runtime_config_path,
+                raw={
+                    "metadata": {"generation": "1"},
+                    "member": {
+                        "runtime": "qwenpaw",
+                        "matrixUserId": "@worker-a:matrix.local",
+                    },
+                    "desired": desired,
+                },
+            ),
+        )
+
+    # No channels.matrix section: historical default, everything shown.
+    apply({})
+    actual = updater.api_client.channels["agentteams_matrix"]
+    assert actual["show_thinking"] is True
+    assert actual["show_tool_calls"] is True
+    assert actual["show_tool_results"] is True
+
+    apply(
+        {
+            "channels": {
+                "matrix": {
+                    "filter_thinking": True,
+                    "filter_tool_messages": False,
+                },
+            },
+        }
+    )
+    actual = updater.api_client.channels["agentteams_matrix"]
+    assert actual["show_thinking"] is False
+    assert actual["show_tool_calls"] is True
+    assert actual["show_tool_results"] is True
+
+    apply(
+        {
+            "channels": {
+                "matrix": {
+                    "filter_thinking": False,
+                    "filter_tool_messages": True,
+                },
+            },
+        }
+    )
+    actual = updater.api_client.channels["agentteams_matrix"]
+    assert actual["show_thinking"] is True
+    assert actual["show_tool_calls"] is False
+    assert actual["show_tool_results"] is False
+
+
 def test_runtime_updater_ignores_unused_dingtalk_fields(
     tmp_path: Path,
 ) -> None:

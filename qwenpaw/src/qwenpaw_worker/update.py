@@ -382,6 +382,11 @@ class MemberRuntimeConfig:
         return value if isinstance(value, dict) else None
 
     @property
+    def matrix_channel(self) -> Optional[Dict[str, Any]]:
+        value = self.channels.get("matrix")
+        return value if isinstance(value, dict) else None
+
+    @property
     def channel_policy(self) -> Dict[str, Any]:
         return _section(self.desired, "channelPolicy")
 
@@ -1938,6 +1943,10 @@ class RuntimeUpdater:
         room_id = desired["room_id"]
         if room_id:
             self._ensure_require_mention_group(groups, room_id)
+        # Display flags come from the controller's desired channels.matrix
+        # section (filter_* inverted to show_*). Unset keeps today's
+        # default: everything shown.
+        flags = config.matrix_channel or {}
         return {
             "enabled": True,
             "homeserver": desired["homeserver"],
@@ -1953,9 +1962,9 @@ class RuntimeUpdater:
             # AGENTTEAMS_MATRIX_SHARE_SESSION=true to restore room-wide
             # session sharing (legacy behavior).
             "share_session_in_group": _env_bool("AGENTTEAMS_MATRIX_SHARE_SESSION"),
-            "show_tool_calls": True,
-            "show_tool_results": True,
-            "show_thinking": True,
+            "show_tool_calls": not _bool(flags.get("filter_tool_messages", False)),
+            "show_tool_results": not _bool(flags.get("filter_tool_messages", False)),
+            "show_thinking": not _bool(flags.get("filter_thinking", False)),
             "groups": groups,
         }
 
