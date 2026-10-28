@@ -25,8 +25,10 @@ Shell policy (fail closed, #1411):
 
 1. Lexical scan — any shell metacharacter **outside** quotes/escapes
    (``; & | < >`` backtick ``$( `` ``${ `` newline ``(){} ``) denies the
-   command outright (``exec-compound``).  Inside quotes such characters
-   are data (``git commit -m "fix: a;b"`` is fine).
+   command outright (``exec-compound``).  Inside single quotes such
+   characters are data, but double quotes still perform command
+   substitution — backtick and ``$( ``/``${ `` are denied inside double
+   quotes too (``git commit -m "fix: a;b"`` is fine).
 2. ``shlex.split`` must succeed (``exec-parse`` otherwise) and
    ``argv[0]`` must be a whitelisted program.
 3. ``cwd`` (when provided) must exist and resolve inside the run roots
@@ -180,6 +182,9 @@ def _has_compound_outside_quotes(command: str) -> bool:
 
     Tracks single/double quotes and backslash escapes the way the shell
     would (in double quotes a backslash only escapes ``$`"\\``).
+    Double quotes still perform command substitution; single quotes do
+    not — so an unescaped backtick or ``$(``/``${`` inside double
+    quotes is still compound.
     """
     quote: str | None = None
     i, n = 0, len(command)
@@ -192,9 +197,14 @@ def _has_compound_outside_quotes(command: str) -> bool:
         elif quote == '"':
             if ch == "\\" and i + 1 < n and command[i + 1] in "$`\"\\":
                 i += 2
+            elif ch == '"':
+                quote = None
+                i += 1
+            elif ch == "`":
+                return True
+            elif ch == "$" and i + 1 < n and command[i + 1] in "({":
+                return True
             else:
-                if ch == '"':
-                    quote = None
                 i += 1
         else:
             if ch == "\\":

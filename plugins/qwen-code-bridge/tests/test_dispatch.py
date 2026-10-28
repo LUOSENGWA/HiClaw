@@ -1507,8 +1507,9 @@ def test_cleanup_maps_terminating_to_watchdog_lost(tmp_path, monkeypatch):
 
 
 def _ctrl_cli(bin_dir: Path, stdin_log: Path) -> None:
-    """Fake CLI issuing two can_use_tool requests: one that must be denied
-    (path outside the run root) and one that must be allowed (git status)."""
+    """Fake CLI issuing four can_use_tool requests: an outside-root path
+    (deny), a double-quoted command substitution (deny, exec-compound),
+    and two that must be allowed (git status, git add)."""
     deny_req = {
         "type": "control_request",
         "request_id": "r-deny",
@@ -1516,6 +1517,15 @@ def _ctrl_cli(bin_dir: Path, stdin_log: Path) -> None:
             "subtype": "can_use_tool",
             "tool_name": "shell",
             "input": {"command": "cat /var/private/data"},
+        },
+    }
+    dq_deny_req = {
+        "type": "control_request",
+        "request_id": "r-dq-deny",
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": "run_shell_command",
+            "input": {"command": 'git commit -m "$(id)"'},
         },
     }
     allow_req = {
@@ -1527,10 +1537,21 @@ def _ctrl_cli(bin_dir: Path, stdin_log: Path) -> None:
             "input": {"command": "git status"},
         },
     }
+    dq_allow_req = {
+        "type": "control_request",
+        "request_id": "r-dq-allow",
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": "run_shell_command",
+            "input": {"command": "git add file"},
+        },
+    }
     script = (
         "#!/bin/sh\n"
         f"echo '{json.dumps(deny_req)}'\n"
+        f"echo '{json.dumps(dq_deny_req)}'\n"
         f"echo '{json.dumps(allow_req)}'\n"
+        f"echo '{json.dumps(dq_allow_req)}'\n"
         f'while IFS= read -r line; do printf "%s\\n" "$line" >> "{stdin_log}"; done\n'
     )
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -1542,7 +1563,9 @@ def _ctrl_cli(bin_dir: Path, stdin_log: Path) -> None:
 @pytest.mark.asyncio
 async def test_control_response_deny_not_allow(tmp_path):
     """#1411: a deny decision must reach the CLI as behavior=deny with a
-    message; allow may only be emitted for policy-clean commands."""
+    message; allow may only be emitted for policy-clean commands.
+    Includes the double-quote bypass: ``git commit -m "$(id)"`` must be
+    denied with exec-compound, while plain ``git add`` keeps flowing."""
     with Env(tmp_path) as env:
         stdin_log = tmp_path / "stdin.log"
         _ctrl_cli(env.bin_dir, stdin_log)
@@ -1554,13 +1577,20 @@ async def test_control_response_deny_not_allow(tmp_path):
         text = ""
         for _ in range(200):
             text = stdin_log.read_text(errors="replace") if stdin_log.exists() else ""
-            if "r-deny" in text and "r-allow" in text:
+            if all(f'"r-{k}"' in text for k in ("deny", "dq-deny", "allow", "dq-allow")):
                 break
             await asyncio.sleep(0.05)
-        deny_line = next(l for l in text.splitlines() if "r-deny" in l)
-        allow_line = next(l for l in text.splitlines() if "r-allow" in l)
+        deny_line = next(l for l in text.splitlines() if '"r-deny"' in l)
+        allow_line = next(l for l in text.splitlines() if '"r-allow"' in l)
+        dq_deny_line = next(l for l in text.splitlines() if '"r-dq-deny"' in l)
+        dq_allow_line = next(l for l in text.splitlines() if '"r-dq-allow"' in l)
         deny_resp = json.loads(deny_line)["response"]["response"]
         allow_resp = json.loads(allow_line)["response"]["response"]
+        dq_deny_resp = json.loads(dq_deny_line)["response"]["response"]
+        dq_allow_resp = json.loads(dq_allow_line)["response"]["response"]
         assert deny_resp["behavior"] == "deny"
         assert deny_resp["message"]
         assert allow_resp["behavior"] == "allow"
+        assert dq_deny_resp["behavior"] == "deny"
+        assert "exec-compound" in dq_deny_resp["message"]
+        assert dq_allow_resp["behavior"] == "allow"

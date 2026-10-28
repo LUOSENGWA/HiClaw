@@ -157,6 +157,48 @@ def test_backtick_deny():
     assert d["behavior"] == "deny" and d["rule"] == "exec-compound"
 
 
+def test_dquote_command_substitution_paren_deny():
+    d = approval.decide("shell", {"command": 'git commit -m "$(id)"'}, [ROOT])
+    assert d["behavior"] == "deny" and d["rule"] == "exec-compound"
+
+
+def test_dquote_command_substitution_backtick_deny():
+    d = approval.decide("shell", {"command": 'git commit -m "`id`"'}, [ROOT])
+    assert d["behavior"] == "deny" and d["rule"] == "exec-compound"
+
+
+def test_dquote_command_substitution_embedded_deny():
+    d = approval.decide(
+        "shell", {"command": 'git commit -m "prefix $(id) suffix"'}, [ROOT]
+    )
+    assert d["behavior"] == "deny" and d["rule"] == "exec-compound"
+
+
+def test_dquote_param_expansion_deny():
+    d = approval.decide("shell", {"command": 'git commit -m "${HOME}"'}, [ROOT])
+    assert d["behavior"] == "deny" and d["rule"] == "exec-compound"
+
+
+def test_dquote_command_substitution_echo_deny():
+    d = approval.decide("shell", {"command": 'echo "a$(date)b"'}, [ROOT])
+    assert d["behavior"] == "deny" and d["rule"] == "exec-compound"
+
+
+def test_squote_command_substitution_allow():
+    d = approval.decide("shell", {"command": "git commit -m '$(id)'"}, [ROOT])
+    assert d["behavior"] == "allow"
+
+
+def test_dquote_escaped_command_substitution_allow():
+    d = approval.decide("shell", {"command": 'git commit -m "\\$(id)"'}, [ROOT])
+    assert d["behavior"] == "allow"
+
+
+def test_dquote_escaped_backtick_allow():
+    d = approval.decide("shell", {"command": 'git commit -m "\\`id\\`"'}, [ROOT])
+    assert d["behavior"] == "allow"
+
+
 def test_python_interpreter_deny():
     d = approval.decide("shell", {"command": "python3 -c 1"}, [ROOT])
     assert d["behavior"] == "deny" and d["rule"] == "exec-denied"
