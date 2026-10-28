@@ -55,7 +55,13 @@ from . import (
 )
 from .endpoints import app_base
 from .registry import CLIS
-from .state import cli_home, prepare_cli_home, qwen_cli, state_dir
+from .state import (
+    APPROVAL_ROOTS_ENV,
+    cli_home,
+    prepare_cli_home,
+    qwen_cli,
+    state_dir,
+)
 
 #: Task ids are ``uuid4().hex``; the check also keeps task file names
 #: safe against traversal via ``get_task`` / ``get_log`` input.
@@ -1814,6 +1820,13 @@ class DispatchService:
         env = dict(os.environ)
         env["QWENPAW_SESSION_ID"] = session_id
         try:
+            # Run roots for the PreToolUse policy hook (hook_policy.py):
+            # a per-task value, so it belongs in this spawn's environment
+            # (the shared settings.json cannot carry per-task roots).
+            # Same list the can_use_tool path passes to approval.decide.
+            env[APPROVAL_ROOTS_ENV] = json.dumps(
+                [cwd] if cwd else [os.getcwd()]
+            )
             _home = cli_home()
             if _home:
                 env["HOME"] = _home

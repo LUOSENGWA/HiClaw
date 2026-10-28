@@ -81,6 +81,84 @@ def qwen_home() -> str:
     return cli_home()
 
 
+#: Name of the worker-proxy policy hook registered in the dispatch CLI
+#: home (idempotency key: an entry with the same name is replaced).
+APPROVAL_HOOK_NAME = "agentteams-worker-proxy-policy"
+
+#: Per-dispatch environment variable carrying the run roots (JSON array)
+#: that ``hook_policy.py`` reads.  Set by the dispatch spawn path — a
+#: per-task value, so it must not live in the shared settings.json.
+APPROVAL_ROOTS_ENV = "AGENTTEAMS_APPROVAL_ROOTS"
+
+
+def approval_hook_command() -> str:
+    """Shell command running the policy hook under the current interpreter.
+
+    Absolute path by design: a plugin upgrade may move the package, and
+    ``prepare_cli_home`` rewrites the settings on every dispatch, picking
+    up the new location.
+    """
+    import shlex
+    import sys
+
+    script = Path(__file__).resolve().with_name("hook_policy.py")
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
+
+
+def ensure_approval_hook(qdir: Path) -> bool:
+    """Idempotently install the worker-proxy PreToolUse hook.
+
+    Merges into ``<qdir>/settings.json``: any existing hook entry named
+    ``agentteams-worker-proxy-policy`` (under any PreToolUse matcher) is
+    replaced by the fresh copy; every other setting and hook is
+    preserved.  Returns False — file left untouched — when the settings
+    are not a valid JSON object or cannot be written.
+    """
+    import json
+
+    path = qdir / "settings.json"
+    try:
+        data: dict = {}
+        if path.exists():
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                return False
+            data = loaded
+        hooks = data.get("hooks")
+        if not isinstance(hooks, dict):
+            hooks = {}
+        pre = hooks.get("PreToolUse")
+        if not isinstance(pre, list):
+            pre = []
+        ours = {
+            "type": "command",
+            "command": approval_hook_command(),
+            "name": APPROVAL_HOOK_NAME,
+            "timeout": 10,
+        }
+        kept: list = []
+        for entry in pre:
+            inner = entry.get("hooks") if isinstance(entry, dict) else None
+            if isinstance(inner, list) and any(
+                isinstance(h, dict) and h.get("name") == APPROVAL_HOOK_NAME
+                for h in inner
+            ):
+                continue  # replaced by the fresh copy below
+            kept.append(entry)
+        kept.append({"matcher": "*", "hooks": [ours]})
+        hooks["PreToolUse"] = kept
+        data["hooks"] = hooks
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def prepare_cli_home(home: str) -> str:
     """Ensure ``<home>/.qwen`` has settings/token; return the QWEN_HOME path.
 
@@ -110,6 +188,10 @@ def prepare_cli_home(home: str) -> str:
                     break
             except OSError:
                 continue
+    # Dispatch-home policy hook (#1411): covers the tool calls the CLI
+    # would auto-approve without a can_use_tool request.  Idempotent, and
+    # never clobbers other settings or hooks.
+    ensure_approval_hook(qdir)
     for name in ("settings.json", "serve-token"):
         try:
             (qdir / name).chmod(0o600)
