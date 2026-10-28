@@ -334,6 +334,10 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "items": {"type": "string"},
                     "description": "Optional full Matrix user ids (@localpart:domain) to mention in the publish summary event. Invalid values are dropped; short names are not expanded.",
                 },
+                "publishId": {
+                    "type": "string",
+                    "description": "Optional caller-chosen id for this publish. Retries of a failed or lost publish must reuse the same value (or omit it) so the homeserver deduplicates the same room+filename+content; pass a fresh value to deliberately re-notify on unchanged content.",
+                },
             },
             "additionalProperties": True,
         },

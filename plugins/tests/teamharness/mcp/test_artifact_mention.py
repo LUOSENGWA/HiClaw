@@ -40,6 +40,9 @@ class _MatrixState:
         self.events: list[dict[str, Any]] = []
         self.seen_txns: dict[str, str] = {}
         self.room_events: dict[str, dict[str, str]] = {}
+        # opt-in per-test behaviors; the defaults keep the stable-MXC mode
+        self.fresh_mxc_each_upload = False
+        self.drop_next_put_response = False
 
 
 def _make_matrix_server(monkeypatch: pytest.MonkeyPatch, workspace: Path, state: _MatrixState):
@@ -73,6 +76,9 @@ def _make_matrix_server(monkeypatch: pytest.MonkeyPatch, workspace: Path, state:
             digest = hashlib.sha256(
                 f"{filename}:{body.decode('utf-8', 'replace')}".encode("utf-8")
             ).hexdigest()[:16]
+            if state.fresh_mxc_each_upload:
+                # real homeservers may mint a new media URI per upload
+                digest = f"{digest}-{len(state.uploads)}"
             self._reply(200, {"content_uri": f"mxc://example.test/{digest}"})
 
         def do_GET(self) -> None:  # noqa: N802
@@ -99,6 +105,12 @@ def _make_matrix_server(monkeypatch: pytest.MonkeyPatch, workspace: Path, state:
             event_id = f"$evt-{len(state.events) + 1}"
             state.seen_txns[txn] = event_id
             state.events.append({"txn": txn, "content": json.loads(body.decode("utf-8") or "{}")})
+            if state.drop_next_put_response:
+                # the server processed the PUT but the client loses the
+                # response (connection closed without a reply)
+                state.drop_next_put_response = False
+                self.close_connection = True
+                return
             self._reply(200, {"event_id": event_id})
 
         def log_message(self, *args: Any) -> None:  # silence
@@ -377,3 +389,92 @@ def test_summary_send_failure_does_not_fail_publish(
     # only the file event made it to the room
     assert len(matrix.events) == 1
     assert matrix.events[0]["content"]["msgtype"] == "m.file"
+
+
+def test_retry_after_fresh_mxc_deduplicates_via_preupload_txn(
+    matrix: _MatrixState,
+    tmp_path: Path,
+) -> None:
+    """Real homeservers may mint a different MXC URI for every upload of
+    the same bytes. The publish txn is derived before the upload (room +
+    filename + content hash), so the retry re-PUTs the same two txns and
+    the room still gets exactly one file + one summary."""
+    matrix.fresh_mxc_each_upload = True
+    first = _publish(tmp_path, mentions=[LEADER])
+    assert first["ok"] is True
+    assert len(matrix.events) == 2
+
+    second = _publish(tmp_path, mentions=[LEADER])
+    assert second["ok"] is True
+    # same content → same pre-upload txn, even though the MXC changed
+    assert second["artifact"]["mxcUri"] != first["artifact"]["mxcUri"]
+    assert second["artifact"]["eventId"] == first["artifact"]["eventId"]
+    assert len(matrix.events) == 2, [event["txn"] for event in matrix.events]
+
+    file_event, summary_event = _file_and_summary(matrix)
+    assert re.fullmatch(r"teamharness-file-[0-9a-f]{24}", file_event["txn"])
+    assert summary_event["txn"] == file_event["txn"] + "-summary"
+
+
+def test_lost_send_response_retry_deduplicates_file_event(
+    matrix: _MatrixState,
+    tmp_path: Path,
+) -> None:
+    """The homeserver processed the file PUT but the client lost the
+    response (the publish failed locally). The retry re-PUTs the same
+    pre-upload txn: the file event deduplicates to the original event id
+    and the summary is sent exactly once."""
+    matrix.fresh_mxc_each_upload = True
+    matrix.drop_next_put_response = True
+
+    first = _publish(tmp_path, mentions=[LEADER])
+    assert first["ok"] is False
+    assert first["artifact"]["status"] == "failed"
+    assert len(matrix.events) == 1
+    assert matrix.events[0]["content"]["msgtype"] == "m.file"
+
+    second = _publish(tmp_path, mentions=[LEADER])
+    assert second["ok"] is True
+    assert len(matrix.events) == 2, [event["txn"] for event in matrix.events]
+    # the file event id is the one created by the lost first publish
+    original_event_id = matrix.seen_txns[matrix.events[0]["txn"]]
+    assert original_event_id == "$evt-1"
+    assert second["artifact"]["eventId"] == original_event_id
+    file_event, summary_event = _file_and_summary(matrix)
+    assert summary_event["txn"] == file_event["txn"] + "-summary"
+
+
+def test_publish_id_mints_new_txn_for_deliberate_republish(
+    matrix: _MatrixState,
+    tmp_path: Path,
+) -> None:
+    """Same content, deliberate second notification: a fresh publishId
+    mints a new txn pair, so the room sees a second file + summary."""
+    first = _publish(tmp_path, mentions=[LEADER])
+    assert first["ok"] is True
+    assert len(matrix.events) == 2
+
+    second = _publish(tmp_path, mentions=[LEADER], publishId="attempt-2")
+    assert second["ok"] is True
+    assert len(matrix.events) == 4, [event["txn"] for event in matrix.events]
+
+    first_file, _ = _file_and_summary(matrix, offset=2)
+    second_file, _ = _file_and_summary(matrix)
+    assert first_file["txn"] != second_file["txn"]
+    assert re.fullmatch(r"teamharness-file-[0-9a-f]{24}", second_file["txn"])
+
+
+def test_changed_content_mints_new_txn(matrix: _MatrixState, tmp_path: Path) -> None:
+    """Changed content hashes to a new txn even without a publishId: the
+    room is notified again."""
+    first = _publish(tmp_path)
+    assert first["ok"] is True
+    assert len(matrix.events) == 2
+
+    (tmp_path / "reports" / "summary.md").write_text("Revised result.\n" * 40, encoding="utf-8")
+    second = _publish(tmp_path)
+    assert second["ok"] is True
+    assert len(matrix.events) == 4, [event["txn"] for event in matrix.events]
+    first_file, _ = _file_and_summary(matrix, offset=2)
+    second_file, _ = _file_and_summary(matrix)
+    assert first_file["txn"] != second_file["txn"]

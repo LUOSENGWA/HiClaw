@@ -438,6 +438,23 @@ def _matrix_send_file_summary(
         print(f"teamharness: artifact summary event failed: {exc}", file=sys.stderr)
 
 
+def _artifact_publish_txn(canonical_room_id: str, filename: str, content_sha: str, publish_id: str) -> str:
+    """Deterministic artifact publish transaction id, derived before upload.
+
+    The seed is (room, filename, content hash, publish id) and
+    deliberately excludes the uploaded MXC URI: a real homeserver may
+    mint a different media URI for every upload of the same bytes, and a
+    txn that depends on the response cannot deduplicate a retry. Same
+    room + filename + content with no publish id retries to the same
+    txn (the homeserver keeps one event pair even when the client lost
+    the first response); changed content hashes to a new txn; a
+    deliberate re-publish of unchanged content passes a fresh
+    ``publish_id``.
+    """
+    seed = f"{canonical_room_id}|{filename}|{content_sha}|{publish_id}".encode("utf-8")
+    return f"teamharness-file-{hashlib.sha256(seed).hexdigest()[:24]}"
+
+
 def _matrix_send_file_event(
     homeserver: str,
     token: str,
@@ -449,17 +466,23 @@ def _matrix_send_file_event(
     parent_event_id: str = "",
     summary: str = "",
     mentions: list[str] | None = None,
+    txn_id: str = "",
 ) -> str:
     """Send an ``m.file`` event, optionally followed by a summary event.
 
     When ``summary`` is non-empty, a second ``m.text`` event goes to the
     same room so the room members are actually notified about the file.
-    The file transaction id is deterministic (room + media + filename) in
-    that case, and the summary derives ``<file-txn>-summary`` from it, so
-    a retried publish of the same file re-PUTs the same two txns and the
-    homeserver deduplicates instead of emitting a second summary. Without
-    a ``summary`` the legacy random transaction id and single-event
-    behavior are preserved.
+    The summary derives ``<file-txn>-summary`` from the file txn, so a
+    retried publish re-PUTs the same two txns and the homeserver
+    deduplicates instead of emitting a second summary.
+
+    ``txn_id`` (when given) is the file transaction id the caller
+    computed before the media upload via ``_artifact_publish_txn`` — it
+    takes precedence over the local fallbacks below, which is what keeps
+    a retry idempotent when the homeserver mints a fresh MXC URI per
+    upload. Without it the legacy behavior is preserved: a
+    deterministic (room + media + filename) id with a summary, otherwise
+    a random single-use id.
     """
     content = {
         "msgtype": "m.file",
@@ -476,11 +499,12 @@ def _matrix_send_file_event(
             "event_id": parent_event_id,
         }
     canonical_room_id = _canonical_room_id(room_id)
-    if summary:
-        stable_seed = f"{canonical_room_id}|{mxc_uri}|{filename}".encode("utf-8")
-        txn_id = f"teamharness-file-{hashlib.sha256(stable_seed).hexdigest()[:24]}"
-    else:
-        txn_id = f"teamharness-file-{os.getpid()}-{int(time.time() * 1000)}-{uuid.uuid4().hex}"
+    if not txn_id:
+        if summary:
+            stable_seed = f"{canonical_room_id}|{mxc_uri}|{filename}".encode("utf-8")
+            txn_id = f"teamharness-file-{hashlib.sha256(stable_seed).hexdigest()[:24]}"
+        else:
+            txn_id = f"teamharness-file-{os.getpid()}-{int(time.time() * 1000)}-{uuid.uuid4().hex}"
     encoded_room_id = urllib.parse.quote(canonical_room_id, safe="")
     url = f"{homeserver}/_matrix/client/v3/rooms/{encoded_room_id}/send/m.room.message/{txn_id}"
     request = urllib.request.Request(
@@ -658,6 +682,20 @@ def _publish_workspace_artifact(
     else:
         summary_mentions = mentions
 
+    # Publish identity is fixed before the upload: the txn seed
+    # (room + filename + content hash + publish id) excludes the upload
+    # response, because real homeservers may mint a fresh MXC URI for
+    # every upload of the same bytes. A retry — including one after a
+    # lost response — re-PUTs the same txns, so the homeserver keeps a
+    # single event pair; a deliberate re-publish of unchanged content
+    # passes a fresh publishId to mint a new identity. Without a summary
+    # and without a publishId the legacy random txn behavior is kept.
+    publish_id = str(arguments.get("publishId") or arguments.get("publish_id") or "").strip()
+    stable_txn = ""
+    if summary_text or publish_id:
+        content_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        stable_txn = _artifact_publish_txn(canonical_room_id, filename, content_sha, publish_id)
+
     try:
         mxc_uri = _matrix_upload_artifact(homeserver, token, path, filename, mimetype)
         event_id = _matrix_send_file_event(
@@ -671,6 +709,7 @@ def _publish_workspace_artifact(
             parent_event_id,
             summary=summary_text,
             mentions=summary_mentions,
+            txn_id=stable_txn,
         )
     except urllib.error.HTTPError as exc:
         result["status"] = "failed"
