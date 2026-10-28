@@ -34,4 +34,13 @@ TRANSITIONS: dict[str, list[str]] = {
 
 TASK_HISTORY_LIMIT = 50
 
+# TeamHarness loop budget ledger (project["loop"]["budget"]): the
+# tier->iteration-budget mapping (simple=3 / standard=5 / full=10). The
+# cost-model tiers only define human-touch budgets, so the mapping is
+# declared here. A loop with neither a recognized tier nor an explicit
+# iteration_budget has no budget at all (iteration_budget stays None).
+LOOP_BUDGET_BY_TIER: dict[str, int] = {"simple": 3, "standard": 5, "full": 10}
+# Per-loop provenance tail kept in meta.json (the newest entries survive).
+LOOP_PROVENANCE_LIMIT = 5
+
 
