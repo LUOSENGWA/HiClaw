@@ -1009,6 +1009,7 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     project_id,
                     "",
                     _attachment_parent_event_id(payload, arguments),
+                    completion_event_id=str(project.get("projectCompletionEventId") or ""),
                 )
             result["notificationNeeded"] = _notification_needed(action, project)
             return result

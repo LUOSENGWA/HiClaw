@@ -23,6 +23,11 @@ SHORT_MATRIX_MENTION_RE = re.compile(
 )
 
 
+# Full Matrix user ID (MXID) gate for m.mentions user_ids: `@localpart:domain`.
+# Short names or plain text must never be treated as mentionable identities.
+MATRIX_MENTION_MXID_RE = re.compile(r"@[^\s:]+:[^\s]+$")
+
+
 MATRIX_ROOM_RE = re.compile(r"^![^:\s]+:[^\s]+$")
 
 

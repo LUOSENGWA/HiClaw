@@ -1,6 +1,8 @@
 # artifact publishing, matrix attachments and sensitive-content scan (W1-a2: real module)
 from __future__ import annotations
 
+import hashlib
+
 import json
 
 import mimetypes
@@ -8,6 +10,8 @@ import mimetypes
 import os
 
 import re
+
+import sys
 
 import time
 
@@ -29,8 +33,9 @@ from mcp.common import refs
 from mcp.common.identity import _canonical_room_id
 from mcp.common.io import _read_json
 from mcp.common.paths import _task_state_path, _workspace_dir
-from mcp.room.matrix import _matrix_env
-from mcp.room.mention import MATRIX_ROOM_RE, _matrix_target
+from mcp.common.payload import _string_list
+from mcp.room.matrix import _matrix_env, _team_leader_matrix_id
+from mcp.room.mention import MATRIX_MENTION_MXID_RE, MATRIX_ROOM_RE, _matrix_content, _matrix_target
 from mcp.transport.route import _reply_route
 from .filesync import _normalize_shared_path
 
@@ -365,6 +370,74 @@ def _matrix_upload_artifact(homeserver: str, token: str, path: Path, filename: s
     return mxc_uri
 
 
+def _valid_mention_mxids(values: Any) -> list[str]:
+    """Validate candidate mention values as full Matrix user IDs (MXIDs).
+
+    A Matrix mention requires the full ``@localpart:domain`` form; short
+    names or malformed values are dropped (with a warning) instead of
+    being concatenated as plain text, which would not mention anyone.
+    """
+    mentions: list[str] = []
+    for raw in _string_list(values):
+        mxid = raw.strip()
+        if not mxid:
+            continue
+        if not MATRIX_MENTION_MXID_RE.fullmatch(mxid):
+            print(f"teamharness: dropping invalid Matrix mention {mxid!r}", file=sys.stderr)
+            continue
+        if mxid not in mentions:
+            mentions.append(mxid)
+    return mentions
+
+
+def _matrix_send_file_summary(
+    homeserver: str,
+    token: str,
+    encoded_room_id: str,
+    file_txn_id: str,
+    summary: str,
+    mentions: list[str] | None,
+) -> None:
+    """Best-effort ``m.text`` companion event for a published file.
+
+    The ``m.file`` event alone notifies nobody; the summary carries the
+    ``m.mentions`` + matrix.to pill notification built by
+    ``_matrix_content``. Its transaction id is the file event's id plus
+    ``-summary`` so the pair is idempotent on retry. Notification-level
+    failures never fail the publish: the file already reached the room.
+
+    Mentions are prepended to the text when the text does not already
+    contain the MXID, mirroring the completion/delegate notifications:
+    ``_formatted_body`` only renders a pill for an MXID present in the
+    text, and the plain ``body`` keeps the readable fallback.
+    """
+    mxids = _valid_mention_mxids(mentions)
+    text = summary
+    missing = [mxid for mxid in mxids if mxid not in text]
+    if missing:
+        text = " ".join(missing) + " " + text
+    content = _matrix_content(text, mxids)
+    summary_txn_id = f"{file_txn_id}-summary"
+    url = (
+        f"{homeserver}/_matrix/client/v3/rooms/{encoded_room_id}/send/"
+        f"m.room.message/{urllib.parse.quote(summary_txn_id, safe='')}"
+    )
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(content).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response.read()
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        print(f"teamharness: artifact summary event failed: {exc}", file=sys.stderr)
+
+
 def _matrix_send_file_event(
     homeserver: str,
     token: str,
@@ -374,7 +447,20 @@ def _matrix_send_file_event(
     size: int,
     mimetype: str,
     parent_event_id: str = "",
+    summary: str = "",
+    mentions: list[str] | None = None,
 ) -> str:
+    """Send an ``m.file`` event, optionally followed by a summary event.
+
+    When ``summary`` is non-empty, a second ``m.text`` event goes to the
+    same room so the room members are actually notified about the file.
+    The file transaction id is deterministic (room + media + filename) in
+    that case, and the summary derives ``<file-txn>-summary`` from it, so
+    a retried publish of the same file re-PUTs the same two txns and the
+    homeserver deduplicates instead of emitting a second summary. Without
+    a ``summary`` the legacy random transaction id and single-event
+    behavior are preserved.
+    """
     content = {
         "msgtype": "m.file",
         "body": filename,
@@ -389,8 +475,13 @@ def _matrix_send_file_event(
             "rel_type": MATRIX_ATTACHMENT_REL_TYPE,
             "event_id": parent_event_id,
         }
-    encoded_room_id = urllib.parse.quote(_canonical_room_id(room_id), safe="")
-    txn_id = f"teamharness-file-{os.getpid()}-{int(time.time() * 1000)}-{uuid.uuid4().hex}"
+    canonical_room_id = _canonical_room_id(room_id)
+    if summary:
+        stable_seed = f"{canonical_room_id}|{mxc_uri}|{filename}".encode("utf-8")
+        txn_id = f"teamharness-file-{hashlib.sha256(stable_seed).hexdigest()[:24]}"
+    else:
+        txn_id = f"teamharness-file-{os.getpid()}-{int(time.time() * 1000)}-{uuid.uuid4().hex}"
+    encoded_room_id = urllib.parse.quote(canonical_room_id, safe="")
     url = f"{homeserver}/_matrix/client/v3/rooms/{encoded_room_id}/send/m.room.message/{txn_id}"
     request = urllib.request.Request(
         url,
@@ -406,7 +497,79 @@ def _matrix_send_file_event(
     event_id = str(data.get("event_id") or "").strip()
     if not event_id:
         raise ValueError("Matrix file event response missing event_id")
+    if summary:
+        _matrix_send_file_summary(homeserver, token, encoded_room_id, txn_id, summary, mentions)
     return event_id
+
+
+def _matrix_event_sender(homeserver: str, token: str, room_id: str, event_id: str) -> str:
+    """Best-effort sender lookup for a room event (fail-open).
+
+    Attributes an artifact summary to the person whose message the file is
+    attached to. Any lookup failure returns "" so the summary is still
+    sent without a mention instead of blocking the publish.
+    """
+    if not event_id:
+        return ""
+    encoded_room_id = urllib.parse.quote(_canonical_room_id(room_id), safe="")
+    encoded_event_id = urllib.parse.quote(event_id, safe="")
+    url = f"{homeserver}/_matrix/client/v3/rooms/{encoded_room_id}/event/{encoded_event_id}"
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8") or "{}")
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return ""
+    sender = str(data.get("sender") or "").strip()
+    return sender if MATRIX_MENTION_MXID_RE.fullmatch(sender) else ""
+
+
+def _default_artifact_summary(filename: str, size: int, source_path: str) -> str:
+    return f"📎 已发布 {filename}（{size / 1024:.1f} KB）— {source_path}；结论/下一步见文件"
+
+
+def _resolve_artifact_mentions(
+    arguments: dict[str, Any],
+    *,
+    room_id: str,
+    parent_event_id: str,
+    homeserver: str,
+    token: str,
+    task_id: str = "",
+) -> list[str]:
+    """Resolve who an artifact summary should mention (fail-open).
+
+    Order: explicit ``mentions`` argument → sender of the parent event
+    the file attaches to → the task's requester/leader. Every step may
+    come up empty; a publish with no resolvable mention still sends the
+    summary text (without a mention) instead of failing.
+    """
+    explicit = _valid_mention_mxids(
+        arguments.get("mentions") or arguments.get("mentionIds") or arguments.get("mention_ids")
+    )
+    if explicit:
+        return explicit
+    if parent_event_id:
+        sender = _matrix_event_sender(homeserver, token, room_id, parent_event_id)
+        if sender:
+            return [sender]
+    task_id = str(task_id or "").strip()
+    if task_id:
+        # Lazy import: mcp.lifecycle.taskflow imports this module at top
+        # level, so a top-level import back would be a cycle.
+        from mcp.lifecycle.taskflow import _load_task
+
+        try:
+            task = _load_task(arguments, task_id)
+        except ValueError:
+            task = {}
+        requester = str(task.get("requester") or "").strip()
+        if requester and MATRIX_MENTION_MXID_RE.fullmatch(requester):
+            return [requester]
+        leader = _team_leader_matrix_id()
+        if leader:
+            return [leader]
+    return []
 
 
 def _publish_workspace_artifact(
@@ -417,6 +580,9 @@ def _publish_workspace_artifact(
     filename: str,
     expected_prefix: str,
     parent_event_id: str = "",
+    summary: str | None = None,
+    mentions: list[str] | None = None,
+    task_id: str = "",
 ) -> dict[str, Any]:
     parent_event_id = str(parent_event_id or "").strip()
     result = _artifact_publish_result(str(source_path), filename, parent_event_id)
@@ -473,6 +639,25 @@ def _publish_workspace_artifact(
         result["error"] = str(exc)
         return result
 
+    # summary=None → the default publish summary; summary="" → no summary
+    # event (the caller's other notification already covers this file).
+    summary_text = (
+        str(summary).strip()
+        if summary is not None
+        else _default_artifact_summary(filename, size, normalized)
+    )
+    if summary_text and mentions is None:
+        summary_mentions = _resolve_artifact_mentions(
+            arguments,
+            room_id=canonical_room_id,
+            parent_event_id=parent_event_id,
+            homeserver=homeserver,
+            token=token,
+            task_id=task_id,
+        )
+    else:
+        summary_mentions = mentions
+
     try:
         mxc_uri = _matrix_upload_artifact(homeserver, token, path, filename, mimetype)
         event_id = _matrix_send_file_event(
@@ -484,6 +669,8 @@ def _publish_workspace_artifact(
             size,
             mimetype,
             parent_event_id,
+            summary=summary_text,
+            mentions=summary_mentions,
         )
     except urllib.error.HTTPError as exc:
         result["status"] = "failed"
@@ -552,6 +739,7 @@ def _artifact(arguments: dict[str, Any]) -> dict[str, Any]:
         filename=filename,
         expected_prefix="",
         parent_event_id=parent_event_id,
+        task_id=str(arguments.get("taskId") or arguments.get("task_id") or "").strip(),
     )
     return {
         "ok": artifact.get("status") == "published",
@@ -580,14 +768,18 @@ def _publish_task_artifacts(
     room_id = str(task.get("room_id") or "")
     expected_prefix = f"shared/tasks/{task_id}"
     result_source = f"{expected_prefix}/result.md"
-    artifacts: list[tuple[str, str]] = []
+    # (source, filename, is_result) — the result.md summary is withheld
+    # because the submit_task action sends the completion notification for
+    # it in the same action (its Result line names the file and mentions
+    # the leader); a second @-summary would double-notify the room.
+    artifacts: list[tuple[str, str, bool]] = []
     try:
         _normalized_result, result_path = _resolve_workspace_artifact_path(arguments, result_source, expected_prefix)
         if result_path.is_file():
-            artifacts.append((result_source, _task_artifact_filename(task_id, "result.md", result_artifact=True)))
+            artifacts.append((result_source, _task_artifact_filename(task_id, "result.md", result_artifact=True), True))
     except ValueError:
         pass
-    seen = {source for source, _filename in artifacts}
+    seen = {source for source, _filename, _is_result in artifacts}
     for item in deliverables:
         source = str(item or "").strip()
         if not source:
@@ -600,7 +792,7 @@ def _publish_task_artifacts(
         if seen_key in seen:
             continue
         seen.add(seen_key)
-        artifacts.append((source, _task_artifact_filename(task_id, source)))
+        artifacts.append((source, _task_artifact_filename(task_id, source), False))
     return [
         _publish_workspace_artifact(
             arguments,
@@ -609,8 +801,10 @@ def _publish_task_artifacts(
             filename=filename,
             expected_prefix=expected_prefix,
             parent_event_id=parent_event_id,
+            summary="" if is_result else None,
+            task_id=task_id,
         )
-        for source, filename in artifacts
+        for source, filename, is_result in artifacts
     ]
 
 
@@ -638,6 +832,7 @@ def _publish_project_artifacts(
     project_id: str,
     task_id: str,
     parent_event_id: str = "",
+    completion_event_id: str = "",
 ) -> list[dict[str, Any]]:
     task = _read_json(_task_state_path(arguments, task_id)) if task_id else {}
     source_path = f"shared/projects/{project_id}/result.md"
@@ -649,6 +844,11 @@ def _publish_project_artifacts(
             filename=f"{project_id}-project-result.md",
             expected_prefix=f"shared/projects/{project_id}",
             parent_event_id=parent_event_id,
+            # A completion notification already emitted for this action
+            # (its event id is recorded) names the result file and
+            # mentions the leader; a second @-summary would double-notify.
+            summary="" if completion_event_id else None,
+            task_id=task_id,
         )
     ]
 

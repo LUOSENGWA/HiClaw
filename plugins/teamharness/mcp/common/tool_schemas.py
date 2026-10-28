@@ -325,6 +325,15 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "type": "string",
                     "description": "Runtime workspace containing the file.",
                 },
+                "taskId": {
+                    "type": "string",
+                    "description": "Optional task id whose requester/leader the publish summary should mention when no parent event sender is resolvable.",
+                },
+                "mentions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional full Matrix user ids (@localpart:domain) to mention in the publish summary event. Invalid values are dropped; short names are not expanded.",
+                },
             },
             "additionalProperties": True,
         },
