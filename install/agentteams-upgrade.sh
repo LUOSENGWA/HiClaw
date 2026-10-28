@@ -8,6 +8,9 @@
 # Safety:
 #   - preflight is read-only and emits JSON;
 #   - backup stops the controller for a cold kine copy, then restarts it;
+#     the copy runs only once the controller is verified stopped, and a failed
+#     stop, restart or post-backup health gate exits nonzero and records
+#     status: failed;
 #   - controller renames the old container, runs the new image with the old
 #     ports/mounts/network/restart policy, health-gates it, and keeps the old
 #     container for rollback;
@@ -235,19 +238,20 @@ container_running() {
 # State
 # ---------------------------------------------------------------------------
 write_state() {
-    local step="$1" status="$2" now
+    local step="$1" status="$2" detail="${3:-}" now
     now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     mkdir -p "$(dirname "${STATE_FILE}")" 2>/dev/null || true
     {
         echo "STEP=${step}"
         echo "STATUS=${status}"
+        [ -n "${detail}" ] && echo "DETAIL=${detail}"
         echo "UPDATED_AT=${now}"
         echo "BACKUP_DIR=${BACKUP_DIR}"
         echo "CONTROLLER_IMAGE=${CONTROLLER_IMAGE}"
         echo "ENV_SOURCE=${ENV_SOURCE}"
     } > "${STATE_FILE%.json}.env"
-    printf '{"step":"%s","status":"%s","updated_at":"%s","backup_dir":"%s","controller_image":"%s","env_source":"%s"}\n' \
-        "${step}" "${status}" "${now}" \
+    printf '{"step":"%s","status":"%s","detail":"%s","updated_at":"%s","backup_dir":"%s","controller_image":"%s","env_source":"%s"}\n' \
+        "${step}" "${status}" "$(json_escape "${detail}")" "${now}" \
         "$(json_escape "${BACKUP_DIR}")" "$(json_escape "${CONTROLLER_IMAGE}")" "$(json_escape "${ENV_SOURCE}")" \
         > "${STATE_FILE}"
 }
@@ -671,24 +675,50 @@ cmd_backup() {
         warn "could not export the controller env to ${BACKUP_DIR}/controller.env"
     fi
 
-    local was_running=0
+    local stopped=0
     if container_running; then
-        was_running=1
-        "${DOCKER_CMD}" stop "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
+        if ! "${DOCKER_CMD}" stop "${CONTROLLER_NAME}" >/dev/null 2>&1; then
+            write_state "backup" "failed" "docker stop failed; the controller was not stopped"
+            die "docker stop ${CONTROLLER_NAME} failed; refusing to copy a live kine database" "${EXIT_GATE}"
+        fi
+        if container_running; then
+            write_state "backup" "failed" "controller still running after docker stop"
+            die "controller is still running after stop; a cold backup requires a stopped controller - refusing to copy" "${EXIT_GATE}"
+        fi
+        stopped=1
     fi
+
+    # Once the controller is stopped, any failure below must still try to bring it back.
+    recover_after_backup_failure() {
+        [ "${stopped}" = "1" ] || return 0
+        if ! "${DOCKER_CMD}" start "${CONTROLLER_NAME}" >/dev/null 2>&1; then
+            err "controller start FAILED after the aborted backup; start it manually: ${DOCKER_CMD} start ${CONTROLLER_NAME}"
+            return 1
+        fi
+        if ! wait_health; then
+            err "controller restarted after the aborted backup but failed the health gate; inspect: ${DOCKER_CMD} logs ${CONTROLLER_NAME}"
+            return 1
+        fi
+        return 0
+    }
 
     mkdir -p "${BACKUP_DIR}/kine"
     if ! "${DOCKER_CMD}" cp "${CONTROLLER_NAME}:/data/agentteams-controller/." "${BACKUP_DIR}/kine/" >/dev/null 2>&1; then
-        [ "${was_running}" = "1" ] && "${DOCKER_CMD}" start "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
-        write_state "backup" "failed"
+        local rec="recovery ok"
+        recover_after_backup_failure || rec="recovery FAILED"
+        write_state "backup" "failed" "docker cp kine failed; ${rec}"
         die "docker cp kine failed" "${EXIT_GATE}"
     fi
     record_images
 
-    if [ "${was_running}" = "1" ]; then
-        "${DOCKER_CMD}" start "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
+    if [ "${stopped}" = "1" ]; then
+        if ! "${DOCKER_CMD}" start "${CONTROLLER_NAME}" >/dev/null 2>&1; then
+            write_state "backup" "failed" "controller restart failed after backup; controller is DOWN"
+            die "controller restart failed after backup; the controller is DOWN - start it manually: ${DOCKER_CMD} start ${CONTROLLER_NAME}" "${EXIT_GATE}"
+        fi
         if ! wait_health; then
-            warn "controller did not pass the health gate after backup; backup is complete"
+            write_state "backup" "failed" "controller failed the health gate after backup"
+            die "controller did not pass the health gate after backup (kine backup is complete at ${BACKUP_DIR}/kine); inspect: ${DOCKER_CMD} logs ${CONTROLLER_NAME}" "${EXIT_GATE}"
         fi
     fi
 

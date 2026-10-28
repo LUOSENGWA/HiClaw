@@ -134,6 +134,8 @@ big-bang in-place flow of `agentteams-install.sh`.
 ./install/agentteams-upgrade.sh status
 ```
 
+`backup` copies kine only after the controller is confirmed stopped; a failed stop, a container that is still running, a failed cp, a failed restart, or a failed post-backup health gate all exit nonzero and write `status: failed` (with a `detail`), and the failure path still attempts to bring the controller back whenever it was stopped.
+
 No remote mount is required: Docker volumes work out of the box. Bind and remote mounts are detected and preserved as-is; remote filesystems are reported as warnings, not failures.
 The preflight also detects the storage backend (embedded MinIO vs external S3/RustFS) from the endpoint, bucket and `/data/minio` mount, and compares the **live** `AGENTTEAMS_FS_ENDPOINT` / `AGENTTEAMS_STORAGE_PROVIDER` / bucket reported by the controller, Manager and Workers. A split — for example, the controller on RustFS while a Manager or Worker still points at MinIO — fails closed with `storage split-brain`; `--allow-storage-split` is an explicit migration-window override, not a normal upgrade flag. Storage migration itself is a separate runbook; do not combine it with a controller upgrade.
 

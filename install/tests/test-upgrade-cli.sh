@@ -25,11 +25,14 @@ trap cleanup EXIT
 BIN="${TMP}/bin"
 mkdir -p "${BIN}"
 REC="${TMP}/rec"
+RUNNING_FILE="${REC}.running"
 export REC
 
 cat > "${BIN}/docker" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${REC}"
+RUNNING_FILE="${REC}.running"
+running_state() { if [ -f "${RUNNING_FILE}" ]; then cat "${RUNNING_FILE}"; else echo true; fi }
 case "$1" in
     info)
         exit 0
@@ -50,7 +53,7 @@ case "$1" in
             *"len .Config.Env"*) echo 2 ;;
             *Config.Env*) printf 'A=1\nB=2\n' ;;
             *Config.Image*) echo "example/controller:old" ;;
-            *State.Running*) echo "true" ;;
+            *State.Running*) running_state ;;
             *RepoDigests*) echo "example/controller@sha256:old" ;;
             *".Id"*) echo "sha256:old" ;;
             *) echo "" ;;
@@ -96,9 +99,24 @@ case "$1" in
     logs)
         [ "${STUB_SCENARIO:-ok}" = "log_panic" ] && echo "panic: boom" || true
         ;;
-    stop|start|rename|cp|run|rm)
+    stop)
+        case "${STUB_SCENARIO:-ok}" in
+            stop_fail) exit 1 ;;
+            stop_noop) exit 0 ;;
+            *) echo false > "${RUNNING_FILE}"; exit 0 ;;
+        esac
+        ;;
+    start)
+        case "${STUB_SCENARIO:-ok}" in
+            start_fail) exit 1 ;;
+            *) echo true > "${RUNNING_FILE}"; exit 0 ;;
+        esac
+        ;;
+    cp)
+        [ "${STUB_SCENARIO:-ok}" = "cp_fail" ] && exit 1
         exit 0
         ;;
+    rename|run|rm) exit 0 ;;
     ps)
         echo "agentteams-controller"
         case "${STUB_SCENARIO:-ok}" in storage_split|storage_embedded) echo "agentteams-manager" ;; esac
@@ -118,6 +136,7 @@ run_case() {
     local scenario="$1"
     shift
     : > "${REC}"
+    rm -f "${RUNNING_FILE}"
     STUB_SCENARIO="${scenario}" bash "${UPGRADE}" "$@" > "${OUT}" 2>&1
     RC=$?
 }
@@ -244,6 +263,45 @@ assert_contains '^cp ' "${REC}" "backup yes cp"
 [ -f "${TMP}/b5/state.json" ] || { echo "FAIL backup yes: state.json missing"; cat "${OUT}"; exit 1; }
 assert_contains '"status":"done"' "${TMP}/b5/state.json" "backup yes state"
 
+# 5.1 docker stop fails: no copy, nonzero, failed state, controller left as-is
+run_case stop_fail backup --yes --env-file "${ENV_FILE}" --backup-dir "${TMP}/b51" --state-file "${TMP}/b51/state.json"
+assert_eq "${RC}" "3" "backup stop-fail rc"
+assert_contains 'refusing to copy' "${OUT}" "backup stop-fail message"
+assert_contains '^stop ' "${REC}" "backup stop-fail stop attempted"
+assert_not_contains '^cp ' "${REC}" "backup stop-fail no copy"
+assert_contains '"status":"failed"' "${TMP}/b51/state.json" "backup stop-fail state"
+assert_contains 'stop failed' "${TMP}/b51/state.json" "backup stop-fail detail"
+assert_not_contains '^start ' "${REC}" "backup stop-fail no restart needed"
+
+# 5.2 stop returns 0 but the container is still running: verified-stop check aborts the copy
+run_case stop_noop backup --yes --env-file "${ENV_FILE}" --backup-dir "${TMP}/b52" --state-file "${TMP}/b52/state.json"
+assert_eq "${RC}" "3" "backup stop-noop rc"
+assert_contains 'still running after stop' "${OUT}" "backup stop-noop message"
+assert_not_contains '^cp ' "${REC}" "backup stop-noop no copy"
+assert_contains '"status":"failed"' "${TMP}/b52/state.json" "backup stop-noop state"
+
+# 5.3 a later step fails (docker cp): the controller is still restarted, exit nonzero
+run_case cp_fail backup --yes --env-file "${ENV_FILE}" --backup-dir "${TMP}/b53" --state-file "${TMP}/b53/state.json"
+assert_eq "${RC}" "3" "backup cp-fail rc"
+assert_contains '^cp ' "${REC}" "backup cp-fail cp attempted"
+assert_contains '^start ' "${REC}" "backup cp-fail recovery start"
+assert_contains '"status":"failed"' "${TMP}/b53/state.json" "backup cp-fail state"
+assert_contains 'recovery ok' "${TMP}/b53/state.json" "backup cp-fail recovery detail"
+
+# 5.4 restart fails after a successful copy: nonzero, DOWN recorded
+run_case start_fail backup --yes --env-file "${ENV_FILE}" --backup-dir "${TMP}/b54" --state-file "${TMP}/b54/state.json"
+assert_eq "${RC}" "3" "backup start-fail rc"
+assert_contains 'is DOWN' "${OUT}" "backup start-fail message"
+assert_contains '"status":"failed"' "${TMP}/b54/state.json" "backup start-fail state"
+
+# 5.5 post-backup health gate fails: nonzero, status failed (NOT done), restart attempted
+run_case health_fail backup --yes --env-file "${ENV_FILE}" --backup-dir "${TMP}/b55" --state-file "${TMP}/b55/state.json" --timeout 2
+assert_eq "${RC}" "3" "backup health-fail rc"
+assert_contains '^start ' "${REC}" "backup health-fail restart"
+assert_contains '"status":"failed"' "${TMP}/b55/state.json" "backup health-fail state"
+assert_not_contains '"status":"done"' "${TMP}/b55/state.json" "backup health-fail not done"
+assert_contains 'health gate' "${TMP}/b55/state.json" "backup health-fail detail"
+
 # 6. controller dry-run: no run/rename
 run_case ok controller --dry-run --controller-image example/controller:new --env-file "${ENV_FILE}" --backup-dir "${TMP}/b6"
 assert_eq "${RC}" "0" "controller dry rc"
@@ -320,4 +378,4 @@ first="$(head -c 1 "${TMP}/json.out")"
 assert_eq "${first}" "{" "preflight json purity first char"
 assert_not_contains 'No such file' "${TMP}/json.err" "preflight json no log-dir noise"
 
-echo "PASS test-upgrade-cli (22 scenarios)"
+echo "PASS test-upgrade-cli (27 scenarios)"
