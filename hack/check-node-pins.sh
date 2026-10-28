@@ -5,6 +5,7 @@
 #   - a Dockerfile uses a floating Node 24 reference (node:24, node:24-*), or NodeSource setup_24.x
 #   - a Node-bearing Dockerfile does not pin 24.22.1
 #   - the DeepSeek Harness base image is not the pinned tag
+#   - the live SHASUMS256.txt extraction yields no valid checksum for x64/arm64 (set SKIP_NODE_LIVE=1 to skip in offline environments)
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -41,6 +42,34 @@ fi
 if ! grep -q 'node:24-bookworm-slim' hack/mirror-images.sh; then
   echo "ERROR: hack/mirror-images.sh must mirror node:24-bookworm-slim" >&2
   fail=1
+fi
+
+# Live extraction check: resolve the version and pull the tarball checksum
+# from the official SHASUMS256.txt exactly as the Dockerfiles do. The text
+# checks above cannot catch an extraction that fails at build time.
+if [ "${SKIP_NODE_LIVE:-0}" != "1" ]; then
+  live_ver="$(curl -fsSL https://nodejs.org/dist/index.json | jq -r '[.[] | select(.lts != false) | select(.version | startswith("v24."))][0].version' | sed 's/^v//')"
+  if [ -z "$live_ver" ]; then
+    echo "ERROR: could not resolve latest Node 24 LTS from dist index" >&2
+    fail=1
+  else
+    for node_arch in x64 arm64; do
+      tarball="node-v${live_ver}-linux-${node_arch}.tar.xz"
+      sha="$(curl -fsSL "https://nodejs.org/dist/v${live_ver}/SHASUMS256.txt" | awk -v f="$tarball" '$2 == f {print $1}')"
+      if printf '%s' "$sha" | grep -qE '^[0-9a-f]{64}$'; then
+        echo "OK: $tarball sha256=$sha"
+      else
+        echo "ERROR: no valid SHASUMS256.txt entry for $tarball" >&2
+        fail=1
+      fi
+    done
+    # Missing-entry failure path: an unknown filename must extract to empty.
+    bogus="node-v${live_ver}-linux-sparc64.tar.xz"
+    if [ -n "$(curl -fsSL "https://nodejs.org/dist/v${live_ver}/SHASUMS256.txt" | awk -v f="$bogus" '$2 == f {print $1}')" ]; then
+      echo "ERROR: checksum extraction is not exact-filename (matched $bogus)" >&2
+      fail=1
+    fi
+  fi
 fi
 
 if [ "$fail" -ne 0 ]; then

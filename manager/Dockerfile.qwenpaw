@@ -72,9 +72,9 @@ RUN set -eux; \
     tarball="node-v${ver}-linux-${node_arch}.tar.xz"; \
     sha="${NODE_SHA256}"; \
     if [ -z "$sha" ]; then \
-      sha="$(curl -fsSL https://nodejs.org/dist/index.json | jq -r --arg v "v${ver}" --arg n "$tarball" '.[] | select(.version == $v) | .files[] | select(.name == $n) | .sha256')"; \
+      sha="$(curl -fsSL "https://nodejs.org/dist/v${ver}/SHASUMS256.txt" | awk -v f="$tarball" '$2 == f {print $1}' | head -n1)"; \
     fi; \
-    test -n "$sha"; \
+    test -n "$sha" || { echo "no SHASUMS256.txt entry for ${tarball}" >&2; exit 1; }; \
     curl -fsSLO "https://nodejs.org/dist/v${ver}/${tarball}"; \
     echo "${sha}  ${tarball}" | sha256sum -c -; \
     tar -xJf "$tarball" -C /usr/local --strip-components=1 --no-same-owner; \
