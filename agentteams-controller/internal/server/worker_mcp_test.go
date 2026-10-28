@@ -342,7 +342,7 @@ func TestWorkerMCP_OversizedUpstream502(t *testing.T) {
 // bodies only).
 func TestWorkerMCP_ExactCapAccepted(t *testing.T) {
 	const prefix = `[{"name":"x","pad":"`
-	const suffix = `"}`
+	const suffix = `"}]`
 	exact := prefix + strings.Repeat("a", workerMCPBodyCap-len(prefix)-len(suffix)) + suffix
 	if len(exact) != workerMCPBodyCap {
 		t.Fatalf("test setup: len=%d, want %d", len(exact), workerMCPBodyCap)

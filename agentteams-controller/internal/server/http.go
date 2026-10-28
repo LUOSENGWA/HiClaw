@@ -244,6 +244,15 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	mux.Handle("POST /api/v1/workers/{name}/channels/{channel}/restart", mw.RequireAuthz(authpkg.ActionUpdate, "worker", nameFn)(http.HandlerFunc(chh.restartChannel)))
 	mux.Handle("POST /api/v1/workers/{name}/channels/{channel}/conflict-check", mw.RequireAuthz(authpkg.ActionUpdate, "worker", nameFn)(http.HandlerFunc(chh.checkChannelConflict)))
 
+	// --- Worker MCP registry (the worker's self-registered MCP servers;
+	// read-only proxy to the worker's qwenpaw app). The deployment catalog
+	// (GET /api/v1/mcp-servers) covers only the shared registry and
+	// spec.mcpServers; this route exposes what the worker's own qwenpaw
+	// app registered (builtin plugins, runtime additions). Same boundary
+	// discipline as channels: ActionGet, W8 team scope in the handler,
+	// uniform 503 in kube mode, embedded only. ---
+	mux.Handle("GET /api/v1/workers/{name}/mcp", mw.RequireAuthz(authpkg.ActionGet, "worker", nameFn)(rh.WorkerMCP(deps.KubeMode, deps.ContainerPrefix)))
+
 	// --- Worker coding CLIs (qwen-code / opencode / qoder; controller-side
 	// management via container exec — runtime-agnostic, works for any
 	// current runtime without worker-side cooperation or a QwenPaw
