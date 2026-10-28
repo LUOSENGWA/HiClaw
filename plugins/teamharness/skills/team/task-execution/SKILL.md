@@ -218,8 +218,14 @@ submission.
 
 While the task is still in flight and you need a human decision (approval /
 decision / escalation) instead of guessing, call `taskflow` with
-`action: request_attention` (payload: `kind`, `question`). Do not rely on
-the human noticing an ambient room message. Once the decision is made,
-close the loop by calling again with the same `kind` plus
-`resolved: true` — closing needs an existing record of that kind (it is
-rejected without one) and reuses the original event (no new ping).
+`action: request_attention` (payload: `kind`, `question`, `options`,
+`suggested`, `expiresAt`). `options` is a list of `{id, label}` pairs
+(at most 10) — the exact ids a human answer must echo; `suggested` is one
+of those option ids (advisory only, never applied automatically);
+`expiresAt` is an optional ISO 8601 deadline recorded on the request.
+Decision-type requests (`kind: decision`) must provide `options` —
+without them the human cannot answer structurally. Do not rely on the
+human noticing an ambient room message. Once the decision is made, close
+the loop by calling again with the same `kind` plus `resolved: true` —
+closing needs an existing record of that kind (it is rejected without
+one) and reuses the original event (no new ping).
