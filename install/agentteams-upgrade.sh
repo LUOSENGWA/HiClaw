@@ -450,7 +450,12 @@ boundary_run_args() {
     [ -n "${workdir}" ] && RUN_ARGS+=(--workdir "${workdir}")
     [ "${ro}" = "true" ] && RUN_ARGS+=(--read-only)
     case "${mem}" in ''|*[!0-9]*) : ;; *) [ "${mem}" != "0" ] && RUN_ARGS+=(--memory "${mem}") ;; esac
-    case "${memswap}" in ''|*[!0-9]*) : ;; *) [ "${memswap}" != "0" ] && RUN_ARGS+=(--memory-swap "${memswap}") ;; esac
+    case "${memswap}" in
+        ''|0) : ;;
+        -1) RUN_ARGS+=(--memory-swap -1) ;;  # docker: -1 = unlimited swap
+        *[!0-9]*) : ;;
+        *) RUN_ARGS+=(--memory-swap "${memswap}") ;;
+    esac
     [ -n "${cpus}" ] && [ "${cpus}" != "0" ] && RUN_ARGS+=(--cpus "${cpus}")
     case "${cpushares}" in ''|*[!0-9]*) : ;; *) [ "${cpushares}" != "0" ] && RUN_ARGS+=(--cpu-shares "${cpushares}") ;; esac
     [ -n "${cpuset}" ] && RUN_ARGS+=(--cpuset-cpus "${cpuset}")

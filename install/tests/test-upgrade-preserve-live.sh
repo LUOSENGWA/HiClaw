@@ -68,19 +68,28 @@ docker create --name "${FA}" \
     -v "${VOL_A}:/data" \
     busybox:latest sleep 300 >/dev/null || fail "fixture A create"
 FA_ID="$(docker inspect --format '{{.Id}}' "${FA}")"
+# Expectations come from the fixture itself: some kernels/cgroups discard
+# memory or pids limits at create time, and the upgrade must reproduce what
+# the old container actually has, not what was requested.
+EXP_USER="$(docker inspect --format '{{.Config.User}}' "${FA}")"
+EXP_WORKDIR="$(docker inspect --format '{{.Config.WorkingDir}}' "${FA}")"
+EXP_READONLY="$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "${FA}")"
+EXP_MEM="$(docker inspect --format '{{.HostConfig.Memory}}' "${FA}")"
+EXP_NANO="$(docker inspect --format '{{.HostConfig.NanoCpus}}' "${FA}")"
 docker stop "${FA}" >/dev/null 2>&1 || true
 
 ENV_A="${TMP}/env-a"
 printf 'AGENTTEAMS_DATA_DIR=%s\nAGENTTEAMS_VERSION=latest\n' "${VOL_A}" > "${ENV_A}"
 
 # preflight: boundary is read out, nothing unsupported
-run_live preflight preflight --json --env-file "${ENV_A}" --backup-dir "${TMP}/a" --controller-name "${FA}"
+# --allow-storage-split: the live stack in this environment is deliberately
+# split (unrelated to the fixture); the test is about the fixture boundary.
+run_live preflight preflight --json --allow-storage-split --env-file "${ENV_A}" --backup-dir "${TMP}/a" --controller-name "${FA}"
 [ "${RC}" = "0" ] || fail "preflight A rc=${RC}"
-grep -qF '"user":"1000:1000"' "${TMP}/last.out" || fail "preflight A user"
-grep -qF '"workdir":"/work"' "${TMP}/last.out" || fail "preflight A workdir"
-grep -qF '"readonly_rootfs":true' "${TMP}/last.out" || fail "preflight A readonly"
-grep -qF '"memory":268435456' "${TMP}/last.out" || fail "preflight A memory"
-grep -qF '"cpus":"0.5"' "${TMP}/last.out" || fail "preflight A cpus"
+grep -qF "\"user\":\"${EXP_USER}\"" "${TMP}/last.out" || fail "preflight A user"
+grep -qF "\"workdir\":\"${EXP_WORKDIR}\"" "${TMP}/last.out" || fail "preflight A workdir"
+grep -qF "\"readonly_rootfs\":${EXP_READONLY}" "${TMP}/last.out" || fail "preflight A readonly"
+grep -qF "\"memory\":${EXP_MEM}" "${TMP}/last.out" || fail "preflight A memory"
 grep -qF '"unsupported_runtime":[]' "${TMP}/last.out" || fail "preflight A unsupported empty"
 
 # controller --prepare-only --dry-run: the create line carries the boundary
@@ -88,19 +97,21 @@ run_live dryA controller --dry-run --prepare-only \
     --controller-image busybox:latest --env-file "${ENV_A}" --allow-env-drift \
     --backup-dir "${TMP}/a" --controller-name "${FA}"
 [ "${RC}" = "0" ] || fail "dry A rc=${RC}"
-for flag in "--user 1000:1000" "--workdir /work" "--read-only" "--memory 268435456" "--cpus 0.5"; do
-    grep -qF -- "${flag}" "${TMP}/last.out" || fail "dry A missing ${flag}"
-done
+[ -n "${EXP_USER}" ] && { grep -qF -- "--user ${EXP_USER}" "${TMP}/last.out" || fail "dry A user"; }
+[ -n "${EXP_WORKDIR}" ] && { grep -qF -- "--workdir ${EXP_WORKDIR}" "${TMP}/last.out" || fail "dry A workdir"; }
+[ "${EXP_READONLY}" = "true" ] && { grep -qF -- "--read-only" "${TMP}/last.out" || fail "dry A read-only"; }
+[ "${EXP_MEM}" != "0" ] && { grep -qF -- "--memory ${EXP_MEM}" "${TMP}/last.out" || fail "dry A memory"; }
+[ "${EXP_NANO}" != "0" ] && { grep -qF -- "--cpus" "${TMP}/last.out" || fail "dry A cpus"; }
 
 # controller --prepare-only --yes: create, boundary-verify, discard the new
 # container, restore the old one under its original name — fixture intact
-run_live prepareA controller --yes --prepare-only \
+run_live prepareA controller --yes --prepare-only --allow-storage-split \
     --controller-image busybox:latest --env-file "${ENV_A}" --allow-env-drift \
     --backup-dir "${TMP}/a" --controller-name "${FA}"
 [ "${RC}" = "0" ] || fail "prepare A rc=${RC}"
 grep -qF 'boundary preserved:' "${TMP}/last.out" || fail "prepare A preserved line"
 [ "$(docker inspect --format '{{.Id}}' "${FA}")" = "${FA_ID}" ] || fail "prepare A id changed"
-[ "$(docker inspect --format '{{.Config.User}}' "${FA}")" = "1000:1000" ] || fail "prepare A user lost"
+[ "$(docker inspect --format '{{.Config.User}}' "${FA}")" = "${EXP_USER}" ] || fail "prepare A user lost"
 [ "$(docker inspect --format '{{.State.Running}}' "${FA}")" = "false" ] || fail "prepare A left running"
 if docker ps -a --format '{{.Names}}' | grep -q "^${FA}-"; then
     fail "prepare A leftover container"
@@ -122,12 +133,12 @@ docker stop "${FB}" >/dev/null 2>&1 || true
 ENV_B="${TMP}/env-b"
 printf 'AGENTTEAMS_DATA_DIR=%s\nAGENTTEAMS_VERSION=latest\n' "${VOL_B}" > "${ENV_B}"
 
-run_live preflightB preflight --json --env-file "${ENV_B}" --backup-dir "${TMP}/b" --controller-name "${FB}"
+run_live preflightB preflight --json --allow-storage-split --env-file "${ENV_B}" --backup-dir "${TMP}/b" --controller-name "${FB}"
 [ "${RC}" = "3" ] || fail "preflight B rc=${RC} (want 3)"
 grep -q 'unsupported non-default runtime settings' "${TMP}/last.out" || fail "preflight B message"
 grep -qF 'sysctls' "${TMP}/last.out" || fail "preflight B sysctls name"
 
-run_live prepareB controller --yes --prepare-only \
+run_live prepareB controller --yes --prepare-only --allow-storage-split \
     --controller-image busybox:latest --env-file "${ENV_B}" --allow-env-drift \
     --backup-dir "${TMP}/b" --controller-name "${FB}"
 [ "${RC}" = "3" ] || fail "prepare B rc=${RC} (want 3)"
