@@ -118,6 +118,11 @@ class _FakeQwenPawApi:
         return {"results": {name: {"success": True} for name in self.enabled_skills}}
 
 
+class _FailingGetChannelApi(_FakeQwenPawApi):
+    def get_channel(self, channel):
+        raise RuntimeError("channel read failed")
+
+
 def _runtime_updater(*args, **kwargs):
     kwargs.setdefault("api_client", _FakeQwenPawApi())
     return RuntimeUpdater(*args, **kwargs)
@@ -723,6 +728,119 @@ def test_runtime_updater_matrix_channel_visibility_follows_filters(
     assert actual["show_thinking"] is True
     assert actual["show_tool_calls"] is False
     assert actual["show_tool_results"] is False
+
+
+def test_runtime_updater_keeps_runtime_display_flags_when_crd_matrix_is_silent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime show_* written via the workbench channel API must survive a
+    reconcile when the CRD has no channels.matrix section (no reset to True)."""
+    monkeypatch.setenv("AGENTTEAMS_MATRIX_URL", "http://matrix.example.com")
+    monkeypatch.setenv("AGENTTEAMS_WORKER_MATRIX_TOKEN", "matrix-token")
+    updater = _runtime_updater(
+        config=_config(tmp_path),
+        package_manager=_NoopPackageManager(),
+    )
+    updater.api_client.channels["agentteams_matrix"] = {
+        "show_thinking": False,
+        "show_tool_calls": False,
+        "show_tool_results": False,
+    }
+
+    updater.apply_once(
+        runtime_config=MemberRuntimeConfig(
+            path=updater.config.runtime_config_path,
+            raw={
+                "metadata": {"generation": "1"},
+                "member": {
+                    "runtime": "qwenpaw",
+                    "matrixUserId": "@worker-a:matrix.local",
+                },
+                "desired": {},
+            },
+        ),
+    )
+
+    actual = updater.api_client.channels["agentteams_matrix"]
+    assert actual["show_thinking"] is False
+    assert actual["show_tool_calls"] is False
+    assert actual["show_tool_results"] is False
+
+
+def test_runtime_updater_matrix_crd_flags_override_runtime_display_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A declared channels.matrix section wins over the runtime's current values."""
+    monkeypatch.setenv("AGENTTEAMS_MATRIX_URL", "http://matrix.example.com")
+    monkeypatch.setenv("AGENTTEAMS_WORKER_MATRIX_TOKEN", "matrix-token")
+    updater = _runtime_updater(
+        config=_config(tmp_path),
+        package_manager=_NoopPackageManager(),
+    )
+    updater.api_client.channels["agentteams_matrix"] = {
+        "show_thinking": False,
+        "show_tool_calls": False,
+        "show_tool_results": False,
+    }
+
+    updater.apply_once(
+        runtime_config=MemberRuntimeConfig(
+            path=updater.config.runtime_config_path,
+            raw={
+                "metadata": {"generation": "1"},
+                "member": {
+                    "runtime": "qwenpaw",
+                    "matrixUserId": "@worker-a:matrix.local",
+                },
+                "desired": {
+                    "channels": {
+                        "matrix": {
+                            "filter_thinking": True,
+                            "filter_tool_messages": False,
+                        },
+                    },
+                },
+            },
+        ),
+    )
+
+    actual = updater.api_client.channels["agentteams_matrix"]
+    assert actual["show_thinking"] is False
+    assert actual["show_tool_calls"] is True
+    assert actual["show_tool_results"] is True
+
+
+def test_matrix_payload_defaults_display_flags_when_channel_read_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing get_channel read must not break the display-flags payload:
+    with no channels.matrix section it falls back to everything shown."""
+    monkeypatch.setenv("AGENTTEAMS_MATRIX_URL", "http://matrix.example.com")
+    monkeypatch.setenv("AGENTTEAMS_WORKER_MATRIX_TOKEN", "matrix-token")
+    updater = RuntimeUpdater(
+        config=_config(tmp_path),
+        package_manager=_NoopPackageManager(),
+        api_client=_FailingGetChannelApi(),
+    )
+    config = MemberRuntimeConfig(
+        path=updater.config.runtime_config_path,
+        raw={
+            "metadata": {"generation": "1"},
+            "member": {
+                "runtime": "qwenpaw",
+                "matrixUserId": "@worker-a:matrix.local",
+            },
+            "desired": {},
+        },
+    )
+    payload = updater._matrix_channel_payload(config)
+    assert payload is not None
+    assert payload["show_thinking"] is True
+    assert payload["show_tool_calls"] is True
+    assert payload["show_tool_results"] is True
 
 
 def test_runtime_updater_ignores_unused_dingtalk_fields(

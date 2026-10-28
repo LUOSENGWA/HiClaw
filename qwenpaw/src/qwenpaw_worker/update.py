@@ -1943,10 +1943,32 @@ class RuntimeUpdater:
         room_id = desired["room_id"]
         if room_id:
             self._ensure_require_mention_group(groups, room_id)
-        # Display flags come from the controller's desired channels.matrix
-        # section (filter_* inverted to show_*). Unset keeps today's
-        # default: everything shown.
-        flags = config.matrix_channel or {}
+        # Display flags: the declarative source of truth is the
+        # controller's desired channels.matrix section (filter_* inverted
+        # to show_*). When the CRD is silent, keep the runtime's current
+        # values; workbench channel-API writes are runtime-only and must
+        # not be reset on the next reconcile.
+        flags = config.matrix_channel
+        if flags is None:
+            # No declarative section: keep what the runtime already has
+            # (the workbench channel API writes are runtime-only; they must
+            # not be reset on the next reconcile).
+            current: Dict[str, Any] = {}
+            if self.api_client is not None:
+                try:
+                    raw_current = self.api_client.get_channel("agentteams_matrix")
+                except Exception:
+                    raw_current = None
+                if isinstance(raw_current, dict):
+                    current = raw_current
+            show_tool_calls = bool(current.get("show_tool_calls", True))
+            show_tool_results = bool(current.get("show_tool_results", True))
+            show_thinking = bool(current.get("show_thinking", True))
+        else:
+            filtered = _bool(flags.get("filter_tool_messages", False))
+            show_tool_calls = not filtered
+            show_tool_results = not filtered
+            show_thinking = not _bool(flags.get("filter_thinking", False))
         return {
             "enabled": True,
             "homeserver": desired["homeserver"],
@@ -1962,9 +1984,9 @@ class RuntimeUpdater:
             # AGENTTEAMS_MATRIX_SHARE_SESSION=true to restore room-wide
             # session sharing (legacy behavior).
             "share_session_in_group": _env_bool("AGENTTEAMS_MATRIX_SHARE_SESSION"),
-            "show_tool_calls": not _bool(flags.get("filter_tool_messages", False)),
-            "show_tool_results": not _bool(flags.get("filter_tool_messages", False)),
-            "show_thinking": not _bool(flags.get("filter_thinking", False)),
+            "show_tool_calls": show_tool_calls,
+            "show_tool_results": show_tool_results,
+            "show_thinking": show_thinking,
             "groups": groups,
         }
 

@@ -428,6 +428,8 @@ class AgentTeamsMatrixChannel(BaseChannel):
         self.history_limit: int = max(0, history_limit)
         self.sync_timeout_ms: int = sync_timeout_ms
         self.show_thinking: bool = show_thinking
+        self.show_tool_calls: bool = show_tool_calls
+        self.show_tool_results: bool = show_tool_results
 
         self._workspace_dir = (
             Path(workspace_dir).expanduser() if workspace_dir else None
@@ -4123,12 +4125,12 @@ class AgentTeamsMatrixChannel(BaseChannel):
         return _enum_name(message_type) == "MESSAGE"
 
     def _thread_content_parts(self, event: Any) -> List[Any]:
-        """Render event for thread display with tool messages enabled."""
+        """Render event for thread display with the channel's tool visibility flags."""
         from dataclasses import replace as dc_replace
         display_config = dc_replace(
             self._render_style.display_config,
-            show_tool_calls=True,
-            show_tool_results=True,
+            show_tool_calls=self.show_tool_calls,
+            show_tool_results=self.show_tool_results,
         )
         style = dc_replace(self._render_style, display_config=display_config)
         renderer = self._renderer.__class__(style)
@@ -4194,6 +4196,12 @@ class AgentTeamsMatrixChannel(BaseChannel):
         message_type = getattr(event, "type", None)
         if self._is_reasoning_message(message_type) and not self.show_thinking:
             # show_thinking disabled: reasoning is never rendered to the room.
+            return
+        if self._is_tool_call_message(message_type) and not self.show_tool_calls:
+            # show_tool_calls disabled: tool calls are never rendered to the room.
+            return
+        if self._is_tool_output_message(message_type) and not self.show_tool_results:
+            # show_tool_results disabled: tool output is never rendered to the room.
             return
         if self._is_reasoning_message(
             message_type,

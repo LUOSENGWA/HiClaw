@@ -406,9 +406,10 @@ type ChannelsSpec struct {
 }
 
 // MatrixChannelSpec holds display flags for the worker's Matrix channel.
-// When the whole matrix section is omitted, the worker keeps its historical
-// default (thinking and tool output shown). When the section is present,
-// unset flags default to false (hidden), mirroring DingTalk semantics.
+// Declarative source of truth for Matrix display flags; runtime channel-API
+// writes are not persisted to the CRD and survive only until this section
+// is set. When the section is present, unset flags default to false
+// (hidden), mirroring DingTalk semantics.
 type MatrixChannelSpec struct {
 	ShowThinking  bool `json:"showThinking,omitempty"`
 	ShowToolCalls bool `json:"showToolCalls,omitempty"`
