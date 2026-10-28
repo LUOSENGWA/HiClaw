@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# ============================================================================
+# test-upgrade-preserve-live.sh — real-engine regression for the controller
+# step's boundary preservation (install/agentteams-upgrade.sh).
+#
+# Unlike test-upgrade-cli.sh (stubbed docker) this drives the real docker
+# daemon with throwaway busybox fixtures. Needs a reachable daemon; without
+# one it prints SKIP and exits 0 so CI/dev machines without docker stay
+# green — the Pi is where this suite is meant to bite.
+# ============================================================================
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+UPGRADE="${REPO_ROOT}/install/agentteams-upgrade.sh"
+
+if [ ! -f "${UPGRADE}" ]; then
+    echo "FAIL setup: ${UPGRADE} not found"
+    exit 1
+fi
+
+if ! docker info >/dev/null 2>&1; then
+    echo "SKIP test-upgrade-preserve-live (no docker daemon)"
+    exit 0
+fi
+
+TMP="$(mktemp -d)"
+FA="atc-boundary-a-$$"
+FB="atc-boundary-b-$$"
+VOL_A="atc-boundary-vol-a-$$"
+VOL_B="atc-boundary-vol-b-$$"
+cleanup() {
+    local n
+    for n in $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "^(${FA}|${FB})" || true); do
+        docker rm -f "${n}" >/dev/null 2>&1 || true
+    done
+    docker volume rm "${VOL_A}" "${VOL_B}" >/dev/null 2>&1 || true
+    rm -rf "${TMP}"
+}
+trap cleanup EXIT
+
+fail() {
+    echo "FAIL $1"
+    echo "--- output ---"
+    cat "${TMP}/last.out" 2>/dev/null
+    exit 1
+}
+
+run_live() {
+    # $1 label (unused, for symmetry with the stub suite); rest: upgrade args
+    shift
+    bash "${UPGRADE}" "$@" > "${TMP}/last.out" 2>&1
+    RC=$?
+}
+
+docker image inspect busybox:latest >/dev/null 2>&1 \
+    || docker pull busybox:latest >/dev/null 2>&1 \
+    || { echo "FAIL setup: busybox:latest not available locally and pull failed"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Fixture A: a created (never started) controller-like container carrying a
+# security/resource boundary: user, workdir, readonly rootfs, memory, cpus.
+# ---------------------------------------------------------------------------
+docker volume create "${VOL_A}" >/dev/null || fail "volume A"
+docker create --name "${FA}" \
+    --user 1000:1000 --workdir /work --read-only \
+    --memory 256m --cpus 0.5 \
+    -v "${VOL_A}:/data" \
+    busybox:latest sleep 300 >/dev/null || fail "fixture A create"
+FA_ID="$(docker inspect --format '{{.Id}}' "${FA}")"
+docker stop "${FA}" >/dev/null 2>&1 || true
+
+ENV_A="${TMP}/env-a"
+printf 'AGENTTEAMS_DATA_DIR=%s\nAGENTTEAMS_VERSION=latest\n' "${VOL_A}" > "${ENV_A}"
+
+# preflight: boundary is read out, nothing unsupported
+run_live preflight preflight --json --env-file "${ENV_A}" --backup-dir "${TMP}/a" --controller-name "${FA}"
+[ "${RC}" = "0" ] || fail "preflight A rc=${RC}"
+grep -qF '"user":"1000:1000"' "${TMP}/last.out" || fail "preflight A user"
+grep -qF '"workdir":"/work"' "${TMP}/last.out" || fail "preflight A workdir"
+grep -qF '"readonly_rootfs":true' "${TMP}/last.out" || fail "preflight A readonly"
+grep -qF '"memory":268435456' "${TMP}/last.out" || fail "preflight A memory"
+grep -qF '"cpus":"0.5"' "${TMP}/last.out" || fail "preflight A cpus"
+grep -qF '"unsupported_runtime":[]' "${TMP}/last.out" || fail "preflight A unsupported empty"
+
+# controller --prepare-only --dry-run: the create line carries the boundary
+run_live dryA controller --dry-run --prepare-only \
+    --controller-image busybox:latest --env-file "${ENV_A}" --allow-env-drift \
+    --backup-dir "${TMP}/a" --controller-name "${FA}"
+[ "${RC}" = "0" ] || fail "dry A rc=${RC}"
+for flag in "--user 1000:1000" "--workdir /work" "--read-only" "--memory 268435456" "--cpus 0.5"; do
+    grep -qF -- "${flag}" "${TMP}/last.out" || fail "dry A missing ${flag}"
+done
+
+# controller --prepare-only --yes: create, boundary-verify, discard the new
+# container, restore the old one under its original name — fixture intact
+run_live prepareA controller --yes --prepare-only \
+    --controller-image busybox:latest --env-file "${ENV_A}" --allow-env-drift \
+    --backup-dir "${TMP}/a" --controller-name "${FA}"
+[ "${RC}" = "0" ] || fail "prepare A rc=${RC}"
+grep -qF 'boundary preserved:' "${TMP}/last.out" || fail "prepare A preserved line"
+[ "$(docker inspect --format '{{.Id}}' "${FA}")" = "${FA_ID}" ] || fail "prepare A id changed"
+[ "$(docker inspect --format '{{.Config.User}}' "${FA}")" = "1000:1000" ] || fail "prepare A user lost"
+[ "$(docker inspect --format '{{.State.Running}}' "${FA}")" = "false" ] || fail "prepare A left running"
+if docker ps -a --format '{{.Names}}' | grep -q "^${FA}-"; then
+    fail "prepare A leftover container"
+fi
+
+# ---------------------------------------------------------------------------
+# Fixture B: an unsupported runtime setting (sysctl) — the upgrade must
+# refuse before anything is renamed or stopped.
+# ---------------------------------------------------------------------------
+docker volume create "${VOL_B}" >/dev/null || fail "volume B"
+docker create --name "${FB}" \
+    --sysctl net.ipv4.ip_forward=1 \
+    -v "${VOL_B}:/data" \
+    busybox:latest sleep 300 >/dev/null || fail "fixture B create"
+FB_ID="$(docker inspect --format '{{.Id}}' "${FB}")"
+FB_STATUS="$(docker inspect --format '{{.State.Status}}' "${FB}")"
+docker stop "${FB}" >/dev/null 2>&1 || true
+
+ENV_B="${TMP}/env-b"
+printf 'AGENTTEAMS_DATA_DIR=%s\nAGENTTEAMS_VERSION=latest\n' "${VOL_B}" > "${ENV_B}"
+
+run_live preflightB preflight --json --env-file "${ENV_B}" --backup-dir "${TMP}/b" --controller-name "${FB}"
+[ "${RC}" = "3" ] || fail "preflight B rc=${RC} (want 3)"
+grep -q 'unsupported non-default runtime settings' "${TMP}/last.out" || fail "preflight B message"
+grep -qF 'sysctls' "${TMP}/last.out" || fail "preflight B sysctls name"
+
+run_live prepareB controller --yes --prepare-only \
+    --controller-image busybox:latest --env-file "${ENV_B}" --allow-env-drift \
+    --backup-dir "${TMP}/b" --controller-name "${FB}"
+[ "${RC}" = "3" ] || fail "prepare B rc=${RC} (want 3)"
+[ "$(docker inspect --format '{{.Id}}' "${FB}")" = "${FB_ID}" ] || fail "prepare B id changed"
+[ "$(docker inspect --format '{{.State.Status}}' "${FB}")" = "${FB_STATUS}" ] || fail "prepare B status changed"
+
+echo "PASS test-upgrade-preserve-live"

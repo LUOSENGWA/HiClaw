@@ -39,6 +39,26 @@ case "$1" in
         ;;
     inspect)
         fmt="$3"
+        # scenario overrides (boundary / unsupported_sysctl); everything else
+        # falls through to the standard answers below
+        if [ "${STUB_SCENARIO:-ok}" = "boundary" ]; then
+            case "$fmt" in
+                *"{{.Config.User}}"*) echo "1000:1000"; exit 0 ;;
+                *"{{.Config.WorkingDir}}"*) echo "/work"; exit 0 ;;
+                *"{{.HostConfig.ReadonlyRootfs}}"*) echo "true"; exit 0 ;;
+                *"{{.HostConfig.Memory}}"*) echo "268435456"; exit 0 ;;
+                *"{{.HostConfig.NanoCpus}}"*) echo "500000000"; exit 0 ;;
+                *"{{.HostConfig.PidsLimit}}"*) echo "128"; exit 0 ;;
+                *"{{.HostConfig.Init}}"*) echo "true"; exit 0 ;;
+                *"HostConfig.GroupAdd"*) echo "1000"; exit 0 ;;
+                *"HostConfig.SecurityOpt"*) printf 'label=disable\nno-new-privileges:true\n'; exit 0 ;;
+                *"HostConfig.CapDrop"*) echo "ALL"; exit 0 ;;
+            esac
+        elif [ "${STUB_SCENARIO:-ok}" = "unsupported_sysctl" ]; then
+            case "$fmt" in
+                *"{{range .HostConfig.Sysctls}}"*) echo "net.ipv4.ip_forward=1"; exit 0 ;;
+            esac
+        fi
         case "$fmt" in
             *"len .HostConfig.PortBindings"*) echo 4 ;;
             *PortBindings*) printf '8080/tcp 0.0.0.0 18080\n9090/tcp 0.0.0.0 19090\n' ;;
@@ -161,6 +181,25 @@ assert_contains() {
 
 assert_not_contains() {
     if grep -q -- "$1" "$2"; then
+        echo "FAIL $3: [$1] unexpectedly found in $2"
+        echo "--- output ---"
+        cat "${OUT}"
+        exit 1
+    fi
+}
+
+assert_contains_fixed() {
+    # fixed-string contains (BRE metacharacters like [ ] in the needle)
+    if ! grep -qF -- "$1" "$2"; then
+        echo "FAIL $3: [$1] not found in $2"
+        echo "--- output ---"
+        cat "${OUT}"
+        exit 1
+    fi
+}
+
+assert_not_contains_fixed() {
+    if grep -qF -- "$1" "$2"; then
         echo "FAIL $3: [$1] unexpectedly found in $2"
         echo "--- output ---"
         cat "${OUT}"
@@ -365,6 +404,41 @@ assert_contains 'backfill applied' "${OUT}" "backfill message"
 assert_contains '^cp ' "${REC}" "backfill cp"
 assert_contains '^restart ' "${REC}" "backfill restart"
 
+# 7.11 boundary: the dry-run create command carries the preserved boundary
+run_case boundary controller --dry-run --controller-image example/controller:new --env-file "${ENV_FILE}" --backup-dir "${TMP}/b711"
+assert_eq "${RC}" "0" "boundary dry rc"
+assert_contains_fixed '--user 1000:1000' "${OUT}" "boundary dry user"
+assert_contains_fixed '--workdir /work' "${OUT}" "boundary dry workdir"
+assert_contains_fixed '--read-only' "${OUT}" "boundary dry readonly"
+assert_contains_fixed '--memory 268435456' "${OUT}" "boundary dry memory"
+assert_contains_fixed '--cpus 0.5' "${OUT}" "boundary dry cpus"
+assert_contains_fixed '--pids-limit 128' "${OUT}" "boundary dry pids"
+assert_contains_fixed '--init' "${OUT}" "boundary dry init"
+assert_contains_fixed '--group-add 1000' "${OUT}" "boundary dry group-add"
+assert_contains_fixed '--security-opt label=disable' "${OUT}" "boundary dry seopt label"
+assert_contains_fixed '--security-opt no-new-privileges' "${OUT}" "boundary dry seopt nnp"
+assert_contains_fixed '--cap-drop ALL' "${OUT}" "boundary dry cap-drop"
+
+# 7.12 default container: no boundary flags are invented
+run_case ok controller --dry-run --controller-image example/controller:new --env-file "${ENV_FILE}" --backup-dir "${TMP}/b712"
+assert_eq "${RC}" "0" "no-boundary dry rc"
+assert_not_contains_fixed '--user' "${OUT}" "no-boundary no user"
+assert_not_contains_fixed '--read-only' "${OUT}" "no-boundary no readonly"
+assert_not_contains_fixed '--memory' "${OUT}" "no-boundary no memory"
+assert_not_contains_fixed '--cpus' "${OUT}" "no-boundary no cpus"
+assert_not_contains_fixed '--pids-limit' "${OUT}" "no-boundary no pids"
+
+# 7.13 unsupported sysctls: preflight fails closed; the controller refuses before rename
+run_case unsupported_sysctl preflight --env-file "${ENV_FILE}" --backup-dir "${TMP}/b713" --json
+assert_eq "${RC}" "3" "sysctl preflight rc"
+assert_contains 'unsupported non-default runtime settings' "${OUT}" "sysctl preflight message"
+assert_contains_fixed '"unsupported_runtime":["sysctls"]' "${OUT}" "sysctl preflight json"
+run_case unsupported_sysctl controller --dry-run --controller-image example/controller:new --env-file "${ENV_FILE}" --backup-dir "${TMP}/b713c"
+assert_eq "${RC}" "3" "sysctl controller rc"
+assert_contains 'unsupported non-default runtime settings' "${OUT}" "sysctl controller message"
+assert_not_contains '^rename ' "${OUT}" "sysctl controller no rename"
+assert_not_contains '^stop ' "${OUT}" "sysctl controller no stop"
+
 # 8. status --json
 run_case ok status --state-file "${TMP}/b5/state.json" --json
 assert_eq "${RC}" "0" "status json rc"
@@ -378,4 +452,4 @@ first="$(head -c 1 "${TMP}/json.out")"
 assert_eq "${first}" "{" "preflight json purity first char"
 assert_not_contains 'No such file' "${TMP}/json.err" "preflight json no log-dir noise"
 
-echo "PASS test-upgrade-cli (27 scenarios)"
+echo "PASS test-upgrade-cli (30 scenarios)"

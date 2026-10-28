@@ -46,6 +46,7 @@ ENV_FROM_CONTAINER=0
 ALLOW_ENV_DRIFT=0
 KEEP_FAILED=0
 ALLOW_GATEWAY_DOWN=0
+PREPARE_ONLY=0
 ALLOW_STORAGE_SPLIT=0
 HIGRESS_BACKFILL_DIR=""
 EFFECTIVE_ENV_FILE=""
@@ -111,7 +112,7 @@ Commands:
   preflight     read-only checks; JSON with --json
   plan          print the upgrade plan
   backup        cold kine backup + env + image record + state
-  controller    upgrade the controller only (rename/run + health gate + rollback)
+  controller    upgrade the controller only (rename/create/verify + health gate + rollback)
   status        show the last state (JSON with --json)
   help          show this help
 
@@ -128,6 +129,10 @@ Options:
   --state-file PATH        default: <backup-dir>/state.json
   --target VERSION         target version (recorded in the plan/state)
   --controller-image IMG   target controller image (required for controller)
+  --controller-name NAME   container to inspect/replace (default: agentteams-controller)
+  --prepare-only           controller step: create the new container, verify the
+                           boundary, then remove it and restore the old name
+                           (no start, no health gate); for pre-flight checks
   --dry-run                print commands; do not mutate
   --yes                    allow mutations (required for backup/controller)
   --json                   machine-readable output (preflight/status)
@@ -338,6 +343,318 @@ wait_health() {
 }
 
 # ---------------------------------------------------------------------------
+# Boundary preservation (security/resource settings of the old container)
+#
+# Two lists, written down explicitly and used nowhere else:
+#   PRESERVED   - re-applied to the new container as docker create flags,
+#                 then verified value-by-value after create and before start;
+#   UNSUPPORTED - must stay at their default value; anything else fails the
+#                 upgrade before the old container is stopped or renamed
+#                 instead of being silently dropped.
+# ---------------------------------------------------------------------------
+BOUNDARY_US=$'\x1f'
+
+join_us() {
+    # join non-empty stdin lines with \x1f
+    local out="" line
+    while IFS= read -r line; do
+        [ -n "${line}" ] || continue
+        out="${out}${out:+${BOUNDARY_US}}${line}"
+    done
+    printf '%s' "${out}"
+}
+
+nano_cpus_to_cpus() {
+    # docker inspect prints NanoCpus in CPU units (0.5); values >= 1e6 are
+    # treated as 100ns units (500000000 -> 0.5). Trailing zeros are trimmed.
+    local v="${1:-}"
+    [ -n "${v}" ] || return 0
+    case "${v}" in
+        *[!0-9.]*|*.*.*) return 0 ;;
+    esac
+    awk -v v="${v}" 'BEGIN {
+        n = v + 0
+        if (n >= 1000000) n = n / 1000000000
+        s = sprintf("%.9f", n)
+        sub(/0+$/, "", s)
+        sub(/\.$/, "", s)
+        if (s == "") s = "0"
+        print s
+    }'
+}
+
+boundary_profile() {
+    # key=value lines (fixed order); array values are joined with \x1f
+    local ctr="$1"
+    local user workdir ro mem memswap cpus cpushares cpuset pids init priv
+    local groups seopts capadds capdrops tmpfs ulimits devices
+    user="$(inspect_fmt '{{.Config.User}}' "${ctr}")"
+    workdir="$(inspect_fmt '{{.Config.WorkingDir}}' "${ctr}")"
+    ro="$(inspect_fmt '{{.HostConfig.ReadonlyRootfs}}' "${ctr}")"
+    mem="$(inspect_fmt '{{.HostConfig.Memory}}' "${ctr}")"
+    memswap="$(inspect_fmt '{{.HostConfig.MemorySwap}}' "${ctr}")"
+    cpus="$(inspect_fmt '{{.HostConfig.NanoCpus}}' "${ctr}")"
+    cpus="$(nano_cpus_to_cpus "${cpus}")"
+    cpushares="$(inspect_fmt '{{.HostConfig.CpuShares}}' "${ctr}")"
+    cpuset="$(inspect_fmt '{{.HostConfig.CpusetCpus}}' "${ctr}")"
+    pids="$(inspect_fmt '{{.HostConfig.PidsLimit}}' "${ctr}")"
+    init="$(inspect_fmt '{{.HostConfig.Init}}' "${ctr}")"
+    priv="$(inspect_fmt '{{.HostConfig.Privileged}}' "${ctr}")"
+    groups="$(inspect_fmt '{{range .HostConfig.GroupAdd}}{{println .}}{{end}}' "${ctr}" | join_us)"
+    seopts="$(inspect_fmt '{{range .HostConfig.SecurityOpt}}{{println .}}{{end}}' "${ctr}" | join_us)"
+    capadds="$(inspect_fmt '{{range .HostConfig.CapAdd}}{{println .}}{{end}}' "${ctr}" | join_us)"
+    capdrops="$(inspect_fmt '{{range .HostConfig.CapDrop}}{{println .}}{{end}}' "${ctr}" | join_us)"
+    tmpfs="$(inspect_fmt '{{range $k, $v := .HostConfig.Tmpfs}}{{if $v}}{{$k}}:{{$v}}{{else}}{{$k}}{{end}}{{println}}{{end}}' "${ctr}" | join_us)"
+    ulimits="$(inspect_fmt '{{range .HostConfig.Ulimits}}{{.Name}}={{.Soft}}:{{.Hard}}{{println}}{{end}}' "${ctr}" | join_us)"
+    devices="$(inspect_fmt '{{range .HostConfig.Devices}}{{.PathOnHost}}:{{.PathInContainer}}:{{.CgroupPermissions}}{{println}}{{end}}' "${ctr}" | join_us)"
+    printf 'user=%s\nworkdir=%s\nreadonly_rootfs=%s\nmemory=%s\nmemory_swap=%s\ncpus=%s\ncpu_shares=%s\ncpuset_cpus=%s\npids_limit=%s\ninit=%s\nprivileged=%s\ngroup_add=%s\nsecurity_opt=%s\ncap_add=%s\ncap_drop=%s\ntmpfs=%s\nulimit=%s\ndevices=%s\n' \
+        "${user}" "${workdir}" "${ro}" "${mem}" "${memswap}" "${cpus}" "${cpushares}" "${cpuset}" \
+        "${pids}" "${init}" "${priv}" "${groups}" "${seopts}" "${capadds}" "${capdrops}" "${tmpfs}" "${ulimits}" "${devices}"
+}
+
+profile_value() {
+    # value of <key> in a boundary profile ("" when absent)
+    local profile="$1" key="$2" line
+    while IFS= read -r line; do
+        if [ "${line%%=*}" = "${key}" ]; then
+            printf '%s' "${line#*=}"
+            return 0
+        fi
+    done <<< "${profile}"
+    return 0
+}
+
+us_split() {
+    # print a \x1f-joined value, one element per line
+    [ -n "$1" ] || return 0
+    printf '%s\n' "$1" | tr '\037' '\n'
+}
+
+boundary_run_args() {
+    # append the non-default preserved settings of <ctr> to RUN_ARGS
+    local ctr="$1"
+    local profile user workdir ro mem memswap cpus cpushares cpuset pids init priv item
+    profile="$(boundary_profile "${ctr}")"
+    user="$(profile_value "${profile}" user)"
+    workdir="$(profile_value "${profile}" workdir)"
+    ro="$(profile_value "${profile}" readonly_rootfs)"
+    mem="$(profile_value "${profile}" memory)"
+    memswap="$(profile_value "${profile}" memory_swap)"
+    cpus="$(profile_value "${profile}" cpus)"
+    cpushares="$(profile_value "${profile}" cpu_shares)"
+    cpuset="$(profile_value "${profile}" cpuset_cpus)"
+    pids="$(profile_value "${profile}" pids_limit)"
+    init="$(profile_value "${profile}" init)"
+    priv="$(profile_value "${profile}" privileged)"
+    [ -n "${user}" ] && RUN_ARGS+=(--user "${user}")
+    [ -n "${workdir}" ] && RUN_ARGS+=(--workdir "${workdir}")
+    [ "${ro}" = "true" ] && RUN_ARGS+=(--read-only)
+    case "${mem}" in ''|*[!0-9]*) : ;; *) [ "${mem}" != "0" ] && RUN_ARGS+=(--memory "${mem}") ;; esac
+    case "${memswap}" in ''|*[!0-9]*) : ;; *) [ "${memswap}" != "0" ] && RUN_ARGS+=(--memory-swap "${memswap}") ;; esac
+    [ -n "${cpus}" ] && [ "${cpus}" != "0" ] && RUN_ARGS+=(--cpus "${cpus}")
+    case "${cpushares}" in ''|*[!0-9]*) : ;; *) [ "${cpushares}" != "0" ] && RUN_ARGS+=(--cpu-shares "${cpushares}") ;; esac
+    [ -n "${cpuset}" ] && RUN_ARGS+=(--cpuset-cpus "${cpuset}")
+    case "${pids}" in ''|*[!0-9]*) : ;; *) [ "${pids}" -gt 0 ] && RUN_ARGS+=(--pids-limit "${pids}") ;; esac
+    [ "${init}" = "true" ] && RUN_ARGS+=(--init)
+    [ "${priv}" = "true" ] && RUN_ARGS+=(--privileged)
+    while IFS= read -r item; do
+        [ -n "${item}" ] && RUN_ARGS+=(--group-add "${item}")
+    done < <(us_split "$(profile_value "${profile}" group_add)")
+    while IFS= read -r item; do
+        [ -n "${item}" ] || continue
+        case "${item}" in
+            no-new-privileges:true) RUN_ARGS+=(--security-opt no-new-privileges) ;;
+            *) RUN_ARGS+=(--security-opt "${item}") ;;
+        esac
+    done < <(us_split "$(profile_value "${profile}" security_opt)")
+    while IFS= read -r item; do
+        [ -n "${item}" ] && RUN_ARGS+=(--cap-add "${item}")
+    done < <(us_split "$(profile_value "${profile}" cap_add)")
+    while IFS= read -r item; do
+        [ -n "${item}" ] && RUN_ARGS+=(--cap-drop "${item}")
+    done < <(us_split "$(profile_value "${profile}" cap_drop)")
+    while IFS= read -r item; do
+        [ -n "${item}" ] && RUN_ARGS+=(--tmpfs "${item}")
+    done < <(us_split "$(profile_value "${profile}" tmpfs)")
+    while IFS= read -r item; do
+        [ -n "${item}" ] && RUN_ARGS+=(--ulimit "${item}")
+    done < <(us_split "$(profile_value "${profile}" ulimit)")
+    while IFS= read -r item; do
+        [ -n "${item}" ] || continue
+        RUN_ARGS+=(--device "${item%:}")
+    done < <(us_split "$(profile_value "${profile}" devices)")
+    return 0
+}
+
+unsupported_boundary() {
+    # print the non-default unsupported field names, space separated
+    local ctr="$1" out="" v
+    v="$(inspect_fmt '{{.HostConfig.IpcMode}}' "${ctr}")"
+    case "${v}" in ''|private) : ;; *) out="${out}ipc_mode " ;; esac
+    v="$(inspect_fmt '{{.HostConfig.PidMode}}' "${ctr}")"
+    [ -n "${v}" ] && out="${out}pid_mode "
+    v="$(inspect_fmt '{{.HostConfig.UTSMode}}' "${ctr}")"
+    [ -n "${v}" ] && out="${out}uts_mode "
+    v="$(inspect_fmt '{{.HostConfig.UsernsMode}}' "${ctr}")"
+    [ -n "${v}" ] && out="${out}userns_mode "
+    v="$(inspect_fmt '{{.HostConfig.CgroupParent}}' "${ctr}")"
+    [ -n "${v}" ] && out="${out}cgroup_parent "
+    v="$(inspect_fmt '{{range .HostConfig.Sysctls}}{{println .}}{{end}}' "${ctr}")"
+    [ -n "${v}" ] && out="${out}sysctls "
+    v="$(inspect_fmt '{{range .HostConfig.ExtraHosts}}{{println .}}{{end}}' "${ctr}")"
+    [ -n "${v}" ] && out="${out}extra_hosts "
+    v="$(inspect_fmt '{{range .HostConfig.Dns}}{{println .}}{{end}}' "${ctr}")"
+    [ -n "${v}" ] && out="${out}dns "
+    v="$(inspect_fmt '{{range .HostConfig.DnsOptions}}{{println .}}{{end}}' "${ctr}")"
+    [ -n "${v}" ] && out="${out}dns_options "
+    v="$(inspect_fmt '{{range .HostConfig.DnsSearch}}{{println .}}{{end}}' "${ctr}")"
+    [ -n "${v}" ] && out="${out}dns_search "
+    v="$(inspect_fmt '{{.HostConfig.LogConfig.Type}}' "${ctr}")"
+    case "${v}" in ''|json-file|none) : ;; *) out="${out}log_config " ;; esac
+    v="$(inspect_fmt '{{.HostConfig.OomScoreAdj}}' "${ctr}")"
+    case "${v}" in ''|0) : ;; *) out="${out}oom_score_adj " ;; esac
+    v="$(inspect_fmt '{{.HostConfig.Runtime}}' "${ctr}")"
+    case "${v}" in ''|runc|io.containerd.runc.v2) : ;; *) out="${out}runtime " ;; esac
+    v="$(inspect_fmt '{{.HostConfig.BlkioWeight}}' "${ctr}")"
+    case "${v}" in ''|0) : ;; *) out="${out}blkio_weight " ;; esac
+    v="$(inspect_fmt '{{.HostConfig.MemoryReservation}}' "${ctr}")"
+    case "${v}" in ''|0) : ;; *) out="${out}memory_reservation " ;; esac
+    v="$(inspect_fmt '{{.HostConfig.ShmSize}}' "${ctr}")"
+    case "${v}" in ''|67108864) : ;; *) out="${out}shm_size " ;; esac
+    v="$(inspect_fmt '{{.HostConfig.CpuQuota}}' "${ctr}")"
+    case "${v}" in ''|0) : ;; *) out="${out}cpu_quota " ;; esac
+    v="$(inspect_fmt '{{.HostConfig.CpuPeriod}}' "${ctr}")"
+    case "${v}" in ''|0) : ;; *) out="${out}cpu_period " ;; esac
+    printf '%s' "${out% }"
+}
+
+value_is_default() {
+    # 1 when <key> holds a default/unset representation, so that cosmetic
+    # differences between "unset" spellings (0 / false / "" / []) do not
+    # fail the verify; meaningful values ("0" for user, -1 for memory_swap)
+    # are never folded into the default
+    local key="$1" val="$2"
+    case "${key}" in
+        readonly_rootfs|init|privileged)
+            case "${val}" in ''|false|'<no value>') return 0 ;; *) return 1 ;; esac ;;
+        memory|memory_swap|cpu_shares|pids_limit|cpus)
+            case "${val}" in ''|0|'<no value>') return 0 ;; *) return 1 ;; esac ;;
+        *)
+            case "${val}" in ''|'<no value>') return 0 ;; *) return 1 ;; esac ;;
+    esac
+}
+
+boundary_verify() {
+    # compare the preserved boundary of <old> and <new> container, key by key
+    local old_ctr="$1" new_ctr="$2"
+    local oldp newp line key ov nv bad=0
+    oldp="$(boundary_profile "${old_ctr}")"
+    newp="$(boundary_profile "${new_ctr}")"
+    [ "${oldp}" = "${newp}" ] && return 0
+    while IFS= read -r line; do
+        [ -n "${line}" ] || continue
+        key="${line%%=*}"
+        ov="$(profile_value "${oldp}" "${key}")"
+        nv="$(profile_value "${newp}" "${key}")"
+        if [ "${ov}" != "${nv}" ]; then
+            if value_is_default "${key}" "${ov}" && value_is_default "${key}" "${nv}"; then
+                continue
+            fi
+            log "boundary mismatch: ${key}: old='${ov}' new='${nv}'"
+            bad=1
+        fi
+    done < <(printf '%s\n%s\n' "${oldp}" "${newp}" | cut -d= -f1 | sort -u)
+    [ "${bad}" = "0" ]
+}
+
+boundary_summary_keys() {
+    # space separated list of the non-default preserved keys of <ctr>
+    local ctr="$1" out="" line key val
+    local profile
+    profile="$(boundary_profile "${ctr}")"
+    while IFS= read -r line; do
+        [ -n "${line}" ] || continue
+        key="${line%%=*}"
+        val="${line#*=}"
+        case "${key}" in
+            user|workdir|cpuset_cpus) [ -n "${val}" ] && out="${out}${key} " ;;
+            readonly_rootfs|init|privileged) [ "${val}" = "true" ] && out="${out}${key} " ;;
+            cpus) [ -n "${val}" ] && [ "${val}" != "0" ] && out="${out}${key} " ;;
+            memory|memory_swap|cpu_shares|pids_limit)
+                case "${val}" in ''|0) : ;; *) out="${out}${key} " ;; esac
+                ;;
+            *) [ -n "${val}" ] && out="${out}${key} " ;;
+        esac
+    done <<< "${profile}"
+    printf '%s' "${out% }"
+}
+
+boundary_json() {
+    # boundary profile -> JSON object for the preflight output
+    local profile="$1"
+    local user workdir ro mem memswap cpus cpushares cpuset pids init priv
+    local groups seopts capadds capdrops tmpfs ulimits devices item k v out
+    user="$(profile_value "${profile}" user)"
+    workdir="$(profile_value "${profile}" workdir)"
+    ro="$(profile_value "${profile}" readonly_rootfs)"
+    mem="$(profile_value "${profile}" memory)"
+    memswap="$(profile_value "${profile}" memory_swap)"
+    cpus="$(profile_value "${profile}" cpus)"
+    cpushares="$(profile_value "${profile}" cpu_shares)"
+    cpuset="$(profile_value "${profile}" cpuset_cpus)"
+    pids="$(profile_value "${profile}" pids_limit)"
+    init="$(profile_value "${profile}" init)"
+    priv="$(profile_value "${profile}" privileged)"
+    groups="$(profile_value "${profile}" group_add)"
+    seopts="$(profile_value "${profile}" security_opt)"
+    capadds="$(profile_value "${profile}" cap_add)"
+    capdrops="$(profile_value "${profile}" cap_drop)"
+    tmpfs="$(profile_value "${profile}" tmpfs)"
+    ulimits="$(profile_value "${profile}" ulimit)"
+    devices="$(profile_value "${profile}" devices)"
+    case "${mem}" in ''|*[!0-9]*) mem=0 ;; esac
+    case "${memswap}" in ''|*[!0-9-]*) memswap=0 ;; esac
+    case "${cpushares}" in ''|*[!0-9]*) cpushares=0 ;; esac
+    case "${pids}" in ''|*[!0-9]*) pids=0 ;; esac
+    local ro_b init_b priv_b
+    [ "${ro}" = "true" ] && ro_b="true" || ro_b="false"
+    [ "${init}" = "true" ] && init_b="true" || init_b="false"
+    [ "${priv}" = "true" ] && priv_b="true" || priv_b="false"
+    local groups_json seopts_json capadds_json capdrops_json ulimits_json devices_json
+    groups_json="$(us_to_json_list "${groups}")"
+    seopts_json="$(us_to_json_list "${seopts}")"
+    capadds_json="$(us_to_json_list "${capadds}")"
+    capdrops_json="$(us_to_json_list "${capdrops}")"
+    ulimits_json="$(us_to_json_list "${ulimits}")"
+    devices_json="$(us_to_json_list "${devices}")"
+    out=""
+    while IFS= read -r item; do
+        [ -n "${item}" ] || continue
+        k="${item%%:*}"
+        v=""
+        case "${item}" in *:*) v="${item#*:}" ;; esac
+        out="${out}${out:+,}\"$(json_escape "${k}")\":\"$(json_escape "${v}")\""
+    done < <(us_split "${tmpfs}")
+    printf '{"user":"%s","workdir":"%s","readonly_rootfs":%s,"memory":%s,"memory_swap":%s,"cpus":"%s","cpu_shares":%s,"cpuset_cpus":"%s","pids_limit":%s,"init":%s,"privileged":%s,"group_add":%s,"security_opt":%s,"cap_add":%s,"cap_drop":%s,"tmpfs":{%s},"ulimit":%s,"devices":%s}' \
+        "$(json_escape "${user}")" "$(json_escape "${workdir}")" "${ro_b}" "${mem}" "${memswap}" \
+        "$(json_escape "${cpus}")" "${cpushares}" "$(json_escape "${cpuset}")" "${pids}" \
+        "${init_b}" "${priv_b}" "${groups_json}" "${seopts_json}" "${capadds_json}" "${capdrops_json}" \
+        "${out}" "${ulimits_json}" "${devices_json}"
+}
+
+us_to_json_list() {
+    local val="$1" out="" first=1 item
+    [ -n "${val}" ] || { printf '[]'; return 0; }
+    while IFS= read -r item; do
+        [ -n "${item}" ] || continue
+        [ "${first}" = "1" ] || out="${out},"
+        first=0
+        out="${out}\"$(json_escape "${item}")\""
+    done < <(us_split "${val}")
+    printf '[%s]' "${out}"
+}
+
+# ---------------------------------------------------------------------------
 # preflight
 # ---------------------------------------------------------------------------
 cmd_preflight() {
@@ -387,6 +704,20 @@ cmd_preflight() {
         if [ "${old_env_count}" -gt 0 ] && [ "${file_env_count}" -gt 0 ] && [ "${old_env_count}" -ne "${file_env_count}" ]; then
             env_drift="true"
             warn "env drift: container=${old_env_count} env-file=${file_env_count}; use --env-from-container (recommended) or --allow-env-drift"
+        fi
+    fi
+
+    # Boundary: the settings a rebuild must preserve, and the non-default
+    # runtime settings it refuses to drop silently. Refusing here (read-only)
+    # happens before any step stops or renames the controller.
+    local boundary_json="{}" unsupported_runtime_json="[]" unsupported_names=""
+    if [ "${ctrl_exists}" = "true" ]; then
+        boundary_json="$(boundary_json "$(boundary_profile "${CONTROLLER_NAME}")")"
+        unsupported_names="$(unsupported_boundary "${CONTROLLER_NAME}")"
+        if [ -n "${unsupported_names}" ]; then
+            local -a unsupported_arr=(${unsupported_names})
+            unsupported_runtime_json="$(json_list "${unsupported_arr[@]}")"
+            err "unsupported non-default runtime settings: ${unsupported_names}; refusing to upgrade (they would be dropped) - preserve them manually or clear them first"
         fi
     fi
 
@@ -593,10 +924,11 @@ cmd_preflight() {
         local warnings_json errors_json
         if [ "${#WARN_LIST[@]}" -gt 0 ]; then warnings_json="$(json_list "${WARN_LIST[@]}")"; else warnings_json="[]"; fi
         if [ "${#ERR_LIST[@]}" -gt 0 ]; then errors_json="$(json_list "${ERR_LIST[@]}")"; else errors_json="[]"; fi
-        printf '{"ok":%s,"env_file":"%s","data_dir":"%s","data_dir_source":"%s","controller":{"name":"%s","exists":%s,"image":"%s","ports":%s,"mounts":%s,"entrypoint":"%s","network":"%s","restart":"%s","running":%s},"env_drift":%s,"data_model":"%s","mounts":%s,"s3":{"backend":"%s","configured":%s,"bucket":"%s","data_minio_mount":%s,"components":%s,"consistent":%s},"gateway":{"http_code":"%s","ok":%s,"plugin_missing":%s},"docker":{"cmd":"%s"},"disk_free_bytes":%s,"kine_bytes":%s,"workers":{"total":%s,"soul_set":%s,"soul_missing":%s},"teams":%s,"warnings":%s,"errors":%s}\n' \
+        printf '{"ok":%s,"env_file":"%s","data_dir":"%s","data_dir_source":"%s","controller":{"name":"%s","exists":%s,"image":"%s","ports":%s,"mounts":%s,"entrypoint":"%s","network":"%s","restart":"%s","running":%s,"boundary":%s,"unsupported_runtime":%s},"env_drift":%s,"data_model":"%s","mounts":%s,"s3":{"backend":"%s","configured":%s,"bucket":"%s","data_minio_mount":%s,"components":%s,"consistent":%s},"gateway":{"http_code":"%s","ok":%s,"plugin_missing":%s},"docker":{"cmd":"%s"},"disk_free_bytes":%s,"kine_bytes":%s,"workers":{"total":%s,"soul_set":%s,"soul_missing":%s},"teams":%s,"warnings":%s,"errors":%s}\n' \
             "${ok}" "$(json_escape "${ENV_FILE}")" "$(json_escape "${data_dir}")" "${data_source}" \
             "${CONTROLLER_NAME}" "${ctrl_exists}" "$(json_escape "${image}")" "${ports}" "${mounts}" \
-            "$(json_escape "${entry}")" "$(json_escape "${net}")" "$(json_escape "${restart}")" "${running}" "${env_drift}" \
+            "$(json_escape "${entry}")" "$(json_escape "${net}")" "$(json_escape "${restart}")" "${running}" \
+            "${boundary_json}" "${unsupported_runtime_json}" "${env_drift}" \
             "${data_model}" "${mounts_json}" "${s3_backend}" "${s3_configured}" "$(json_escape "${s3_bucket}")" "$([ "${has_data_minio}" = "1" ] && echo true || echo false)" \
             "${storage_components}" "${storage_consistent}" \
             "${gw_code}" "${gw_ok}" "${plugin_missing}" "${DOCKER_CMD}" "${free_bytes}" "${kine_bytes}" "${workers}" "${soul_set}" "${soul_missing}" "${teams}" \
@@ -624,7 +956,7 @@ cmd_plan() {
     log "  controller img : ${CONTROLLER_IMAGE:-<current>}"
     log "  1. preflight (read-only)"
     log "  2. backup (kine cold copy + env + image record)"
-    log "  3. controller (rename/run + health gate; old container retained)"
+    log "  3. controller (rename/create/verify + health gate; old container retained)"
     log "  P2: workers (canary) / P3: manager, dashboard, memory"
 }
 
@@ -731,7 +1063,9 @@ cmd_backup() {
 # controller
 # ---------------------------------------------------------------------------
 build_run_args() {
-    RUN_ARGS=(-d --name "${CONTROLLER_NAME}")
+    # docker create (no -d); the container is started only after the
+    # boundary verify passes.
+    RUN_ARGS=(--name "${CONTROLLER_NAME}")
     local net restart
     net="$(inspect_fmt '{{.HostConfig.NetworkMode}}' "${CONTROLLER_NAME}")"
     restart="$(inspect_fmt '{{.HostConfig.RestartPolicy.Name}}' "${CONTROLLER_NAME}")"
@@ -754,6 +1088,8 @@ build_run_args() {
     done < <(inspect_fmt '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}{{println $p .HostIp .HostPort}}{{end}}{{end}}' "${CONTROLLER_NAME}")
 
     local mtype mname msrc mdst mrw mprop mdriver spec
+    local tmpfs_keys
+    tmpfs_keys="$(inspect_fmt '{{range $k, $v := .HostConfig.Tmpfs}}{{println $k}}{{end}}' "${CONTROLLER_NAME}")"
     while IFS='|' read -r mtype mname msrc mdst mrw mprop mdriver; do
         [ -n "${mdst}" ] || continue
         case "${mtype}" in
@@ -773,13 +1109,26 @@ build_run_args() {
                 RUN_ARGS+=(--mount "${spec}")
                 ;;
             tmpfs)
-                RUN_ARGS+=(--mount "type=tmpfs,dst=${mdst}")
+                if printf '%s\n' "${tmpfs_keys}" | grep -qxF -- "${mdst}"; then
+                    # re-applied by boundary_run_args from HostConfig.Tmpfs,
+                    # which also carries the mount options
+                    :
+                else
+                    # in Mounts but not in HostConfig.Tmpfs: keep the mount
+                    # instead of dropping it (no duplicate - boundary_run_args
+                    # only emits the Tmpfs entries)
+                    RUN_ARGS+=(--mount "type=tmpfs,dst=${mdst}")
+                fi
                 ;;
             *)
                 die "unsupported mount type: ${mtype} at ${mdst}" "${EXIT_GATE}"
                 ;;
         esac
     done < <(mount_lines)
+
+    # Security/resource boundary of the current container. Must be computed
+    # before the old container is renamed away (it is the inspect source).
+    boundary_run_args "${CONTROLLER_NAME}"
 
     local ep_first="" ep_item
     local ep_rest=()
@@ -812,7 +1161,7 @@ rollback_controller() {
     log "rolling back controller"
     if [ "${KEEP_FAILED}" = "1" ]; then
         "${DOCKER_CMD}" stop "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
-        local failed="agentteams-controller-failed-$(date -u +%Y%m%dT%H%M%SZ)"
+        local failed="${CONTROLLER_NAME}-failed-$(date -u +%Y%m%dT%H%M%SZ)"
         if "${DOCKER_CMD}" rename "${CONTROLLER_NAME}" "${failed}" >/dev/null 2>&1; then
             log "kept failed controller as ${failed}"
         else
@@ -856,7 +1205,7 @@ cmd_controller() {
     else
         EFFECTIVE_ENV_FILE="${ENV_FILE}"
         ENV_SOURCE="file"
-OLD_IMAGE=""
+        OLD_IMAGE=""
         [ -f "${ENV_FILE}" ] || die "env file not found: ${ENV_FILE}" "${EXIT_GATE}"
     fi
     container_exists "${CONTROLLER_NAME}" || die "controller container not found: ${CONTROLLER_NAME}" "${EXIT_GATE}"
@@ -868,19 +1217,17 @@ OLD_IMAGE=""
     mounts="$(mounts_count)"
     case "${ports}" in ''|*[!0-9]*) ports=0 ;; esac
     case "${mounts}" in ''|*[!0-9]*) mounts=0 ;; esac
-    if [ "${ports}" -eq 0 ]; then
-        die "unsupported controller shape: no published ports; run the controller step manually" "${EXIT_GATE}"
-    fi
-    if [ "${mounts}" -eq 0 ]; then
-        die "unsupported controller shape: no mounts; run the controller step manually" "${EXIT_GATE}"
-    fi
-
-    if [ -n "${HIGRESS_BACKFILL_DIR}" ]; then
-        [ -d "${HIGRESS_BACKFILL_DIR}" ] || die "higress backfill dir not found: ${HIGRESS_BACKFILL_DIR}" "${EXIT_GATE}"
-        if ! find "${HIGRESS_BACKFILL_DIR}" -name plugin.wasm 2>/dev/null | grep -q .; then
-            die "higress backfill dir contains no plugin.wasm: ${HIGRESS_BACKFILL_DIR}" "${EXIT_GATE}"
+    # prepare-only creates the container just to verify the boundary, so the
+    # shape guards do not apply to containers without ports/mounts
+    if [ "${PREPARE_ONLY}" != "1" ]; then
+        if [ "${ports}" -eq 0 ]; then
+            die "unsupported controller shape: no published ports; run the controller step manually" "${EXIT_GATE}"
+        fi
+        if [ "${mounts}" -eq 0 ]; then
+            die "unsupported controller shape: no mounts; run the controller step manually" "${EXIT_GATE}"
         fi
     fi
+
     if [ "${ENV_FROM_CONTAINER}" = "1" ]; then
         if [ "${DRY_RUN}" = "1" ]; then
             log "[dry-run] export container env -> ${EFFECTIVE_ENV_FILE} (0600)"
@@ -902,12 +1249,32 @@ OLD_IMAGE=""
         fi
     fi
 
+    # Refuse before anything is renamed or stopped: a rebuild would silently
+    # drop these non-default runtime settings.
+    local unsupported_names
+    unsupported_names="$(unsupported_boundary "${CONTROLLER_NAME}")"
+    if [ -n "${unsupported_names}" ]; then
+        die "unsupported non-default runtime settings: ${unsupported_names}; refusing to upgrade (they would be dropped) - preserve them manually or clear them first" "${EXIT_GATE}"
+    fi
+
+    OLD_NAME="${CONTROLLER_NAME}-$(printf '%s' "${old_image}" | tr '/:' '__')-old"
+    if container_exists "${OLD_NAME}"; then
+        OLD_NAME="${OLD_NAME}-$(date -u +%Y%m%dT%H%M%SZ)"
+    fi
+
     build_run_args
 
     if [ "${DRY_RUN}" = "1" ]; then
-        log "[dry-run] ${DOCKER_CMD} stop ${CONTROLLER_NAME}"
-        log "[dry-run] ${DOCKER_CMD} rename ${CONTROLLER_NAME} agentteams-controller-<old>-old"
-        log "[dry-run] ${DOCKER_CMD} run ${RUN_ARGS[*]}"
+        log "[dry-run] ${DOCKER_CMD} rename ${CONTROLLER_NAME} ${OLD_NAME}"
+        log "[dry-run] ${DOCKER_CMD} create ${RUN_ARGS[*]}"
+        log "[dry-run] boundary verify ${OLD_NAME} ${CONTROLLER_NAME}"
+        if [ "${PREPARE_ONLY}" = "1" ]; then
+            log "[dry-run] ${DOCKER_CMD} rm -f ${CONTROLLER_NAME}"
+            log "[dry-run] ${DOCKER_CMD} rename ${OLD_NAME} ${CONTROLLER_NAME}"
+        else
+            log "[dry-run] ${DOCKER_CMD} stop ${OLD_NAME}"
+            log "[dry-run] ${DOCKER_CMD} start ${CONTROLLER_NAME}"
+        fi
         if [ -n "${HIGRESS_BACKFILL_DIR}" ]; then
             log "[dry-run] docker cp ${HIGRESS_BACKFILL_DIR}/. ${CONTROLLER_NAME}:/usr/share/nginx/html/plugins/"
             log "[dry-run] docker exec ${CONTROLLER_NAME} pkill envoy; docker restart ${CONTROLLER_NAME}"
@@ -918,18 +1285,35 @@ OLD_IMAGE=""
     fi
     [ "${YES}" = "1" ] || die "controller requires --yes (or use --dry-run)" "${EXIT_USAGE}"
 
-    OLD_NAME="agentteams-controller-$(printf '%s' "${old_image}" | tr '/:' '__')-old"
-    if container_exists "${OLD_NAME}"; then
-        OLD_NAME="${OLD_NAME}-$(date -u +%Y%m%dT%H%M%SZ)"
-    fi
-
-    "${DOCKER_CMD}" stop "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
+    # Rename first and let the old container keep running until the new one
+    # is created and boundary-verified: a create/verify failure then costs no
+    # downtime and the recovery is just a rename back.
     if ! "${DOCKER_CMD}" rename "${CONTROLLER_NAME}" "${OLD_NAME}" >/dev/null 2>&1; then
-        "${DOCKER_CMD}" start "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
         die "cannot rename the old controller; nothing changed" "${EXIT_GATE}"
     fi
 
-    if ! "${DOCKER_CMD}" run "${RUN_ARGS[@]}"; then
+    if ! "${DOCKER_CMD}" create "${RUN_ARGS[@]}" >/dev/null 2>&1; then
+        "${DOCKER_CMD}" rename "${OLD_NAME}" "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
+        die "cannot create the new controller container; old controller restored as ${CONTROLLER_NAME}" "${EXIT_GATE}"
+    fi
+
+    if ! boundary_verify "${OLD_NAME}" "${CONTROLLER_NAME}"; then
+        "${DOCKER_CMD}" rm -f "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
+        "${DOCKER_CMD}" rename "${OLD_NAME}" "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
+        die "boundary verify failed (mismatches logged above); old controller restored as ${CONTROLLER_NAME}" "${EXIT_GATE}"
+    fi
+
+    if [ "${PREPARE_ONLY}" = "1" ]; then
+        log "boundary preserved: $(boundary_summary_keys "${CONTROLLER_NAME}")"
+        "${DOCKER_CMD}" rm -f "${CONTROLLER_NAME}" >/dev/null 2>&1 || true
+        if ! "${DOCKER_CMD}" rename "${OLD_NAME}" "${CONTROLLER_NAME}" >/dev/null 2>&1; then
+            die "prepare-only: cannot rename the old controller back" "${EXIT_ROLLBACK}"
+        fi
+        exit "${EXIT_OK}"
+    fi
+
+    "${DOCKER_CMD}" stop "${OLD_NAME}" >/dev/null 2>&1 || true
+    if ! "${DOCKER_CMD}" start "${CONTROLLER_NAME}" >/dev/null 2>&1; then
         rollback_controller
     fi
     if [ -n "${HIGRESS_BACKFILL_DIR}" ]; then
@@ -995,6 +1379,8 @@ while [ $# -gt 0 ]; do
         --state-file) STATE_FILE="$2"; shift 2 ;;
         --target) TARGET="$2"; shift 2 ;;
         --controller-image) CONTROLLER_IMAGE="$2"; shift 2 ;;
+        --controller-name) CONTROLLER_NAME="$2"; shift 2 ;;
+        --prepare-only) PREPARE_ONLY=1; shift ;;
         --timeout) TIMEOUT="$2"; shift 2 ;;
         --log-file) LOG_FILE="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;

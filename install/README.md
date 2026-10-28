@@ -142,6 +142,38 @@ The preflight also detects the storage backend (embedded MinIO vs external S3/Ru
 > **Gateway note:** if the controller embeds the Higress gateway, a controller upgrade can leave `healthz` green while the data plane is down (Wasm plugin version mismatch). Verify `http://127.0.0.1:8080/v1/models` after the controller step; plugin files are container-layer and may need a backfill after each rebuild.
 > If plugin files were added to the running container at runtime, a fresh container from the same image fails the default 8080 gate and the controller step rolls back (live-validated on a single-node aarch64 host: same image, no backfill → rollback; with `--higress-backfill-dir` → `8080/v1/models=401`, `state=done`). Pass `--higress-backfill-dir <dir>` on upgrade in that case.
 
+### Boundary preservation
+
+A controller rebuilt from the image would silently lose any security or
+resource boundary applied to the running container (`--user`, read-only
+rootfs, memory caps, dropped capabilities, ...). The `controller` step
+therefore carries the current container's boundary over into the new one:
+
+- **Preserved and re-applied:** `user`, `workdir`, read-only rootfs,
+  `memory`, `memory-swap`, `cpus`, `cpu-shares`, `cpuset-cpus`, `pids-limit`,
+  `init`, `privileged`, `group-add`, `security-opt`, `cap-add`, `cap-drop`,
+  `tmpfs`, `ulimit`, `devices`.
+- **Not representable in `docker create`** and **refused while non-default:**
+  `ipc-mode`, `pid-mode`, `uts-mode`, `userns-mode`, `cgroup-parent`,
+  `sysctls`, `extra-hosts`, `dns*`, non-default log driver, `oom-score-adj`,
+  `runtime`, `blkio-weight`, `memory-reservation`, `shm-size`, `cpu-quota`,
+  `cpu-period`. Preflight reports them (and fails the gate) before anything
+  is stopped; the controller step refuses to rename the container while any
+  of them is set.
+- After the new container is created, the preserved fields are compared
+  key by key (`boundary verify`); a mismatch discards the new container and
+  restores the old one before it is ever stopped. Empty/default values are
+  treated as "not set".
+- `--prepare-only` runs exactly that cycle — create, verify, discard the new
+  container, restore the old one — and exits 0 with `boundary preserved: ...`
+  without starting anything. Use it as a pre-check before a real upgrade.
+- `--controller-name <name>` targets a controller container with a
+  non-default name; the preserved-boundary logic applies identically.
+
+This is the same failure mode class as the gateway note above: the health
+gate would pass while the security posture silently regressed. `--dry-run`
+shows the exact `docker create` line including every preserved flag.
+
 Add `--dry-run` to any mutating command to print the exact steps first. P1
 covers `preflight`/`backup`/`controller`/`status`; workers (canary), manager,
 dashboard and memory are follow-ups. See the upgrade design issue for the full design.
