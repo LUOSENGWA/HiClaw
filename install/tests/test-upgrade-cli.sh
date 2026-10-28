@@ -33,6 +33,24 @@ cat > "${BIN}/docker" <<'STUB'
 printf '%s\n' "$*" >> "${REC}"
 RUNNING_FILE="${REC}.running"
 running_state() { if [ -f "${RUNNING_FILE}" ]; then cat "${RUNNING_FILE}"; else echo true; fi }
+shm_value() {
+    # $1 = container name. The original container reports its own size; a
+    # container created in this run reports the daemon default unless the
+    # upgrade passed --shm-size explicitly.
+    local name="$1"
+    case "${STUB_SCENARIO:-ok}" in
+        shm_drift|shm_verify_mismatch)
+            if [ -f "${REC}.create" ] && grep -q -- "--name ${name} " "${REC}.create"; then
+                if [ "${STUB_SCENARIO}" = "shm_verify_mismatch" ]; then echo 8403288064; return; fi
+                if grep -q -- "--shm-size 67108864" "${REC}.create"; then echo 67108864; else echo 8403288064; fi
+            else
+                echo 67108864
+            fi
+            ;;
+        boundary) echo 134217728 ;;
+        *) echo 67108864 ;;
+    esac
+}
 case "$1" in
     info)
         exit 0
@@ -72,6 +90,7 @@ case "$1" in
             *RestartPolicy.Name*) echo "unless-stopped" ;;
             *"len .Config.Env"*) echo 2 ;;
             *Config.Env*) printf 'A=1\nB=2\n' ;;
+            *HostConfig.ShmSize*) shm_value "$4" ;;
             *Config.Image*) echo "example/controller:old" ;;
             *State.Running*) running_state ;;
             *RepoDigests*) echo "example/controller@sha256:old" ;;
@@ -136,6 +155,10 @@ case "$1" in
         [ "${STUB_SCENARIO:-ok}" = "cp_fail" ] && exit 1
         exit 0
         ;;
+    create)
+        printf '%s\n' "$*" >> "${REC}.create"
+        exit 0
+        ;;
     rename|run|rm) exit 0 ;;
     ps)
         echo "agentteams-controller"
@@ -156,7 +179,7 @@ run_case() {
     local scenario="$1"
     shift
     : > "${REC}"
-    rm -f "${RUNNING_FILE}"
+    rm -f "${RUNNING_FILE}" "${REC}.create"
     STUB_SCENARIO="${scenario}" bash "${UPGRADE}" "$@" > "${OUT}" 2>&1
     RC=$?
 }
@@ -439,6 +462,24 @@ assert_contains 'unsupported non-default runtime settings' "${OUT}" "sysctl cont
 assert_not_contains '^rename ' "${OUT}" "sysctl controller no rename"
 assert_not_contains '^stop ' "${OUT}" "sysctl controller no stop"
 
+# 7.14 shared-memory size is carried explicitly (never inherited from the daemon default)
+run_case boundary controller --dry-run --controller-image example/controller:new --env-file "${ENV_FILE}" --backup-dir "${TMP}/b714"
+assert_eq "${RC}" "0" "shm dry rc"
+assert_contains_fixed '--shm-size 134217728' "${OUT}" "shm dry flag"
+
+# 7.15 daemon default differs: without the explicit flag the new container would
+# get 8403288064; with it the boundary verify passes
+run_case shm_drift controller --yes --prepare-only --controller-image example/controller:new --env-file "${ENV_FILE}" --backup-dir "${TMP}/b715" --state-file "${TMP}/b715/state.json" --timeout 4
+assert_eq "${RC}" "0" "shm drift prepare rc"
+assert_contains 'boundary preserved' "${OUT}" "shm drift preserved"
+assert_contains_fixed 'shm_size' "${OUT}" "shm drift summary key"
+
+# 7.16 a replacement that still drifts is rejected before the old container is started
+run_case shm_verify_mismatch controller --yes --prepare-only --controller-image example/controller:new --env-file "${ENV_FILE}" --backup-dir "${TMP}/b716" --state-file "${TMP}/b716/state.json" --timeout 4
+[ "${RC}" = "3" ] || { echo "FAIL shm mismatch rc: ${RC}"; cat "${OUT}"; exit 1; }
+assert_contains 'boundary mismatch: shm_size' "${OUT}" "shm mismatch message"
+assert_not_contains '^start ' "${REC}" "shm mismatch never starts the replacement"
+
 # 8. status --json
 run_case ok status --state-file "${TMP}/b5/state.json" --json
 assert_eq "${RC}" "0" "status json rc"
@@ -452,4 +493,4 @@ first="$(head -c 1 "${TMP}/json.out")"
 assert_eq "${first}" "{" "preflight json purity first char"
 assert_not_contains 'No such file' "${TMP}/json.err" "preflight json no log-dir noise"
 
-echo "PASS test-upgrade-cli (30 scenarios)"
+echo "PASS test-upgrade-cli ($(grep -c '^run_case ' "${BASH_SOURCE[0]}") scenarios)"

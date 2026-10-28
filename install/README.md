@@ -152,11 +152,14 @@ therefore carries the current container's boundary over into the new one:
 - **Preserved and re-applied:** `user`, `workdir`, read-only rootfs,
   `memory`, `memory-swap`, `cpus`, `cpu-shares`, `cpuset-cpus`, `pids-limit`,
   `init`, `privileged`, `group-add`, `security-opt`, `cap-add`, `cap-drop`,
-  `tmpfs`, `ulimit`, `devices`.
+  `tmpfs`, `ulimit`, `devices`, **`shm-size`**. The shared-memory size is
+  always passed explicitly (`--shm-size <old value>`): daemons differ in
+  their default (64 MiB vs several GiB), so relying on the default silently
+  changes the runtime configuration.
 - **Not representable in `docker create`** and **refused while non-default:**
   `ipc-mode`, `pid-mode`, `uts-mode`, `userns-mode`, `cgroup-parent`,
   `sysctls`, `extra-hosts`, `dns*`, non-default log driver, `oom-score-adj`,
-  `runtime`, `blkio-weight`, `memory-reservation`, `shm-size`, `cpu-quota`,
+  `runtime`, `blkio-weight`, `memory-reservation`, `cpu-quota`,
   `cpu-period`. Preflight reports them (and fails the gate) before anything
   is stopped; the controller step refuses to rename the container while any
   of them is set.

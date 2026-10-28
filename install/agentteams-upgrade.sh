@@ -387,7 +387,7 @@ boundary_profile() {
     # key=value lines (fixed order); array values are joined with \x1f
     local ctr="$1"
     local user workdir ro mem memswap cpus cpushares cpuset pids init priv
-    local groups seopts capadds capdrops tmpfs ulimits devices
+    local groups seopts capadds capdrops tmpfs ulimits devices shm
     user="$(inspect_fmt '{{.Config.User}}' "${ctr}")"
     workdir="$(inspect_fmt '{{.Config.WorkingDir}}' "${ctr}")"
     ro="$(inspect_fmt '{{.HostConfig.ReadonlyRootfs}}' "${ctr}")"
@@ -407,9 +407,10 @@ boundary_profile() {
     tmpfs="$(inspect_fmt '{{range $k, $v := .HostConfig.Tmpfs}}{{if $v}}{{$k}}:{{$v}}{{else}}{{$k}}{{end}}{{println}}{{end}}' "${ctr}" | join_us)"
     ulimits="$(inspect_fmt '{{range .HostConfig.Ulimits}}{{.Name}}={{.Soft}}:{{.Hard}}{{println}}{{end}}' "${ctr}" | join_us)"
     devices="$(inspect_fmt '{{range .HostConfig.Devices}}{{.PathOnHost}}:{{.PathInContainer}}:{{.CgroupPermissions}}{{println}}{{end}}' "${ctr}" | join_us)"
-    printf 'user=%s\nworkdir=%s\nreadonly_rootfs=%s\nmemory=%s\nmemory_swap=%s\ncpus=%s\ncpu_shares=%s\ncpuset_cpus=%s\npids_limit=%s\ninit=%s\nprivileged=%s\ngroup_add=%s\nsecurity_opt=%s\ncap_add=%s\ncap_drop=%s\ntmpfs=%s\nulimit=%s\ndevices=%s\n' \
+    shm="$(inspect_fmt '{{.HostConfig.ShmSize}}' "${ctr}")"
+    printf 'user=%s\nworkdir=%s\nreadonly_rootfs=%s\nmemory=%s\nmemory_swap=%s\ncpus=%s\ncpu_shares=%s\ncpuset_cpus=%s\npids_limit=%s\ninit=%s\nprivileged=%s\ngroup_add=%s\nsecurity_opt=%s\ncap_add=%s\ncap_drop=%s\ntmpfs=%s\nulimit=%s\ndevices=%s\nshm_size=%s\n' \
         "${user}" "${workdir}" "${ro}" "${mem}" "${memswap}" "${cpus}" "${cpushares}" "${cpuset}" \
-        "${pids}" "${init}" "${priv}" "${groups}" "${seopts}" "${capadds}" "${capdrops}" "${tmpfs}" "${ulimits}" "${devices}"
+        "${pids}" "${init}" "${priv}" "${groups}" "${seopts}" "${capadds}" "${capdrops}" "${tmpfs}" "${ulimits}" "${devices}" "${shm}"
 }
 
 profile_value() {
@@ -433,7 +434,7 @@ us_split() {
 boundary_run_args() {
     # append the non-default preserved settings of <ctr> to RUN_ARGS
     local ctr="$1"
-    local profile user workdir ro mem memswap cpus cpushares cpuset pids init priv item
+    local profile user workdir ro mem memswap cpus cpushares cpuset pids init priv shm item
     profile="$(boundary_profile "${ctr}")"
     user="$(profile_value "${profile}" user)"
     workdir="$(profile_value "${profile}" workdir)"
@@ -462,6 +463,8 @@ boundary_run_args() {
     case "${pids}" in ''|*[!0-9]*) : ;; *) [ "${pids}" -gt 0 ] && RUN_ARGS+=(--pids-limit "${pids}") ;; esac
     [ "${init}" = "true" ] && RUN_ARGS+=(--init)
     [ "${priv}" = "true" ] && RUN_ARGS+=(--privileged)
+    shm="$(profile_value "${profile}" shm_size)"
+    case "${shm}" in ''|*[!0-9]*) : ;; *) [ "${shm}" != "0" ] && RUN_ARGS+=(--shm-size "${shm}") ;; esac
     while IFS= read -r item; do
         [ -n "${item}" ] && RUN_ARGS+=(--group-add "${item}")
     done < <(us_split "$(profile_value "${profile}" group_add)")
@@ -524,8 +527,6 @@ unsupported_boundary() {
     case "${v}" in ''|0) : ;; *) out="${out}blkio_weight " ;; esac
     v="$(inspect_fmt '{{.HostConfig.MemoryReservation}}' "${ctr}")"
     case "${v}" in ''|0) : ;; *) out="${out}memory_reservation " ;; esac
-    v="$(inspect_fmt '{{.HostConfig.ShmSize}}' "${ctr}")"
-    case "${v}" in ''|67108864) : ;; *) out="${out}shm_size " ;; esac
     v="$(inspect_fmt '{{.HostConfig.CpuQuota}}' "${ctr}")"
     case "${v}" in ''|0) : ;; *) out="${out}cpu_quota " ;; esac
     v="$(inspect_fmt '{{.HostConfig.CpuPeriod}}' "${ctr}")"
@@ -598,7 +599,7 @@ boundary_json() {
     # boundary profile -> JSON object for the preflight output
     local profile="$1"
     local user workdir ro mem memswap cpus cpushares cpuset pids init priv
-    local groups seopts capadds capdrops tmpfs ulimits devices item k v out
+    local groups seopts capadds capdrops tmpfs ulimits devices shm item k v out
     user="$(profile_value "${profile}" user)"
     workdir="$(profile_value "${profile}" workdir)"
     ro="$(profile_value "${profile}" readonly_rootfs)"
@@ -617,6 +618,7 @@ boundary_json() {
     tmpfs="$(profile_value "${profile}" tmpfs)"
     ulimits="$(profile_value "${profile}" ulimit)"
     devices="$(profile_value "${profile}" devices)"
+    shm="$(profile_value "${profile}" shm_size)"
     case "${mem}" in ''|*[!0-9]*) mem=0 ;; esac
     case "${memswap}" in ''|*[!0-9-]*) memswap=0 ;; esac
     case "${cpushares}" in ''|*[!0-9]*) cpushares=0 ;; esac
@@ -640,11 +642,11 @@ boundary_json() {
         case "${item}" in *:*) v="${item#*:}" ;; esac
         out="${out}${out:+,}\"$(json_escape "${k}")\":\"$(json_escape "${v}")\""
     done < <(us_split "${tmpfs}")
-    printf '{"user":"%s","workdir":"%s","readonly_rootfs":%s,"memory":%s,"memory_swap":%s,"cpus":"%s","cpu_shares":%s,"cpuset_cpus":"%s","pids_limit":%s,"init":%s,"privileged":%s,"group_add":%s,"security_opt":%s,"cap_add":%s,"cap_drop":%s,"tmpfs":{%s},"ulimit":%s,"devices":%s}' \
+    printf '{"user":"%s","workdir":"%s","readonly_rootfs":%s,"memory":%s,"memory_swap":%s,"cpus":"%s","cpu_shares":%s,"cpuset_cpus":"%s","pids_limit":%s,"init":%s,"privileged":%s,"group_add":%s,"security_opt":%s,"cap_add":%s,"cap_drop":%s,"tmpfs":{%s},"ulimit":%s,"devices":%s,"shm_size":%s}' \
         "$(json_escape "${user}")" "$(json_escape "${workdir}")" "${ro_b}" "${mem}" "${memswap}" \
         "$(json_escape "${cpus}")" "${cpushares}" "$(json_escape "${cpuset}")" "${pids}" \
         "${init_b}" "${priv_b}" "${groups_json}" "${seopts_json}" "${capadds_json}" "${capdrops_json}" \
-        "${out}" "${ulimits_json}" "${devices_json}"
+        "${out}" "${ulimits_json}" "${devices_json}" "${shm}"
 }
 
 us_to_json_list() {

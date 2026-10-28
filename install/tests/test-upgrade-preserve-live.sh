@@ -31,10 +31,10 @@ VOL_A="atc-boundary-vol-a-$$"
 VOL_B="atc-boundary-vol-b-$$"
 cleanup() {
     local n
-    for n in $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "^(${FA}|${FB})" || true); do
+    for n in $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "^(${FA}|${FB}|${FC})" || true); do
         docker rm -f "${n}" >/dev/null 2>&1 || true
     done
-    docker volume rm "${VOL_A}" "${VOL_B}" >/dev/null 2>&1 || true
+    docker volume rm "${VOL_A}" "${VOL_B}" "${VOL_C}" >/dev/null 2>&1 || true
     rm -rf "${TMP}"
 }
 trap cleanup EXIT
@@ -116,6 +116,32 @@ grep -qF 'boundary preserved:' "${TMP}/last.out" || fail "prepare A preserved li
 if docker ps -a --format '{{.Names}}' | grep -q "^${FA}-"; then
     fail "prepare A leftover container"
 fi
+
+# ---------------------------------------------------------------------------
+# Fixture C: a non-default shared-memory size. Daemons differ in their default
+# (64 MiB vs several GiB), so the upgrade must pass --shm-size explicitly and
+# the boundary verify must compare it.
+# ---------------------------------------------------------------------------
+FC="atc-boundary-c-$$"
+VOL_C="atc-boundary-vol-c-$$"
+docker volume create "${VOL_C}" >/dev/null || fail "volume C"
+docker create --name "${FC}" --shm-size 134217728 -v "${VOL_C}:/data" \
+    busybox:latest sleep 300 >/dev/null || fail "fixture C create"
+FC_ID="$(docker inspect --format '{{.Id}}' "${FC}")"
+FC_SHM="$(docker inspect --format '{{.HostConfig.ShmSize}}' "${FC}")"
+docker stop "${FC}" >/dev/null 2>&1 || true
+ENV_C="${TMP}/env-c"
+printf 'AGENTTEAMS_DATA_DIR=%s\nAGENTTEAMS_VERSION=latest\n' "${VOL_C}" > "${ENV_C}"
+run_live prepareC controller --yes --prepare-only --allow-storage-split \
+    --controller-image busybox:latest --env-file "${ENV_C}" --allow-env-drift \
+    --backup-dir "${TMP}/c" --controller-name "${FC}"
+[ "${RC}" = "0" ] || fail "prepare C rc=${RC}"
+grep -qF 'boundary preserved:' "${TMP}/last.out" || fail "prepare C preserved line"
+grep -qF 'shm_size' "${TMP}/last.out" || fail "prepare C shm summary"
+[ "$(docker inspect --format '{{.Id}}' "${FC}")" = "${FC_ID}" ] || fail "prepare C id changed"
+[ "$(docker inspect --format '{{.HostConfig.ShmSize}}' "${FC}")" = "${FC_SHM}" ] || fail "prepare C shm changed"
+docker rm -f "${FC}" >/dev/null 2>&1 || true
+docker volume rm "${VOL_C}" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # Fixture B: an unsupported runtime setting (sysctl) — the upgrade must
