@@ -10,9 +10,19 @@ This page explains what stays identical, what changes as you add people, and whe
 
 - **Same installation, same upgrade path, same storage layout, same APIs.** One person or fifty people use the same deployment.
 - **A Team Leader is required in every deployment**, including a one-person setup. Team coordination, team-memory broadcasting and event relaying always have an owner.
-- **A Manager is optional.** It turns controller API and CLI operations into a conversation on its admin DM, and it is available to **L1 (administrator)** users only. A deployment can run entirely without one: the dashboard and the workbench plugin cover point-and-click operations.
-- **Personal memory belongs to the person, not to the Manager.** It is stored per human and reached through the controller API, so it works the same whether or not a Manager exists.
+- **A Manager is optional.** It turns controller API and CLI operations into a conversation on its admin DM, and it is available to **L1 (administrator)** users only. A deployment can run without one: the dashboard and the workbench plugin cover point-and-click operations (premises and gaps: see the Manager section below).
+- **Personal memory belongs to the person, not to the Manager.** It is stored per human and reached through the controller API, so it works the same whether or not a Manager exists (design proposal — #1412; not available today).
 - **Adding a person is a resource change, not a deployment change**: create a Human, grant a permission level, add the person to teams.
+
+## Proposed, not yet available
+
+The capabilities below are **design proposals, not available today**; they are not part of this release's behaviour:
+
+- Per-human file area, file API, trash and quota — issue #1414 (implementation PR #1426, open).
+- Per-human memory anchor — issue #1412 (V16 pending).
+- Team-facts write path — issue #1412, Phase 2.
+
+These are designs, not behaviour in this release; the rest of this document describes only what is available today. Until they land, treat personal memory as not available today rather than as something a Manager owns.
 
 ## Roles
 
@@ -23,6 +33,8 @@ This page explains what stays identical, what changes as you add people, and whe
 | **Worker** | As needed | Executes focused tasks with its own model, runtime, skills and MCP configuration |
 | **Human** | At least one | Sets goals, observes work, intervenes; each human has a permission level and their own scope |
 | **Manager** | **Optional** | Conversational operations for L1: creates and manages resources by talking to the platform |
+
+> "Required"/"Optional" describes the intended role model; enforcement differs per row (see below).
 
 The first three are deployment concerns. Humans and the Manager are additions you make to a running deployment.
 
@@ -51,7 +63,7 @@ Add people one at a time; nothing is reinstalled and no mode is switched.
 Practical rules:
 
 - **One Human resource per person.** Display name, identity source and permission level live on that resource; the person's scope follows them.
-- **Access follows membership.** A person's work area lives in their own namespace and is shared by default with the teams they belong to; memory stays personal. Team content stays inside the team's prefixes, people do not read another person's area, and a person only sees the teams and workers they were granted.
+- **Access follows membership.** A person's work area lives in their own namespace and is shared by default with the teams they belong to; memory stays personal (both proposed — see "Proposed, not yet available"). Team content stays inside the team's prefixes, people do not read another person's area, and a person only sees the teams and workers they were granted.
 - **Teams scale independently of people.** Add a team when a group needs its own Leader and Workers; a person can belong to several teams.
 - **Rooms mirror membership.** Each team has its own room; a person joins the rooms of the teams they belong to.
 - **Removing a person** removes their membership and access. Deleting their stored data is a separate, explicit action — retention is not implied by removal.
@@ -74,16 +86,27 @@ Practical rules:
 | Human resources | More `Human` objects, each with its own level, teams and capabilities |
 | Team membership | More team rooms and more memberships; `humanMembers` and `accessibleTeams` grow |
 | Permission matrix | More principals to review; capabilities are granted per person |
-| Personal data | More per-human work areas (shared with their teams) and memory anchors (personal) |
+| Personal data | More per-human work areas (shared with their teams) and memory anchors (personal) — proposed, not available today (see "Proposed, not yet available") |
 
 ## The Manager in one-person and multi-person deployments
 
-- **Optional in both.** The Manager is a convenience layer for L1 operations, not an execution dependency.
+**Intended model.**
+
+- A **Leader is required** in every deployment, including one-person setups; the **Manager is optional** — a convenience layer for L1 operations, not an execution dependency.
 - **L1 only.** Only administrators use its conversational surface; L2 and L3 humans work through the dashboard, the workbench plugin and their own scope.
 - **Its memory is operational memory.** What was created, incidents, operational history — stored in its own agent prefix and `manager/*`. It never owns or writes a person's memory.
-- **Removing it must not remove capability.** Point-and-click operations cover management in its absence; if you remove it, review the operational flows you relied on.
 
-## Personal work area and personal memory
+**Enforced today, and what covers its absence.**
+
+- **Leader — enforced.** The Leader requirement is enforced by the controller (CRD validation and reconciliation).
+- **Manager — not enforced.** Nothing in the controller requires or forbids a Manager; a deployment simply runs without one.
+- **Covered without a Manager.** The dashboard and the workbench plugin cover **declarative resources and the read-only operational surface**: creating and editing resources, inspecting state, following team work. This assumes the installed controller version and the workbench plugin provide those surfaces.
+- **Not covered.** Conversational operations, some cross-resource flows, and upgrade/migration orchestration still need a Manager or direct controller API/CLI. These substitute paths have not been verified item by item in this document.
+- If you remove the Manager, review the operational flows you relied on before treating the point-and-click surfaces as sufficient.
+
+## Personal work area and personal memory (proposed design)
+
+Nothing in this section is available today.
 
 These follow the person, not the Manager:
 
@@ -93,30 +116,28 @@ These follow the person, not the Manager:
 - Isolation: no agent — including the Manager — is granted storage access to `humans/*`; scope is enforced by the API, and non-member teams get 404.
 - Deletions go to a **remote recycle bin** (restorable, default retention 30 days); sync is switched on per device and scoped to the folders the user selects.
 
-> **Status.** The per-human file area and the per-human memory anchor are design proposals: see issue #1414 (personal file area and file API) and issue #1412 (memory anchors). Until they land, treat personal memory as not yet available rather than as something a Manager owns.
-
 ## FAQ
 
 **Do I choose a deployment mode for one person?**
-No. Install once; the number of humans is a resource decision, not an installation option.
+**Today:** available. No deployment mode to choose — install once; the number of humans is a resource decision, not an installation option.
 
 **Can I run without a Leader?**
-No. A Leader is required in every deployment, including one-person setups.
+**Today:** not available. A Leader is required in every deployment, including one-person setups; the requirement is enforced by the controller (see the Manager section).
 
 **Can I run without a Manager?**
-Yes. The dashboard and the workbench plugin cover management; the Manager only adds a conversational surface for L1.
+**Today:** available. The dashboard and the workbench plugin cover declarative resources and the read-only operational surface (premises and gaps: see the Manager section); the Manager adds a conversational surface for L1.
 
 **Where does personal memory live if I do not install a Manager?**
-In the per-human namespace, reachable through the controller API — it does not depend on the Manager.
+**Today:** not available — per-human memory is a design proposal (#1412). Once it lands: the per-human namespace, reachable through the controller API — it does not depend on the Manager.
 
 **Can one person belong to several teams?**
-Yes. Team membership and `accessibleTeams` define the scope; a person can work in more than one team.
+**Today:** available. Team membership and `accessibleTeams` define the scope; a person can work in more than one team.
 
 **Do L2 and L3 humans do the same things?**
-No. L2 is team-scoped and can work inside its teams; L3 is read-only and limited to the workers assigned to it.
+**Today:** available. L2 is team-scoped and can work inside its teams; L3 is read-only and limited to the workers assigned to it.
 
 **Does adding people change the upgrade or backup procedure?**
-No. The same procedures apply; there are simply more human-scoped resources to include.
+**Today:** available. The same procedures apply; there are simply more human-scoped resources to include.
 
 ## See also
 
