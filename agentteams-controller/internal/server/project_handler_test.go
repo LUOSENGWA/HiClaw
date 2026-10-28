@@ -136,6 +136,36 @@ func putProject(store *ossfake.Memory, key string, meta map[string]any) {
 	_ = store.PutObject(context.Background(), key, data)
 }
 
+// canonicalProjectMetaNoAudit normalizes raw project meta JSON to the
+// struct's canonical serialization (so map-seeded fixtures compare against
+// handler-written state without empty-field artifacts such as team_id/mode/
+// assigned_to), then strips the dual-ledger audit fields
+// (controlActions / controlActionsTruncatedCount). The remaining bytes are
+// compared for byte-equality by the caller: every business field is still
+// asserted, the exemption covers only the audit ledger.
+func canonicalProjectMetaNoAudit(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var m projectMeta
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("canonicalProjectMetaNoAudit: unmarshal: %v (data=%s)", err, data)
+	}
+	canonical, err := json.Marshal(&m)
+	if err != nil {
+		t.Fatalf("canonicalProjectMetaNoAudit: marshal: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(canonical, &fields); err != nil {
+		t.Fatalf("canonicalProjectMetaNoAudit: re-unmarshal: %v", err)
+	}
+	delete(fields, "controlActions")
+	delete(fields, "controlActionsTruncatedCount")
+	out, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("canonicalProjectMetaNoAudit: final marshal: %v", err)
+	}
+	return out
+}
+
 func team(name string) *v1beta1.Team {
 	return &v1beta1.Team{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
@@ -3354,7 +3384,7 @@ func TestReplanProject_CannotReopenCancellationDecision(t *testing.T) {
 		t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
 	}
 	after, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
-	if string(after) != string(before) {
+	if string(canonicalProjectMetaNoAudit(t, after)) != string(canonicalProjectMetaNoAudit(t, before)) {
 		t.Fatalf("reopen attempt changed project: %s", after)
 	}
 }
@@ -3381,7 +3411,7 @@ func TestReplanProject_CannotRemoveCancellationDecision(t *testing.T) {
 		t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
 	}
 	after, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
-	if string(after) != string(before) {
+	if string(canonicalProjectMetaNoAudit(t, after)) != string(canonicalProjectMetaNoAudit(t, before)) {
 		t.Fatalf("remove attempt changed project: %s", after)
 	}
 }
@@ -3745,7 +3775,7 @@ func TestCancelTask_SubmissionFence(t *testing.T) {
 			}
 			afterProject, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
 			afterTask, _ := store.GetObject(context.Background(), "shared/tasks/t1/meta.json")
-			if string(afterProject) != string(beforeProject) || string(afterTask) != string(beforeTask) {
+			if string(canonicalProjectMetaNoAudit(t, afterProject)) != string(canonicalProjectMetaNoAudit(t, beforeProject)) || string(afterTask) != string(beforeTask) {
 				t.Fatalf("submission fence changed state: project=%s task=%s", afterProject, afterTask)
 			}
 		})
@@ -3778,7 +3808,7 @@ func TestCancelTask_LegacyRejectsUnknownSubmissionID(t *testing.T) {
 	}
 	afterProject, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
 	afterTask, _ := store.GetObject(context.Background(), "shared/tasks/t1/meta.json")
-	if string(afterProject) != string(beforeProject) || string(afterTask) != string(beforeTask) {
+	if string(canonicalProjectMetaNoAudit(t, afterProject)) != string(canonicalProjectMetaNoAudit(t, beforeProject)) || string(afterTask) != string(beforeTask) {
 		t.Fatalf("unknown legacy identity changed state: project=%s task=%s", afterProject, afterTask)
 	}
 }
@@ -3841,7 +3871,7 @@ func TestCancelTask_RepeatedDecisionIsIdempotentAndConflictingPayloadIsRejected(
 		}
 		afterProject, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
 		afterTask, _ := store.GetObject(context.Background(), "shared/tasks/t1/meta.json")
-		if string(afterProject) != string(firstProject) || string(afterTask) != string(firstTask) {
+		if string(canonicalProjectMetaNoAudit(t, afterProject)) != string(canonicalProjectMetaNoAudit(t, firstProject)) || string(afterTask) != string(firstTask) {
 			t.Fatalf("conflicting retry changed state: project=%s task=%s", afterProject, afterTask)
 		}
 	}
@@ -3876,7 +3906,7 @@ func TestCancelTask_TaskMetaTerminalDecisionCannotBeOverwritten(t *testing.T) {
 	}
 	afterProject, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
 	afterTask, _ := store.GetObject(context.Background(), "shared/tasks/t1/meta.json")
-	if string(afterProject) != string(beforeProject) || string(afterTask) != string(beforeTask) {
+	if string(canonicalProjectMetaNoAudit(t, afterProject)) != string(canonicalProjectMetaNoAudit(t, beforeProject)) || string(afterTask) != string(beforeTask) {
 		t.Fatalf("terminal task decision changed: project=%s task=%s", afterProject, afterTask)
 	}
 }
@@ -3908,7 +3938,7 @@ func TestCancelTask_RejectsTaskMetaOwnedByAnotherProject(t *testing.T) {
 	}
 	afterProject, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
 	afterTask, _ := store.GetObject(context.Background(), "shared/tasks/t1/meta.json")
-	if string(afterProject) != string(beforeProject) || string(afterTask) != string(beforeTask) {
+	if string(canonicalProjectMetaNoAudit(t, afterProject)) != string(canonicalProjectMetaNoAudit(t, beforeProject)) || string(afterTask) != string(beforeTask) {
 		t.Fatalf("ownership mismatch changed state: project=%s task=%s", afterProject, afterTask)
 	}
 }
@@ -3987,7 +4017,7 @@ func TestCancelTask_InvalidReplacementID400(t *testing.T) {
 			}
 			afterProject, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
 			afterTask, _ := store.GetObject(context.Background(), "shared/tasks/t1/meta.json")
-			if string(afterProject) != string(beforeProject) || string(afterTask) != string(beforeTask) {
+			if string(canonicalProjectMetaNoAudit(t, afterProject)) != string(canonicalProjectMetaNoAudit(t, beforeProject)) || string(afterTask) != string(beforeTask) {
 				t.Fatalf("invalid replacement changed state: project=%s task=%s", afterProject, afterTask)
 			}
 		})
@@ -6308,5 +6338,97 @@ func TestWorkflowStrongRereadRacesAdvance(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Consistency"); got != "" {
 		t.Fatalf("X-Consistency = %q, want empty (an advance racing the re-read must withdraw the claim)", got)
+	}
+}
+
+// TestGetProjectEvents_CursorBoundToKind: cursors are bound to the feed
+// they were issued from via the anchor's kind field. Same-feed paging
+// keeps working (and the issued cursor carries the feed's kind);
+// cross-feed reuse is rejected with 400 cursor_kind_mismatch in both
+// directions; a cursor issued before the kind field existed (format
+// upgrade) stays valid on the default feed but is rejected on the
+// control-action feed.
+func TestGetProjectEvents_CursorBoundToKind(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []string{}},
+		},
+		"controlActions": []map[string]any{
+			{"action_id": "a1", "project_id": "p1", "action": "pause", "actor": "admin", "role": "admin", "at": "2026-09-09T09:00:00Z", "reason": "checkpoint", "result": "ok"},
+			{"action_id": "a2", "project_id": "p1", "action": "resume", "actor": "admin", "role": "admin", "at": "2026-09-09T09:00:01Z", "reason": "continue", "result": "ok"},
+		},
+	})
+	putTaskMeta(store, "", "t1", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "in_progress",
+		"history": []map[string]any{
+			{"ts": "2026-09-09T10:00:00Z", "from": "planned", "to": "prepared", "action": "delegate_task", "actor": "leader:default"},
+			{"ts": "2026-09-09T10:00:01Z", "from": "prepared", "to": "assigned", "action": "delegate_task", "actor": "leader:default"},
+		},
+	})
+	h := newProjectTestHandler(t, store)
+
+	decodeCursor := func(cursor string) eventsCursorAnchor {
+		b, err := base64.RawURLEncoding.DecodeString(cursor)
+		if err != nil {
+			t.Fatalf("decode cursor: %v (cursor=%s)", err, cursor)
+		}
+		var a eventsCursorAnchor
+		if err := json.Unmarshal(b, &a); err != nil {
+			t.Fatalf("decode anchor: %v (cursor=%s)", err, cursor)
+		}
+		return a
+	}
+	wantMismatch := func(q string) {
+		rec := doGetProjectEvents(t, h, q)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status=%d body=%s, want 400", q, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "cursor_kind_mismatch") {
+			t.Fatalf("%s: body=%s, want cursor_kind_mismatch", q, rec.Body.String())
+		}
+	}
+
+	// 1. Same kind (control_action): paging works, and the issued
+	//    cursor carries the feed's kind.
+	resp := decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?kind=control_action&limit=1"))
+	if resp.CursorExpired || len(resp.Events) != 1 || resp.NextCursor == "" {
+		t.Fatalf("ctrl page1=%+v, want 1 control event + cursor", resp)
+	}
+	if resp.Events[0].Action != "control.pause" || resp.Events[0].Actor != "admin" {
+		t.Fatalf("ctrl page1[0]=%+v, want admin control.pause", resp.Events[0])
+	}
+	ctrlCursor := resp.NextCursor
+	if a := decodeCursor(ctrlCursor); a.Kind != "control_action" {
+		t.Fatalf("issued ctrl cursor kind=%q, want control_action", a.Kind)
+	}
+	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?kind=control_action&limit=1&cursor="+ctrlCursor))
+	if resp.CursorExpired || len(resp.Events) != 1 || resp.NextCursor != "" || resp.Events[0].Action != "control.resume" {
+		t.Fatalf("ctrl page2=%+v, want control.resume + exhausted cursor", resp)
+	}
+
+	// 2. Cross-feed: a control_action cursor on the default feed.
+	wantMismatch("/api/v1/projects/p1/events?cursor=" + ctrlCursor)
+
+	// 3. Cross-feed, the other way: a default-feed cursor on the
+	//    control-action feed (its kind decodes to empty).
+	resp = decodeEvents(t, doGetProjectEvents(t, h, "/api/v1/projects/p1/events?limit=1"))
+	if resp.CursorExpired || len(resp.Events) != 1 || resp.NextCursor == "" {
+		t.Fatalf("default page1=%+v, want 1 event + cursor", resp)
+	}
+	if a := decodeCursor(resp.NextCursor); a.Kind != "" {
+		t.Fatalf("issued default cursor kind=%q, want empty (default feed)", a.Kind)
+	}
+	wantMismatch("/api/v1/projects/p1/events?kind=control_action&cursor=" + resp.NextCursor)
+
+	// 4. Pre-kind (old format) cursor — no kind field: rejected for a
+	//    non-empty kind, still admitted on the default feed (the format
+	//    upgrade is one-way).
+	old := base64.RawURLEncoding.EncodeToString([]byte(`{"v":1,"ts":"2026-09-09T09:00:00Z","task_id":"","seq":0}`))
+	wantMismatch("/api/v1/projects/p1/events?kind=control_action&cursor=" + old)
+	rec := doGetProjectEvents(t, h, "/api/v1/projects/p1/events?cursor=" + old)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("old cursor on default feed status=%d body=%s, want 200 (kind check passed)", rec.Code, rec.Body.String())
 	}
 }
