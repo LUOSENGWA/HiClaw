@@ -299,3 +299,28 @@ jobs:
         run: |
           python -m pytest plugins/tests/agentteams-matrix-channel/test_sync_timeout_clamp.py -q -rs
 
+  plugin-release-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler: none
+
+      - name: Install plugin release contract test dependencies
+        run: |
+          python -m pip install \
+            'pytest>=8.3,<10' \
+            'PyYAML>=6.0,<7'
+
+      - name: Run plugin release contract tests
+        run: |
+          python -m pytest plugins/tests/plugins -q
+
