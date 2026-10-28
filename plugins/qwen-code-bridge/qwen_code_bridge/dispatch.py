@@ -1473,7 +1473,10 @@ class DispatchService:
         parts = [part for part in cmdline.split("\0") if part]
         cli_name = str(task.get("cli") or "qwen").split("/")[-1]
         session_id = str(task.get("session_id") or "")
-        cli_ok = bool(parts) and parts[0].split("/")[-1] == cli_name
+        # argv[0] is the interpreter for a Node/Python entrypoint
+        # (``node /…/qwen …``), so match the CLI name against *any*
+        # argv element rather than argv[0] alone.
+        cli_ok = any(part.split("/")[-1] == cli_name for part in parts)
         sid_ok = bool(session_id) and session_id in cmdline
         if not (cli_ok and sid_ok):
             raise PidMismatchError(

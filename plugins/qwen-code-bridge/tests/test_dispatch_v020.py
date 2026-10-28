@@ -462,3 +462,31 @@ def test_timeout_terminal_state_watchdog_lost(svc, dispatch_dir):
     assert task3["state"] == "stale"
     assert task3["death_reason"] == "crash_or_restart"
     assert task3["finished_at"] is not None
+
+
+def test_cancel_accepts_interpreter_wrapped_cli(svc, dispatch_dir):
+    """Real dispatches run ``node <path>/qwen …``: argv[0] is the
+    interpreter, so the CLI name must be matched against any argv element.
+    """
+    sid = uuid.uuid4().hex
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)", "qwen", sid],
+        start_new_session=True,
+    )
+    try:
+        tid = _write_task(
+            dispatch_dir,
+            state="running",
+            pid=proc.pid,
+            cli="qwen",
+            session_id=sid,
+        )
+        res = asyncio.run(svc.request_cancel(tid, reason="interpreter-wrapped"))
+        assert res["ok"] is True
+        assert res["signalled"] == "SIGTERM"
+        _wait_dead(proc)
+    finally:
+        try:
+            _killpg(proc)
+        except Exception:
+            pass
