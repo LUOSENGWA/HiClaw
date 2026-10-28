@@ -51,6 +51,8 @@ jobs:
         run: bash scripts/storage-migrate/tests/storage-migrate-state-machine.sh
       - name: Dry run against a fake S3 stack (no mutation, plan written)
         run: bash scripts/storage-migrate/tests/storage-migrate-dryrun-fake.sh
+      - name: Cutover runbook checklist assertions (read-only, no mc)
+        run: bash scripts/storage-migrate/tests/storage-migrate-runbook.sh
 
   migrate-e2e:
     name: migration tool full chain against real engines

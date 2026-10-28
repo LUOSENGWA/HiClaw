@@ -691,6 +691,165 @@ phase_verify() {
   state_stage "VERIFIED"
 }
 
+# ============ cutover runbook (9-section operator checklist) ============
+# render_cutover_checklist is the single source of truth for the cutover
+# runbook: phase 4 writes exactly this text into cutover-checklist.sh, and
+# --print-checklist prints it before the cutover (read-only: no state
+# read/write, no mc, no dependency gate).
+DEPLOY_MODE="both"      # embedded|helm|both: which command blocks the checklist prints
+PRINT_CHECKLIST=false   # --print-checklist: print the runbook to stdout and exit 0
+
+checklist_usage_extra() {
+  cat <<'EOF'
+
+Cutover runbook options (read-only; they never touch the state machine):
+  --deploy-mode embedded|helm|both  which command blocks the cutover
+                                     checklist prints (default: both)
+  --print-checklist                 print the cutover checklist to stdout and
+                                     exit 0 (no state read/write, no mc needed)
+EOF
+}
+
+# Pre-parse the checklist-only flags before parse_args (which lives in
+# lib/common.sh and is not extended for them):
+#   pass 1: strip --deploy-mode / --print-checklist; the rest -> CHECKLIST_REST
+#   pass 2: in print mode, consume only the endpoint values for the checklist
+#           header and reject anything else, so the preview never reads or
+#           writes state and never needs mc
+checklist_preparse() {
+  local rest=() a
+  while [ $# -gt 0 ]; do
+    a="$1"
+    case "$a" in
+      --deploy-mode)
+        [ $# -ge 2 ] || die 4 "--deploy-mode requires a value (embedded|helm|both)"
+        case "$2" in embedded|helm|both) : ;; *) die 4 "--deploy-mode must be embedded|helm|both (got: $2)" ;; esac
+        DEPLOY_MODE="$2"; shift 2 ;;
+      --print-checklist) PRINT_CHECKLIST=true; shift ;;
+      -h|--help) usage; checklist_usage_extra; exit 0 ;;
+      *) rest+=("$a"); shift ;;
+    esac
+  done
+  CHECKLIST_REST=()
+  [ ${#rest[@]} -gt 0 ] && CHECKLIST_REST=("${rest[@]}")
+  [ "$PRINT_CHECKLIST" = true ] || return 0
+  local i=0 n=${#CHECKLIST_REST[@]}
+  while [ $i -lt $n ]; do
+    a="${CHECKLIST_REST[$i]}"
+    case "$a" in
+      --src-endpoint)
+        [ $((i + 1)) -lt $n ] || die 4 "--src-endpoint requires a value"
+        SRC_EP="${CHECKLIST_REST[$((i + 1))]}"; i=$((i + 2)) ;;
+      --dst-endpoint)
+        [ $((i + 1)) -lt $n ] || die 4 "--dst-endpoint requires a value"
+        DST_EP="${CHECKLIST_REST[$((i + 1))]}"; i=$((i + 2)) ;;
+      *) die 4 "unexpected argument with --print-checklist: $a (print mode accepts only --deploy-mode, --src-endpoint, --dst-endpoint)" ;;
+    esac
+  done
+}
+
+render_cutover_checklist() {
+  cat <<EOF
+#!/usr/bin/env bash
+# cutover-checklist.sh - generated at $(now_iso) (human-executed; tick each item)
+# deploy-mode=$DEPLOY_MODE | source=${SRC_EP:-<source endpoint>} | target=${DST_EP:-<target endpoint>} | shadow=$SHADOW_DAYS days
+# Preconditions: verify green (V1-V9) + final delta applied + target write probe ok (see report-cutover.json)
+# Step tags: [tool] = done by the tool run, [manual] = an operator runs it, [verify] = check the evidence.
+# [1] [tool]  final delta + verify already done by this run (see report-cutover.json)
+#     on a RustFS target the ODM source fallback stays off after cutover (RUSTFS_ON_DEMAND_MIGRATION_ENABLED=false; RUSTFS_DURABILITY_MODE=$DST_DURABILITY unchanged)
+# [2] [manual] freeze ALL writers — external clients -> members -> controller
+EOF
+  case "$DEPLOY_MODE" in
+    embedded|both)
+      cat <<'EOF'
+#     embedded:
+#       agt update worker <name> --state Stopped   (repeat per worker, or your loop)
+#       agt update manager <name> --state Stopped
+#       # do NOT delete pods/containers to freeze: they are recreated immediately and keep writing
+#       # controller: no CR/config changes during the window; final delta must run BEFORE the controller stops (embedded MinIO lives in it)
+EOF
+      ;;
+  esac
+  case "$DEPLOY_MODE" in
+    helm|both)
+      cat <<'EOF'
+#     helm:
+#       kubectl -n <ns> patch worker <name> --type merge -p '{"spec":{"state":"Stopped"}}'
+#       kubectl -n <ns> patch manager <name> --type merge -p '{"spec":{"state":"Stopped"}}'
+#       # strict tier (optional): kubectl -n <ns> scale deploy <release>-controller --replicas=0
+EOF
+      ;;
+  esac
+  cat <<'EOF'
+# [verify] no writes: object counts stable on both ends for N seconds
+# [3] [manual] switch deployment config atomically (provider + endpoint + bucket + credentials in ONE change)
+EOF
+  case "$DEPLOY_MODE" in
+    embedded|both)
+      cat <<'EOF'
+#     embedded (manual container recreate; installer does not support external S3 yet):
+#       docker inspect agentteams-controller --format '{{json .Config.Env}}'   # capture the full current env first
+#       docker rm -f agentteams-controller
+#       docker run -d --name agentteams-controller --network agentteams-net \
+#         --network-alias matrix-local.agentteams.io --network-alias aigw-local.agentteams.io --network-alias fs-local.agentteams.io \
+#         <all previous -e flags> \
+#         -e AGENTTEAMS_STORAGE_PROVIDER=s3 \
+#         -e AGENTTEAMS_FS_ENDPOINT=<dst endpoint> -e AGENTTEAMS_FS_BUCKET=<bucket> \
+#         -e AGENTTEAMS_FS_ACCESS_KEY=<key> -e AGENTTEAMS_FS_SECRET_KEY=<secret> \
+#         -v /var/run/docker.sock:/var/run/docker.sock --security-opt label=disable \
+#         -v agentteams-data:/data -v <workspace>:/root/agentteams-fs/agents/manager \
+#         -p 8080:8080 -p 8001:8001 -p 18088:8088 --restart unless-stopped <embedded image>
+#       # WARNING: never use the installer reinstall path to change storage config (it deletes agentteams-data, the workspace and the env file)
+EOF
+      ;;
+  esac
+  case "$DEPLOY_MODE" in
+    helm|both)
+      cat <<'EOF'
+#     helm:
+#       helm upgrade --install <release> <chart> -n <ns> \
+#         --set storage.provider=s3 --set storage.mode=existing --set storage.bucket=<bucket> \
+#         --set storage.s3.endpoint=<dst endpoint> --set storage.s3.existingSecret=<secret>
+#       # the MinIO StatefulSet stops rendering after the switch; do NOT delete its PVC (it is the rollback data source)
+EOF
+      ;;
+  esac
+  cat <<'EOF'
+# [verify] controller: storage provider=s3 (external) in logs; env inside the new container/pod shows the new AGENTTEAMS_FS_*
+# [4] [manual] recreate every consumer (env is baked at creation; "restart" does NOT re-read env)
+EOF
+  case "$DEPLOY_MODE" in
+    embedded|both)
+      cat <<'EOF'
+#     embedded: docker rm -f <prefix><manager> <prefix><worker-1> ... ; controller recreates them from current config
+EOF
+      ;;
+  esac
+  case "$DEPLOY_MODE" in
+    helm|both)
+      cat <<'EOF'
+#     helm:     kubectl -n <ns> delete pod <prefix><manager>; kubectl -n <ns> delete pod <prefix><worker>
+EOF
+      ;;
+  esac
+  cat <<'EOF'
+# [verify] inside a recreated consumer: env | grep AGENTTEAMS_FS_  -> new endpoint, same bucket as controller
+# [5] [manual] per-component read/write + permission checks
+#     controller: trigger one config deploy, confirm the object lands on the target
+#     manager: write + read one object
+#     each worker: write + read with its own credentials (proves the per-worker IAM policy exists on the target)
+#     negative: worker A must get 403 reading worker B's prefix
+# [6] [manual] resume traffic: agt update worker --state Running (or kubectl patch back); watch errors/audit
+# [7] [manual] keep the source read-only for the shadow window; do not delete it
+# [8] [manual] rollback (preserves target-side writes)
+#     freeze target writers first, then per bucket:
+#       mc mirror --overwrite --remove <dst>/<bucket> <src>/<bucket>
+#     --remove is safe ONLY while the source took no writes (Gate A empty); otherwise reconcile key by key and do NOT use --remove
+#     then flip the config back (provider=minio / previous env), recreate all consumers again and re-run [5]
+# [9] [manual] record completion: --mark-cutover-done records an operator ACKNOWLEDGEMENT only; it does not verify restarts or configuration
+EOF
+}
+
 # ============ Phase 4: cutover (three steps) ============
 phase_cutover() {
   log_info "phase: cutover start"
@@ -728,28 +887,14 @@ phase_cutover() {
     && report_add "cutover" "probe-dst" "pass" "target write probe OK" || die 1 "target write probe failed - cutover aborted (target not writable)"
 
   # --- (3) cutover checklist (human-executed; the script never changes production) ---
+  state_set "stage_detail.deploy_mode" "\"$DEPLOY_MODE\""
+  report_add "cutover" "deploy_mode" "info" "cutover checklist deploy-mode=$DEPLOY_MODE (recorded in state and report)"
   local list="$STATE_DIR/cutover-checklist.sh"
-  cat > "$list" <<EOF
-#!/usr/bin/env bash
-# cutover-checklist.sh - generated at $(now_iso) (human-executed; tick each item)
-# Preconditions: verify green + source frozen (workers notified to stop writing) + target smoke test passed
-set -euo pipefail
-# [1] target health + engine
-curl -fsS "${DST_EP}/minio/health/live" >/dev/null && echo "[1] health OK"
-# [2] environment (verified against 1.0.3: the admin route is always on; ODM toggle = RUSTFS_ON_DEMAND_MIGRATION_ENABLED, default true)
-#     RUSTFS_DURABILITY_MODE=$DST_DURABILITY
-#     RUSTFS_ON_DEMAND_MIGRATION_ENABLED=false   (disable ODM source fallback after cutover)
-# [3] switch consumer endpoints (standard S3 semantics: endpoint only, credentials unchanged, workers untouched):
-#     AgentTeams production = change the endpoint env on the controller and re-apply;
-#     other S3 consumers = update the endpoint field in config.json/agent.json (back up first: cp config.json config.json.bak)
-#     value: $SRC_EP -> $DST_EP
-# [4] post-switch validation: one worker write+read, one manager mc cp, audit stream healthy
-# [5] shadow period $SHADOW_DAYS days: keep the source read-only, do not delete (rollback path)
-EOF
+  render_cutover_checklist > "$list"
   chmod +x "$list"
-  report_add "cutover" "checklist" "pass" "cutover checklist -> $list (human-executed)"
+  report_add "cutover" "checklist" "pass" "cutover checklist -> $list (human-executed; deploy-mode=$DEPLOY_MODE)"
   log_info "cutover steps done: final delta ok, both write probes ok, checklist -> $list"
-  log_warn "after running [1]-[5] in $list, record the state with: $0 <same args> --state-dir $(dirname "$STATE_FILE") --mark-cutover-done"
+  log_warn "after completing [2]-[9] in $list, record the state with: $0 <same args> --state-dir $(dirname "$STATE_FILE") --mark-cutover-done (records an operator acknowledgement only; it does not verify restarts or configuration)"
   state_set "stage" '"CUTOVER_PENDING"'
   report_write > "$STATE_DIR/report-cutover.json"
 }
@@ -784,7 +929,16 @@ status_json() {
 }
 
 main() {
-  parse_args "$0" "$@"
+  checklist_preparse "$@"
+  # --print-checklist is a read-only preview: pre-parse consumed its remaining
+  # arguments (the endpoint values for the header), so it must not read or
+  # write state and needs no mc - it bypasses parse_args entirely (which
+  # would create the state directory and gate on dependencies).
+  if [ "$PRINT_CHECKLIST" = true ]; then
+    render_cutover_checklist
+    exit 0
+  fi
+  parse_args "$0" ${CHECKLIST_REST[@]+"${CHECKLIST_REST[@]}"}
   # --status is a read-only introspection path: no dependency gate, no state
   # mutation. A future API/UI polls it to render progress.
   if [ "$STATUS_MODE" = true ]; then
@@ -838,7 +992,7 @@ main() {
     mark-cutover-done)
       [ "$stage" = "CUTOVER_PENDING" ] || die 1 "state.stage=$stage (run --phase cutover and complete cutover-checklist.sh first)"
       state_stage "CUTOVER_DONE"
-      report_add "cutover" "done" "pass" "human confirmed cutover at $(now_iso)"
+      report_add "cutover" "done" "pass" "operator acknowledgement recorded at $(now_iso) (it does not verify restarts or configuration)"
       report_write > "$STATE_DIR/report-final.json"
       log_info "state=CUTOVER_DONE - the $SHADOW_DAYS-day shadow period starts (keep the source read-only, do not delete)"
       ;;

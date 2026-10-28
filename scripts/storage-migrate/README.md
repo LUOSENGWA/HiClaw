@@ -27,6 +27,66 @@ phase 4 cutover     final delta, write probes on both sides, and a checklist for
 refuses `cutover` unless `verify` is green, and refuses `mark-cutover-done`
 until the checklist has been executed.
 
+## Operator runbook
+
+Phases 0-3 are automated; the cutover (phase 4) is a **human-executed
+runbook**. The tool runs the final delta, writes both write probes, and
+generates `cutover-checklist.sh` — it never freezes writers, flips the
+deployment config, or restarts consumers. The full command blocks for both
+deployment modes (embedded and helm) are in the
+[design document, §5 Cutover runbook (operator)](../../docs/design/storage-external-s3-backend.md#5-cutover-runbook-operator);
+preview them before the cutover with
+`bash scripts/storage-migrate/storage-migrate.sh --print-checklist --deploy-mode embedded|helm|both`
+(read-only: no state read/write, no mc needed). The nine steps, each tagged
+`[tool]`/`[manual]`/`[verify]` in the generated checklist:
+
+1. `[tool]` Final delta + verify — already done by the tool run (see
+   `report-cutover.json`).
+2. `[manual]` Freeze ALL writers — external clients, then members, then the
+   controller: embedded `agt update worker <name> --state Stopped` and
+   `agt update manager <name> --state Stopped`; helm
+   `kubectl -n <ns> patch worker <name> --type merge -p
+   '{"spec":{"state":"Stopped"}}'`. Do not delete pods/containers to freeze
+   (they are recreated immediately and keep writing); no CR/config changes
+   during the window; the final delta must run before the embedded
+   controller stops (the embedded MinIO lives in it).
+3. `[manual]` Switch the deployment config in ONE change (provider +
+   endpoint + bucket + credentials): embedded =
+   `docker rm -f agentteams-controller`, then `docker run` with the captured
+   previous flags plus `-e AGENTTEAMS_STORAGE_PROVIDER=s3 -e
+   AGENTTEAMS_FS_ENDPOINT=… -e AGENTTEAMS_FS_BUCKET=…` and the target
+   credentials (the installer does not support external S3 yet; **never use
+   the installer reinstall path** — it deletes the data volume, the
+   workspace and the env file); helm = `helm upgrade --install <release>
+   <chart> -n <ns> --set storage.provider=s3 --set storage.mode=existing
+   --set storage.s3.endpoint=… --set storage.s3.existingSecret=<secret>`
+   (the MinIO StatefulSet stops rendering after the switch; do not delete
+   its PVC — it is the rollback data source).
+4. `[manual]` Recreate every consumer — env is baked at pod/container
+   creation and "restart" does not re-read it: embedded
+   `docker rm -f <prefix><manager> <prefix><worker-1> …`; helm
+   `kubectl -n <ns> delete pod <prefix><manager>` and
+   `kubectl -n <ns> delete pod <prefix><worker>`. Then, inside a recreated
+   consumer: `env | grep AGENTTEAMS_FS_` must show the new endpoint and the
+   same bucket as the controller.
+5. `[manual]` Per-component read/write + permission checks: controller (one
+   config deploy lands on the target), manager (write + read one object),
+   each worker with its own credentials (proves the per-worker IAM policy
+   exists on the target), and the negative case (worker A must get a 403
+   reading worker B's prefix).
+6. `[manual]` Resume traffic: `agt update worker --state Running` (or
+   `kubectl patch` the CRs back); watch errors/audit.
+7. `[manual]` Keep the source read-only for the shadow window; do not delete
+   it.
+8. `[manual]` Rollback (preserves target-side writes): freeze the target
+   writers first, then per bucket `mc mirror --overwrite --remove
+   <dst>/<bucket> <src>/<bucket>` — `--remove` is safe only while the source
+   took no writes (Gate A empty); otherwise reconcile key by key and do NOT
+   use `--remove`. Then flip the config back (provider=minio / the captured
+   previous env), recreate all consumers again, and re-run step 5.
+9. `[manual]` Record completion: `--mark-cutover-done` records an operator
+   ACKNOWLEDGEMENT only — it does not verify restarts or configuration.
+
 ## Requirements
 
 `bash >= 4`, `mc` (`RELEASE.2025-08-13` or newer), `curl` (8.x for `--aws-sigv4`),
@@ -55,6 +115,17 @@ bash scripts/storage-migrate/storage-migrate.sh <same args> --phase cutover
 bash scripts/storage-migrate/storage-migrate.sh <same args> --mark-cutover-done
 ```
 
+Cutover runbook options (they only affect the generated checklist text and
+the read-only print; they never touch the state machine):
+
+- `--deploy-mode embedded|helm|both` (default `both`) — which deployment-mode
+  command blocks `cutover-checklist.sh` prints; recorded in the state
+  (`stage_detail.deploy_mode`) and the cutover report.
+- `--print-checklist` — print the cutover checklist to stdout and exit 0.
+  Read-only: it does not read or write the state, creates no state
+  directory, and needs no mc. Use it to preview the runbook before the
+  cutover or to feed it into a change-management ticket.
+
 The state machine resumes: re-running the same command continues from the
 current stage. `state.json` lives in `--state-dir` (default
 `./storage-migrate-state`), together with the report, the log and the IAM
@@ -79,6 +150,7 @@ docker run --rm --network host \
 ```bash
 bash scripts/storage-migrate/tests/storage-migrate-state-machine.sh   # phase gating, arg parsing
 bash scripts/storage-migrate/tests/storage-migrate-dryrun-fake.sh     # dry run against a fake S3 stack
+bash scripts/storage-migrate/tests/storage-migrate-runbook.sh         # cutover runbook assertions (read-only, no mc)
 bash scripts/storage-migrate/tests/storage-migrate-e2e.sh             # full chain on real engines (Docker)
 bash test/e2e/external-s3-backend.sh                                  # S3 plane + migration regression on real engines
 ```
@@ -123,4 +195,6 @@ confirmations rather than automating them away.
 The tool moves data and IAM between two S3 endpoints and produces the cutover
 checklist. It does not start the target engine, flip the deployment's
 configuration, or delete the source: those stay operational decisions described
-in the guide.
+in the guide. The tool never freezes writers, flips config or restarts
+consumers — the [runbook in the design document, §5](../../docs/design/storage-external-s3-backend.md#5-cutover-runbook-operator)
+covers that for both deployment modes.
