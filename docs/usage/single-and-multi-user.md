@@ -9,7 +9,7 @@ This page explains what stays identical, what changes as you add people, and whe
 ## The short answer
 
 - **Same installation, same upgrade path, same storage layout, same APIs.** One person or fifty people use the same deployment.
-- **A Team Leader is required in every deployment**, including a one-person setup. Team coordination, team-memory broadcasting and event relaying always have an owner.
+- **Each Team requires exactly one Leader.** The controller rejects a Team whose `workerMembers` has zero or more than one `team_leader`, so team coordination, team-memory broadcasting and event relaying always have an owner. This is a per-team invariant, not an installation requirement: an installation can contain no Team at all, and standalone Workers are valid. The recommended default topology — Leader + Workers, optionally with a Manager — is a recommendation, not a constraint.
 - **A Manager is optional.** It turns controller API and CLI operations into a conversation on its admin DM, and it is available to **L1 (administrator)** users only. A deployment can run without one: the dashboard and the workbench plugin cover point-and-click operations (premises and gaps: see the Manager section below).
 - **Personal memory belongs to the person, not to the Manager.** It is stored per human and reached through the controller API, so it works the same whether or not a Manager exists (design proposal — #1412; not available today).
 - **Adding a person is a resource change, not a deployment change**: create a Human, grant a permission level, add the person to teams.
@@ -29,18 +29,18 @@ These are designs, not behaviour in this release; the rest of this document desc
 | Role | Required? | Responsibility |
 |---|---|---|
 | **Controller** | Yes | Platform layer: resources, containers, storage, permissions, gateway configuration |
-| **Leader** | **Yes, always** | Team-facing coordination: task breakdown, assignment, team-memory broadcast, event relay |
+| **Leader** | **Yes — exactly one Leader per Team** | Team-facing coordination: task breakdown, assignment, team-memory broadcast, event relay. Required inside every Team; not an installation-level requirement |
 | **Worker** | As needed | Executes focused tasks with its own model, runtime, skills and MCP configuration |
 | **Human** | At least one | Sets goals, observes work, intervenes; each human has a permission level and their own scope |
 | **Manager** | **Optional** | Conversational operations for L1: creates and manages resources by talking to the platform |
 
-> "Required"/"Optional" describes the intended role model; enforcement differs per row (see below).
+> "Required" describes the scope where the controller enforces it, not the shape of the deployment: the Leader requirement applies **inside each Team** (exactly one `team_leader` in `workerMembers`). Teams themselves are optional and standalone Workers are allowed. "Optional" (the Manager) is neither required nor forbidden. See "Enforced today" below.
 
-The first three are deployment concerns. Humans and the Manager are additions you make to a running deployment.
+The Controller is the platform layer and Workers are what you instantiate; a Leader is required *inside each Team*. Humans and the Manager are additions you make to a running deployment.
 
 ## Using the instance with one person
 
-1. Install AgentTeams as usual (local or Kubernetes) and keep the default Leader/Worker topology.
+1. Install AgentTeams as usual (local or Kubernetes) and keep the recommended default topology (Leader + Workers).
 2. Create the person:
    - the **administrator (L1)** identity administers the deployment. L1 humans have Matrix accounts like everyone else; their administrative API operations use the admin credential, while L2/L3 humans authenticate with their own Matrix token;
    - a **team member (L2)** identity is scoped to the teams listed in `accessibleTeams`.
@@ -92,13 +92,13 @@ Practical rules:
 
 **Intended model.**
 
-- A **Leader is required** in every deployment, including one-person setups; the **Manager is optional** — a convenience layer for L1 operations, not an execution dependency.
+- **Each Team requires exactly one Leader** (enforced per team — see "Enforced today"); the **Manager is optional** — a convenience layer for L1 operations, not an execution dependency. The recommended default topology (Leader + Workers, optionally a Manager) is a recommendation, not a deployment constraint: an installation can run with no Team, or with standalone Workers.
 - **L1 only.** Only administrators use its conversational surface; L2 and L3 humans work through the dashboard, the workbench plugin and their own scope.
 - **Its memory is operational memory.** What was created, incidents, operational history — stored in its own agent prefix and `manager/*`. It never owns or writes a person's memory.
 
 **Enforced today, and what covers its absence.**
 
-- **Leader — enforced.** The Leader requirement is enforced by the controller (CRD validation and reconciliation).
+- **Leader — enforced per Team.** When a Team is created or updated, the controller validates that `workerMembers` contains exactly one member with role `team_leader` and rejects zero or multiple. It does not require an installation to contain a Team, and it does not restrict standalone Workers.
 - **Manager — not enforced.** Nothing in the controller requires or forbids a Manager; a deployment simply runs without one.
 - **Covered without a Manager.** The dashboard and the workbench plugin cover **declarative resources and the read-only operational surface**: creating and editing resources, inspecting state, following team work. This assumes the installed controller version and the workbench plugin provide those surfaces.
 - **Not covered.** Conversational operations, some cross-resource flows, and upgrade/migration orchestration still need a Manager or direct controller API/CLI. These substitute paths have not been verified item by item in this document.
@@ -122,7 +122,7 @@ These follow the person, not the Manager:
 **Today:** available. No deployment mode to choose — install once; the number of humans is a resource decision, not an installation option.
 
 **Can I run without a Leader?**
-**Today:** not available. A Leader is required in every deployment, including one-person setups; the requirement is enforced by the controller (see the Manager section).
+**Today:** yes, as long as you do not run a Team. An installation can contain no Team at all, and standalone Workers are allowed. What is not possible is a Team without exactly one Leader: the controller rejects a Team whose `workerMembers` has zero or more than one `team_leader` (see the Manager section).
 
 **Can I run without a Manager?**
 **Today:** available. The dashboard and the workbench plugin cover declarative resources and the read-only operational surface (premises and gaps: see the Manager section); the Manager adds a conversational surface for L1.

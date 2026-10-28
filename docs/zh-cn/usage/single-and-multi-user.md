@@ -9,7 +9,7 @@
 ## 一句话结论
 
 - **同一套安装、同一条升级路径、同一套存储布局、同一套 API。** 一个人和五十个人用的是同一个部署。
-- **任何部署都必须有 Team Leader**，哪怕只有一个人。团队协调、团队记忆播报与事件转述始终要有归属。
+- **每个 Team 必须恰有一个 Leader。** controller 会拒绝 `workerMembers` 中 `team_leader` 数量为 0 或多于 1 的 Team，因此团队协调、团队记忆播报与事件转述始终有归属。这是**每个 Team 的约束**，不是安装级要求：一个安装可以完全没有 Team，独立 Worker 也是允许的。推荐的默认拓扑（Leader + Worker，Manager 可选）是建议，不是约束。
 - **Manager 是可选的。** 它把 controller API 与 CLI 操作翻译成 admin DM 里的对话，且**仅 L1（管理员）**可用。部署可以不装它——dashboard 与工作台插件覆盖点选式运维（前提与缺口见下文 Manager 一节）。
 - **个人记忆属于这个真人，不属于 Manager。** 它按人存放、经 controller API 访问，因此装不装 Manager 都一样（设计提案 — #1412；尚未可用）。
 - **接入一个人是资源变更，不是部署变更**：创建 Human、授予权限级别、把这个人加进团队。
@@ -29,18 +29,18 @@
 | 角色 | 是否必需 | 职责 |
 |---|---|---|
 | **Controller** | 必需 | 平台层：资源、容器、存储、权限、网关配置 |
-| **Leader** | **始终必需** | 团队面协调：任务分解、分配、团队记忆播报、事件转述 |
+| **Leader** | **必需——每个 Team 恰有一个 Leader** | 团队面协调：任务分解、分配、团队记忆播报、事件转述。每个 Team 内部必需；不是安装级要求 |
 | **Worker** | 按需 | 执行具体任务，拥有自己的模型、runtime、技能与 MCP 配置 |
 | **Human** | 至少一个 | 设定目标、观察进展、随时介入；每个真人有一个权限级别和各自的作用域 |
 | **Manager** | **可选** | 面向 L1 的对话式运维：通过对话创建与管理资源 |
 
-> "必需"/"可选"描述的是预期的角色模型；每一行的实际强制方式不同（见下文）。
+> “必需”描述的是 controller 强制执行的范围，不是部署形态：Leader 要求作用于**每个 Team 内部**（`workerMembers` 恰有一个 `team_leader`）。Team 本身可选，独立 Worker 允许存在；“可选”（Manager）表示 controller 既不要求也不禁止。详见下文“当前的强制方式”。
 
-前三者是部署层面的事；真人与 Manager 是在一个已运行的部署上追加的。
+Controller 是平台层，Worker 是你按需实例化的执行单元；Leader 是**每个 Team 内部**的要求。真人与 Manager 是在一个已运行的部署上追加的。
 
 ## 只有一个人时怎么用
 
-1. 照常安装 AgentTeams（本地或 Kubernetes），保持默认的 Leader/Worker 拓扑。
+1. 照常安装 AgentTeams（本地或 Kubernetes），保持推荐的默认拓扑（Leader + Worker）。
 2. 创建这个人：
    - **管理员（L1）**身份负责管理部署。L1 真人与其他人一样拥有 Matrix 账号；其管理类 API 操作使用 admin 凭据，而 L2/L3 真人用自己的 Matrix token 认证；
    - **团队成员（L2）**身份的作用域是 `accessibleTeams` 中列出的团队。
@@ -92,13 +92,13 @@
 
 **预期模型。**
 
-- **任何部署都必须有 Leader**（含单人部署）；**Manager 可选**——L1 运维的便利层，不是执行依赖。
+- **每个 Team 必须恰有一个 Leader**（按团队强制，见下文“当前的强制方式”）；**Manager 可选**——L1 运维的便利层，不是执行依赖。推荐的默认拓扑（Leader + Worker，Manager 可选）是建议而非部署约束：一个安装可以没有 Team，也可以只有独立 Worker。
 - **仅 L1。** 只有管理员使用它的对话面；L2 与 L3 真人通过 dashboard、工作台插件与自己的作用域工作。
 - **它的记忆是运维记忆。** 建过什么、事故、运维历史——存在它自己的 agent 前缀与 `manager/*` 下。它永不拥有、也不写入某个真人的记忆。
 
 **当前的强制方式，以及缺席时由什么覆盖。**
 
-- **Leader——强制。** Leader 的要求由 controller（CRD 校验与协调）强制。
+- **Leader——按 Team 强制。** 创建或更新 Team 时，controller 校验 `workerMembers` 中恰有一个 `role=team_leader` 的成员，0 个或多个都会被拒绝。它不要求安装中存在 Team，也不限制独立 Worker。
 - **Manager——不强制。** controller 中没有任何机制要求或禁止 Manager；部署缺省即可无 Manager 运行。
 - **无 Manager 时覆盖的是：** dashboard 与工作台插件覆盖**声明式资源与只读运维面**——创建/编辑资源、查看状态、跟踪团队工作。前提是所装 controller 版本与工作台插件提供这些界面。
 - **未覆盖的：** 对话式运维、部分跨资源流程、升级/迁移编排，仍需 Manager 或直接 controller API/CLI。这些替代路径未在当前文档版本中逐项验证。
@@ -122,7 +122,7 @@
 **当前：** 可用。无需选择部署模式——安装一次即可；接入多少真人是资源决策，不是安装选项。
 
 **可以没有 Leader 吗？**
-**当前：** 不可用。任何部署都必须有 Leader（含单人部署）；该要求由 controller 强制（见 Manager 一节）。
+**当前：** 可以——只要你没有运行 Team。安装中可以完全没有 Team，独立 Worker 也是允许的。不可能的是“没有 Leader 的 Team”：**每个 Team 必须恰有一个 Leader**——`workerMembers` 中 `team_leader` 数量为 0 或多于 1 的 Team 会被 controller 拒绝（见 Manager 一节）。
 
 **可以没有 Manager 吗？**
 **当前：** 可用。dashboard 与工作台插件覆盖声明式资源与只读运维面（前提与缺口见 Manager 一节）；Manager 只是给 L1 多一个对话面。
