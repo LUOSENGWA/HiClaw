@@ -402,6 +402,17 @@ type ChannelPolicySpec struct {
 
 type ChannelsSpec struct {
 	DingTalk *DingTalkChannelSpec `json:"dingtalk,omitempty"`
+	Matrix   *MatrixChannelSpec   `json:"matrix,omitempty"`
+}
+
+// MatrixChannelSpec holds display flags for the worker's Matrix channel.
+// Declarative source of truth for Matrix display flags; runtime channel-API
+// writes are not persisted to the CRD and survive only until this section
+// is set. When the section is present, unset flags default to false
+// (hidden), mirroring DingTalk semantics.
+type MatrixChannelSpec struct {
+	ShowThinking  bool `json:"showThinking,omitempty"`
+	ShowToolCalls bool `json:"showToolCalls,omitempty"`
 }
 
 type DingTalkChannelSpec struct {
