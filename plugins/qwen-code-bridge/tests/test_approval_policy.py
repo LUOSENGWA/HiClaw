@@ -111,3 +111,100 @@ def test_receipt_records_decision(tmp_path):
     approval.append_receipt(path, approval.receipt_entry("t1", "write_file", {}, d, "r1"))
     line = path.read_text().strip()
     assert '"behavior": "deny"' in line
+
+
+# ---------------------------------------------------------------------------
+# #1411 — fail closed: compound commands, unvalidated paths, interpreters
+# ---------------------------------------------------------------------------
+
+
+def test_compound_semicolon_deny():
+    d = approval.decide(
+        "shell",
+        {"command": "pwd; python3 -c 'print(123)'", "cwd": "/outside"},
+        [ROOT],
+    )
+    assert d["behavior"] == "deny" and d["rule"] == "exec-compound"
+
+
+def test_cat_outside_root_deny():
+    d = approval.decide("shell", {"command": "cat /var/private/data"}, [ROOT])
+    assert d["behavior"] == "deny" and d["rule"] == "outside-root"
+
+
+def test_git_branch_delete_deny():
+    d = approval.decide("shell", {"command": "git branch -D important"}, [ROOT])
+    assert d["behavior"] == "deny"
+
+
+def test_cwd_outside_root_deny():
+    d = approval.decide("shell", {"command": "pwd", "cwd": "/outside"}, [ROOT])
+    assert d["behavior"] == "deny" and d["rule"] == "outside-root-cwd"
+
+
+def test_compound_and_deny():
+    d = approval.decide("shell", {"command": "echo hi && rm -rf x"}, [ROOT])
+    assert d["behavior"] == "deny" and d["rule"] == "exec-compound"
+
+
+def test_command_substitution_dollar_paren_deny():
+    d = approval.decide("shell", {"command": "cat $(echo /etc/passwd)"}, [ROOT])
+    assert d["behavior"] == "deny" and d["rule"] == "exec-compound"
+
+
+def test_backtick_deny():
+    d = approval.decide("shell", {"command": "echo `id`"}, [ROOT])
+    assert d["behavior"] == "deny" and d["rule"] == "exec-compound"
+
+
+def test_python_interpreter_deny():
+    d = approval.decide("shell", {"command": "python3 -c 1"}, [ROOT])
+    assert d["behavior"] == "deny" and d["rule"] == "exec-denied"
+
+
+def test_bash_c_deny():
+    d = approval.decide("shell", {"command": "bash -c 'ls'"}, [ROOT])
+    assert d["behavior"] == "deny" and d["rule"] == "exec-denied"
+
+
+def test_sed_inplace_deny():
+    d = approval.decide("shell", {"command": "sed -i s/a/b/ f"}, [ROOT])
+    assert d["behavior"] == "deny" and d["rule"] == "sed-inplace"
+
+
+def test_find_exec_deny():
+    d = approval.decide("shell", {"command": "find . -exec rm {} +"}, [ROOT])
+    assert d["behavior"] == "deny"
+
+
+def test_find_exec_quoted_braces_deny():
+    # Braces quoted => lexical scan passes, the find action flag must catch it.
+    d = approval.decide("shell", {"command": "find . -exec rm '{}' +"}, [ROOT])
+    assert d["behavior"] == "deny" and d["rule"] == "find-action"
+
+
+def test_quoted_semicolon_allow():
+    d = approval.decide("shell", {"command": 'git commit -m "fix: a;b"'}, [ROOT])
+    assert d["behavior"] == "allow"
+
+
+def test_git_add_status_diff_allow():
+    for command in ("git add file", "git status", "git diff"):
+        d = approval.decide("shell", {"command": command}, [ROOT])
+        assert d["behavior"] == "allow", command
+
+
+def test_read_outside_root_deny():
+    d = approval.decide("read_file", {"path": "/var/private/data"}, [ROOT])
+    assert d["behavior"] == "deny" and d["rule"] == "outside-root"
+
+
+def test_symlink_escape_deny(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("top secret")
+    link = root / "link.txt"
+    link.symlink_to(outside)
+    d = approval.decide("read_file", {"file_path": str(link)}, [str(root)])
+    assert d["behavior"] == "deny" and d["rule"] == "outside-root"

@@ -1504,3 +1504,63 @@ def test_cleanup_maps_terminating_to_watchdog_lost(tmp_path, monkeypatch):
     task = json.loads((tmp_path / f"{tid}.json").read_text())
     assert task["state"] == "stale"
     assert task["death_reason"] == "timeout_killed_watchdog_lost"
+
+
+def _ctrl_cli(bin_dir: Path, stdin_log: Path) -> None:
+    """Fake CLI issuing two can_use_tool requests: one that must be denied
+    (path outside the run root) and one that must be allowed (git status)."""
+    deny_req = {
+        "type": "control_request",
+        "request_id": "r-deny",
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": "shell",
+            "input": {"command": "cat /var/private/data"},
+        },
+    }
+    allow_req = {
+        "type": "control_request",
+        "request_id": "r-allow",
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": "shell",
+            "input": {"command": "git status"},
+        },
+    }
+    script = (
+        "#!/bin/sh\n"
+        f"echo '{json.dumps(deny_req)}'\n"
+        f"echo '{json.dumps(allow_req)}'\n"
+        f'while IFS= read -r line; do printf "%s\\n" "$line" >> "{stdin_log}"; done\n'
+    )
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    path = bin_dir / "fakectrl"
+    path.write_text(script, encoding="utf-8")
+    path.chmod(0o755)
+
+
+@pytest.mark.asyncio
+async def test_control_response_deny_not_allow(tmp_path):
+    """#1411: a deny decision must reach the CLI as behavior=deny with a
+    message; allow may only be emitted for policy-clean commands."""
+    with Env(tmp_path) as env:
+        stdin_log = tmp_path / "stdin.log"
+        _ctrl_cli(env.bin_dir, stdin_log)
+        service = DispatchService(wake_sender=lambda *a, **k: None)
+        task_id = await service.start(
+            task_name="t-ctrl", prompt="x", cwd=None, cli="fakectrl",
+            timeout=30, wake=dict(WAKE), approval_mode="default",
+        )
+        text = ""
+        for _ in range(200):
+            text = stdin_log.read_text(errors="replace") if stdin_log.exists() else ""
+            if "r-deny" in text and "r-allow" in text:
+                break
+            await asyncio.sleep(0.05)
+        deny_line = next(l for l in text.splitlines() if "r-deny" in l)
+        allow_line = next(l for l in text.splitlines() if "r-allow" in l)
+        deny_resp = json.loads(deny_line)["response"]["response"]
+        allow_resp = json.loads(allow_line)["response"]["response"]
+        assert deny_resp["behavior"] == "deny"
+        assert deny_resp["message"]
+        assert allow_resp["behavior"] == "allow"

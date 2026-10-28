@@ -20,13 +20,31 @@ This module is the **deterministic policy** the worker uses to answer on
 the human's behalf ("worker 代审批").  No LLM in the loop: the same
 tool call always maps to the same decision, every decision is written to
 a receipt, and anything unrecognised fails closed (deny).
+
+Shell policy (fail closed, #1411):
+
+1. Lexical scan — any shell metacharacter **outside** quotes/escapes
+   (``; & | < >`` backtick ``$( `` ``${ `` newline ``(){} ``) denies the
+   command outright (``exec-compound``).  Inside quotes such characters
+   are data (``git commit -m "fix: a;b"`` is fine).
+2. ``shlex.split`` must succeed (``exec-parse`` otherwise) and
+   ``argv[0]`` must be a whitelisted program.
+3. ``cwd`` (when provided) must exist and resolve inside the run roots
+   (``outside-root-cwd``).
+4. Path-like argv (absolute, ``./``, ``../``, ``~/``, contains ``/``)
+   must ``realpath`` into the roots — symlinks included
+   (``outside-root``).  Secret-ish paths are refused everywhere.
+5. Unconstrained interpreters (``sh``/``bash``/``python*``/``node`` …)
+   and destructive utilities are hard-denied (``exec-denied``);
+   anything else escalates (deny by default, overridable via
+   ``escalate_behavior``).  Hard denies are never overridable.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
+import shlex
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -75,40 +93,34 @@ _SECRET_MARKERS = (
     ".pypirc",
 )
 
-#: Command patterns auto-denied regardless of path.
-_DENY_COMMANDS = (
-    r"\bgit\s+push\b",
-    r"\bgit\s+reset\s+--hard\b",
-    r"\bgit\s+clean\s+-[a-z]*f",
-    r"\brm\s+(-[a-zA-Z]*\s+)*-?[rf]",
-    r"\bsudo\b",
-    r"\bsu\b",
-    r"\bchmod\s+777\b",
-    r"\bchown\b",
-    r"\bdd\s+if=",
-    r"\bmkfs\.",
-    r"\b(shutdown|reboot|halt|poweroff)\b",
-    r"\bkill\s+-9\s+1\b",
-    r"\bcurl\b",
-    r"\bwget\b",
-    r"\bssh\b",
-    r"\bscp\b",
-    r"\bcurl\s+.*\|\s*(sh|bash)\b",
-    r"\/etc\/",
-    r"~\/\.ssh",
-)
+#: Shell metacharacters that make a command compound.  Checked outside
+#: quotes/escapes only — inside quotes they are data.
+_COMPOUND_CHARS = frozenset(";&|<>`\n")
+_PAREN_CHARS = frozenset("(){}")
 
-#: Commands auto-allowed inside the run root (tests / builds / VCS reads).
-_ALLOW_COMMANDS = (
-    r"^(pytest|python3?\s+-m\s+pytest)\b",
-    r"^(npm|pnpm|yarn)\s+(test|run\s+(test|lint|build|typecheck))\b",
-    r"^(go\s+(test|build|vet))\b",
-    r"^(cargo\s+(test|build|check))\b",
-    r"^(ruff|black\s+--check|mypy|eslint|prettier\s+--check)\b",
-    r"^(git\s+(status|diff|log|show|rev-parse|branch|checkout\s+--|add|commit))\b",
-    r"^(ls|pwd|cat|head|tail|wc|sort|uniq|grep|rg|find|sed\s+-n|awk)\b",
-    r"^(bash\s+-n|sh\s+-n|node\s+--check)\b",
-)
+#: argv[0] programs that are never auto-approved: unconstrained
+#: interpreters, network tools, and destructive file utilities.
+#: ``python*`` is matched by prefix (``python``/``python2``/``python3.x``).
+_DENY_PROGRAMS = frozenset({
+    "sh", "bash", "zsh", "dash", "ash", "ksh", "fish",
+    "node", "nodejs", "ruby", "perl", "php",
+    "env", "xargs", "sudo", "su", "ssh", "scp",
+    "curl", "wget", "awk", "gawk", "mawk", "busybox",
+    "rm", "rmdir", "chmod", "chown", "dd",
+    "shutdown", "reboot", "halt", "poweroff",
+})
+
+#: argv[0] programs auto-approved inside the run roots (read-only file
+#: inspection and the test runner).  ``git`` is validated separately.
+_ALLOW_PROGRAMS = frozenset({
+    "cat", "head", "tail", "wc", "ls", "sed", "grep", "rg", "find",
+    "pwd", "pytest",
+})
+
+#: git flag tokens forbidden for every subcommand (config/dir overrides).
+_GIT_FORBIDDEN_FLAGS = frozenset({"-c", "-C", "--exec"})
+#: git branch: the only accepted flags (read-only listing).
+_GIT_BRANCH_LIST_FLAGS = frozenset({"--list", "-a", "-v"})
 
 
 def _norm(text: Any) -> str:
@@ -163,6 +175,246 @@ def _command_from_input(tool_input: Any) -> str:
     return ""
 
 
+def _has_compound_outside_quotes(command: str) -> bool:
+    """True if a shell metacharacter appears outside quotes/escapes.
+
+    Tracks single/double quotes and backslash escapes the way the shell
+    would (in double quotes a backslash only escapes ``$`"\\``).
+    """
+    quote: str | None = None
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+        elif quote == '"':
+            if ch == "\\" and i + 1 < n and command[i + 1] in "$`\"\\":
+                i += 2
+            else:
+                if ch == '"':
+                    quote = None
+                i += 1
+        else:
+            if ch == "\\":
+                i += 2
+            elif ch == "'":
+                quote = "'"
+                i += 1
+            elif ch == '"':
+                quote = '"'
+                i += 1
+            elif ch in _COMPOUND_CHARS or ch in _PAREN_CHARS:
+                return True
+            elif ch == "$" and i + 1 < n and command[i + 1] in "({":
+                return True
+            else:
+                i += 1
+    return False
+
+
+def _git_verdict(args: list[str]) -> tuple[str, str, str] | None:
+    """Validate ``git <args>``; ``None`` means allowed (paths checked
+    by the caller), otherwise ``(risk, rule, reason)``.
+    """
+    for a in args:
+        if a.split("=", 1)[0] in _GIT_FORBIDDEN_FLAGS:
+            return (
+                RISK_DENY,
+                "git-flag-forbidden",
+                f"git flag not allowed: {a}",
+            )
+    sub = next((a for a in args if not a.startswith("-")), None)
+    if sub is None:
+        return (RISK_DENY, "git-disallowed", "git without a subcommand")
+    rest = args[args.index(sub) + 1:]
+    if sub in ("status", "diff", "log", "show", "rev-parse"):
+        return None
+    if sub == "branch":
+        if all(a in _GIT_BRANCH_LIST_FLAGS for a in rest):
+            return None
+        return (
+            RISK_DENY,
+            "git-disallowed",
+            "git branch only allows list flags (--list/-a/-v)",
+        )
+    if sub == "checkout":
+        if rest and rest[0] == "--":
+            return None
+        return (
+            RISK_DENY,
+            "git-disallowed",
+            "git checkout only allows: checkout -- <path>",
+        )
+    if sub == "add":
+        if all(a == "--" or not a.startswith("-") for a in rest):
+            return None
+        return (
+            RISK_DENY,
+            "git-disallowed",
+            "git add only accepts pathspecs (no flags)",
+        )
+    if sub == "commit":
+        if not rest or (len(rest) == 2 and rest[0] == "-m"):
+            return None
+        return (
+            RISK_DENY,
+            "git-disallowed",
+            "git commit only allows: commit [-m <message>]",
+        )
+    return (
+        RISK_DENY,
+        "git-disallowed",
+        f"git subcommand not allowed: {sub}",
+    )
+
+
+def _sed_has_inplace(args: list[str]) -> bool:
+    for a in args:
+        if a == "-" or not a.startswith("-"):
+            continue
+        if a.startswith("--"):
+            if a.startswith("--in-place"):
+                return True
+        elif "i" in a[1:]:
+            return True
+    return False
+
+
+def _find_has_action(args: list[str]) -> bool:
+    return any(
+        a.startswith("-exec") or a.startswith("-delete") or a.startswith("-ok")
+        for a in args
+    )
+
+
+def _rg_has_pre(args: list[str]) -> bool:
+    return any(a == "--pre" or a.startswith("--pre=") for a in args)
+
+
+def _path_like(arg: str) -> bool:
+    return (
+        arg in (".", "..", "~")
+        or arg.startswith(("/", "./", "../", "~/"))
+        or "/" in arg
+    )
+
+
+def _classify_shell(tool_input: Any, root_list: list[str]) -> dict[str, Any]:
+    """Fail-closed shell policy (see module docstring)."""
+    command = _command_from_input(tool_input).strip()
+    if not command:
+        return _result(RISK_ESCALATE, "exec-empty", "empty command", command)
+    if _has_compound_outside_quotes(command):
+        return _result(
+            RISK_DENY,
+            "exec-compound",
+            "shell metacharacter outside quotes",
+            command[:200],
+        )
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return _result(
+            RISK_DENY, "exec-parse", "command could not be tokenized", command[:200]
+        )
+    if not argv:
+        return _result(RISK_DENY, "exec-parse", "command has no argv", command[:200])
+
+    cwd_input: str | None = None
+    if isinstance(tool_input, dict):
+        raw = tool_input.get("cwd")
+        if isinstance(raw, str) and raw:
+            cwd_input = raw
+    if cwd_input is not None:
+        if not os.path.isdir(cwd_input):
+            return _result(
+                RISK_DENY, "outside-root-cwd", "cwd does not exist", cwd_input
+            )
+        if not _inside(cwd_input, root_list):
+            return _result(
+                RISK_DENY,
+                "outside-root-cwd",
+                "cwd is outside the run root",
+                cwd_input,
+            )
+
+    prog = os.path.basename(argv[0])
+    if prog in _DENY_PROGRAMS or prog.startswith("python"):
+        return _result(
+            RISK_DENY,
+            "exec-denied",
+            f"program not allowed in worker runs: {argv[0]}",
+            argv[0],
+        )
+    skip_message = False
+    if prog == "git":
+        verdict = _git_verdict(argv[1:])
+        if verdict is not None:
+            return _result(verdict[0], verdict[1], verdict[2], argv[0])
+        # ``git commit -m <message>``: the message is data, not a path.
+        if len(argv) == 4 and argv[1] == "commit" and argv[2] == "-m":
+            skip_message = True
+    elif prog == "sed" and _sed_has_inplace(argv[1:]):
+        return _result(
+            RISK_DENY, "sed-inplace", "sed in-place edit not allowed", argv[0]
+        )
+    elif prog == "find" and _find_has_action(argv[1:]):
+        return _result(
+            RISK_DENY, "find-action", "find action flag not allowed", argv[0]
+        )
+    elif prog == "rg" and _rg_has_pre(argv[1:]):
+        return _result(
+            RISK_DENY,
+            "rg-pre",
+            "rg --pre external preprocessor not allowed",
+            argv[0],
+        )
+    elif prog not in _ALLOW_PROGRAMS:
+        return _result(
+            RISK_ESCALATE,
+            "exec-unknown",
+            "command not in the auto-approve allowlist",
+            argv[0],
+        )
+
+    base_dir = cwd_input or (root_list[0] if root_list else os.getcwd())
+    for i, arg in enumerate(argv[1:]):
+        if skip_message and i == 2:
+            continue
+        if not _path_like(arg):
+            continue
+        if _looks_secret(arg):
+            return _result(
+                RISK_DENY,
+                "secret-path",
+                "refuses to touch credential-like files",
+                arg,
+            )
+        resolved = os.path.join(base_dir, os.path.expanduser(arg))
+        if not _inside(resolved, root_list):
+            return _result(
+                RISK_DENY,
+                "outside-root",
+                "path argument is outside the run root",
+                arg,
+            )
+    if not root_list:
+        return _result(
+            RISK_ESCALATE,
+            "exec-unrooted",
+            "no run root configured, nothing is auto-approved",
+            argv[0],
+        )
+    return _result(
+        RISK_ALLOW,
+        "exec-allow",
+        "command passed the shell policy",
+        command[:200],
+    )
+
+
 def classify_tool(
     tool_name: str,
     tool_input: Any,
@@ -183,33 +435,7 @@ def classify_tool(
         return _result(RISK_DENY, "network", "network access is not allowed", name)
 
     if lowered in _EXEC_TOOLS or "shell" in lowered or "exec" in lowered:
-        command = _command_from_input(tool_input).strip()
-        if not command:
-            return _result(RISK_ESCALATE, "exec-empty", "empty command", name)
-        for pattern in _DENY_COMMANDS:
-            if re.search(pattern, command):
-                return _result(
-                    RISK_DENY,
-                    f"deny-command:{pattern}",
-                    f"command matches forbidden pattern: {pattern}",
-                    command[:200],
-                )
-        if root_list:
-            for pattern in _ALLOW_COMMANDS:
-                if re.search(pattern, command):
-                    return _result(
-                        RISK_ALLOW,
-                        f"allow-command:{pattern}",
-                        "known-safe command",
-                        command[:200],
-                    )
-        # Unknown command with no allowlist hit: escalate (fail closed).
-        return _result(
-            RISK_ESCALATE,
-            "exec-unknown",
-            "command not in the auto-approve allowlist",
-            command[:200],
-        )
+        return _classify_shell(tool_input, root_list)
 
     if lowered in _WRITE_TOOLS or "write" in lowered or "edit" in lowered:
         paths = _paths_from_input(tool_input)
@@ -240,6 +466,13 @@ def classify_tool(
                     RISK_DENY,
                     "secret-path",
                     "refuses to read credential-like files",
+                    path,
+                )
+            if root_list and not _inside(path, root_list):
+                return _result(
+                    RISK_DENY,
+                    "outside-root",
+                    "path is outside the run root",
                     path,
                 )
         return _result(RISK_ALLOW, "read", "read-only tool", paths[0] if paths else name)
