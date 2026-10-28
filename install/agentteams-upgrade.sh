@@ -387,7 +387,7 @@ boundary_profile() {
     # key=value lines (fixed order); array values are joined with \x1f
     local ctr="$1"
     local user workdir ro mem memswap cpus cpushares cpuset pids init priv
-    local groups seopts capadds capdrops tmpfs ulimits devices shm
+    local groups seopts capadds capdrops tmpfs ulimits devices shm domain stopsig stoptimeout oomkill cgroupns
     user="$(inspect_fmt '{{.Config.User}}' "${ctr}")"
     workdir="$(inspect_fmt '{{.Config.WorkingDir}}' "${ctr}")"
     ro="$(inspect_fmt '{{.HostConfig.ReadonlyRootfs}}' "${ctr}")"
@@ -408,9 +408,14 @@ boundary_profile() {
     ulimits="$(inspect_fmt '{{range .HostConfig.Ulimits}}{{.Name}}={{.Soft}}:{{.Hard}}{{println}}{{end}}' "${ctr}" | join_us)"
     devices="$(inspect_fmt '{{range .HostConfig.Devices}}{{.PathOnHost}}:{{.PathInContainer}}:{{.CgroupPermissions}}{{println}}{{end}}' "${ctr}" | join_us)"
     shm="$(inspect_fmt '{{.HostConfig.ShmSize}}' "${ctr}")"
-    printf 'user=%s\nworkdir=%s\nreadonly_rootfs=%s\nmemory=%s\nmemory_swap=%s\ncpus=%s\ncpu_shares=%s\ncpuset_cpus=%s\npids_limit=%s\ninit=%s\nprivileged=%s\ngroup_add=%s\nsecurity_opt=%s\ncap_add=%s\ncap_drop=%s\ntmpfs=%s\nulimit=%s\ndevices=%s\nshm_size=%s\n' \
+    domain="$(inspect_fmt '{{.Config.Domainname}}' "${ctr}")"
+    stopsig="$(inspect_fmt '{{.Config.StopSignal}}' "${ctr}")"
+    stoptimeout="$(inspect_fmt '{{.Config.StopTimeout}}' "${ctr}")"
+    oomkill="$(inspect_fmt '{{.HostConfig.OomKillDisable}}' "${ctr}")"
+    cgroupns="$(inspect_fmt '{{.HostConfig.CgroupnsMode}}' "${ctr}")"
+    printf 'user=%s\nworkdir=%s\nreadonly_rootfs=%s\nmemory=%s\nmemory_swap=%s\ncpus=%s\ncpu_shares=%s\ncpuset_cpus=%s\npids_limit=%s\ninit=%s\nprivileged=%s\ngroup_add=%s\nsecurity_opt=%s\ncap_add=%s\ncap_drop=%s\ntmpfs=%s\nulimit=%s\ndevices=%s\nshm_size=%s\ndomainname=%s\nstop_signal=%s\nstop_timeout=%s\noom_kill_disable=%s\ncgroupns=%s\n' \
         "${user}" "${workdir}" "${ro}" "${mem}" "${memswap}" "${cpus}" "${cpushares}" "${cpuset}" \
-        "${pids}" "${init}" "${priv}" "${groups}" "${seopts}" "${capadds}" "${capdrops}" "${tmpfs}" "${ulimits}" "${devices}" "${shm}"
+        "${pids}" "${init}" "${priv}" "${groups}" "${seopts}" "${capadds}" "${capdrops}" "${tmpfs}" "${ulimits}" "${devices}" "${shm}" "${domain}" "${stopsig}" "${stoptimeout}" "${oomkill}" "${cgroupns}"
 }
 
 profile_value() {
@@ -434,7 +439,7 @@ us_split() {
 boundary_run_args() {
     # append the non-default preserved settings of <ctr> to RUN_ARGS
     local ctr="$1"
-    local profile user workdir ro mem memswap cpus cpushares cpuset pids init priv shm item
+    local profile user workdir ro mem memswap cpus cpushares cpuset pids init priv shm item domain stopsig stoptimeout oomkill cgroupns
     profile="$(boundary_profile "${ctr}")"
     user="$(profile_value "${profile}" user)"
     workdir="$(profile_value "${profile}" workdir)"
@@ -465,6 +470,17 @@ boundary_run_args() {
     [ "${priv}" = "true" ] && RUN_ARGS+=(--privileged)
     shm="$(profile_value "${profile}" shm_size)"
     case "${shm}" in ''|*[!0-9]*) : ;; *) [ "${shm}" != "0" ] && RUN_ARGS+=(--shm-size "${shm}") ;; esac
+    [ -n "$(profile_value "${profile}" domainname)" ] && RUN_ARGS+=(--domainname "$(profile_value "${profile}" domainname)")
+    [ -n "$(profile_value "${profile}" stop_signal)" ] && RUN_ARGS+=(--stop-signal "$(profile_value "${profile}" stop_signal)")
+    case "$(profile_value "${profile}" stop_timeout)" in
+        ''|'<nil>'|0|*[!0-9]*) : ;;
+        *) RUN_ARGS+=(--stop-timeout "$(profile_value "${profile}" stop_timeout)") ;;
+    esac
+    [ "$(profile_value "${profile}" oom_kill_disable)" = "true" ] && RUN_ARGS+=(--oom-kill-disable)
+    case "$(profile_value "${profile}" cgroupns)" in
+        ''|private|'<no value>') : ;;
+        *) RUN_ARGS+=(--cgroupns "$(profile_value "${profile}" cgroupns)") ;;
+    esac
     while IFS= read -r item; do
         [ -n "${item}" ] && RUN_ARGS+=(--group-add "${item}")
     done < <(us_split "$(profile_value "${profile}" group_add)")
@@ -529,6 +545,16 @@ unsupported_boundary() {
     case "${v}" in ''|0) : ;; *) out="${out}memory_reservation " ;; esac
     v="$(inspect_fmt '{{.HostConfig.CpuQuota}}' "${ctr}")"
     case "${v}" in ''|0) : ;; *) out="${out}cpu_quota " ;; esac
+    v="$(inspect_fmt '{{.Config.Hostname}}' "${ctr}")"
+    if [ -n "${v}" ]; then
+        local cid short
+        cid="$(inspect_fmt '{{.Id}}' "${ctr}")"
+        short="${cid#sha256:}"
+        short="${short:0:12}"
+        [ "${v}" != "${short}" ] && out="${out}hostname "
+    fi
+    v="$(inspect_fmt '{{.Config.MacAddress}}' "${ctr}")"
+    [ -n "${v}" ] && out="${out}mac_address "
     v="$(inspect_fmt '{{.HostConfig.CpuPeriod}}' "${ctr}")"
     case "${v}" in ''|0) : ;; *) out="${out}cpu_period " ;; esac
     printf '%s' "${out% }"
@@ -599,7 +625,7 @@ boundary_json() {
     # boundary profile -> JSON object for the preflight output
     local profile="$1"
     local user workdir ro mem memswap cpus cpushares cpuset pids init priv
-    local groups seopts capadds capdrops tmpfs ulimits devices shm item k v out
+    local groups seopts capadds capdrops tmpfs ulimits devices shm domain stopsig stoptimeout oomkill cgroupns oomkill_b item k v out
     user="$(profile_value "${profile}" user)"
     workdir="$(profile_value "${profile}" workdir)"
     ro="$(profile_value "${profile}" readonly_rootfs)"
@@ -619,6 +645,12 @@ boundary_json() {
     ulimits="$(profile_value "${profile}" ulimit)"
     devices="$(profile_value "${profile}" devices)"
     shm="$(profile_value "${profile}" shm_size)"
+    domain="$(profile_value "${profile}" domainname)"
+    stopsig="$(profile_value "${profile}" stop_signal)"
+    stoptimeout="$(profile_value "${profile}" stop_timeout)"
+    oomkill="$(profile_value "${profile}" oom_kill_disable)"
+    oomkill_b=false; [ "${oomkill}" = "true" ] && oomkill_b=true
+    cgroupns="$(profile_value "${profile}" cgroupns)"
     case "${mem}" in ''|*[!0-9]*) mem=0 ;; esac
     case "${memswap}" in ''|*[!0-9-]*) memswap=0 ;; esac
     case "${cpushares}" in ''|*[!0-9]*) cpushares=0 ;; esac
@@ -642,11 +674,11 @@ boundary_json() {
         case "${item}" in *:*) v="${item#*:}" ;; esac
         out="${out}${out:+,}\"$(json_escape "${k}")\":\"$(json_escape "${v}")\""
     done < <(us_split "${tmpfs}")
-    printf '{"user":"%s","workdir":"%s","readonly_rootfs":%s,"memory":%s,"memory_swap":%s,"cpus":"%s","cpu_shares":%s,"cpuset_cpus":"%s","pids_limit":%s,"init":%s,"privileged":%s,"group_add":%s,"security_opt":%s,"cap_add":%s,"cap_drop":%s,"tmpfs":{%s},"ulimit":%s,"devices":%s,"shm_size":%s}' \
+    printf '{"user":"%s","workdir":"%s","readonly_rootfs":%s,"memory":%s,"memory_swap":%s,"cpus":"%s","cpu_shares":%s,"cpuset_cpus":"%s","pids_limit":%s,"init":%s,"privileged":%s,"group_add":%s,"security_opt":%s,"cap_add":%s,"cap_drop":%s,"tmpfs":{%s},"ulimit":%s,"devices":%s,"shm_size":%s,"domainname":"%s","stop_signal":"%s","stop_timeout":"%s","oom_kill_disable":%s,"cgroupns":"%s"}' \
         "$(json_escape "${user}")" "$(json_escape "${workdir}")" "${ro_b}" "${mem}" "${memswap}" \
         "$(json_escape "${cpus}")" "${cpushares}" "$(json_escape "${cpuset}")" "${pids}" \
         "${init_b}" "${priv_b}" "${groups_json}" "${seopts_json}" "${capadds_json}" "${capdrops_json}" \
-        "${out}" "${ulimits_json}" "${devices_json}" "${shm}"
+        "${out}" "${ulimits_json}" "${devices_json}" "${shm}" "$(json_escape "${domain}")" "$(json_escape "${stopsig}")" "$(json_escape "${stoptimeout}")" "${oomkill_b}" "$(json_escape "${cgroupns}")"
 }
 
 us_to_json_list() {

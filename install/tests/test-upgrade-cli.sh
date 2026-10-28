@@ -71,10 +71,23 @@ case "$1" in
                 *"HostConfig.GroupAdd"*) echo "1000"; exit 0 ;;
                 *"HostConfig.SecurityOpt"*) printf 'label=disable\nno-new-privileges:true\n'; exit 0 ;;
                 *"HostConfig.CapDrop"*) echo "ALL"; exit 0 ;;
+                *"{{.Config.Domainname}}"*) echo "example.com"; exit 0 ;;
+                *"{{.Config.StopSignal}}"*) echo "SIGQUIT"; exit 0 ;;
+                *"{{.Config.StopTimeout}}"*) echo "30"; exit 0 ;;
+                *"{{.HostConfig.OomKillDisable}}"*) echo "true"; exit 0 ;;
+                *"{{.HostConfig.CgroupnsMode}}"*) echo "host"; exit 0 ;;
             esac
         elif [ "${STUB_SCENARIO:-ok}" = "unsupported_sysctl" ]; then
             case "$fmt" in
                 *"{{range .HostConfig.Sysctls}}"*) echo "net.ipv4.ip_forward=1"; exit 0 ;;
+            esac
+        elif [ "${STUB_SCENARIO:-ok}" = "unsupported_mac" ]; then
+            case "$fmt" in
+                *"{{.Config.MacAddress}}"*) echo "02:42:ac:11:00:02"; exit 0 ;;
+            esac
+        elif [ "${STUB_SCENARIO:-ok}" = "unsupported_hostname" ]; then
+            case "$fmt" in
+                *"{{.Config.Hostname}}"*) echo "pinned-host"; exit 0 ;;
             esac
         fi
         case "$fmt" in
@@ -441,6 +454,12 @@ assert_contains_fixed '--group-add 1000' "${OUT}" "boundary dry group-add"
 assert_contains_fixed '--security-opt label=disable' "${OUT}" "boundary dry seopt label"
 assert_contains_fixed '--security-opt no-new-privileges' "${OUT}" "boundary dry seopt nnp"
 assert_contains_fixed '--cap-drop ALL' "${OUT}" "boundary dry cap-drop"
+assert_contains_fixed '--shm-size 134217728' "${OUT}" "boundary dry shm-size"
+assert_contains_fixed '--domainname example.com' "${OUT}" "boundary dry domainname"
+assert_contains_fixed '--stop-signal SIGQUIT' "${OUT}" "boundary dry stop-signal"
+assert_contains_fixed '--stop-timeout 30' "${OUT}" "boundary dry stop-timeout"
+assert_contains_fixed '--oom-kill-disable' "${OUT}" "boundary dry oom-kill-disable"
+assert_contains_fixed '--cgroupns host' "${OUT}" "boundary dry cgroupns"
 
 # 7.12 default container: no boundary flags are invented
 run_case ok controller --dry-run --controller-image example/controller:new --env-file "${ENV_FILE}" --backup-dir "${TMP}/b712"
@@ -479,6 +498,15 @@ run_case shm_verify_mismatch controller --yes --prepare-only --controller-image 
 [ "${RC}" = "3" ] || { echo "FAIL shm mismatch rc: ${RC}"; cat "${OUT}"; exit 1; }
 assert_contains 'boundary mismatch: shm_size' "${OUT}" "shm mismatch message"
 assert_not_contains '^start ' "${REC}" "shm mismatch never starts the replacement"
+
+# 7.17 explicit MAC and custom hostname cannot be reproduced safely: refuse before rename
+run_case unsupported_mac preflight --env-file "${ENV_FILE}" --backup-dir "${TMP}/b717" --json
+assert_eq "${RC}" "3" "mac preflight rc"
+assert_contains 'unsupported non-default runtime settings' "${OUT}" "mac preflight message"
+assert_contains_fixed '"unsupported_runtime":["mac_address"]' "${OUT}" "mac preflight json"
+run_case unsupported_hostname preflight --env-file "${ENV_FILE}" --backup-dir "${TMP}/b718" --json
+assert_eq "${RC}" "3" "hostname preflight rc"
+assert_contains_fixed '"unsupported_runtime":["hostname"]' "${OUT}" "hostname preflight json"
 
 # 8. status --json
 run_case ok status --state-file "${TMP}/b5/state.json" --json
