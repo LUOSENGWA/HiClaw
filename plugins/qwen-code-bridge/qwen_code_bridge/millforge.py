@@ -20,6 +20,8 @@ TERMINAL_FAILURES = {"failed", "timeout", "killed"}
 _TIER_BY_EVENT = {
     "queued": "machine",
     "running": "agent",
+    "cancelling": "agent",
+    "cancelled": "agent",
     "done": "agent",
     "failed": "human",
     "timeout": "human",
@@ -29,6 +31,8 @@ _TIER_BY_EVENT = {
 _STATUS_MAP = {
     "queued": "queued",
     "running": "running",
+    "cancelling": "running",
+    "cancelled": "cancelled",
     "done": "succeeded",
     "failed": "failed",
     "timeout": "timeout",

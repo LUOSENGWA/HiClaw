@@ -75,6 +75,31 @@ curl -X POST 'http://127.0.0.1:8088/api/plugins/upload?force=true' \
 
 > 上传安装已实测：`loaded=true`，插件目录内含 `web-shell/dist`；`/web/` 200、客户端路由刷新回退正常。
 
+## Update & rollback（热更新与回滚，0.2.0+）
+
+**升级（zip 热更新，无需重建容器）**：
+
+```bash
+curl -X POST 'http://127.0.0.1:8088/api/plugins/upload?force=true' \
+  -H "X-Agent-Id: $AGENT" -F 'file=@qwen-code-bridge-0.2.0.zip;type=application/zip'
+# 版本核验
+curl -s http://127.0.0.1:8088/api/qwen-code-bridge/version -H "X-Agent-Id: $AGENT"
+```
+
+- `force=true` 直接覆盖插件目录并热加载；**状态目录在插件目录之外**（`<workspace>/.qwenpaw/qwen-code-bridge/`，即 `$QWENPAW_WORKING_DIR/.qwenpaw/qwen-code-bridge`，本部署为 `/app/working/.qwenpaw/qwen-code-bridge`），升级不覆盖——任务/日志/唤醒队列/审批 receipts 全部保留。
+- 升级瞬间进行中的派单：watchdog 在旧进程内存里，升级后由启动钩子的孤儿清理兜底（`running` + 子进程已死 → `failed`/`orphaned_on_reload`；子进程仍活的任务不受影响）。
+
+**回滚**：把旧版 zip 再传一次（同命令换旧 zip 即可）。兼容性说明：
+
+- 0.2.0 任务文件是 0.1.0 的**字段超集**（新增 `timeout_s`/`cancel_requested_at`/`signals`/`cancelled_at`），旧版忽略未知字段，回滚无损。
+- 唯一例外：升级期间处于 `cancelling` 的在途任务，0.1.0 不识别该状态——但子进程已收到 SIGTERM（grace 后 SIGKILL），会很快自行结束，不会卡死。
+
+**自打包**（产出 `qwen-code-bridge-<version>.zip`，不含 `__pycache__`/`tests`/`state`/`web-shell/dist`/`*.pyc`/`*.log`）：
+
+```bash
+sh scripts/package.sh [输出目录]   # 缺省输出到 /tmp
+```
+
 ### 3) 原生 Web 控制台（可选但推荐）
 
 QwenPaw 单端口内跑**原生 Qwen Code web**需要一份按 base 重建的 shell：

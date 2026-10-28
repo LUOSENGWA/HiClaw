@@ -27,10 +27,12 @@ files.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 import urllib.error
@@ -69,8 +71,30 @@ _DEFAULT_WATCH_INTERVAL = 20.0
 #: DISPATCH_WATCH_INTERVAL for the same purpose).
 WATCH_INTERVAL_ENV = "QWENPAW_DISPATCH_WATCH_INTERVAL"
 
-#: Default per-task wall-clock timeout (s).
-DEFAULT_DISPATCH_TIMEOUT = 3600.0
+#: Default per-task wall-clock timeout (s). Bumped 3600 -> 7200 in v0.2.0
+#: (B1): unattended coding runs routinely need 1-2 h. The watchdog is now
+#: always bounded — a missing/zero/``None`` timeout falls back to this
+#: default instead of running unbounded.
+DEFAULT_DISPATCH_TIMEOUT = 7200.0
+
+#: Cancel/stop defaults (v0.2.0 A): SIGTERM first, SIGKILL after grace.
+DEFAULT_CANCEL_GRACE_S = 10.0
+MAX_CANCEL_GRACE_S = 60.0
+#: ``wait=true`` polls for the terminal state at most this long (s).
+WAIT_TIMEOUT_S = 5.0
+
+#: Terminal task states (cancel idempotency). ``stale`` is included: a
+#: reaper-closed task is as good as terminal for cancellation purposes.
+TERMINAL_TASK_STATES = ("done", "failed", "timeout", "cancelled", "stale")
+
+#: Log tail truncation (v0.2.0 B2): default 200 lines, cap 2000, 0 = full.
+LOG_TAIL_DEFAULT = 200
+LOG_TAIL_MAX = 2000
+
+#: Progress event truncation (v0.2.0 B3): last 200 stream-json events,
+#: cap 2000, 0 = all events.
+PROGRESS_EVENTS_DEFAULT = 200
+PROGRESS_EVENTS_MAX = 2000
 
 _DEFAULT_WAKE_URL = ""  # resolved dynamically via endpoints.app_base
 _WAKE_ENDPOINT = "/api/console/chat"
@@ -137,6 +161,11 @@ STREAM_INPUT_MODES: tuple[str, ...] = ("default", "auto-edit", "auto")
 #: One reaper per dispatch dir (module-level so it survives per-request
 #: service instances; the task itself survives a plugin/process restart).
 _REAPERS: dict[str, asyncio.Task] = {}
+
+#: One cancel lock per (dispatch dir, task) — module-level like _REAPERS
+#: because the service is constructed per request. Serializes the cancel
+#: endpoint against the spawn path (the pending-cancel race, v0.2.0 A).
+_CANCEL_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 def build_spawn_plan(
@@ -416,6 +445,18 @@ class CliNotFoundError(RuntimeError):
 
 class SpawnFailedError(RuntimeError):
     """Raised when the child process cannot be started."""
+
+
+class TaskNotFoundError(RuntimeError):
+    """Raised when a cancel targets an unknown task id."""
+
+
+class PidMismatchError(RuntimeError):
+    """Raised when the task's pid fails the identity check (no signal sent)."""
+
+
+class NotCancellableError(RuntimeError):
+    """Raised when a task cannot be cancelled (protected/bad pid, EPERM)."""
 
 
 #: ``wake_sender(session_id, agent_id, base_url, text) -> None``;
@@ -733,6 +774,32 @@ def _install_hint(cli: str) -> str:
     )
 
 
+def _timeout_evidence(task: dict[str, Any]) -> bool:
+    """True when the wall budget is provably spent.
+
+    The task carries a finite ``timeout`` and ``now - started >= timeout``.
+    The recovery paths (reaper / read / cleanup / load-time orphan sweep)
+    use this to write the decidable ``timeout`` terminal state instead of
+    ``stale`` when the watchdog that owned the kill never wrote the
+    terminal state (v0.2.0 fix: watchdog-lost incident left
+    ``stale`` / ``timeout_killed_watchdog_lost``).
+    """
+    try:
+        timeout = float(task.get("timeout") or 0)
+    except (TypeError, ValueError):
+        return False
+    if timeout <= 0:
+        return False
+    raw = task.get("started_epoch")
+    if isinstance(raw, (int, float)) and float(raw) > 0:
+        started = float(raw)
+    else:
+        started = _parse_epoch(task.get("started_at"))
+    if started <= 0:
+        return False
+    return time.time() - started >= timeout
+
+
 class DispatchService:
     """File-backed dispatch task manager (one instance per request).
 
@@ -747,6 +814,7 @@ class DispatchService:
         dispatch_dir: Path | None = None,
         watch_interval: float | None = None,
         wake_sender: WakeSender | None = None,
+        pre_spawn_hook: Callable[[str], Any] | None = None,
     ) -> None:
         if dispatch_dir is None:
             dispatch_dir = state_dir() / "dispatch"
@@ -760,6 +828,12 @@ class DispatchService:
                 watch_interval = _DEFAULT_WATCH_INTERVAL
         self._watch_interval = max(watch_interval, 0.05)
         self._wake_sender = wake_sender or default_wake_sender
+        # Test seam (v0.2.0 A): invoked (sync or async) after the task file
+        # is written and before spawn — lets a test race a cancel into the
+        # spawn window to prove the abort path. The default must be a
+        # no-op, not None: start() calls the hook unconditionally, so a
+        # bare None default would crash every real (hook-less) dispatch.
+        self._pre_spawn_hook = pre_spawn_hook or (lambda _task_id: None)
 
     # ---- state IO (atomic, same pattern as install tasks) ----
 
@@ -837,12 +911,52 @@ class DispatchService:
         )
         return proc_alive and ps_alive
 
+    def _mark_timeout(
+        self,
+        task: dict[str, Any],
+        reason: str = "timeout_killed_watchdog_lost",
+    ) -> dict[str, Any]:
+        """Decidable terminal state for a task whose wall budget is spent.
+
+        The watchdog that owned the kill (or the timeout itself) never
+        wrote the terminal state — it was lost with its process. The
+        budget evidence is deterministic, so the task gets ``timeout`` /
+        ``timeout_killed`` instead of ``stale`` (v0.2.0 fix): callers can
+        then branch on a decidable terminal state.
+        """
+        now = _utcnow()
+        try:
+            timeout = float(task.get("timeout") or 0)
+        except (TypeError, ValueError):
+            timeout = 0.0
+        age = time.time() - float(task.get("started_epoch") or 0.0)
+        task.update(
+            {
+                "state": "timeout",
+                "exit_code": task.get("exit_code"),
+                "death_reason": "timeout_killed",
+                "finished_at": task.get("finished_at") or now,
+                "updated_at": now,
+                "terminal_summary": [
+                    (
+                        f"[{task.get('task')}] timeout · 预算 {timeout:.0f}s "
+                        f"已用尽（已运行 {age:.0f}s），看门狗丢失，恢复路径写终态"
+                    ),
+                    f"evidence: {reason}",
+                    "下一步：查看日志（/dispatch/{task_id}/log）或重新派单",
+                ],
+            }
+        )
+        self._write_task(task)
+        return task
+
     def _mark_stale(
         self,
         task: dict[str, Any],
         reason: str = "crash_or_restart",
     ) -> dict[str, Any]:
-        """A ``running`` task whose pid is gone can never finish by itself.
+        """A ``running``/``cancelling`` task whose child is gone can never
+        finish by itself; give it a decidable terminal state.
 
         Guards against the watchdog-finalize race (10/23 incident):
 
@@ -854,6 +968,37 @@ class DispatchService:
         - the age guard keeps the spawn window (pid not written yet) and
           short-lived test doubles from being reaped.
         """
+        state = task.get("state")
+        if state == "cancelling":
+            # Cancel in flight and the child is already gone (the watcher
+            # that should have written the terminal state is lost): close
+            # it as cancelled so reads never dangle on a non-terminal
+            # state (v0.2.0 fix; the live-watcher case still ends
+            # cancelled via the watchdog's own terminal write).
+            if (
+                task.get("pid") is not None
+                and not self._pid_alive(task.get("pid"))
+            ):
+                now = _utcnow()
+                task.update(
+                    {
+                        "state": "cancelled",
+                        "death_reason": "cancelled_by_user",
+                        "cancelled_at": task.get("cancelled_at") or now,
+                        "finished_at": task.get("finished_at") or now,
+                        "updated_at": now,
+                    }
+                )
+                self._write_task(task)
+            return task
+        if state != "running":
+            return task
+        if _timeout_evidence(task) and not self._pid_alive(task.get("pid")):
+            # Budget spent and no live child: the watchdog that should
+            # have written `timeout` is gone. Decidable terminal state
+            # instead of `stale` (v0.2.0 fix: watchdog-lost incident).
+            # Covers pid=None (lost spawn window) as well as dead pid.
+            return self._mark_timeout(task, reason)
         age = time.time() - float(
             task.get("started_epoch") or 0.0
         )
@@ -946,6 +1091,12 @@ class DispatchService:
                 continue
             pid = task.get("pid")
             if pid is None:
+                # Lost spawn window (plugin died before the pid was
+                # written). A spent budget is still a decidable terminal
+                # state — never leave `running` without a pid past its
+                # budget (v0.2.0 fix).
+                if _timeout_evidence(task):
+                    changed.append(self._mark_timeout(task, "pid_never_written"))
                 continue
             age = time.time() - float(task.get("started_epoch") or 0)
             updated_epoch = _parse_epoch(task.get("updated_at")) or 0.0
@@ -1109,7 +1260,9 @@ class DispatchService:
         """Mark dead ``running`` tasks as stale (report-first).
 
         ``kill=True`` only removes nothing live: it is accepted for API
-        symmetry; stale task files are kept for audit.
+        symmetry; stale task files are kept for audit. Tasks whose wall
+        budget is provably spent are closed as ``timeout`` (decidable),
+        even on a fresh task file (v0.2.0 fix).
         """
         self._ensure_reaper()
         stale: list[str] = []
@@ -1121,7 +1274,10 @@ class DispatchService:
             if task.get("state") != "running":
                 continue
             updated_epoch = _parse_epoch(task.get("updated_at")) or 0.0
-            if (time.time() - updated_epoch) < STALE_FRESH_SECONDS:
+            if (
+                (time.time() - updated_epoch) < STALE_FRESH_SECONDS
+                and not _timeout_evidence(task)
+            ):
                 continue
             if not self._pid_alive(task.get("pid")):
                 # Same reason mapping as the reaper: a terminating task was
@@ -1133,7 +1289,8 @@ class DispatchService:
                     else "crash_or_restart"
                 )
                 task = self._mark_stale(task, reason)
-                stale.append(str(task.get("task_id")))
+                if task.get("state") in ("stale", "timeout"):
+                    stale.append(str(task.get("task_id")))
         return {"stale": stale, "count": len(stale), "kill": bool(kill)}
 
     def answer_question(
@@ -1203,6 +1360,287 @@ class DispatchService:
         except OSError:
             return ""
 
+    # ---- truncated views (v0.2.0 B2/B3) ----
+
+    @staticmethod
+    def _normalize_count(value: Any, default: int, cap: int) -> int:
+        """Coerce a tail/limit query param: int, clamped to [0, cap]."""
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(0, min(count, cap))
+
+    def get_log_tail(
+        self, task_id: str, tail: int = LOG_TAIL_DEFAULT
+    ) -> tuple[str, bool, int, int]:
+        """Tail-truncated log (B2): ``(text, truncated, total_lines, tail)``.
+
+        ``tail=0`` is the explicit full-log opt-in; otherwise the last
+        ``tail`` lines are kept (cap :data:`LOG_TAIL_MAX`).
+        """
+        tail_eff = self._normalize_count(tail, LOG_TAIL_DEFAULT, LOG_TAIL_MAX)
+        full = self.get_log(task_id) or ""
+        lines = full.splitlines()
+        if tail_eff == 0 or len(lines) <= tail_eff:
+            return full, False, len(lines), tail_eff
+        text = "\n".join(lines[-tail_eff:])
+        if full.endswith("\n"):
+            text += "\n"
+        return text, True, len(lines), tail_eff
+
+    def get_progress_events(
+        self, task_id: str, limit: int = PROGRESS_EVENTS_DEFAULT
+    ) -> tuple[list[dict[str, Any]], bool, int, int]:
+        """Last stream-json events of the log (B3).
+
+        Returns ``(events, truncated, total_events, limit)``; ``limit=0``
+        is the explicit all-events opt-in (cap :data:`PROGRESS_EVENTS_MAX`).
+        Non-JSON log lines are skipped.
+        """
+        limit_eff = self._normalize_count(
+            limit, PROGRESS_EVENTS_DEFAULT, PROGRESS_EVENTS_MAX
+        )
+        full = self.get_log(task_id) or ""
+        events: list[dict[str, Any]] = []
+        for line in full.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("{"):
+                continue
+            try:
+                event = json.loads(stripped)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        total = len(events)
+        if limit_eff == 0 or total <= limit_eff:
+            return events, False, total, limit_eff
+        return events[-limit_eff:], True, total, limit_eff
+
+    # ---- cancel / stop (v0.2.0 A) ----
+
+    def _cancel_lock(self, task_id: str) -> asyncio.Lock:
+        key = f"{self._dispatch_dir}:{task_id}"
+        lock = _CANCEL_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _CANCEL_LOCKS[key] = lock
+        return lock
+
+    @staticmethod
+    def _clamp_grace(value: Any) -> float:
+        """Grace window in [0, MAX_CANCEL_GRACE_S]; bad input -> default."""
+        try:
+            grace = float(value)
+        except (TypeError, ValueError):
+            return float(DEFAULT_CANCEL_GRACE_S)
+        if grace != grace:  # NaN
+            return float(DEFAULT_CANCEL_GRACE_S)
+        return max(0.0, min(grace, MAX_CANCEL_GRACE_S))
+
+    def _verify_kill_target(self, task: dict[str, Any]) -> int:
+        """Return the verified child pid, or raise (no signal is sent).
+
+        Hard safety rules (v0.2.0 A §1.3):
+        - pid must be an int and not protected (pid <= 1, self, parent);
+        - ``/proc/<pid>/cmdline`` must name *this* dispatch: argv[0]'s
+          basename equals the task's CLI executable name AND the task's
+          ``session_id`` appears in the cmdline. Both required, else
+          :class:`PidMismatchError`.
+        """
+        raw_pid = task.get("pid")
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            raise NotCancellableError(
+                f"task pid is not an integer: {raw_pid!r}"
+            ) from None
+        if pid <= 1 or pid == os.getpid() or pid == os.getppid():
+            raise NotCancellableError(f"refusing to signal protected pid {pid}")
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(
+                "utf-8", "replace"
+            )
+        except OSError:
+            return pid  # already gone: let the kill attempt surface it
+        parts = [part for part in cmdline.split("\0") if part]
+        cli_name = str(task.get("cli") or "qwen").split("/")[-1]
+        session_id = str(task.get("session_id") or "")
+        cli_ok = bool(parts) and parts[0].split("/")[-1] == cli_name
+        sid_ok = bool(session_id) and session_id in cmdline
+        if not (cli_ok and sid_ok):
+            raise PidMismatchError(
+                f"pid {pid} cmdline does not match this dispatch "
+                f"(cli={cli_name!r}, session_id={session_id[:8] or '?'}); "
+                "no signal sent"
+            )
+        return pid
+
+    async def _cancel_escalate(
+        self, task_id: str, pid: int, grace: float
+    ) -> None:
+        """SIGKILL a still-alive cancelled child after the grace window.
+
+        Background follow-up to ``request_cancel`` (the request returns
+        immediately; the escalation must not block it). Both signals are
+        recorded in the task's ``signals[]``.
+        """
+        await asyncio.sleep(grace)
+        try:
+            if not self._pid_alive(pid):
+                return
+            os.kill(pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            return
+        task = self._read_task(task_id)
+        if task is None:
+            return
+        signals = list(task.get("signals") or [])
+        signals.append({"ts": _utcnow(), "signal": "SIGKILL", "pid": pid})
+        self._update_task(task_id, {"signals": signals, "updated_at": _utcnow()})
+
+    async def request_cancel(
+        self,
+        task_id: str,
+        reason: str = "",
+        grace_s: float = DEFAULT_CANCEL_GRACE_S,
+        wait: bool = False,
+    ) -> dict[str, Any]:
+        """Cancel/stop one task (idempotent; never signals an unverified pid).
+
+        State machine (v0.2.0 A §1.2):
+
+            pending / running(pid=None)  -> cancelled   (before spawn)
+            running(pid)                 -> cancelling  -> cancelled
+                                              (watcher writes the terminal)
+            done/failed/timeout/cancelled/stale -> no-op (already_terminal)
+
+        This method only writes ``cancelling`` + ``cancel_requested_at``;
+        the terminal state is written by the watchdog, which avoids racing
+        the watchdog on the terminal write. With ``wait=True`` the call
+        polls for the terminal state for at most :data:`WAIT_TIMEOUT_S`.
+        """
+        task = self._read_task(task_id)
+        if task is None:
+            raise TaskNotFoundError(task_id)
+        previous_state = str(task.get("state") or "")
+        if previous_state in TERMINAL_TASK_STATES:
+            return {
+                "ok": True,
+                "task_id": task_id,
+                "previous_state": previous_state,
+                "state": previous_state,
+                "pid": task.get("pid"),
+                "signalled": None,
+                "already_terminal": True,
+            }
+        grace = self._clamp_grace(grace_s)
+        signalled = None
+        async with self._cancel_lock(task_id):
+            task = self._read_task(task_id)
+            if task is None:
+                raise TaskNotFoundError(task_id)
+            state = str(task.get("state") or "")
+            if state in TERMINAL_TASK_STATES:
+                return {
+                    "ok": True,
+                    "task_id": task_id,
+                    "previous_state": state,
+                    "state": state,
+                    "pid": task.get("pid"),
+                    "signalled": None,
+                    "already_terminal": True,
+                }
+            pid = task.get("pid")
+            now = _utcnow()
+            if state == "pending" or (state == "running" and pid is None):
+                # Pending: never spawned. The spawn path re-checks under
+                # the same lock and will not start a cancelled task.
+                self._update_task(
+                    task_id,
+                    {
+                        "state": "cancelled",
+                        "death_reason": "cancelled_before_spawn",
+                        "cancel_requested_at": now,
+                        "cancel_reason": str(reason or "") or None,
+                        "cancelled_at": now,
+                        "finished_at": now,
+                        "updated_at": now,
+                    },
+                )
+                return {
+                    "ok": True,
+                    "task_id": task_id,
+                    "previous_state": state,
+                    "state": "cancelled",
+                    "pid": None,
+                    "signalled": None,
+                    "already_terminal": False,
+                }
+            if state == "cancelling":
+                # In progress: a repeated cancel never re-signals.
+                return {
+                    "ok": True,
+                    "task_id": task_id,
+                    "previous_state": "cancelling",
+                    "state": "cancelling",
+                    "pid": task.get("pid"),
+                    "signalled": None,
+                    "already_terminal": False,
+                }
+            kill_pid = self._verify_kill_target(task)
+            try:
+                os.kill(kill_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                signalled = None  # exited in the gap; the watcher finalizes
+            except OSError as exc:
+                raise NotCancellableError(
+                    f"cannot signal pid {kill_pid}: {exc}"
+                ) from exc
+            else:
+                signalled = "SIGTERM"
+            signals = list(task.get("signals") or [])
+            if signalled:
+                signals.append(
+                    {"ts": now, "signal": signalled, "pid": kill_pid}
+                )
+            self._update_task(
+                task_id,
+                {
+                    "state": "cancelling",
+                    "cancel_requested_at": now,
+                    "cancel_reason": str(reason or "") or None,
+                    "signals": signals,
+                    "updated_at": now,
+                },
+            )
+            if signalled and grace > 0:
+                asyncio.get_running_loop().create_task(
+                    self._cancel_escalate(task_id, kill_pid, grace),
+                    name=f"cancel-escalate-{task_id}",
+                )
+        if wait:
+            deadline = time.monotonic() + WAIT_TIMEOUT_S
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.1)
+                current = self._read_task(task_id)
+                if (
+                    current is not None
+                    and str(current.get("state") or "") in TERMINAL_TASK_STATES
+                ):
+                    break
+        final = self._read_task(task_id) or {}
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "previous_state": previous_state,
+            "state": str(final.get("state") or ""),
+            "pid": final.get("pid"),
+            "signalled": signalled,
+            "already_terminal": False,
+        }
+
     # ---- lifecycle ----
 
     async def start(
@@ -1241,6 +1679,14 @@ class DispatchService:
                 ``approval_mode``.
             SpawnFailedError: the child process could not be started.
         """
+        # B1: the budget must always be finite — bad/missing input falls
+        # back to DEFAULT_DISPATCH_TIMEOUT instead of "None = unbounded".
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            timeout = float(DEFAULT_DISPATCH_TIMEOUT)
+        if not timeout or timeout <= 0:
+            timeout = float(DEFAULT_DISPATCH_TIMEOUT)
         _agent_hint = str((wake or {}).get("agent_id") or "")
         # Consent-affecting QwenCode setting: dispatch runs have no human
         # sitting in front of the propose_goal dialog, so the tool is
@@ -1313,6 +1759,7 @@ class DispatchService:
             "pid": None,
             "exit_code": None,
             "timeout": timeout,
+            "timeout_s": timeout,
             "started_at": _utcnow(),
             "started_epoch": time.time(),
             "updated_at": _utcnow(),
@@ -1347,6 +1794,10 @@ class DispatchService:
             "progress": None,
             "interaction_pending": 0,
             "death_reason": None,
+            "cancel_requested_at": None,
+            "cancel_reason": None,
+            "signals": [],
+            "cancelled_at": None,
             "evidence": str(evidence).upper() if evidence else None,
             "resumed_from": resumed_from,
             "runs_dir": runs_dir or None,
@@ -1387,35 +1838,44 @@ class DispatchService:
             task_id,
             {"input_format": "stream-json" if prompt_via_stdin else "text"},
         )
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                bin_path,
-                *spawn_args,
-                cwd=cwd,
-                env=env,
-                stdin=(
-                    asyncio.subprocess.PIPE
-                    if prompt_via_stdin
-                    else asyncio.subprocess.DEVNULL
-                ),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-        except OSError as exc:
-            self._update_task(
-                task_id,
-                {
-                    "state": "failed",
-                    "finished_at": _utcnow(),
-                    "updated_at": _utcnow(),
-                    "log_tail": f"spawn failed: {exc}",
-                },
-            )
-            raise SpawnFailedError(
-                f"failed to spawn {cli!r}: {exc}"
-            ) from exc
+        _hook_result = self._pre_spawn_hook(task_id)
+        if inspect.isawaitable(_hook_result):
+            await _hook_result
+        async with self._cancel_lock(task_id):
+            # A cancel can slip in between task creation and spawn (it
+            # holds the same lock); a cancelled task must never start.
+            fresh = self._read_task(task_id) or {}
+            if str(fresh.get("state") or "") in TERMINAL_TASK_STATES:
+                return task_id
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    bin_path,
+                    *spawn_args,
+                    cwd=cwd,
+                    env=env,
+                    stdin=(
+                        asyncio.subprocess.PIPE
+                        if prompt_via_stdin
+                        else asyncio.subprocess.DEVNULL
+                    ),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+            except OSError as exc:
+                self._update_task(
+                    task_id,
+                    {
+                        "state": "failed",
+                        "finished_at": _utcnow(),
+                        "updated_at": _utcnow(),
+                        "log_tail": f"spawn failed: {exc}",
+                    },
+                )
+                raise SpawnFailedError(
+                    f"failed to spawn {cli!r}: {exc}"
+                ) from exc
 
-        self._update_task(task_id, {"pid": proc.pid})
+            self._update_task(task_id, {"pid": proc.pid})
         self._ensure_reaper()
         if prompt_via_stdin and proc.stdin is not None:
             try:
@@ -1494,6 +1954,13 @@ class DispatchService:
         write the terminal state, then send the wake (best-effort).
         """
         started = time.time()
+        # B1: the watchdog budget must always be bounded (never None).
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            timeout = float(DEFAULT_DISPATCH_TIMEOUT)
+        if not timeout or timeout <= 0:
+            timeout = float(DEFAULT_DISPATCH_TIMEOUT)
         tail: list[str] = [""]
         killed = False
         killed_reason = "timeout_killed"
@@ -1948,16 +2415,22 @@ class DispatchService:
                 except (asyncio.CancelledError, Exception):
                     pass
 
-        if killed:
+        wall = round(time.time() - started, 1)
+        now = _utcnow()
+
+        task = self._read_task(task_id) or {}
+        # v0.2.0 A: the watcher owns the terminal write; a cancel request
+        # takes precedence over timeout/exit code, so the state is
+        # `cancelled` (death_reason `cancelled_by_user`).
+        cancelled = bool(task.get("cancel_requested_at"))
+        if cancelled:
+            status = "cancelled"
+        elif killed:
             status = "timeout"
         elif code == 0:
             status = "done"
         else:
             status = "failed"
-        wall = round(time.time() - started, 1)
-        now = _utcnow()
-
-        task = self._read_task(task_id) or {}
         snap = tracker.snapshot(status)
         try:
             progress.write_progress(progress_path, snap)
@@ -2007,10 +2480,16 @@ class DispatchService:
                 "updated_at": now,
                 "log_tail": tail[0],
                 "death_reason": (
-                    killed_reason
-                    if killed
-                    else ("completed" if code == 0 else "failed")
+                    "cancelled_by_user"
+                    if cancelled
+                    else (
+                        killed_reason
+                        if killed
+                        else ("completed" if code == 0 else "failed")
+                    )
                 ),
+                "cancelled_at": task.get("cancelled_at")
+                or (now if cancelled else None),
                 "terminating": False,
                 "wake_status": "pending" if wake_session_id else "skipped",
                 "notify_tier": millforge.notify_tier(status),
@@ -2105,18 +2584,115 @@ class DispatchService:
             )
 
 
+# ---- orphan cleanup on load (v0.2.0 B4) ----
+
+
+def orphan_cleanup(dispatch_dir: str | Path | None = None) -> list[dict[str, Any]]:
+    """Sweep stale dispatch tasks on plugin load (idempotent, never kills).
+
+    Scans ``<state_dir>/dispatch/*.json`` and finalizes tasks the previous
+    process left ``running``/``cancelling`` whose child pid no longer
+    exists:
+
+    - ``running`` + dead pid + wall budget spent -> ``timeout``
+      (``timeout_killed``) — the decidable terminal state wins, even with
+      the ``terminating`` marker set (v0.2.0 fix: watchdog-lost incident);
+    - ``running``    + dead pid -> ``failed``    (``orphaned_on_reload``)
+    - ``cancelling`` + dead pid -> ``cancelled`` (``cancelled_by_user``)
+
+    Guards: tasks carrying the ``terminating`` marker belong to the
+    in-process reaper and are skipped (except the spent-budget case
+    above); a task whose ``updated_at`` is fresher than
+    :data:`STALE_FRESH_SECONDS` may still be written by a live watchdog
+    and is skipped; a task whose pid is still alive is never touched
+    (this function must not kill anything). Returns the list of changed
+    task dicts.
+    """
+    base = Path(dispatch_dir) if dispatch_dir else state_dir() / "dispatch"
+    if not base.is_dir():
+        return []
+    changed: list[dict[str, Any]] = []
+    now = _utcnow()
+    for path in sorted(base.glob("*.json")):
+        try:
+            task = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(task, dict):
+            continue
+        state = str(task.get("state") or "")
+        if state not in ("running", "cancelling"):
+            continue
+        pid = task.get("pid")
+        pid_live = pid is not None and DispatchService._pid_alive(pid)
+        if state == "running" and _timeout_evidence(task) and not pid_live:
+            # Wall budget provably spent and no live child remains: the
+            # watchdog that should have written `timeout` is gone. Decidable
+            # terminal state instead of `stale` (v0.2.0 fix); this also
+            # covers the `terminating` marker, previously skipped wholesale.
+            fields: dict[str, Any] = {
+                "state": "timeout",
+                "death_reason": "timeout_killed",
+                "exit_code": task.get("exit_code"),
+            }
+        elif task.get("terminating"):
+            continue  # the reaper owns terminating tasks
+        else:
+            updated_epoch = _parse_epoch(task.get("updated_at"))
+            if (time.time() - updated_epoch) < STALE_FRESH_SECONDS:
+                continue  # possibly still written by a live watchdog
+            if pid_live:
+                continue  # live child: a watchdog may still be finishing it
+            if state == "running":
+                fields = {
+                    "state": "failed",
+                    "death_reason": "orphaned_on_reload",
+                    "exit_code": task.get("exit_code"),
+                }
+            else:
+                fields = {
+                    "state": "cancelled",
+                    "death_reason": "cancelled_by_user",
+                    "exit_code": task.get("exit_code"),
+                    "cancelled_at": task.get("cancelled_at") or now,
+                }
+        fields["finished_at"] = task.get("finished_at") or now
+        fields["updated_at"] = now
+        task.update(fields)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(task, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+        changed.append(task)
+    return changed
+
+
 __all__ = [
     "APPROVAL_MODES",
     "APPROVAL_MODE_ENV",
     "DEFAULT_APPROVAL_MODE",
+    "DEFAULT_CANCEL_GRACE_S",
     "DEFAULT_DISPATCH_TIMEOUT",
+    "LOG_TAIL_DEFAULT",
+    "LOG_TAIL_MAX",
+    "MAX_CANCEL_GRACE_S",
+    "PROGRESS_EVENTS_DEFAULT",
+    "PROGRESS_EVENTS_MAX",
     "SPAWN_ARG_TEMPLATE",
+    "TERMINAL_TASK_STATES",
+    "WAIT_TIMEOUT_S",
     "WATCH_INTERVAL_ENV",
     "CliNotFoundError",
     "DispatchBusyError",
     "DispatchService",
+    "NotCancellableError",
+    "PidMismatchError",
     "SpawnFailedError",
+    "TaskNotFoundError",
     "WakeSender",
     "default_wake_sender",
+    "orphan_cleanup",
     "resolve_approval_mode",
 ]

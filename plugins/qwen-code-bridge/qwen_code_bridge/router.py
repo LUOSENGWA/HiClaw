@@ -20,15 +20,19 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from .dispatch import (
-    DEFAULT_DISPATCH_TIMEOUT,
     CliNotFoundError,
+    LOG_TAIL_DEFAULT,
+    PROGRESS_EVENTS_DEFAULT,
     DispatchBusyError,
     DispatchService,
+    NotCancellableError,
+    PidMismatchError,
     SpawnFailedError,
+    TaskNotFoundError,
 )
 from .registry import CLIS, get_cli
 from .service import CodingCliService, InstallBusyError
@@ -129,7 +133,16 @@ class DispatchRequest(BaseModel):
     prompt: str = Field(min_length=1)
     cwd: str | None = None
     cli: str = "qwen"
-    timeout: float = Field(default=DEFAULT_DISPATCH_TIMEOUT, ge=1)
+    timeout: float | None = Field(
+        default=None,
+        ge=1,
+        description="Wall budget in seconds; omitted -> 7200 (v0.2.0 B1).",
+    )
+    timeout_s: float | None = Field(
+        default=None,
+        ge=1,
+        description="Alias of `timeout` (v0.2.0 spec name); wins when both are given.",
+    )
     files_to_touch: list[str] = Field(default_factory=list)
     evidence: str | None = Field(
         default=None,
@@ -196,13 +209,18 @@ async def post_dispatch(
     origin = body.origin.model_dump() if body.origin is not None else None
     if wake is not None and not str(wake.get("base_url") or "").strip():
         wake["base_url"] = str(request.base_url).rstrip("/")
+    # B1: `timeout_s` (spec name) wins over `timeout`; None -> 7200 default
+    # applied in DispatchService.start (the budget is always bounded).
+    effective_timeout = (
+        body.timeout_s if body.timeout_s is not None else body.timeout
+    )
     try:
         task_id = await service.start(
             task_name=body.task,
             prompt=body.prompt,
             cwd=body.cwd,
             cli=body.cli,
-            timeout=body.timeout,
+            timeout=effective_timeout,
             wake=wake,
             origin=origin,
             approval_mode=body.approval_mode,
@@ -225,6 +243,81 @@ async def post_dispatch(
     except SpawnFailedError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return {"task_id": task_id}
+
+
+class CancelRequest(BaseModel):
+    """Optional cancel body (v0.2.0 A); all fields have defaults."""
+
+    reason: str = ""
+    grace_s: float = 10.0
+    wait: bool = False
+
+
+async def _dispatch_cancel(
+    task_id: str,
+    body: CancelRequest | None,
+    service: DispatchService,
+) -> JSONResponse:
+    """Shared handler for /cancel and /stop (alias)."""
+    cancel = body or CancelRequest()
+    try:
+        payload = await service.request_cancel(
+            task_id,
+            reason=cancel.reason,
+            grace_s=cancel.grace_s,
+            wait=cancel.wait,
+        )
+    except TaskNotFoundError:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "task_not_found",
+                "task_id": task_id,
+            },
+            status_code=404,
+        )
+    except PidMismatchError as exc:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "pid_mismatch",
+                "task_id": task_id,
+                "detail": str(exc),
+            },
+            status_code=409,
+        )
+    except NotCancellableError as exc:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "not_cancellable",
+                "task_id": task_id,
+                "detail": str(exc),
+            },
+            status_code=409,
+        )
+    status_code = 200 if payload.get("already_terminal") else 202
+    return JSONResponse(payload, status_code=status_code)
+
+
+@router.post("/dispatch/{task_id}/cancel")
+async def post_dispatch_cancel(
+    task_id: str,
+    body: CancelRequest | None = None,
+    service: DispatchService = Depends(_get_dispatch_service),
+):
+    """Cancel a dispatch task (idempotent; 404/409 on bad targets)."""
+    return await _dispatch_cancel(task_id, body, service)
+
+
+@router.post("/dispatch/{task_id}/stop")
+async def post_dispatch_stop(
+    task_id: str,
+    body: CancelRequest | None = None,
+    service: DispatchService = Depends(_get_dispatch_service),
+):
+    """Alias of ``/dispatch/{task_id}/cancel`` (v0.2.0 A)."""
+    return await _dispatch_cancel(task_id, body, service)
 
 
 class SidebarRequest(BaseModel):
@@ -351,19 +444,39 @@ async def get_dispatch(
 @router.get("/dispatch/{task_id}/progress")
 async def get_dispatch_progress(
     task_id: str,
+    limit: int = PROGRESS_EVENTS_DEFAULT,
     service: DispatchService = Depends(_get_dispatch_service),
 ) -> dict:
-    """Derived live progress (phase/last tool/turns/tests/stalled)."""
+    """Derived live progress (phase/last tool/turns/tests/stalled).
+
+    v0.2.0 B3: also returns the last ``?limit=`` stream-json events
+    (default 200, cap 2000; ``limit=0`` = all) from the log.
+    """
     task = service.get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
+    events, truncated, total_events, limit_eff = service.get_progress_events(
+        task_id, limit
+    )
     return {
         "task_id": task_id,
         "state": task.get("state"),
         "progress": task.get("progress"),
         "approvals": task.get("approvals"),
         "terminal_summary": task.get("terminal_summary"),
+        "events": events,
+        "truncated": truncated,
+        "total_events": total_events,
+        "limit": limit_eff,
     }
+
+
+@router.get("/version")
+async def get_version() -> dict:
+    """Plugin version + runtime facts (v0.2.0 B5)."""
+    from .version import version_info
+
+    return version_info()
 
 
 @router.get("/dispatch/{task_id}/pending")
@@ -492,14 +605,24 @@ async def post_dispatch_cleanup(
 @router.get("/dispatch/{task_id}/log")
 async def get_dispatch_log(
     task_id: str,
+    tail: int = LOG_TAIL_DEFAULT,
     service: DispatchService = Depends(_get_dispatch_service),
 ) -> dict:
-    """Full captured stdout of a dispatch task."""
+    """Captured stdout, tail-truncated (v0.2.0 B2).
+
+    ``?tail=N`` (default 200, cap 2000); ``?tail=0`` = full log.
+    """
     if service.get_task(task_id) is None:
         raise HTTPException(status_code=404, detail="Task not found")
+    text, truncated, total_lines, tail_eff = service.get_log_tail(
+        task_id, tail
+    )
     return {
         "task_id": task_id,
-        "log": service.get_log(task_id) or "",
+        "log": text,
+        "truncated": truncated,
+        "total_lines": total_lines,
+        "tail": tail_eff,
     }
 
 

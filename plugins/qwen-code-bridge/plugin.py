@@ -165,6 +165,20 @@ def _ensure_state_dir() -> None:
 
     state_dir().mkdir(parents=True, exist_ok=True)
     _ensure_qwen_link()
+    # B4: finalize tasks the previous process left running/cancelling
+    # with a dead child pid (idempotent, never kills live processes).
+    try:
+        from qwen_code_bridge.dispatch import orphan_cleanup
+
+        closed = orphan_cleanup()
+        if closed:
+            logger.info(
+                "orphan cleanup closed %d stale dispatch task(s): %s",
+                len(closed),
+                ", ".join(str(t.get("task_id")) for t in closed),
+            )
+    except Exception as exc:
+        logger.warning("orphan cleanup skipped: %s", exc)
 
 
 async def _start_wake_queue() -> None:
