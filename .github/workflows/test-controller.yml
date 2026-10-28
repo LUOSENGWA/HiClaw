@@ -8,6 +8,9 @@ on:
       - 'plugins/teamharness/**'
       - 'plugins/agentteams-matrix-channel/**'
       - 'plugins/tests/**'
+      - 'plugins/scripts/**'
+      - 'plugins/*/plugin.yaml'
+      - '.github/workflows/build-plugin.yml'
       - 'docs/design/teamharness/**'
       - '.github/workflows/test-controller.yml'
   push:
@@ -18,7 +21,11 @@ on:
       - 'plugins/teamharness/**'
       - 'plugins/agentteams-matrix-channel/**'
       - 'plugins/tests/**'
+      - 'plugins/scripts/**'
+      - 'plugins/*/plugin.yaml'
+      - '.github/workflows/build-plugin.yml'
       - 'docs/design/teamharness/**'
+      - '.github/workflows/test-controller.yml'
   workflow_dispatch:
 
 jobs:
