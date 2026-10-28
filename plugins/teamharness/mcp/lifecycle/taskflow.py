@@ -980,6 +980,45 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             question = str(payload.get("question") or payload.get("reason") or "").strip()
             if not question:
                 raise ValueError("question is required")
+            # Structured answer payload (#1418): options is the validation
+            # set a human answer must echo, suggested is advisory only
+            # (never auto-applied), expiresAt is recorded verbatim for the
+            # console's expiry policy. All three are optional and are
+            # written to the record only when provided, so records from
+            # older workers keep their original shape.
+            raw_options = payload.get("options")
+            attention_options: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            if raw_options is not None:
+                if not isinstance(raw_options, list) or len(raw_options) > 10:
+                    raise ValueError(
+                        "options must be a list of {id, label} objects with at most 10 entries"
+                    )
+                for entry in raw_options:
+                    if not isinstance(entry, dict):
+                        raise ValueError("options entries must be {id, label} objects")
+                    raw_id = entry.get("id")
+                    raw_label = entry.get("label")
+                    if not isinstance(raw_id, str) or not isinstance(raw_label, str):
+                        raise ValueError("options entries require string id and label")
+                    option_id = raw_id.strip()
+                    option_label = raw_label.strip()
+                    if not option_id or not option_label:
+                        raise ValueError("options entries require non-empty string id and label")
+                    if option_id in seen:
+                        raise ValueError("options ids must be unique")
+                    seen.add(option_id)
+                    attention_options.append({"id": option_id, "label": option_label})
+            suggested_raw = payload.get("suggested")
+            if suggested_raw is not None and not isinstance(suggested_raw, str):
+                raise ValueError("suggested must be a string")
+            suggested = (suggested_raw or "").strip()
+            if suggested and suggested not in seen:
+                raise ValueError("suggested must be the id of one of the provided options")
+            expires_raw = payload.get("expiresAt", payload.get("expires_at"))
+            if expires_raw is not None and not isinstance(expires_raw, str):
+                raise ValueError("expiresAt must be a string")
+            expires_at = (expires_raw or "").strip()
             attention = task.get("attention")
             if not isinstance(attention, list):
                 attention = []
@@ -1134,6 +1173,14 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     # (handled above): a freshly raised record is always open.
                     "resolved": False,
                 }
+                # camelCase to match the existing meta.json record fields;
+                # each is written only when provided (backward compatible).
+                if attention_options:
+                    record["options"] = attention_options
+                if suggested:
+                    record["suggested"] = suggested
+                if expires_at:
+                    record["expiresAt"] = expires_at
                 attention.append(record)
                 task["attention"] = attention
                 _write_task(arguments, task)
