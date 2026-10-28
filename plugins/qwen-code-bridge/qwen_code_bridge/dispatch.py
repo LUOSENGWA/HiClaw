@@ -1735,7 +1735,10 @@ class DispatchService:
             cli_version = runs.parse_cli_version(probe.stdout or probe.stderr)
         except Exception:
             cli_version = None
-        tested_cli_versions = {"0.26.0"}
+        # Versions we have exercised end to end (smoke dispatch + approval
+        # hook). A new upstream release is reported as unsupported until it
+        # is added here, which is a warning rather than a hard block.
+        tested_cli_versions = {"0.25.0", "0.26.0", "0.26.3"}
         cli_version_supported = (
             cli_version in tested_cli_versions if cli_version else None
         )
