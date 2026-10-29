@@ -61,7 +61,7 @@ func (f *fakeExecBackend) written(path string) (string, bool) {
 	return c, ok
 }
 
-func newTestCodingCliHandler(t *testing.T, kubeMode string, exec *fakeExecBackend, store *ossfake.Memory, objs ...runtime.Object) *CodingCliHandler {
+func newTestCodingCliHandler(t *testing.T, kubeMode string, exec codingCliExecer, store *ossfake.Memory, objs ...runtime.Object) *CodingCliHandler {
 	t.Helper()
 	k8s := fake.NewClientBuilder().WithScheme(newProjectTestScheme(t)).WithRuntimeObjects(objs...).Build()
 	h := NewCodingCliHandler(k8s, "default", kubeMode, nil, nil)

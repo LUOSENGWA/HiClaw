@@ -176,9 +176,9 @@ func TestCodingCliOpenCodeSettingsAuthRoundTrip(t *testing.T) {
 			switch {
 			case strings.Contains(cmd[2], "printf %s"):
 				return "/root", "", 0, nil
-			case strings.Contains(cmd[2], "test -f ~/.config/opencode/opencode.json"):
+			case strings.Contains(cmd[2], "test -f ") && strings.Contains(cmd[2], ".config/opencode/opencode.json"):
 				return "", "", 0, nil
-			case strings.Contains(cmd[2], "cat ~/.config/opencode/opencode.json"):
+			case strings.Contains(cmd[2], "cat ") && strings.Contains(cmd[2], ".config/opencode/opencode.json"):
 				data, _ := exec.written(path)
 				return data, "", 0, nil
 			}
