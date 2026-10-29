@@ -291,13 +291,18 @@ if ! grep -q "name: agentteams-rustfs" "${rustfs_render}"; then
     echo "FAIL: managed RustFS resources missing (expected name: agentteams-rustfs)"
     exit 1
 fi
+# Count only RustFS-owned documents; the higress dependency may render its
+# own Statefulsets/Services, so a global kind count is not meaningful.
+count_rustfs_docs() {
+    awk -v kind="$1" 'BEGIN{RS="---"} $0 ~ ("kind: " kind) && /-rustfs/ {n++} END{print n+0}' "${rustfs_render}"
+}
 for kind in StatefulSet Service Secret; do
-    if ! grep -q "^kind: ${kind}" "${rustfs_render}"; then
+    if [ "$(count_rustfs_docs "${kind}")" = "0" ]; then
         echo "FAIL: engine=rustfs did not render a RustFS ${kind}"
         exit 1
     fi
 done
-stss="$(grep -c "^kind: StatefulSet" "${rustfs_render}")"
+stss="$(count_rustfs_docs StatefulSet)"
 if [ "${stss}" -ne 1 ]; then
     echo "FAIL: expected exactly 1 StatefulSet (RustFS) in engine=rustfs render, got: ${stss}"
     exit 1
