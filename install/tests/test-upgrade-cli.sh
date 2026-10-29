@@ -58,8 +58,26 @@ case "$1" in
     image)
         # docker image inspect --format <fmt> <ref>  -> $4 = fmt, $5 = ref
         fmt="$4"
+        ref="$5"
         case "${STUB_SCENARIO:-ok}" in
-            image_inspect_fail) exit 1 ;;
+            image_inspect_fail|image_inspect_fail_health) exit 1 ;;
+            image_retag)
+                # The test tag was moved to another cached image: inspecting
+                # the tag returns the other image, inspecting the container's
+                # immutable ID keeps the original.
+                if [ "${ref}" = "sha256:stableimageid" ]; then
+                    case "$fmt" in
+                        *"{{.Id}}"*) echo "sha256:stableimageid" ;;
+                        *RepoDigests*) printf 'example/controller@sha256:stable\n' ;;
+                    esac
+                else
+                    case "$fmt" in
+                        *"{{.Id}}"*) echo "sha256:retagged" ;;
+                        *RepoDigests*) printf 'example/controller@sha256:retagged\n' ;;
+                    esac
+                fi
+                exit 0
+                ;;
         esac
         case "$fmt" in
             *"{{.Id}}"*) echo "sha256:imageid" ;;
@@ -120,6 +138,9 @@ case "$1" in
             *Config.Env*) printf 'A=1\nB=2\n' ;;
             *HostConfig.ShmSize*) shm_value "$4" ;;
             *Config.Image*) echo "example/controller:old" ;;
+            *"{{.Image}}"*)
+                [ "${STUB_SCENARIO:-ok}" = "image_retag" ] && echo "sha256:stableimageid" || echo "sha256:imageid"
+                ;;
             *State.Running*) running_state ;;
             *RepoDigests*) echo "example/controller@sha256:old" ;;
             *".Id"*) echo "sha256:old" ;;
@@ -149,7 +170,12 @@ case "$1" in
                 esac
                 ;;
             *"8080/v1/models"*) [ "${STUB_SCENARIO:-ok}" = "gateway_down" ] && echo "000" || echo "200" ;;
-            *healthz*) [ "${STUB_SCENARIO:-ok}" = "health_fail" ] && exit 1 || exit 0 ;;
+            *healthz*)
+                case "${STUB_SCENARIO:-ok}" in
+                    health_fail|image_inspect_fail_health) exit 1 ;;
+                    *) exit 0 ;;
+                esac
+                ;;
             *"agt get workers -o json"*)
                 [ "${STUB_SCENARIO:-ok}" = "storage_embedded" ] && echo '{"workers":[]}' || echo '{"workers":[{"name":"w1","soul":"full"}]}'
                 ;;
@@ -366,11 +392,38 @@ run_case image_no_digest backup --yes --env-file "${ENV_FILE}" --backup-dir "${T
 assert_eq "${RC}" "0" "backup no-digest rc"
 assert_contains 'digests=none' "${TMP}/b5n/images.txt" "no-digest inventory"
 
-# 5d. an image-inspect failure fails the backup instead of writing an empty line
+# 5d. an image-inspect failure fails the backup instead of writing an empty line,
+# and a controller that was stopped for the copy is started again (recovery
+# gate) even though the backup status stays failed.
 run_case image_inspect_fail backup --yes --env-file "${ENV_FILE}" --backup-dir "${TMP}/b5f" --state-file "${TMP}/b5f/state.json"
 assert_eq "${RC}" "3" "backup image-fail rc"
 assert_contains 'image inventory failed' "${OUT}" "image-fail message"
 assert_contains '"status":"failed"' "${TMP}/b5f/state.json" "image-fail state"
+assert_contains '^stop ' "${REC}" "image-fail stop before the copy"
+assert_contains '^cp ' "${REC}" "image-fail copy ran"
+assert_contains '^start ' "${REC}" "image-fail recovery start"
+assert_contains 'exec agentteams-controller curl -fsS' "${REC}" "image-fail recovery health gate"
+assert_contains 'recovery ok' "${TMP}/b5f/state.json" "image-fail recovery detail"
+assert_not_contains '"status":"done"' "${TMP}/b5f/state.json" "image-fail stays failed"
+
+# 5d2. the inventory records the container's immutable image ID, not the
+# (mutable) tag it was created with: moving the tag to another cached image
+# must not change the recorded ID/digests.
+run_case image_retag backup --yes --env-file "${ENV_FILE}" --backup-dir "${TMP}/b5r" --state-file "${TMP}/b5r/state.json"
+assert_eq "${RC}" "0" "backup retagged-tag rc"
+assert_contains 'agentteams-controller: image=example/controller:old id=sha256:stableimageid digests=example/controller@sha256:stable'     "${TMP}/b5r/images.txt" "inventory follows the container image ID"
+assert_not_contains 'retagged' "${TMP}/b5r/images.txt" "inventory ignores the moved tag"
+assert_contains_fixed 'sha256:stableimageid' "${REC}" "image inspect used the immutable ID"
+assert_not_contains_fixed 'sha256:retagged' "${REC}" "image inspect never followed the moved tag"
+
+# 5d3. inventory failure with a health gate that also fails: the controller is
+# started, the failed gate is recorded, and the backup stays failed.
+run_case image_inspect_fail_health backup --yes --env-file "${ENV_FILE}" --backup-dir "${TMP}/b5fh" --state-file "${TMP}/b5fh/state.json" --timeout 2
+assert_eq "${RC}" "3" "inventory+health rc"
+assert_contains '^start ' "${REC}" "inventory+health recovery start"
+assert_contains 'recovery FAILED' "${TMP}/b5fh/state.json" "inventory+health recovery detail"
+assert_contains '"status":"failed"' "${TMP}/b5fh/state.json" "inventory+health stays failed"
+assert_not_contains '"status":"done"' "${TMP}/b5fh/state.json" "inventory+health not done"
 
 # 5.1 docker stop fails: no copy, nonzero, failed state, controller left as-is
 run_case stop_fail backup --yes --env-file "${ENV_FILE}" --backup-dir "${TMP}/b51" --state-file "${TMP}/b51/state.json"
