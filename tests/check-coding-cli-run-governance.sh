@@ -21,6 +21,17 @@
 #   6. json-file   — --json-file reaches the runner argv and the runner's
 #      structured-output file lands on disk (the stub writes it there), i.e.
 #      the optional structured-output passthrough is wired end to end.
+#   7. cli-missing — a wiped install fails fast (exit 125) with the
+#      re-install hint.
+#   8. distinct-home — a config in the delegating agent's ORIGINAL home
+#      (HOME moved to QWENPAW_WORKING_DIR, no CODING_CLI_CONFIG): all four
+#      controls reach the runner argv and --yolo is absent (#1409
+#      regression: the persisted-home move must not hide the control
+#      config).
+#   9. new-home fallback — a config only in the effective (persisted) home
+#      is still read (backward compat for configs created after the move).
+#  10. both homes — different configs in both homes: the original home
+#      wins.
 #
 # jq is optional: the config-driven budget/sandbox assertions are skipped (with
 # a note) when jq is absent, matching the detect suite's "skip when a
@@ -83,6 +94,20 @@ run_qwen() {
     QWEN_STUB_ARGS="${STUB_ARGS}" \
     CODING_CLI_CONFIG="${CFG:-${TMP}/nonexistent.json}" \
     bash "${RUN_SCRIPT}" --cli qwen --workspace "${workspace}" --prompt-file "${prompt}" "$@" 2>&1
+}
+
+run_qwen_distinct_home() {
+    # $1 = the delegating agent's original home, $2 = the persisted working
+    # dir (QWENPAW_WORKING_DIR), $3... = extra run-coding-cli.sh flags.
+    # Unlike run_qwen this does NOT set CODING_CLI_CONFIG (it is pinned to
+    # empty, which the wrapper treats as unset): it exercises the DEFAULT
+    # config resolution with a moved HOME — the #1409 scenario.
+    PATH="${STUB_BIN}:${PATH}" \
+    QWEN_STUB_ARGS="${STUB_ARGS}" \
+    CODING_CLI_CONFIG="" \
+    HOME="$1" \
+    QWENPAW_WORKING_DIR="$2" \
+    bash "${RUN_SCRIPT}" --cli qwen --workspace "${workspace}" --prompt-file "${prompt}" "${@:3}" 2>&1
 }
 
 # --- case 1: flag passthrough always; config-driven budget/sandbox iff jq -----
@@ -206,6 +231,80 @@ fi
 if ! grep -qi "install endpoint\|recreat" <<<"${out}"; then
     echo "FAIL case7: expected an actionable re-install hint (got: ${out})"
     fail=1
+fi
+
+# --- cases 8-10: default config path with a moved HOME (#1409) --------------
+# These do NOT set CODING_CLI_CONFIG: they exercise the default resolution
+# with HOME (the delegating agent's original home) distinct from
+# QWENPAW_WORKING_DIR (the persisted runtime home the wrapper moves HOME to).
+# All three assert config-driven flags, so they need jq and follow the
+# suite's skip-when-absent convention.
+if [ "${HAS_JQ}" = "1" ]; then
+    # --- case 8: distinct-home default config — original home is read ------
+    orig_home="${TMP}/homes/orig8"
+    work_home="${TMP}/homes/work8"
+    mkdir -p "${orig_home}" "${work_home}"
+    printf '{"approval_mode":"plan","max_session_turns":3,"max_wall_time":"30s","sandbox":true}' > "${orig_home}/coding-cli-config.json"
+    rm -f "${STUB_ARGS}"
+    out="$(run_qwen_distinct_home "${orig_home}" "${work_home}")"
+    rc=$?
+    if [ "${rc}" -ne 0 ]; then
+        echo "FAIL case8: distinct-home run should exit 0 (got ${rc}): ${out}"
+        fail=1
+    fi
+    for want in --approval-mode plan --max-session-turns 3 --max-wall-time 30s --sandbox; do
+        if ! have_arg "${want}"; then
+            echo "FAIL case8: runner argv missing '${want}' (got: $(argv_show))"
+            fail=1
+        fi
+    done
+    if have_arg "--yolo"; then
+        echo "FAIL case8: approval_mode plan from the original home must not add --yolo (got: $(argv_show))"
+        fail=1
+    fi
+
+    # --- case 9: new-home fallback — config only in the effective home -----
+    orig_home="${TMP}/homes/orig9"
+    work_home="${TMP}/homes/work9"
+    mkdir -p "${orig_home}" "${work_home}"
+    printf '{"approval_mode":"plan","max_session_turns":3,"max_wall_time":"30s","sandbox":true}' > "${work_home}/coding-cli-config.json"
+    rm -f "${STUB_ARGS}"
+    out="$(run_qwen_distinct_home "${orig_home}" "${work_home}")"
+    rc=$?
+    if [ "${rc}" -ne 0 ]; then
+        echo "FAIL case9: new-home fallback run should exit 0 (got ${rc}): ${out}"
+        fail=1
+    fi
+    for want in --approval-mode plan --max-session-turns 3 --max-wall-time 30s --sandbox; do
+        if ! have_arg "${want}"; then
+            echo "FAIL case9: effective-home config must still be read (got: $(argv_show))"
+            fail=1
+        fi
+    done
+
+    # --- case 10: both homes set — the original home's config wins ---------
+    orig_home="${TMP}/homes/orig10"
+    work_home="${TMP}/homes/work10"
+    mkdir -p "${orig_home}" "${work_home}"
+    printf '{"approval_mode":"plan","max_session_turns":3,"max_wall_time":"30s","sandbox":true}' > "${orig_home}/coding-cli-config.json"
+    printf '{"approval_mode":"yolo","max_session_turns":9,"max_wall_time":"1h","sandbox":false}' > "${work_home}/coding-cli-config.json"
+    rm -f "${STUB_ARGS}"
+    out="$(run_qwen_distinct_home "${orig_home}" "${work_home}")"
+    rc=$?
+    if [ "${rc}" -ne 0 ]; then
+        echo "FAIL case10: both-homes run should exit 0 (got ${rc}): ${out}"
+        fail=1
+    fi
+    if ! have_arg "--approval-mode" || ! have_arg "plan"; then
+        echo "FAIL case10: the original home's config must win (got: $(argv_show))"
+        fail=1
+    fi
+    if have_arg "--yolo" || have_arg "9" || have_arg "1h"; then
+        echo "FAIL case10: the effective home's config must not apply (got: $(argv_show))"
+        fail=1
+    fi
+else
+    echo "SKIP cases 8-10 distinct-home default config (jq absent)"
 fi
 
 if [ "${fail}" -eq 0 ]; then
