@@ -100,8 +100,11 @@ gateway:
 #   MinIO-compatible admin API: the controller creates the bucket and
 #   manages per-worker users/policies via mc (verified against RustFS
 #   1.0.3; see docs/design/storage-external-s3-backend.md).
+# provider=s3 + engine=rustfs → chart-managed single-node RustFS
+#   StatefulSet (image pinned with the release, same policy as MinIO).
 storage:
   provider: minio             # minio | oss | s3
+  engine: external            # external (default; user-managed backend) | rustfs (chart-managed; requires provider=s3)
   mode: managed               # managed | existing
   bucket: "agentteams-storage"
   # Required when provider=oss:
@@ -143,6 +146,27 @@ storage:
     auth:
       rootUser: "minioadmin"
       rootPassword: "minioadmin"
+  # Chart-managed single-node RustFS (provider=s3 + engine=rustfs).
+  # The image tag is pinned with the AgentTeams release, same policy as
+  # minio.image.tag. Upgrade by bumping the tag + `helm upgrade` (the
+  # StatefulSet PVC is preserved); rollback with `helm rollback`.
+  rustfs:
+    image:
+      repository: higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/rustfs
+      tag: "1.0.4"
+      pullPolicy: IfNotPresent
+    resources: {}
+    service:
+      type: ClusterIP
+      apiPort: 9000
+    persistence:
+      enabled: true
+      size: 10Gi
+      storageClassName: ""
+    auth:
+      rootUser: "rustfsadmin"
+      rootPassword: "rustfsadmin"
+      existingSecret: ""      # Secret holding RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY
 
 # ── Higress subchart values (passed directly to the higress dependency) ───
 # `gateway.higress.enabled` is the materialized condition flag. The actual

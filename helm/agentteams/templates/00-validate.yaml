@@ -7,6 +7,7 @@ Validate public values at render time. Supported combinations:
   storage.provider=minio      storage.mode=managed    → deploy MinIO StatefulSet
   storage.provider=oss        storage.mode=existing   → external OSS bucket
   storage.provider=s3         storage.mode=existing   → external S3 backend (e.g. RustFS)
+  storage.provider=s3         storage.engine=rustfs   → chart-managed single-node RustFS
 */ -}}
 
 {{- $matrixProvider := .Values.matrix.provider | default "" -}}
@@ -42,6 +43,15 @@ Validate public values at render time. Supported combinations:
 
 {{- $storageProvider := .Values.storage.provider | default "" -}}
 {{- $storageMode := .Values.storage.mode | default "" -}}
+{{- $storageEngine := .Values.storage.engine | default "external" -}}
+{{- if eq $storageEngine "rustfs" -}}
+  {{- if ne $storageProvider "s3" -}}
+  {{- fail (printf "storage.engine=rustfs requires storage.provider=s3 (got %q)" $storageProvider) -}}
+  {{- end -}}
+  {{- if eq $storageMode "existing" -}}
+  {{- fail "storage.engine=rustfs cannot be combined with storage.mode=existing (the managed engine is always chart-deployed)" -}}
+  {{- end -}}
+{{- end -}}
 {{- if eq $storageProvider "minio" -}}
   {{- if ne $storageMode "managed" -}}
   {{- fail (printf "storage.provider=minio requires storage.mode=managed (got %q)" $storageMode) -}}
@@ -54,6 +64,7 @@ Validate public values at render time. Supported combinations:
   {{- fail "storage.oss.region is required when storage.provider=oss" -}}
   {{- end -}}
 {{- else if eq $storageProvider "s3" -}}
+  {{- if ne $storageEngine "rustfs" -}}
   {{- if ne $storageMode "existing" -}}
   {{- fail (printf "storage.provider=s3 requires storage.mode=existing (got %q)" $storageMode) -}}
   {{- end -}}
@@ -63,6 +74,7 @@ Validate public values at render time. Supported combinations:
   {{- $s3HasInline := and (.Values.storage.s3.accessKey | default "") (.Values.storage.s3.secretKey | default "") -}}
   {{- if not (or (.Values.storage.s3.existingSecret | default "") $s3HasInline) -}}
   {{- fail "storage.provider=s3 requires storage.s3.existingSecret or storage.s3.accessKey + storage.s3.secretKey" -}}
+  {{- end -}}
   {{- end -}}
 {{- else -}}
 {{- fail (printf "unsupported storage.provider %q: expected \"minio\", \"oss\" or \"s3\"" $storageProvider) -}}

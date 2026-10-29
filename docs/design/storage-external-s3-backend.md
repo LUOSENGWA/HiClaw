@@ -63,6 +63,49 @@ storage:
 The MinIO StatefulSet is not rendered and no credential-provider sidecar
 is deployed.
 
+## Managed RustFS (single-node)
+
+Instead of operating the S3 backend yourself, the chart can deploy
+RustFS for you: a single-node StatefulSet whose image tag is pinned
+with the AgentTeams release — the same pinning policy as the bundled
+MinIO (the default `storage.rustfs.image.tag` and the
+`hack/mirror-images.sh` entry always match).
+
+```yaml
+# values.yaml
+storage:
+  provider: s3
+  engine: rustfs              # chart-managed RustFS (requires provider=s3)
+  bucket: agentteams-storage
+  rustfs:
+    image:
+      tag: "1.0.4"            # pinned with the release
+    resources: {}
+    persistence:
+      size: 10Gi
+    # Optional: reference an existing Secret (RUSTFS_ACCESS_KEY /
+    # RUSTFS_SECRET_KEY) instead of the inline defaults:
+    # auth:
+    #   existingSecret: my-rustfs-creds
+```
+
+The controller is wired to the in-chart RustFS automatically
+(`AGENTTEAMS_FS_ENDPOINT=http://<release>-rustfs:9000`, credentials via
+secretKeyRef). `storage.engine=rustfs` fails the render when combined
+with `storage.provider=minio`/`oss` or `storage.mode=existing`;
+explicitly setting `storage.s3.endpoint` switches the endpoint back to
+that external value.
+
+**Version pinning.** Like MinIO, the RustFS image tag is pinned per
+AgentTeams release.
+
+**Upgrade.** Change `storage.rustfs.image.tag` and run `helm upgrade`.
+Data lives on the StatefulSet PVC and is preserved across upgrades
+(check the RustFS version's data-dir compatibility before upgrading).
+
+**Rollback.** `helm rollback <release> <revision>` restores the
+previous revision, including the previous RustFS image tag.
+
 ## Tests
 
 Two reproducible layers:
