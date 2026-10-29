@@ -211,6 +211,14 @@ def _validate_task_result_status(value: Any) -> str:
     return status
 
 
+def _validate_iso8601(value: str, field: str) -> None:
+    """Reject a deadline that is not an ISO-8601 timestamp (Z tolerated)."""
+    try:
+        datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an ISO-8601 timestamp") from exc
+
+
 def _validate_task_deliverables(task_id: str, deliverables: list[Any]) -> list[str]:
     expected_prefix = f"shared/tasks/{task_id}"
     normalized_deliverables: list[str] = []
@@ -980,11 +988,12 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             question = str(payload.get("question") or payload.get("reason") or "").strip()
             if not question:
                 raise ValueError("question is required")
-            # Structured answer payload (#1418): options is the validation
-            # set a human answer must echo, suggested is advisory only
-            # (never auto-applied), expiresAt is recorded verbatim for the
-            # console's expiry policy. All three are optional and are
-            # written to the record only when provided, so records from
+            # Structured answer payload (#1418/#1394): options is the
+            # validation set a human answer must echo, suggested is advisory
+            # only (never auto-applied), and the deadline is recorded under
+            # the canonical timeoutAt (expiresAt stays a compatibility
+            # alias for the #1449/#1434 readers). Every field is optional
+            # and written to the record only when provided, so records from
             # older workers keep their original shape.
             raw_options = payload.get("options")
             attention_options: list[dict[str, Any]] = []
@@ -1008,17 +1017,63 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     if option_id in seen:
                         raise ValueError("options ids must be unique")
                     seen.add(option_id)
-                    attention_options.append({"id": option_id, "label": option_label})
+                    attention_entry: dict[str, Any] = {
+                        "id": option_id,
+                        "label": option_label,
+                    }
+                    raw_description = entry.get("description")
+                    if raw_description is not None and not isinstance(raw_description, str):
+                        raise ValueError("options entries require a string description")
+                    description = (raw_description or "").strip()
+                    if description:
+                        attention_entry["description"] = description[:300]
+                    attention_options.append(attention_entry)
             suggested_raw = payload.get("suggested")
             if suggested_raw is not None and not isinstance(suggested_raw, str):
                 raise ValueError("suggested must be a string")
             suggested = (suggested_raw or "").strip()
             if suggested and suggested not in seen:
                 raise ValueError("suggested must be the id of one of the provided options")
+            timeout_raw = payload.get("timeoutAt", payload.get("timeout_at"))
+            if timeout_raw is not None and not isinstance(timeout_raw, str):
+                raise ValueError("timeoutAt must be a string")
+            timeout_at = (timeout_raw or "").strip()
+            if timeout_at:
+                _validate_iso8601(timeout_at, "timeoutAt")
             expires_raw = payload.get("expiresAt", payload.get("expires_at"))
             if expires_raw is not None and not isinstance(expires_raw, str):
                 raise ValueError("expiresAt must be a string")
             expires_at = (expires_raw or "").strip()
+            if expires_at:
+                _validate_iso8601(expires_at, "expiresAt")
+            if timeout_at and expires_at and timeout_at != expires_at:
+                raise ValueError(
+                    "timeoutAt and expiresAt must be identical when both are provided"
+                )
+            # Canonical deadline: timeoutAt wins; a caller that used only
+            # the expiresAt alias gets both keys written (same value).
+            deadline_at = timeout_at or expires_at
+            # S0 resolve provenance (#1394): validated up front so a bad
+            # payload never reaches the write path; applied only on the
+            # resolved=true close below.
+            resolve_via_raw = payload.get("resolvedVia", payload.get("resolved_via"))
+            if resolve_via_raw is None:
+                resolve_via = "tool"
+            elif not isinstance(resolve_via_raw, str):
+                raise ValueError("resolvedVia must be a string")
+            else:
+                resolve_via = resolve_via_raw.strip().lower()
+            if resolve_via not in {"tool", "dashboard", "im_reply", "im_command", "api"}:
+                raise ValueError(
+                    "resolvedVia must be one of tool, dashboard, im_reply, im_command, api"
+                )
+            resolve_by_raw = payload.get("resolvedBy", payload.get("resolved_by"))
+            if resolve_by_raw is not None and not isinstance(resolve_by_raw, str):
+                raise ValueError("resolvedBy must be a string")
+            resolve_by = (resolve_by_raw or "").strip()[:200]
+            resolve_evidence = payload.get("resolveEvidence", payload.get("resolve_evidence"))
+            if resolve_evidence is not None and not isinstance(resolve_evidence, dict):
+                raise ValueError("resolveEvidence must be an object")
             attention = task.get("attention")
             if not isinstance(attention, list):
                 attention = []
@@ -1063,6 +1118,15 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         "call request_attention without resolved to raise one"
                     )
                 target["resolved"] = True
+                # S0 resolve provenance (#1394): who closed the loop and
+                # how. A human reply in a room is recorded as im_reply with
+                # the evidence cited, never conflated with a tool flip.
+                target["resolvedVia"] = resolve_via
+                if resolve_by:
+                    target["resolvedBy"] = resolve_by
+                if resolve_evidence:
+                    target["resolveEvidence"] = resolve_evidence
+                target["resolvedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 _write_task(arguments, task)
                 synced = _sync_task(arguments, task_id, exclude=["spec.md", "base/"])
                 event_id = str(target.get("eventId") or "") or None
@@ -1122,6 +1186,39 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 ):
                     continue
                 if existing.get("eventId"):
+                    # Sync-first, like the resolved close: when the
+                    # original post-send push failed, the recorded
+                    # eventId/outcome is still local-only. Push it before
+                    # reporting success — a retry of an already-notified
+                    # record must never re-send the Matrix event.
+                    event_id = str(existing["eventId"])
+                    synced = _sync_task(arguments, task_id, exclude=["spec.md", "base/"])
+                    if not synced:
+                        return {
+                            "ok": False,
+                            "retryable": True,
+                            "tool": "taskflow",
+                            "action": action,
+                            "task": task,
+                            "attention": {
+                                "kind": kind,
+                                "reused": True,
+                                "notification": {
+                                    "sent": True,
+                                    "eventId": event_id,
+                                    "reused": True,
+                                },
+                            },
+                            "synced": False,
+                            "statePersisted": True,
+                            "error": (
+                                "shared storage sync failed while re-syncing "
+                                f"the already-notified attention record of kind "
+                                f"'{kind}'; the Matrix event ({event_id}) is not "
+                                "re-sent. Retry request_attention (idempotent: "
+                                "only the sync is retried)."
+                            ),
+                        }
                     return {
                         "ok": True,
                         "tool": "taskflow",
@@ -1132,7 +1229,7 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                             "reused": True,
                             "notification": {
                                 "sent": True,
-                                "eventId": str(existing["eventId"]),
+                                "eventId": event_id,
                                 "reused": True,
                             },
                         },
@@ -1175,10 +1272,15 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 }
                 # camelCase to match the existing meta.json record fields;
                 # each is written only when provided (backward compatible).
+                # The deadline is recorded under the canonical timeoutAt;
+                # the expiresAt alias is echoed (same value) only when the
+                # caller used it, so the #1449/#1434 readers keep working.
                 if attention_options:
                     record["options"] = attention_options
                 if suggested:
                     record["suggested"] = suggested
+                if deadline_at:
+                    record["timeoutAt"] = deadline_at
                 if expires_at:
                     record["expiresAt"] = expires_at
                 attention.append(record)
@@ -1235,7 +1337,88 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         )
                         if notification.get("sent"):
                             record["eventId"] = notification.get("eventId")
-                            _write_task(arguments, task)
+            # S4a notification outcome persistence (#1394): one durable
+            # entry per logical attempt (one Matrix transaction id).
+            # `room_accepted` is Matrix's acceptance of the room event;
+            # `channel_accepted` is the per-recipient receipt and stays
+            # null unless an adapter reports it — never inferred from room
+            # acceptance. A first request appends the entry; a retry of
+            # the same pending record (same attempt) re-uses it — the
+            # entry's previous physical outcome is demoted into
+            # `retries` and the entry is re-pointed at the new outcome,
+            # so the log never grows a second entry per attempt.
+            outcome_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            log_entries = record.setdefault("notification_log", [])
+            folded_entry = None
+            for entry in reversed(log_entries):
+                if isinstance(entry, dict) and int(entry.get("attempt") or 0) == attempt:
+                    folded_entry = entry
+                    break
+            if folded_entry is not None:
+                previous_outcome: dict[str, Any] = {
+                    "ts": folded_entry.get("ts"),
+                    "room_accepted": bool(folded_entry.get("room_accepted")),
+                    "channel_accepted": folded_entry.get("channel_accepted"),
+                }
+                if folded_entry.get("error"):
+                    previous_outcome["error"] = str(folded_entry["error"])[:300]
+                folded_entry.setdefault("retries", []).append(previous_outcome)
+                folded_entry["ts"] = outcome_ts
+                folded_entry["room_accepted"] = bool(notification.get("sent"))
+                folded_entry["channel_accepted"] = notification.get("channel_accepted")
+                folded_entry.pop("error", None)
+                if notification.get("error"):
+                    folded_entry["error"] = str(notification["error"])[:300]
+            else:
+                new_entry: dict[str, Any] = {
+                    "attempt": attempt,
+                    "ts": outcome_ts,
+                    "room_accepted": bool(notification.get("sent")),
+                    "channel_accepted": notification.get("channel_accepted"),
+                    "retries": list(notification.get("retries") or []),
+                }
+                if notification.get("error"):
+                    new_entry["error"] = str(notification["error"])[:300]
+                log_entries.append(new_entry)
+            _write_task(arguments, task)
+            # The outcome write above is local only: push it, so the
+            # shared snapshot carries the notification_log and the
+            # eventId the send produced. A failed push never rolls the
+            # eventId back — a retry takes the reuse path and only
+            # re-syncs, never re-sending the Matrix event.
+            synced = _sync_task(arguments, task_id, exclude=["spec.md", "base/"])
+            if not synced:
+                if notification.get("sent"):
+                    sync_error = (
+                        "shared storage sync failed after the attention "
+                        "notification was sent; the outcome and the eventId "
+                        "are recorded locally. Retry request_attention "
+                        "(idempotent: the recorded Matrix event is not "
+                        "re-sent — only the sync is retried)."
+                    )
+                else:
+                    sync_error = (
+                        "shared storage sync failed after the attention "
+                        "send attempt; the outcome is recorded locally. "
+                        "Retry request_attention (idempotent: the pending "
+                        "record is reused — no second record, no second "
+                        "event)."
+                    )
+                return {
+                    "ok": False,
+                    "retryable": True,
+                    "tool": "taskflow",
+                    "action": action,
+                    "task": task,
+                    "attention": {
+                        "kind": kind,
+                        "attempt": attempt,
+                        "notification": notification,
+                    },
+                    "synced": False,
+                    "statePersisted": True,
+                    "error": sync_error,
+                }
             return {
                 "ok": True,
                 "tool": "taskflow",

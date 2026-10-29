@@ -2192,7 +2192,10 @@ Dir.mktmpdir("teamharness-taskflow-") do |dir|
     nv_plain_records = [it for it in (nv_plain_meta.get("attention") or []) if it.get("kind") == "approval"]
     if len(nv_plain_records) != 1:
         raise AssertionError(f"expected exactly one approval record: {nv_plain_meta.get('attention')!r}")
-    legacy_keys = {"kind", "question", "attempt", "requestedAt", "resolved", "eventId"}
+    # notification_log is the S4a outcome entry: it is always present on a
+    # record that went through the notification stage, independent of the
+    # optional S0 fields this shape check guards.
+    legacy_keys = {"kind", "question", "attempt", "requestedAt", "resolved", "eventId", "notification_log"}
     if not set(nv_plain_records[0].keys()) <= legacy_keys:
         raise AssertionError(f"omitted fields must keep the legacy record shape: {nv_plain_records[0]!r}")
     if any(key in nv_plain_records[0] for key in ("options", "suggested", "expiresAt")):
