@@ -141,6 +141,98 @@ _controller_storage_prefix() {
         printf '%s' 'agentteams/agentteams-storage'
     fi
 }
+
+# ============================================================
+# Controller storage env (embedded architecture)
+#
+# Resolves the controller's storage backend from the environment and
+# fills _CONTROLLER_STORAGE_ENV_ARGS with one "-e KEY=VALUE" pair per
+# entry:
+#   AGENTTEAMS_STORAGE_PROVIDER  minio (embedded, default) | s3 (external)
+#   AGENTTEAMS_FS_ENDPOINT       external endpoint (must start with http:// or https://)
+#   AGENTTEAMS_FS_BUCKET         external bucket
+#   AGENTTEAMS_FS_ACCESS_KEY     access key (falls back to the embedded MinIO credentials)
+#   AGENTTEAMS_FS_SECRET_KEY     secret key (falls back to the embedded MinIO credentials)
+#
+# minio: values are byte-identical to the pre-existing hardcoded env.
+# s3:    MINIO_ENDPOINT/MINIO_BUCKET mirror the external endpoint and
+#        bucket so no fallback path can point back at 127.0.0.1; the
+#        MINIO_USER/MINIO_PASSWORD pairs keep their generated values
+#        (the embedded MinIO is unused in this mode).
+#
+# Dies on invalid input (bad provider, incomplete s3 config) so the
+# failure happens before any container is started.
+# ============================================================
+
+_controller_storage_env_args() {
+    local version="${AGENTTEAMS_VERSION:-latest}"
+    local prefix storage_prefix
+    prefix="$(_controller_env_prefix "${version}")"
+    storage_prefix="$(_controller_storage_prefix "${version}")"
+
+    _CONTROLLER_STORAGE_ENV_ARGS=()
+
+    local provider="${AGENTTEAMS_STORAGE_PROVIDER:-minio}"
+    case "${provider}" in
+        minio|s3) ;;
+        *) die "Invalid AGENTTEAMS_STORAGE_PROVIDER '${provider}'. Allowed values: minio, s3." ;;
+    esac
+
+    if _use_legacy_image_env "${version}"; then
+        if [ "${provider}" = "s3" ]; then
+            die "external S3 requires a modern image (>= v1.1.0); AGENTTEAMS_VERSION=${version} is a legacy image."
+        fi
+        # Legacy images keep today's hardcoded embedded-MinIO env.
+        _CONTROLLER_STORAGE_ENV_ARGS+=("-e ${prefix}MINIO_ENDPOINT=http://127.0.0.1:9000")
+        _CONTROLLER_STORAGE_ENV_ARGS+=("-e ${prefix}MINIO_BUCKET=agentteams-storage")
+        _CONTROLLER_STORAGE_ENV_ARGS+=("-e ${prefix}STORAGE_PREFIX=${storage_prefix}")
+        _CONTROLLER_STORAGE_ENV_ARGS+=("-e ${prefix}FS_ENDPOINT=http://127.0.0.1:9000")
+        _CONTROLLER_STORAGE_ENV_ARGS+=("-e ${prefix}FS_BUCKET=agentteams-storage")
+        return 0
+    fi
+
+    local endpoint bucket ak sk
+    if [ "${provider}" = "s3" ]; then
+        endpoint="${AGENTTEAMS_FS_ENDPOINT:-}"
+        bucket="${AGENTTEAMS_FS_BUCKET:-}"
+        ak="${AGENTTEAMS_FS_ACCESS_KEY:-${AGENTTEAMS_MINIO_USER:-}}"
+        sk="${AGENTTEAMS_FS_SECRET_KEY:-${AGENTTEAMS_MINIO_PASSWORD:-}}"
+
+        local missing=""
+        [ -n "${endpoint}" ] || missing="${missing} AGENTTEAMS_FS_ENDPOINT"
+        [ -n "${bucket}" ] || missing="${missing} AGENTTEAMS_FS_BUCKET"
+        [ -n "${ak}" ] || missing="${missing} AGENTTEAMS_FS_ACCESS_KEY"
+        [ -n "${sk}" ] || missing="${missing} AGENTTEAMS_FS_SECRET_KEY"
+        case "${endpoint}" in
+            http://*|https://*) ;;
+            *) missing="${missing} AGENTTEAMS_FS_ENDPOINT (missing http:// or https:// scheme)" ;;
+        esac
+        if [ -n "${missing}" ]; then
+            die "AGENTTEAMS_STORAGE_PROVIDER=s3 requires:${missing}. Example: AGENTTEAMS_STORAGE_PROVIDER=s3 AGENTTEAMS_FS_ENDPOINT=http://rustfs:9000 AGENTTEAMS_FS_BUCKET=agentteams-storage AGENTTEAMS_FS_ACCESS_KEY=<access-key> AGENTTEAMS_FS_SECRET_KEY=<secret-key>"
+        fi
+    else
+        # minio: embedded MinIO, byte-identical values to the pre-existing
+        # hardcoded env; endpoint/bucket overrides are ignored in this mode.
+        endpoint="http://127.0.0.1:9000"
+        bucket="agentteams-storage"
+        ak="${AGENTTEAMS_FS_ACCESS_KEY:-${AGENTTEAMS_MINIO_USER:-}}"
+        sk="${AGENTTEAMS_FS_SECRET_KEY:-${AGENTTEAMS_MINIO_PASSWORD:-}}"
+    fi
+
+    _CONTROLLER_STORAGE_ENV_ARGS+=("-e ${prefix}STORAGE_PROVIDER=${provider}")
+    _CONTROLLER_STORAGE_ENV_ARGS+=("-e ${prefix}MINIO_ENDPOINT=${endpoint}")
+    _CONTROLLER_STORAGE_ENV_ARGS+=("-e ${prefix}MINIO_BUCKET=${bucket}")
+    _CONTROLLER_STORAGE_ENV_ARGS+=("-e ${prefix}FS_ENDPOINT=${endpoint}")
+    _CONTROLLER_STORAGE_ENV_ARGS+=("-e ${prefix}FS_BUCKET=${bucket}")
+    if [ -n "${ak}" ]; then
+        _CONTROLLER_STORAGE_ENV_ARGS+=("-e ${prefix}FS_ACCESS_KEY=${ak}")
+    fi
+    if [ -n "${sk}" ]; then
+        _CONTROLLER_STORAGE_ENV_ARGS+=("-e ${prefix}FS_SECRET_KEY=${sk}")
+    fi
+    _CONTROLLER_STORAGE_ENV_ARGS+=("-e ${prefix}STORAGE_PREFIX=${storage_prefix}")
+    return 0
+}
 AGENTTEAMS_NON_INTERACTIVE="${AGENTTEAMS_NON_INTERACTIVE:-0}"
 AGENTTEAMS_MOUNT_SOCKET="${AGENTTEAMS_MOUNT_SOCKET:-1}"
 AGENTTEAMS_DOCKER_PROXY="${AGENTTEAMS_DOCKER_PROXY:-1}"
@@ -152,7 +244,7 @@ STEP_RESULT=""  # Used by state machine to signal "back" navigation
 
 AGENTTEAMS_LOG_FILE="${HOME}/agentteams-install.log"
 
-if [ "${1:-}" != "uninstall" ]; then
+if [ "${1:-}" != "uninstall" ] && [ "${1:-}" != "--print-controller-env" ] && [ "${AGENTTEAMS_PRINT_CONTROLLER_ENV:-0}" != "1" ]; then
     # Redirect all output (stdout and stderr) to both terminal and log file
     exec > >(tee -a "${AGENTTEAMS_LOG_FILE}") 2>&1
 
@@ -183,6 +275,24 @@ die() {
     error "$1"
     exit 1
 }
+
+# ============================================================
+# Read-only preview: print the controller storage env and exit.
+# Triggered by AGENTTEAMS_PRINT_CONTROLLER_ENV=1 or the
+# --print-controller-env argument. The log-file redirection above
+# is skipped in this mode, and everything below (timezone/language
+# detection, argument dispatch, Docker) never runs: no root, no
+# Docker, no prompts, no log file. Validation failures exit
+# non-zero via die().
+# ============================================================
+if [ "${AGENTTEAMS_PRINT_CONTROLLER_ENV:-0}" = "1" ] || [ "${1:-}" = "--print-controller-env" ]; then
+    AGENTTEAMS_VERSION="${AGENTTEAMS_VERSION:-latest}"
+    _controller_storage_env_args
+    for _arg in "${_CONTROLLER_STORAGE_ENV_ARGS[@]}"; do
+        printf '%s\n' "${_arg}"
+    done
+    exit 0
+fi
 
 # ============================================================
 # Timezone detection (compatible with Linux and macOS)
@@ -4227,8 +4337,6 @@ CREDEOF
         # Controller env args
         local _ctrl_env_prefix
         _ctrl_env_prefix="$(_controller_env_prefix "${AGENTTEAMS_VERSION}")"
-        local _storage_prefix
-        _storage_prefix="$(_controller_storage_prefix "${AGENTTEAMS_VERSION}")"
         local _ctrl_env_args=(
             -e "${_ctrl_env_prefix}ADMIN_USER=${AGENTTEAMS_ADMIN_USER}"
             -e "${_ctrl_env_prefix}ADMIN_PASSWORD=${AGENTTEAMS_ADMIN_PASSWORD}"
@@ -4252,10 +4360,6 @@ CREDEOF
             -e "${_ctrl_env_prefix}ELEMENT_HOMESERVER_URL=http://127.0.0.1:${AGENTTEAMS_PORT_GATEWAY}"
             -e "${_ctrl_env_prefix}MATRIX_URL=http://127.0.0.1:6167"
             -e "${_ctrl_env_prefix}MATRIX_E2EE=${AGENTTEAMS_MATRIX_E2EE:-0}"
-            -e "${_ctrl_env_prefix}MINIO_ENDPOINT=http://127.0.0.1:9000"
-            -e "${_ctrl_env_prefix}MINIO_BUCKET=agentteams-storage"
-            -e "${_ctrl_env_prefix}STORAGE_PREFIX=${_storage_prefix}"
-            -e "${_ctrl_env_prefix}FS_ENDPOINT=http://127.0.0.1:9000"
             -e "${_ctrl_env_prefix}AI_GATEWAY_URL=http://${_aigw_domain}"
             -e "${_ctrl_env_prefix}CONTROLLER_URL=http://agentteams-controller:8090"
             -e "${_ctrl_env_prefix}DOCKER_NETWORK=agentteams-net"
@@ -4266,7 +4370,6 @@ CREDEOF
         )
         if _use_legacy_image_env "${AGENTTEAMS_VERSION}"; then
             _ctrl_env_args+=(
-                -e "${_ctrl_env_prefix}FS_BUCKET=agentteams-storage"
                 -e "${_ctrl_env_prefix}RESOURCE_PREFIX=agentteams-"
             )
         else
@@ -4276,6 +4379,12 @@ CREDEOF
                 -e "${_ctrl_env_prefix}MATRIX_APPSERVICE_HS_TOKEN=${AGENTTEAMS_MATRIX_APPSERVICE_HS_TOKEN:-}"
             )
         fi
+
+        # Storage backend env (provider / endpoint / bucket / credentials),
+        # resolved and validated up front — invalid input dies before any
+        # container is started.
+        _controller_storage_env_args
+        _ctrl_env_args+=("${_CONTROLLER_STORAGE_ENV_ARGS[@]}")
 
         # Timezone
         if [ -n "${AGENTTEAMS_TIMEZONE:-}" ]; then
