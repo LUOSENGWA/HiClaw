@@ -333,3 +333,128 @@ def test_legacy_call_keeps_legacy_shape(tmp_path, monkeypatch):
     # fields stay absent.
     assert set(record.keys()) <= legacy_keys | {"notification_log"}
     assert not ({"options", "suggested", "timeoutAt", "expiresAt"} & set(record.keys()))
+
+
+def _sync_double(
+    workspace: Path, outcomes: list[bool]
+) -> tuple[Any, list[dict[str, Any]]]:
+    """A snapshotting _sync_task stand-in.
+
+    ``outcomes`` is the per-push return value by call index (the last
+    one repeats once exhausted). Every push snapshots the on-disk task
+    meta as it stands at that moment, so a test can assert what the
+    shared storage actually received.
+    """
+    snapshots: list[dict[str, Any]] = []
+    calls = {"n": 0}
+
+    def sync(arguments: Any, task_id: str, **kwargs: Any) -> bool:
+        index = calls["n"]
+        calls["n"] += 1
+        ok = outcomes[index] if index < len(outcomes) else outcomes[-1]
+        snapshots.append(_read_task(workspace, task_id))
+        return ok
+
+    return sync, snapshots
+
+
+def test_notification_outcome_is_pushed_after_send(tmp_path, monkeypatch):
+    workspace, task_id = _prepare(tmp_path, monkeypatch, notify=lambda *a, **k: _sent())
+    sync, snapshots = _sync_double(workspace, [True])
+    monkeypatch.setattr(server, "_sync_task", sync)
+    result = server._taskflow(
+        _arguments(workspace, taskId=task_id, kind="approval", question="Approve?")
+    )
+    assert result["ok"] is True, result
+    assert result["synced"] is True, result
+    # Two pushes: the pre-send push (record without the send outcome)
+    # and the post-send push that must carry it.
+    assert len(snapshots) == 2, snapshots
+    first_push = snapshots[0]["attention"][-1]
+    assert "eventId" not in first_push
+    assert "notification_log" not in first_push
+    pushed = snapshots[1]["attention"][-1]
+    assert pushed["eventId"] == "$evt1"
+    assert pushed["notification_log"][-1]["room_accepted"] is True
+
+
+def test_post_send_sync_failure_is_retryable_without_resend(tmp_path, monkeypatch):
+    send_calls: list[Any] = []
+
+    def notify(arguments, **kwargs):
+        send_calls.append(kwargs.get("attempt"))
+        return _sent()
+
+    workspace, task_id = _prepare(tmp_path, monkeypatch, notify=notify)
+    # Push 1 (pre-send) succeeds, push 2 (post-send) fails; pushes after
+    # storage recovery succeed.
+    sync, snapshots = _sync_double(workspace, [True, False, True])
+    monkeypatch.setattr(server, "_sync_task", sync)
+    first = server._taskflow(
+        _arguments(workspace, taskId=task_id, kind="approval", question="Approve?")
+    )
+    assert first["ok"] is False, first
+    assert first["retryable"] is True, first
+    assert first["synced"] is False, first
+    # The eventId is recorded locally and is never rolled back on the
+    # failed push ...
+    on_disk = _read_task(workspace, task_id)
+    record = on_disk["attention"][-1]
+    assert record["eventId"] == "$evt1"
+    assert record["notification_log"][-1]["room_accepted"] is True
+    # ... and the retry only re-syncs: the notifier is not called again.
+    second = server._taskflow(
+        _arguments(workspace, taskId=task_id, kind="approval", question="Approve?")
+    )
+    assert second["ok"] is True, second
+    assert second["synced"] is True, second
+    assert (second.get("attention") or {}).get("reused") is True, second
+    assert send_calls == [1], send_calls
+    # The recovered push carries the outcome the failed one left behind.
+    final_push = snapshots[-1]["attention"][-1]
+    assert final_push["eventId"] == "$evt1"
+    assert final_push["notification_log"][-1]["room_accepted"] is True
+
+
+def test_retry_folds_into_single_log_entry(tmp_path, monkeypatch):
+    outcomes = {"send": False}
+
+    def notify(arguments, **kwargs):
+        if outcomes["send"]:
+            return _sent()
+        return {"sent": False, "error": "Matrix API error: HTTP 503"}
+
+    workspace, task_id = _prepare(tmp_path, monkeypatch, notify=notify)
+    first = server._taskflow(
+        _arguments(workspace, taskId=task_id, kind="approval", question="Approve?")
+    )
+    assert first["ok"] is True, first
+    failed = first["task"]["attention"][-1]["notification_log"][-1]
+    assert failed["room_accepted"] is False
+    assert "HTTP 503" in failed["error"]
+
+    outcomes["send"] = True
+    second = server._taskflow(
+        _arguments(workspace, taskId=task_id, kind="approval", question="Approve?")
+    )
+    assert second["ok"] is True, second
+    record = second["task"]["attention"][-1]
+    log = record["notification_log"]
+    # One entry per logical attempt: the retry did not append a second
+    # attempt=1 entry.
+    assert len(log) == 1, log
+    entry = log[0]
+    assert entry["attempt"] == 1
+    assert entry["room_accepted"] is True
+    assert "error" not in entry
+    # The failed physical attempt was folded into retries[] with its
+    # error.
+    assert len(entry["retries"]) == 1, entry
+    folded = entry["retries"][0]
+    assert folded["room_accepted"] is False
+    assert "HTTP 503" in folded["error"]
+    # The record carries the event id of the successful send ...
+    assert record["eventId"] == "$evt1"
+    # ... and the folded shape is what was persisted.
+    on_disk = _read_task(workspace, task_id)
+    assert len(on_disk["attention"][-1]["notification_log"]) == 1

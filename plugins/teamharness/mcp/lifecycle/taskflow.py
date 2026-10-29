@@ -1186,6 +1186,39 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 ):
                     continue
                 if existing.get("eventId"):
+                    # Sync-first, like the resolved close: when the
+                    # original post-send push failed, the recorded
+                    # eventId/outcome is still local-only. Push it before
+                    # reporting success — a retry of an already-notified
+                    # record must never re-send the Matrix event.
+                    event_id = str(existing["eventId"])
+                    synced = _sync_task(arguments, task_id, exclude=["spec.md", "base/"])
+                    if not synced:
+                        return {
+                            "ok": False,
+                            "retryable": True,
+                            "tool": "taskflow",
+                            "action": action,
+                            "task": task,
+                            "attention": {
+                                "kind": kind,
+                                "reused": True,
+                                "notification": {
+                                    "sent": True,
+                                    "eventId": event_id,
+                                    "reused": True,
+                                },
+                            },
+                            "synced": False,
+                            "statePersisted": True,
+                            "error": (
+                                "shared storage sync failed while re-syncing "
+                                f"the already-notified attention record of kind "
+                                f"'{kind}'; the Matrix event ({event_id}) is not "
+                                "re-sent. Retry request_attention (idempotent: "
+                                "only the sync is retried)."
+                            ),
+                        }
                     return {
                         "ok": True,
                         "tool": "taskflow",
@@ -1196,7 +1229,7 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                             "reused": True,
                             "notification": {
                                 "sent": True,
-                                "eventId": str(existing["eventId"]),
+                                "eventId": event_id,
                                 "reused": True,
                             },
                         },
@@ -1305,23 +1338,87 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         if notification.get("sent"):
                             record["eventId"] = notification.get("eventId")
             # S4a notification outcome persistence (#1394): one durable
-            # entry per logical attempt, written with the main record in
-            # the same _write_task as the send result. `room_accepted` is
-            # Matrix's acceptance of the room event; `channel_accepted` is
-            # the per-recipient receipt and stays null unless an adapter
-            # reports it — never inferred from room acceptance. Network
-            # retries inside one attempt are folded into `retries`.
-            log_entry: dict[str, Any] = {
-                "attempt": attempt,
-                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "room_accepted": bool(notification.get("sent")),
-                "channel_accepted": notification.get("channel_accepted"),
-                "retries": list(notification.get("retries") or []),
-            }
-            if notification.get("error"):
-                log_entry["error"] = str(notification["error"])[:300]
-            record.setdefault("notification_log", []).append(log_entry)
+            # entry per logical attempt (one Matrix transaction id).
+            # `room_accepted` is Matrix's acceptance of the room event;
+            # `channel_accepted` is the per-recipient receipt and stays
+            # null unless an adapter reports it — never inferred from room
+            # acceptance. A first request appends the entry; a retry of
+            # the same pending record (same attempt) re-uses it — the
+            # entry's previous physical outcome is demoted into
+            # `retries` and the entry is re-pointed at the new outcome,
+            # so the log never grows a second entry per attempt.
+            outcome_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            log_entries = record.setdefault("notification_log", [])
+            folded_entry = None
+            for entry in reversed(log_entries):
+                if isinstance(entry, dict) and int(entry.get("attempt") or 0) == attempt:
+                    folded_entry = entry
+                    break
+            if folded_entry is not None:
+                previous_outcome: dict[str, Any] = {
+                    "ts": folded_entry.get("ts"),
+                    "room_accepted": bool(folded_entry.get("room_accepted")),
+                    "channel_accepted": folded_entry.get("channel_accepted"),
+                }
+                if folded_entry.get("error"):
+                    previous_outcome["error"] = str(folded_entry["error"])[:300]
+                folded_entry.setdefault("retries", []).append(previous_outcome)
+                folded_entry["ts"] = outcome_ts
+                folded_entry["room_accepted"] = bool(notification.get("sent"))
+                folded_entry["channel_accepted"] = notification.get("channel_accepted")
+                folded_entry.pop("error", None)
+                if notification.get("error"):
+                    folded_entry["error"] = str(notification["error"])[:300]
+            else:
+                new_entry: dict[str, Any] = {
+                    "attempt": attempt,
+                    "ts": outcome_ts,
+                    "room_accepted": bool(notification.get("sent")),
+                    "channel_accepted": notification.get("channel_accepted"),
+                    "retries": list(notification.get("retries") or []),
+                }
+                if notification.get("error"):
+                    new_entry["error"] = str(notification["error"])[:300]
+                log_entries.append(new_entry)
             _write_task(arguments, task)
+            # The outcome write above is local only: push it, so the
+            # shared snapshot carries the notification_log and the
+            # eventId the send produced. A failed push never rolls the
+            # eventId back — a retry takes the reuse path and only
+            # re-syncs, never re-sending the Matrix event.
+            synced = _sync_task(arguments, task_id, exclude=["spec.md", "base/"])
+            if not synced:
+                if notification.get("sent"):
+                    sync_error = (
+                        "shared storage sync failed after the attention "
+                        "notification was sent; the outcome and the eventId "
+                        "are recorded locally. Retry request_attention "
+                        "(idempotent: the recorded Matrix event is not "
+                        "re-sent — only the sync is retried)."
+                    )
+                else:
+                    sync_error = (
+                        "shared storage sync failed after the attention "
+                        "send attempt; the outcome is recorded locally. "
+                        "Retry request_attention (idempotent: the pending "
+                        "record is reused — no second record, no second "
+                        "event)."
+                    )
+                return {
+                    "ok": False,
+                    "retryable": True,
+                    "tool": "taskflow",
+                    "action": action,
+                    "task": task,
+                    "attention": {
+                        "kind": kind,
+                        "attempt": attempt,
+                        "notification": notification,
+                    },
+                    "synced": False,
+                    "statePersisted": True,
+                    "error": sync_error,
+                }
             return {
                 "ok": True,
                 "tool": "taskflow",
