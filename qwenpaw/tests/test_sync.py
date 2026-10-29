@@ -565,3 +565,96 @@ def test_sync_status_reports_unpushed(tmp_path: Path) -> None:
         {"root": "worker", "path": "state.txt", "status": "modified"}
     ]
     assert status["tracked"]["worker"] == 1
+
+
+def test_mirror_all_restores_after_network_error(tmp_path: Path, monkeypatch) -> None:
+    """A partial mirror failure must not leave the older remote copy behind."""
+    sync = _sync(tmp_path)
+    sync.local_dir.mkdir(parents=True)
+    state = sync.local_dir / "state.txt"
+    state.write_text("local-new", encoding="utf-8")
+    _write_manifest(
+        sync,
+        {"state.txt": {"sha256": hashlib.sha256(b"old-pushed").hexdigest(),
+                       "pushed_at": 1.0}},
+    )
+    monkeypatch.setattr(sync, "ensure_alias", lambda: None)
+
+    def fake_mc(*args, **_kwargs):
+        if args and args[0] == "mirror" and "agents/worker-a/" in args[1]:
+            (Path(args[2]) / "state.txt").write_text("remote-old", encoding="utf-8")
+            raise subprocess.CalledProcessError(
+                1, args, stderr="net error: connection refused"
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(sync, "_mc", fake_mc)
+
+    with pytest.raises(RuntimeError, match="mirror storage failed"):
+        sync.mirror_all()
+
+    assert state.read_text(encoding="utf-8") == "local-new"
+
+
+def test_mirror_all_restores_after_missing_object_error(tmp_path: Path, monkeypatch) -> None:
+    """The empty-prefix branch returns normally and must restore too."""
+    sync = _sync(tmp_path)
+    sync.local_dir.mkdir(parents=True)
+    state = sync.local_dir / "state.txt"
+    state.write_text("local-new", encoding="utf-8")
+    _write_manifest(
+        sync,
+        {"state.txt": {"sha256": hashlib.sha256(b"old-pushed").hexdigest(),
+                       "pushed_at": 1.0}},
+    )
+    monkeypatch.setattr(sync, "ensure_alias", lambda: None)
+
+    def fake_mc(*args, **_kwargs):
+        if args and args[0] == "mirror" and "agents/worker-a/" in args[1]:
+            (Path(args[2]) / "state.txt").write_text("remote-old", encoding="utf-8")
+            raise subprocess.CalledProcessError(
+                1, args, stderr="Object does not exist"
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(sync, "_mc", fake_mc)
+
+    sync.mirror_all()  # must return normally, not raise
+
+    assert state.read_text(encoding="utf-8") == "local-new"
+
+
+def test_push_manifest_survives_restart(tmp_path: Path, monkeypatch) -> None:
+    """A new FileSync instance (process restart) still sees pushed state."""
+    sync = _sync(tmp_path)
+    sync.local_dir.mkdir(parents=True)
+    state = sync.local_dir / "state.txt"
+    state.write_text("v1", encoding="utf-8")
+    monkeypatch.setattr(sync, "ensure_alias", lambda: None)
+    monkeypatch.setattr(
+        sync, "_mc",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(sync, "_cat_bytes", lambda key: None)
+
+    assert sync.push_paths([state]) == ["state.txt"]
+
+    # Simulate a process restart: a brand-new instance over the same dirs.
+    restarted = _sync(tmp_path)
+    status = restarted.sync_status()
+    assert status["tracked"]["worker"] == 1
+    assert status["unpushed"] == []
+
+    # The restarted mirror must not lose the pushed file.
+    monkeypatch.setattr(restarted, "ensure_alias", lambda: None)
+
+    def fake_mc(*args, **_kwargs):
+        if args and args[0] == "mirror" and "agents/worker-a/" in args[1]:
+            (Path(args[2]) / "state.txt").write_text("v1", encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(restarted, "_mc", fake_mc)
+
+    restarted.mirror_all()
+
+    assert state.read_text(encoding="utf-8") == "v1"

@@ -378,7 +378,11 @@ class FileSync:
                 logger.info("storage prefix is empty component=sync remote=%s", remote)
                 return
             raise RuntimeError(f"mirror storage failed: {_mc_error_message(exc)}") from None
-        self._restore_protected(local_dir, protected)
+        finally:
+            # #1391: restore on every outcome — a partial mirror failure or
+            # the empty-prefix branch must not leave the older remote copy
+            # over an unpushed local write.
+            self._restore_protected(local_dir, protected)
         logger.info(
             "mirrored storage prefix component=sync worker=%s remote=%s local=%s",
             self.worker_name,
