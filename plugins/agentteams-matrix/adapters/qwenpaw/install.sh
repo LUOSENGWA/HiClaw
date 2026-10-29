@@ -8,7 +8,11 @@
 #
 # Re-running with unchanged content is a no-op: no file is rewritten and the
 # marker is left untouched. Re-running after a payload change updates only
-# the files whose content changed.
+# the files whose content changed and removes the files the previous marker
+# recorded that the new payload no longer contains (plus the directories
+# that become empty), so the marker always describes exactly what the
+# installer owns and uninstall never leaves an installer-owned file behind.
+# Files the installer never wrote are never touched.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,6 +78,13 @@ if marker_path.is_file():
     except ValueError:
         installed = None
 
+# Files the previous install owned, used to reconcile files the new payload
+# no longer contains. A missing or malformed field means nothing is known
+# to be owned, so nothing is removed.
+previous = installed.get("files") if isinstance(installed, dict) else None
+if not isinstance(previous, dict):
+    previous = {}
+
 up_to_date = (
     installed is not None
     and installed.get("contentHash") == expected
@@ -99,6 +110,28 @@ for rel, sha in sorted(entries.items()):
     shutil.copy2(src, dst)
     changed += 1
 
+# Reconcile ownership: a file the previous marker recorded but the new
+# payload no longer contains is installer-owned residue — remove it (and
+# prune the directories that become empty) so the new marker, which
+# records only the current payload, stays complete for uninstall. Only
+# paths the previous marker recorded are ever removed; user files are
+# untouched.
+removed = 0
+for rel in sorted(set(previous) - set(entries)):
+    path = target_dir / rel
+    if not path.is_file():
+        continue
+    path.unlink()
+    removed += 1
+    parts = Path(rel).parts
+    for depth in range(len(parts) - 1, 0, -1):
+        try:
+            target_dir.joinpath(*parts[:depth]).rmdir()
+        except OSError:
+            # The directory still holds files (installer or user) or is
+            # gone; either way there is nothing to prune.
+            pass
+
 marker = {
     "schemaVersion": 1,
     "bundle": BUNDLE_ID,
@@ -111,5 +144,9 @@ marker_path.parent.mkdir(parents=True, exist_ok=True)
 tmp = marker_path.with_name(marker_path.name + ".tmp")
 tmp.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 tmp.replace(marker_path)
+if removed:
+    print(
+        f"agentteams-matrix qwenpaw adapter: removed {removed} file(s) no longer in the payload from {target_dir}"
+    )
 print(f"agentteams-matrix qwenpaw adapter: installed {changed} file(s) to {target_dir}")
 PY

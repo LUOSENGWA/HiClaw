@@ -134,3 +134,81 @@ def test_qwenpaw_install_keeps_legacy_identity(tmp_path: Path) -> None:
             f"qwenpaw plugin uninstall failed: "
             f"{result.stdout}\n{result.stderr}"
         )
+
+
+def test_reinstall_after_native_uninstall(tmp_path: Path) -> None:
+    """A native ``qwenpaw plugin uninstall`` removes the installed plugin
+    directory but leaves the bundle marker behind. The next install must
+    verify the installed payload and reinstall, not take the marker's
+    no-op path and report "up to date".
+    """
+    if shutil.which("qwenpaw") is None or shutil.which("ruby") is None:
+        pytest.skip(
+            "qwenpaw CLI and ruby are required for the native-uninstall "
+            "reinstall test; neither is installed in this environment"
+        )
+
+    # Iron rule: qwenpaw always points at a throwaway working directory.
+    working_dir = tmp_path / "qwenpaw-workdir"
+    working_dir.mkdir()
+    env = dict(os.environ)
+    env["QWENPAW_WORKING_DIR"] = str(working_dir)
+    env["OUT_DIR"] = str(tmp_path / "dist")
+    env["PYTHONPYCACHEPREFIX"] = str(tmp_path / "pycache")
+    env.pop("TEAMHARNESS_INSTALL_LOG", None)
+
+    install = BUNDLE_DIR / "adapters" / "qwenpaw" / "install.sh"
+    plugin_dir = working_dir / "plugins" / EXPECTED_PLUGIN_ID
+    marker = working_dir / ".agentteams" / "teamharness" / "installed.json"
+
+    # 1. Install through the bundle script (real CLI, real build).
+    result = subprocess.run(
+        ["bash", str(install)],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"install failed: {result.stdout}\n{result.stderr}"
+    )
+    assert (plugin_dir / "plugin.json").is_file()
+    recorded = json.loads(marker.read_text(encoding="utf-8"))
+    assert recorded["pluginDir"] == str(plugin_dir)
+    assert recorded["files"]["plugin.json"]
+
+    # 2. Native uninstall: the CLI removes the plugin directory, the
+    #    bundle marker survives.
+    result = subprocess.run(
+        ["qwenpaw", "plugin", "uninstall", EXPECTED_PLUGIN_ID],
+        cwd=REPO_ROOT,
+        env=env,
+        input="y\n",
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"qwenpaw plugin uninstall failed: {result.stdout}\n{result.stderr}"
+    )
+    assert not plugin_dir.exists()
+    assert marker.is_file(), "native uninstall is expected to keep the marker"
+
+    # 3. Reinstall: the stale marker must not take the no-op path.
+    result = subprocess.run(
+        ["bash", str(install)],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"reinstall failed: {result.stdout}\n{result.stderr}"
+    )
+    assert "up to date" not in result.stdout
+    assert (plugin_dir / "plugin.json").is_file()

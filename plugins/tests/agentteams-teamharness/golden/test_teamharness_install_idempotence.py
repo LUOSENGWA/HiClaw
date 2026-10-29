@@ -19,8 +19,23 @@ UNINSTALL = BUNDLE_DIR / "scripts" / "uninstall.sh"
 
 
 def _make_fake_qwenpaw(bin_dir: Path, call_log: Path) -> None:
+    # Emulates the real CLI's file behaviour (verified against the real
+    # qwenpaw CLI): `plugin install <dir>` copies the package contents to
+    # ${QWENPAW_WORKING_DIR}/plugins/teamharness and `plugin uninstall
+    # teamharness` removes that directory, while the installer marker
+    # (owned by the bundle scripts) is left in place by the CLI.
     script = f"""#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$(printf '%s' {call_log})"
+if [ "${{1:-}}" = "plugin" ] && [ "${{2:-}}" = "install" ]; then
+  dest="${{QWENPAW_WORKING_DIR}}/plugins/teamharness"
+  mkdir -p "$dest"
+  cp -R "$3/." "$dest/"
+  exit 0
+fi
+if [ "${{1:-}}" = "plugin" ] && [ "${{2:-}}" = "uninstall" ] && [ "${{3:-}}" = "teamharness" ]; then
+  rm -rf "${{QWENPAW_WORKING_DIR}}/plugins/teamharness"
+  exit 0
+fi
 exit 0
 """
     fake = bin_dir / "qwenpaw"
@@ -81,6 +96,10 @@ def test_install_twice_then_uninstall_twice(tmp_path):
     assert recorded["bundle"] == "agentteams-teamharness"
     assert recorded["pluginId"] == "teamharness"
     assert recorded["contentHash"]
+    plugin_dir = working_dir / "plugins" / "teamharness"
+    assert (plugin_dir / "plugin.json").is_file()
+    assert recorded["pluginDir"] == str(plugin_dir)
+    assert recorded["files"]["plugin.json"]
     first_calls = _read_calls(call_log)
     assert len(first_calls) == 1
     assert first_calls[0].startswith("plugin install ")

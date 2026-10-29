@@ -69,6 +69,15 @@ def _run(script: Path, env: dict) -> None:
     )
 
 
+def _adapter_env(working_dir: Path) -> dict:
+    """Environment for running the adapter scripts directly (no QwenPaw
+    CLI is involved in the Matrix file-level installer)."""
+    env = dict(os.environ)
+    env["QWENPAW_WORKING_DIR"] = str(working_dir)
+    env.pop("TEAMHARNESS_INSTALL_LOG", None)
+    return env
+
+
 def test_install_twice_then_uninstall_twice(tmp_path):
     working_dir = tmp_path / "qwenpaw-workdir"
     working_dir.mkdir()
@@ -161,4 +170,71 @@ def test_install_update_touches_only_changed_files(tmp_path):
     assert (
         "0.1.1"
         in target_file.read_text(encoding="utf-8")
+    )
+
+
+def test_update_removes_owned_file_removed_from_payload(tmp_path):
+    working_dir = tmp_path / "work"
+    working_dir.mkdir()
+    env = _adapter_env(working_dir)
+
+    # Work on a copy of the bundle so the test can mutate the payload.
+    bundle_copy = tmp_path / "bundle"
+    shutil.copytree(BUNDLE_DIR, bundle_copy)
+    adapter_install = bundle_copy / "adapters" / "qwenpaw" / "install.sh"
+
+    plugin_dir = working_dir / "plugins" / PLUGIN_DIRNAME
+    marker_file = (
+        working_dir / ".agentteams" / "agentteams-matrix" / "installed.json"
+    )
+
+    _run(adapter_install, env)
+    removed_rel = "agentteams_matrix/__init__.py"
+    assert (plugin_dir / removed_rel).is_file()
+    recorded = json.loads(marker_file.read_text(encoding="utf-8"))
+    assert recorded["files"][removed_rel]
+
+    # Remove the file from the payload, then update.
+    (bundle_copy / "adapters" / "qwenpaw" / removed_rel).unlink()
+    _run(adapter_install, env)
+
+    # The previously owned file is gone from the install target and from
+    # the marker; the rest of the payload is intact.
+    assert not (plugin_dir / removed_rel).exists()
+    updated = json.loads(marker_file.read_text(encoding="utf-8"))
+    assert removed_rel not in updated["files"]
+    for rel in ("plugin.json", "plugin.py", "agentteams_matrix/channel.py"):
+        assert (plugin_dir / rel).is_file()
+        assert updated["files"][rel]
+
+
+def test_uninstall_preserves_user_files(tmp_path):
+    working_dir = tmp_path / "work"
+    working_dir.mkdir()
+    env = _adapter_env(working_dir)
+
+    bundle_copy = tmp_path / "bundle"
+    shutil.copytree(BUNDLE_DIR, bundle_copy)
+
+    plugin_dir = working_dir / "plugins" / PLUGIN_DIRNAME
+    state_dir = working_dir / ".agentteams" / "agentteams-matrix"
+
+    _run(bundle_copy / "adapters" / "qwenpaw" / "install.sh", env)
+    assert (plugin_dir / "plugin.json").is_file()
+
+    # A user file inside the plugin directory is not installer-owned.
+    user_file = plugin_dir / "notes.txt"
+    user_file.write_text("keep me\n", encoding="utf-8")
+
+    _run(bundle_copy / "adapters" / "qwenpaw" / "uninstall.sh", env)
+
+    assert not (state_dir / "installed.json").exists()
+    assert not plugin_dir.exists() or not any(
+        p.name != "notes.txt" for p in plugin_dir.rglob("*")
+    )
+    assert user_file.is_file(), (
+        "uninstall removed a file the installer never wrote"
+    )
+    assert plugin_dir.is_dir(), (
+        "plugin directory removed although it still holds user files"
     )

@@ -16,8 +16,9 @@ WORKING_DIR="${QWENPAW_WORKING_DIR:-$HOME/.qwenpaw}"
 
 # Content hash of exactly what build-qwenpaw-plugin.rb would package: the
 # manifest, prompts, skills, mcp, the adapter entrypoints, and the version
-# used in the generated plugin.json. When the marker matches this hash, the
-# QwenPaw plugin is already current and the install is a no-op.
+# used in the generated plugin.json. The no-op path requires the marker to
+# match this hash and every recorded installed file to exist in the plugin
+# directory unchanged; otherwise the plugin is rebuilt and reinstalled.
 package_hash="$(python3 - "$TEAMHARNESS_DIR" <<'PY'
 import hashlib
 import sys
@@ -58,10 +59,47 @@ print(digest.hexdigest())
 PY
 )"
 
+# The QwenPaw CLI installs a package under ${WORKING_DIR}/plugins/<plugin id>
+# (verified against the real CLI, which reports the install location as
+# <working dir>/plugins/teamharness). Native `qwenpaw plugin uninstall
+# teamharness` removes this directory but keeps the marker, so the no-op
+# check must verify the installed payload on disk, not only the marker.
+PLUGIN_DIR="${WORKING_DIR}/plugins/teamharness"
 MARKER_FILE="${WORKING_DIR}/.agentteams/teamharness/installed.json"
 if [ -f "$MARKER_FILE" ]; then
-  recorded_hash="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("contentHash",""))' "$MARKER_FILE" 2>/dev/null || true)"
-  if [ "$recorded_hash" = "$package_hash" ]; then
+  up_to_date="$(python3 - "$MARKER_FILE" "$package_hash" "$PLUGIN_DIR" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+marker_path, package_hash, plugin_dir = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+try:
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    print("no")
+    sys.exit(0)
+if not isinstance(marker, dict) or marker.get("contentHash") != package_hash:
+    print("no")
+    sys.exit(0)
+# A marker without the installed file set predates the files field: treat
+# it as stale so one reinstall brings the marker up to date.
+files = marker.get("files")
+if not isinstance(files, dict) or not files:
+    print("no")
+    sys.exit(0)
+if not (plugin_dir / "plugin.json").is_file():
+    print("no")
+    sys.exit(0)
+for rel, sha in files.items():
+    path = plugin_dir / rel
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != sha:
+        print("no")
+        sys.exit(0)
+print("yes")
+PY
+)"
+  if [ "$up_to_date" = "yes" ]; then
     echo "teamharness qwenpaw adapter: up to date (${WORKING_DIR})"
     exit 0
   fi
@@ -98,7 +136,8 @@ fi
 
 qwenpaw plugin install "$package_dir" --force
 
-python3 - "$MARKER_FILE" "$package_hash" "$TEAMHARNESS_DIR" <<'PY'
+python3 - "$MARKER_FILE" "$package_hash" "$TEAMHARNESS_DIR" "$package_dir" "$PLUGIN_DIR" <<'PY'
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -106,12 +145,23 @@ from pathlib import Path
 marker_path = Path(sys.argv[1])
 package_hash = sys.argv[2]
 root = Path(sys.argv[3])
+package_dir = Path(sys.argv[4])
+plugin_dir = Path(sys.argv[5])
 
 version = ""
 for line in (root / "plugin.yaml").read_text(encoding="utf-8").splitlines():
     if line.strip().startswith("version:"):
         version = line.split(":", 1)[1].strip().strip('"').strip("'")
         break
+
+# The installed file set, keyed by path relative to the plugin directory.
+# The no-op check requires every entry to exist with this exact hash, so a
+# plugin removed out-of-band (native uninstall) forces a reinstall.
+files = {
+    path.relative_to(package_dir).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in sorted(package_dir.rglob("*"))
+    if path.is_file()
+}
 
 marker = {
     "schemaVersion": 1,
@@ -120,6 +170,8 @@ marker = {
     "pluginId": "teamharness",
     "version": version,
     "contentHash": package_hash,
+    "pluginDir": str(plugin_dir.resolve()),
+    "files": files,
 }
 marker_path.parent.mkdir(parents=True, exist_ok=True)
 tmp = marker_path.with_name(marker_path.name + ".tmp")
