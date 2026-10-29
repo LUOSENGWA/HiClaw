@@ -658,3 +658,122 @@ def test_push_manifest_survives_restart(tmp_path: Path, monkeypatch) -> None:
     restarted.mirror_all()
 
     assert state.read_text(encoding="utf-8") == "v1"
+
+
+class _FakeRemote:
+    """In-memory object store behind `mc`, enough for push/pull lifecycles."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+
+    def mc(self, *args, **_kwargs):
+        if args and args[0] == "cp":
+            self.objects[args[2]] = Path(args[1]).read_bytes()
+        elif args and args[0] == "mirror":
+            prefix, local = args[1], Path(args[2])
+            for key, data in list(self.objects.items()):
+                if not key.startswith(prefix):
+                    continue
+                target = local / key[len(prefix):]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    def cat(self, key: str):
+        return self.objects.get(key)
+
+
+def test_background_push_records_manifest_and_protects_later_edit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """push_local -> restart -> mirror, with no manifest seeded up front."""
+    sync = _sync(tmp_path)
+    sync.local_dir.mkdir(parents=True)
+    state = sync.local_dir / "state.txt"
+    state.write_text("pushed-old", encoding="utf-8")
+    remote = _FakeRemote()
+
+    monkeypatch.setattr(sync, "ensure_alias", lambda: None)
+    monkeypatch.setattr(sync, "_mc", remote.mc)
+    monkeypatch.setattr(sync, "_cat_bytes", remote.cat)
+
+    assert push_local(sync, since=0) == ["state.txt"]
+    manifest = json.loads(sync.sync_state_path.read_text(encoding="utf-8"))
+    assert manifest["roots"]["worker"]["state.txt"]["sha256"] == (
+        hashlib.sha256(b"pushed-old").hexdigest()
+    )
+
+    # The agent edits after the background push, then the worker restarts.
+    state.write_text("unpushed-new-content", encoding="utf-8")
+    restarted = _sync(tmp_path)
+    monkeypatch.setattr(restarted, "ensure_alias", lambda: None)
+    monkeypatch.setattr(restarted, "_mc", remote.mc)
+    monkeypatch.setattr(restarted, "_cat_bytes", remote.cat)
+
+    restarted.mirror_all()
+
+    assert state.read_text(encoding="utf-8") == "unpushed-new-content"
+
+
+def test_background_push_noop_records_baseline_for_later_edit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Remote bytes already match: no upload, but the baseline must be recorded."""
+    sync = _sync(tmp_path)
+    sync.local_dir.mkdir(parents=True)
+    state = sync.local_dir / "state.txt"
+    state.write_text("same", encoding="utf-8")
+    remote = _FakeRemote()
+    remote.objects["agents/worker-a/state.txt"] = b"same"
+
+    monkeypatch.setattr(sync, "ensure_alias", lambda: None)
+    monkeypatch.setattr(sync, "_mc", remote.mc)
+    monkeypatch.setattr(sync, "_cat_bytes", remote.cat)
+
+    assert push_local(sync, since=0) == []
+    manifest = json.loads(sync.sync_state_path.read_text(encoding="utf-8"))
+    assert manifest["roots"]["worker"]["state.txt"]["sha256"] == (
+        hashlib.sha256(b"same").hexdigest()
+    )
+
+    state.write_text("unpushed-edit", encoding="utf-8")
+    restarted = _sync(tmp_path)
+    monkeypatch.setattr(restarted, "ensure_alias", lambda: None)
+    monkeypatch.setattr(restarted, "_mc", remote.mc)
+    monkeypatch.setattr(restarted, "_cat_bytes", remote.cat)
+
+    restarted.mirror_all()
+
+    assert state.read_text(encoding="utf-8") == "unpushed-edit"
+
+
+def test_push_paths_noop_records_baseline_for_later_edit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An explicit helper whose remote copy already matches still records."""
+    sync = _sync(tmp_path)
+    sync.local_dir.mkdir(parents=True)
+    state = sync.local_dir / "state.txt"
+    state.write_text("same", encoding="utf-8")
+    remote = _FakeRemote()
+    remote.objects["agents/worker-a/state.txt"] = b"same"
+
+    monkeypatch.setattr(sync, "ensure_alias", lambda: None)
+    monkeypatch.setattr(sync, "_mc", remote.mc)
+    monkeypatch.setattr(sync, "_cat_bytes", remote.cat)
+
+    assert sync.push_paths([state]) == []
+    manifest = json.loads(sync.sync_state_path.read_text(encoding="utf-8"))
+    assert manifest["roots"]["worker"]["state.txt"]["sha256"] == (
+        hashlib.sha256(b"same").hexdigest()
+    )
+
+    state.write_text("unpushed-edit", encoding="utf-8")
+    restarted = _sync(tmp_path)
+    monkeypatch.setattr(restarted, "ensure_alias", lambda: None)
+    monkeypatch.setattr(restarted, "_mc", remote.mc)
+    monkeypatch.setattr(restarted, "_cat_bytes", remote.cat)
+
+    restarted.mirror_all()
+
+    assert state.read_text(encoding="utf-8") == "unpushed-edit"

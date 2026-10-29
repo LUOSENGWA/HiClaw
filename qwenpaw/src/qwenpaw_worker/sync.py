@@ -428,6 +428,11 @@ class FileSync:
             if path.stat().st_size <= COMPARE_CONTENT_MAX_BYTES:
                 remote = self._cat_bytes(key)
                 if remote == path.read_bytes():
+                    # #1391: the remote already holds this exact content, so
+                    # the upload is a no-op — but the manifest still needs the
+                    # baseline, otherwise the next local edit looks untracked
+                    # and a pull may overwrite it.
+                    self._record_pushed("worker", rel.as_posix(), path)
                     continue
             try:
                 self._mc("cp", str(path), self._object_path(key), check=True)
@@ -547,9 +552,18 @@ def push_local(sync: FileSync, since: float = 0) -> List[str]:
             if stat.st_size <= COMPARE_CONTENT_MAX_BYTES:
                 remote = sync._cat_bytes(key)
                 if remote == path.read_bytes():
+                    # #1391: no upload needed, but the background push is the
+                    # only writer that knows this content is now the remote
+                    # baseline; record it so a later local edit survives the
+                    # next mirror.
+                    sync._record_pushed("worker", rel.as_posix(), path)
                     continue
             sync._mc("cp", str(path), sync._object_path(key), check=True)
             pushed.append(rel.as_posix())
+            # #1391: background uploads are pushes too — without the manifest
+            # entry the next startup mirror cannot tell a later unpushed edit
+            # from stale pulled state.
+            sync._record_pushed("worker", rel.as_posix(), path)
         except Exception as exc:
             logger.debug("push_local failed component=sync file=%s error_type=%s", rel, type(exc).__name__)
 
