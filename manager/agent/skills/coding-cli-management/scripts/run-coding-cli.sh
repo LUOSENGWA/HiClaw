@@ -296,10 +296,24 @@ if [ "$cli" != "qwen" ] && { [ -n "$g_model" ] || [ -n "$g_allowed_tools" ] || [
 fi
 
 # Optional per-runner budget/boundary fields from the delegating agent's
-# config (default ~/coding-cli-config.json, override with CODING_CLI_CONFIG
-# for tests). Only the qwen case consumes them today; absent/0/false -> no
-# extra flags.
-config_file="${CODING_CLI_CONFIG:-${HOME}/coding-cli-config.json}"
+# control config. The HOME override above moves HOME to the persisted
+# runtime home (CLI installation and auth belong there); the control
+# config belongs to the delegating agent, so its default path is resolved
+# against the ORIGINAL home captured before that override — otherwise an
+# existing config in the original home would be hidden by the move.
+# Backward compatible: a config created in the effective (persisted) home
+# after the move is still honoured when the original home has none.
+# Override with CODING_CLI_CONFIG for tests. Only the qwen case consumes
+# these today; absent/0/false -> no extra flags.
+if [ -n "${CODING_CLI_CONFIG:-}" ]; then
+    config_file="$CODING_CLI_CONFIG"
+elif [ -n "${_orig_home:-}" ] && [ -f "${_orig_home}/coding-cli-config.json" ]; then
+    config_file="${_orig_home}/coding-cli-config.json"
+elif [ -f "${HOME}/coding-cli-config.json" ]; then
+    config_file="${HOME}/coding-cli-config.json"
+else
+    config_file="${_orig_home:-$HOME}/coding-cli-config.json"
+fi
 max_session_turns=""
 sandbox_setting=""
 approval_mode_setting=""
