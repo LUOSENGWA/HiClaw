@@ -15,7 +15,11 @@ from typing import Any
 # note): mcp/ on sys.path keeps one module identity in both load modes.
 from mcp.common import refs
 from mcp.common.config import _runtime_team_name
-from mcp.common.constants import TERMINAL_TASK_STATUSES
+from mcp.common.constants import (
+    LOOP_BUDGET_BY_TIER,
+    LOOP_PROVENANCE_LIMIT,
+    TERMINAL_TASK_STATUSES,
+)
 from mcp.common.errors import (
     _persisted_state_failure_result,
     _pull_failed_response,
@@ -69,6 +73,36 @@ _sync_task = refs.proxy("_sync_task")
 _write_json = refs.proxy("_write_json")
 _write_project_plan = refs.proxy("_write_project_plan")
 _write_task = refs.proxy("_write_task")
+
+
+# Loop budget ledger (project["loop"]["budget"]). No budget by default:
+# iteration_budget stays None unless the project explicitly declares a
+# recognized tier or iteration_budget - an explicit project
+# iteration_budget wins over the tier mapping. Over budget the loop is
+# flagged (over_budget + provenance), not truncated. iterations_used is
+# a view of len(loop["iterations"]) recomputed on every record, so it is
+# never initialized from the previous budget here (tokens_used is the
+# only field carried over).
+def _loop_budget(project: dict[str, Any], previous_budget: Any) -> dict[str, Any]:
+    tier = str(project.get("tier") or "").strip().lower()
+    tier = tier if tier in LOOP_BUDGET_BY_TIER else None
+    budget = {
+        "tier": tier,
+        "iteration_budget": LOOP_BUDGET_BY_TIER[tier] if tier else None,
+        "iterations_used": 0,
+        "tokens_used": 0,
+        "over_budget": False,
+    }
+    explicit = project.get("iteration_budget")
+    if explicit is not None:
+        budget["iteration_budget"] = _non_negative_int(explicit, "iteration_budget")
+    if isinstance(previous_budget, dict):
+        budget["tokens_used"] = _non_negative_int(previous_budget.get("tokens_used") or 0, "tokens_used")
+    budget["over_budget"] = (
+        budget["iteration_budget"] is not None
+        and budget["iterations_used"] > budget["iteration_budget"]
+    )
+    return budget
 
 
 def _source_room_id_from_payload(payload: dict[str, Any], reply_route: dict[str, str] | None = None) -> str:
@@ -777,6 +811,14 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 loop["task_id"] = task_id
             if loop_id:
                 loop["loop_id"] = loop_id
+            # Budget + iteration ledger start fresh on (re)plan:
+            # iterations_used is len(loop["iterations"]) recomputed on
+            # every record, so no stale counter survives a re-plan
+            # (pre-ledger history kept above is re-absorbed by
+            # record_loop_iteration).
+            loop["budget"] = _loop_budget(project, None)
+            loop["iterations"] = {}
+            loop["provenance"] = []
             if not loop["goal"]:
                 raise ValueError("goal is required")
             if not loop["stop_condition"]:
@@ -842,6 +884,73 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
             if iteration > max_iterations:
                 raise ValueError("iteration cannot exceed maxIterations")
             decision = _safe_loop_decision(payload.get("decision"))
+            summary = str(payload.get("summary") or "").strip()
+            next_action = str(payload.get("nextAction") or payload.get("next_action") or "").strip()
+            # Iteration ledger: one entry per distinct iteration id.
+            # Loops recorded before the ledger existed (or re-planned with
+            # the ledger reset while history was kept) rebuild it from
+            # history: same id collapses to the last entry, revision
+            # counts the occurrences. iterations_used is
+            # len(iterations) recomputed on every write below, which
+            # self-heals the historical double count.
+            history = loop.get("history") if isinstance(loop.get("history"), list) else []
+            iterations = loop.get("iterations")
+            if not isinstance(iterations, dict) or (not iterations and history):
+                counts: dict[str, int] = {}
+                iterations = {}
+                for entry in history:
+                    if not isinstance(entry, dict):
+                        continue
+                    entry_iteration = entry.get("iteration")
+                    if not isinstance(entry_iteration, int) or isinstance(entry_iteration, bool):
+                        continue
+                    key = str(entry_iteration)
+                    counts[key] = counts.get(key, 0) + 1
+                    iterations[key] = {
+                        "decision": str(entry.get("decision") or ""),
+                        "summary": str(entry.get("summary") or ""),
+                        "next_action": str(entry.get("next_action") or ""),
+                        "revision": counts[key] - 1,
+                        "first_at": None,
+                        "updated_at": None,
+                    }
+                loop["iterations"] = iterations
+            current_iteration = _non_negative_int(loop.get("current_iteration") or 0, "currentIteration")
+            if iteration < current_iteration and str(iteration) not in iterations:
+                raise ValueError("iteration_below_current")
+            rec = iterations.get(str(iteration))
+            if rec is None:
+                now = _utc_timestamp()
+                rec = {
+                    "decision": decision,
+                    "summary": summary,
+                    "next_action": next_action,
+                    "revision": 0,
+                    "first_at": now,
+                    "updated_at": now,
+                }
+                iterations[str(iteration)] = rec
+                loop["current_iteration"] = max(current_iteration, iteration)
+            elif rec["decision"] == decision and rec["summary"] == summary and rec["next_action"] == next_action:
+                # Idempotent retry of the same operation: no state change,
+                # no history/provenance entry, no signal, no disk write.
+                return {
+                    "ok": True,
+                    "idempotent": True,
+                    "revision": rec["revision"],
+                    "project": project,
+                    "loop": loop,
+                    "readyLoopNodes": _ready_loop_nodes(project),
+                }
+            else:
+                # Revision: the same iteration was re-decided. The ledger
+                # entry (and only it) advances; the distinct-iteration
+                # count stays len(iterations).
+                rec["decision"] = decision
+                rec["summary"] = summary
+                rec["next_action"] = next_action
+                rec["revision"] = _non_negative_int(rec.get("revision") or 0, "revision") + 1
+                rec["updated_at"] = _utc_timestamp()
             loop["status"] = {
                 "continue": "running",
                 "replan": "running",
@@ -849,15 +958,39 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 "stop_success": "completed",
                 "stop_blocked": "blocked",
             }[decision]
-            loop["current_iteration"] = max(_non_negative_int(loop.get("current_iteration") or 0, "currentIteration"), iteration)
-            history = loop.get("history", []) if isinstance(loop.get("history"), list) else []
+            # Budget ledger: iterations_used is a view of the distinct
+            # iteration ledger, recomputed on every write. No budget
+            # (iteration_budget None): usage still accumulates and
+            # over_budget stays False.
+            budget = loop.get("budget")
+            if not isinstance(budget, dict):
+                budget = _loop_budget(project, budget)
+            iterations_used = len(iterations)
+            tokens_used = _non_negative_int(budget.get("tokens_used") or 0, "tokens_used")
+            iteration_budget = budget.get("iteration_budget")
+            if iteration_budget is not None:
+                iteration_budget = _non_negative_int(iteration_budget, "iteration_budget")
+            budget["iterations_used"] = iterations_used
+            budget["tokens_used"] = tokens_used
+            budget["over_budget"] = iteration_budget is not None and iterations_used > iteration_budget
+            loop["budget"] = budget
             history.append({
                 "iteration": iteration,
                 "decision": decision,
-                "summary": str(payload.get("summary") or "").strip(),
-                "next_action": str(payload.get("nextAction") or payload.get("next_action") or "").strip(),
+                "summary": summary,
+                "next_action": next_action,
+                "revision": rec["revision"],
             })
             loop["history"] = history
+            provenance = loop.get("provenance") if isinstance(loop.get("provenance"), list) else []
+            provenance.append({
+                "iteration": iteration,
+                "revision": rec["revision"],
+                "iterations_used": iterations_used,
+                "iteration_budget": iteration_budget,
+                "over_budget": budget["over_budget"],
+            })
+            loop["provenance"] = provenance[-LOOP_PROVENANCE_LIMIT:]
             project["plan_type"] = "loop"
             project["loop"] = loop
             project_dir = _project_dir(arguments, project_id)
@@ -880,6 +1013,7 @@ def _projectflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 payload={
                     "project_id": project_id,
                     "iteration": iteration,
+                    "revision": rec["revision"],
                     "decision": decision,
                     "loop_status": loop.get("status"),
                 },

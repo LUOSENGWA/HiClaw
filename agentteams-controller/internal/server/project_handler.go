@@ -93,6 +93,12 @@ type projectMeta struct {
 	// (same seq, same bytes) re-lands on the same id. Always serialized (no
 	// omitempty) so the field is a stable part of the stored bytes.
 	AuditSeq int `json:"audit_seq"`
+	// Control-action audit ledger (dual ledger, audit side): one entry per
+	// control action (pause/resume/replan/cancel/complete), ok or error.
+	// Written by the same meta write as the intervention itself; capped at
+	// controlActionsLimit with the dropped count preserved.
+	ControlActions               []controlActionEntry `json:"controlActions,omitempty"`
+	ControlActionsTruncatedCount int                  `json:"controlActionsTruncatedCount,omitempty"`
 }
 
 type projectTaskMeta struct {
@@ -2372,6 +2378,14 @@ type projectEventsResponse struct {
 // event. V marks the cursor format; anchors without it (pre-seq
 // content-tuple cursors) are answered with cursor_expired.
 //
+// Kind records the ledger family the cursor was issued from: "" for the
+// default task-transition feed, "control_action" for the audit feed. The
+// two feeds share no positions, so a cursor presented to a feed of a
+// different kind is rejected with 400 cursor_kind_mismatch. Cursors
+// issued before the kind field existed carry no Kind (format upgrade):
+// they stay valid on the default feed and are rejected on the
+// control-action feed.
+//
 // Occ and N only concern seq-less legacy entries, whose identity
 // (ts, task_id, seq=0) is shared by every duplicate written in the same
 // second:
@@ -2388,6 +2402,7 @@ type projectEventsResponse struct {
 // Cursors anchored at a unique identity carry neither field.
 type eventsCursorAnchor struct {
 	V      int    `json:"v"`
+	Kind   string `json:"kind,omitempty"`
 	Ts     string `json:"ts"`
 	TaskID string `json:"task_id"`
 	Seq    int64  `json:"seq"`
@@ -2397,9 +2412,10 @@ type eventsCursorAnchor struct {
 
 const eventsCursorVersion = 1
 
-func anchorOfEvent(e projectEvent, occ, n int64) eventsCursorAnchor {
+func anchorOfEvent(e projectEvent, occ, n int64, kind string) eventsCursorAnchor {
 	return eventsCursorAnchor{
 		V:      eventsCursorVersion,
+		Kind:   kind,
 		Ts:     e.Ts,
 		TaskID: e.TaskID,
 		Seq:    e.Seq,
@@ -2415,7 +2431,7 @@ func anchorOfEvent(e projectEvent, occ, n int64) eventsCursorAnchor {
 // length as a snapshot marker, so the next request resumes exactly past
 // this event — and expires explicitly if the snapshot truncated —
 // instead of issuing a cursor that cannot advance.
-func encodeEventsCursorFor(events []projectEvent, pos int) string {
+func encodeEventsCursorFor(events []projectEvent, pos int, kind string) string {
 	e := events[pos]
 	total, occ := int64(0), int64(0)
 	for i, f := range events {
@@ -2428,15 +2444,15 @@ func encodeEventsCursorFor(events []projectEvent, pos int) string {
 		}
 	}
 	if total <= 1 {
-		return encodeEventsCursor(e, 0, 0)
+		return encodeEventsCursor(e, 0, 0, kind)
 	}
-	return encodeEventsCursor(e, occ, int64(len(events)))
+	return encodeEventsCursor(e, occ, int64(len(events)), kind)
 }
 
 // encodeEventsCursor packs an anchor as an opaque cursor. Raw URL-safe
 // base64 keeps it free to pass as a query parameter unescaped.
-func encodeEventsCursor(e projectEvent, occ, n int64) string {
-	b, err := json.Marshal(anchorOfEvent(e, occ, n))
+func encodeEventsCursor(e projectEvent, occ, n int64, kind string) string {
+	b, err := json.Marshal(anchorOfEvent(e, occ, n, kind))
 	if err != nil {
 		return ""
 	}
@@ -2456,10 +2472,16 @@ func decodeEventsCursor(raw string) (eventsCursorAnchor, bool) {
 	if err := json.Unmarshal(b, &a); err != nil {
 		return eventsCursorAnchor{}, false
 	}
-	// ts + task_id are the minimum identity of a transition; from/to/action
-	// would be empty only for a malformed event that collectProjectEvents
-	// never produces.
-	if a.Ts == "" || a.TaskID == "" || a.Occ < 0 || a.N < 0 {
+	// ts is the minimum identity of a transition. task_id is NOT required:
+	// the control-action feed has no task (events carry task_id ""), and
+	// pre-kind cursors may legitimately omit it. from/to/action would be
+	// empty only for a malformed event that collectProjectEvents never
+	// produces; an unknown kind is rejected because it cannot bind to any
+	// feed.
+	if a.Ts == "" || a.Occ < 0 || a.N < 0 {
+		return eventsCursorAnchor{}, false
+	}
+	if a.Kind != "" && a.Kind != "control_action" {
 		return eventsCursorAnchor{}, false
 	}
 	return a, true
@@ -2476,8 +2498,18 @@ const (
 // meta of the project graph is read (same scope rules as readTasksDetail —
 // the project's owning prefix only, no cross-scope fallback) and its
 // `history` entries are merged into one ascending list. No new storage and
-// no write-side hook. Project-level intervention events are out of scope
-// here; the /history snapshot endpoint covers those.
+// no write-side hook.
+//
+// The kind query parameter selects the ledger family: absent (default)
+// serves the task-transition aggregation exactly as before;
+// "control_action" serves the control-action audit ledger derived from the
+// project meta's controlActions entries (action values "control.pause" /
+// "control.resume" / "control.replan" / "control.cancel" / "control.complete").
+// Any other value is rejected with 400. Cursors are bound to the feed
+// they were issued from via the anchor's kind field: presenting a
+// cursor issued for one feed on the other is rejected with 400
+// cursor_kind_mismatch, and a cursor issued before the kind field
+// existed (no kind) is only valid on the default feed.
 //
 // Auth mirrors GetProjectHistory: cross-team access is hidden as 404.
 func (h *ProjectHandler) GetProjectEvents(w http.ResponseWriter, r *http.Request) {
@@ -2524,6 +2556,15 @@ func (h *ProjectHandler) GetProjectEvents(w http.ResponseWriter, r *http.Request
 	if limit > projectEventsMaxLimit {
 		limit = projectEventsMaxLimit
 	}
+	// kind selects the ledger family; anything but "" / "control_action"
+	// is rejected so a typo cannot silently filter the wrong ledger.
+	kind := strings.TrimSpace(r.URL.Query().Get("kind"))
+	switch kind {
+	case "", "control_action":
+	default:
+		httputil.WriteError(w, http.StatusBadRequest, "kind must be empty or control_action")
+		return
+	}
 	anchor := eventsCursorAnchor{}
 	hasCursor := false
 	if raw := strings.TrimSpace(r.URL.Query().Get("cursor")); raw != "" {
@@ -2532,11 +2573,28 @@ func (h *ProjectHandler) GetProjectEvents(w http.ResponseWriter, r *http.Request
 			httputil.WriteError(w, http.StatusBadRequest, "invalid cursor")
 			return
 		}
+		// Cursors are bound to the feed they were issued from: the anchor
+		// records the issuing kind ("" = default task-transition feed)
+		// and the two feeds share no positions, so a cross-feed cursor
+		// would resume at a meaningless offset. Cursors issued before the
+		// kind field existed carry no Kind (format upgrade); they are
+		// only meaningful for the default feed, so a non-empty kind
+		// rejects them exactly like any other mismatch.
+		if a.Kind != kind {
+			httputil.WriteError(w, http.StatusBadRequest, "cursor_kind_mismatch")
+			return
+		}
 		anchor = a
 		hasCursor = true
 	}
 
 	events := h.collectProjectEvents(r.Context(), match.meta, match.team)
+	if kind == "control_action" {
+		// Audit ledger family: replace the task-transition aggregation with
+		// the control-actions derived from the project meta. The cursor and
+		// pagination machinery below is reused unchanged.
+		events = controlActionEvents(match.meta)
+	}
 	resp := projectEventsResponse{ProjectID: projectID, Events: []projectEvent{}}
 	if hasCursor && anchor.V != eventsCursorVersion {
 		// A pre-seq (content-tuple) cursor has no unambiguous identity
@@ -2569,7 +2627,7 @@ func (h *ProjectHandler) GetProjectEvents(w http.ResponseWriter, r *http.Request
 		}
 		resp.Events = events[offset:pageEnd]
 		if pageEnd < len(events) {
-			resp.NextCursor = encodeEventsCursorFor(events, pageEnd-1)
+			resp.NextCursor = encodeEventsCursorFor(events, pageEnd-1, kind)
 		}
 	}
 	httputil.WriteJSON(w, http.StatusOK, resp)
@@ -2713,6 +2771,34 @@ func (h *ProjectHandler) collectProjectEvents(ctx context.Context, meta *project
 		}
 		if events[i].TaskID != events[j].TaskID {
 			return events[i].TaskID < events[j].TaskID
+		}
+		return events[i].Action < events[j].Action
+	})
+	return events
+}
+
+// controlActionEvents derives the project's control-action audit ledger as
+// projectEvent values for the ?kind=control_action feed. Each entry is
+// project-level (task_id empty, no writer-persisted seq), so cursors
+// anchored inside this feed use the occurrence/snapshot mechanism the
+// feed already provides for seq-less identities.
+func controlActionEvents(meta *projectMeta) []projectEvent {
+	if len(meta.ControlActions) == 0 {
+		return nil
+	}
+	events := make([]projectEvent, 0, len(meta.ControlActions))
+	for _, a := range meta.ControlActions {
+		events = append(events, projectEvent{
+			Ts:     a.At,
+			TaskID: "",
+			Actor:  a.Actor,
+			Action: "control." + a.Action,
+			Note:   a.Reason,
+		})
+	}
+	sort.SliceStable(events, func(i, j int) bool {
+		if events[i].Ts != events[j].Ts {
+			return events[i].Ts < events[j].Ts
 		}
 		return events[i].Action < events[j].Action
 	})
@@ -2892,6 +2978,88 @@ func markAuditFields(meta *projectMeta, actor, reason string) {
 	}
 }
 
+// controlActionEntry is one record in the project's control-action audit
+// ledger (meta.json controlActions). One entry is written per control
+// action — pause/resume/replan/cancel/complete — on both the success and
+// the failure path of the write endpoint.
+type controlActionEntry struct {
+	ActionID  string `json:"action_id"`
+	ProjectID string `json:"project_id"`
+	Action    string `json:"action"` // pause|resume|replan|cancel|complete
+	Actor     string `json:"actor"`
+	Role      string `json:"role"`
+	At        string `json:"at"`
+	Reason    string `json:"reason,omitempty"`
+	Result    string `json:"result"` // ok|error
+}
+
+// controlActionsLimit caps the retained control-action audit entries per
+// project (oldest dropped, count preserved) so a long-running project's
+// meta.json cannot grow unbounded.
+const controlActionsLimit = 200
+
+// appendControlAction records one control action on the project's audit
+// ledger. On the success path the entry rides the same meta write as the
+// intervention (no extra write, no concurrent-overwrite window); overflow
+// past controlActionsLimit drops the oldest entries and accumulates the
+// dropped count in ControlActionsTruncatedCount.
+func appendControlAction(meta *projectMeta, action, actor, role, reason, result string) {
+	meta.ControlActions = append(meta.ControlActions, controlActionEntry{
+		ActionID:  uuid.NewString(),
+		ProjectID: meta.ProjectID,
+		Action:    action,
+		Actor:     actor,
+		Role:      role,
+		At:        utcTimestamp(),
+		Reason:    reason,
+		Result:    result,
+	})
+	if len(meta.ControlActions) > controlActionsLimit {
+		dropped := len(meta.ControlActions) - controlActionsLimit
+		meta.ControlActionsTruncatedCount += dropped
+		meta.ControlActions = meta.ControlActions[dropped:]
+	}
+}
+
+// auditCaller resolves the (actor, role) pair for the control-action audit
+// ledger. The project write endpoints carry no authenticated identity in
+// the current configuration (the authz middleware exists but no auth layer
+// is wired), so an absent caller is attributed to the system with the
+// unauthenticated role; the pair fills in automatically once the auth
+// layer lands.
+func auditCaller(caller *authpkg.CallerIdentity) (actor, role string) {
+	if caller != nil && caller.Username != "" {
+		if caller.Role == "" {
+			return caller.Username, "unauthenticated"
+		}
+		return caller.Username, caller.Role
+	}
+	return "system", "unauthenticated"
+}
+
+// persistControlActionAudit is the best-effort audit write for the failure
+// path: the HTTP error response has already been sent, so the updated meta
+// is pushed directly to storage bound to the resolve-time ETag. A
+// concurrent modification (etag mismatch) or a storage failure drops the
+// entry (logged) — the audit must never mask or replace the primary error
+// response. No history snapshot is taken: the audit write changes no
+// lifecycle state.
+func (h *ProjectHandler) persistControlActionAudit(ctx context.Context, key, etag string, meta *projectMeta) {
+	data, err := json.Marshal(meta)
+	if err != nil {
+		log.FromContext(ctx).Info("control action audit: marshal failed", "key", key, "error", err.Error())
+		return
+	}
+	if etag != "" {
+		err = h.oss.PutObjectIfMatch(ctx, key, data, etag)
+	} else {
+		err = h.oss.PutObject(ctx, key, data)
+	}
+	if err != nil {
+		log.FromContext(ctx).Info("control action audit: best-effort write failed", "key", key, "error", err.Error())
+	}
+}
+
 // projectWriteContext is the resolved write target: the project meta, its
 // owning team, its exact object key, and the object's ETag at read time.
 // The ETag binds the read version to the write — writeProjectMeta performs
@@ -2973,6 +3141,7 @@ func (h *ProjectHandler) PauseProject(w http.ResponseWriter, r *http.Request) {
 	}
 	meta := pwc.meta
 	caller := authpkg.CallerFromContext(r.Context())
+	actor, role := auditCaller(caller)
 	var reqBody struct {
 		Reason string `json:"reason"`
 	}
@@ -2980,14 +3149,19 @@ func (h *ProjectHandler) PauseProject(w http.ResponseWriter, r *http.Request) {
 
 	if meta.Status == "paused" {
 		writeError(w, http.StatusConflict, "project is already paused")
+		appendControlAction(meta, "pause", actor, role, "project is already paused", "error")
+		h.persistControlActionAudit(r.Context(), pwc.key, pwc.etag, meta)
 		return
 	}
 	if meta.Status == "completed" {
 		writeError(w, http.StatusConflict, "cannot pause a completed project")
+		appendControlAction(meta, "pause", actor, role, "cannot pause a completed project", "error")
+		h.persistControlActionAudit(r.Context(), pwc.key, pwc.etag, meta)
 		return
 	}
 	meta.Status = "paused"
 	markAuditFields(meta, authzActor(caller), reqBody.Reason)
+	appendControlAction(meta, "pause", actor, role, reqBody.Reason, "ok")
 	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
@@ -3010,12 +3184,16 @@ func (h *ProjectHandler) ResumeProject(w http.ResponseWriter, r *http.Request) {
 	}
 	meta := pwc.meta
 	caller := authpkg.CallerFromContext(r.Context())
+	actor, role := auditCaller(caller)
 	if meta.Status != "paused" {
 		writeError(w, http.StatusConflict, "project is not paused")
+		appendControlAction(meta, "resume", actor, role, "project is not paused", "error")
+		h.persistControlActionAudit(r.Context(), pwc.key, pwc.etag, meta)
 		return
 	}
 	meta.Status = "active"
 	markAuditFields(meta, authzActor(caller), "")
+	appendControlAction(meta, "resume", actor, role, "", "ok")
 	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
@@ -3057,25 +3235,34 @@ func (h *ProjectHandler) ReplanProject(w http.ResponseWriter, r *http.Request) {
 	}
 	meta := pwc.meta
 	caller := authpkg.CallerFromContext(r.Context())
+	actor, role := auditCaller(caller)
+	replanFail := func(message string) {
+		appendControlAction(meta, "replan", actor, role, message, "error")
+		h.persistControlActionAudit(r.Context(), pwc.key, pwc.etag, meta)
+	}
 	var reqBody struct {
 		Tasks []json.RawMessage `json:"tasks"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		replanFail("invalid request body: " + err.Error())
 		return
 	}
 
 	if meta.PlanType != "" && meta.PlanType != "dag" {
 		writeError(w, http.StatusConflict, "replan is only supported for dag plans")
+		replanFail("replan is only supported for dag plans")
 		return
 	}
 	if meta.Status != "active" {
 		writeError(w, http.StatusConflict, "replan requires an active project")
+		replanFail("replan requires an active project")
 		return
 	}
 	for _, t := range meta.Tasks {
 		if t.Status == "in_progress" || t.Status == "submitted" {
 			writeError(w, http.StatusConflict, "project has in-flight tasks; replan is only safe before execution")
+			replanFail("project has in-flight tasks; replan is only safe before execution")
 			return
 		}
 	}
@@ -3083,6 +3270,7 @@ func (h *ProjectHandler) ReplanProject(w http.ResponseWriter, r *http.Request) {
 		for _, t := range meta.Loop.Tasks {
 			if t.Status == "in_progress" || t.Status == "submitted" {
 				writeError(w, http.StatusConflict, "project has in-flight tasks; replan is only safe before execution")
+				replanFail("project has in-flight tasks; replan is only safe before execution")
 				return
 			}
 		}
@@ -3101,23 +3289,26 @@ func (h *ProjectHandler) ReplanProject(w http.ResponseWriter, r *http.Request) {
 	planned, err := normalizeReplanTasks(reqBody.Tasks, previous)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		replanFail(err.Error())
 		return
 	}
 	if err := validateTaskGraph(planned); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		replanFail(err.Error())
 		return
 	}
 
 	meta.Tasks = planned
 	meta.PlanType = "dag"
 	markAuditFields(meta, authzActor(caller), "")
+	appendControlAction(meta, "replan", actor, role, "", "ok")
 	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
 	h.emitSignalEvent(r.Context(), signalEmitters["ReplanProject"], pwc.team, signalTeamID(meta, pwc.team), meta.ProjectID, "", nil, pwc.key, refBytes(meta), map[string]any{
-		"project_id":  meta.ProjectID,
-		"task_count":  len(planned),
-		"actor":       authzActor(caller),
+		"project_id": meta.ProjectID,
+		"task_count": len(planned),
+		"actor":      authzActor(caller),
 	}, meta.AuditSeq)
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("📋 项目 %s 已重规划（%d 个任务）", meta.ProjectID, len(planned)))
 	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false, time.Time{}))
@@ -3309,6 +3500,7 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	caller := authpkg.CallerFromContext(r.Context())
+	actor, role := auditCaller(caller)
 	teamFilter := r.URL.Query().Get("team")
 	prefixes, crToEffective, err := h.teamProjectPrefixes(r.Context())
 	if err != nil {
@@ -3334,12 +3526,18 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := h.checkProjectAccess(caller, team, crToEffective); err != nil {
+		// Denied access is not audited: the 404/403 must stay side-effect
+		// free (writing the meta would betray the project's existence).
 		if _, ok := err.(*accessDeniedError); ok {
 			writeError(w, http.StatusNotFound, "project not found")
 			return
 		}
 		writeError(w, http.StatusForbidden, err.Error())
 		return
+	}
+	cancelFail := func(message string) {
+		appendControlAction(meta, "cancel", actor, role, message, "error")
+		h.persistControlActionAudit(r.Context(), key, etag, meta)
 	}
 
 	var reqBody struct {
@@ -3351,11 +3549,13 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 	reason := strings.TrimSpace(reqBody.Reason)
 	if reason == "" {
 		writeError(w, http.StatusBadRequest, "reason is required")
+		cancelFail("reason is required")
 		return
 	}
 	replacementTaskID := strings.TrimSpace(reqBody.ReplacementTaskID)
 	if replacementTaskID != "" && !isPlainToken(replacementTaskID) {
 		writeError(w, http.StatusBadRequest, "replacementTaskId must be a plain token (letters, digits, '-', '_', '.')")
+		cancelFail("replacementTaskId must be a plain token (letters, digits, '-', '_', '.')")
 		return
 	}
 
@@ -3378,6 +3578,7 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if !found {
 		writeError(w, http.StatusNotFound, "task not found in project")
+		cancelFail("task not found in project")
 		return
 	}
 	// A node already cancelled is NOT rejected: it is the retry-convergence
@@ -3385,6 +3586,7 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 	// task-meta write, and the retry re-writes the idempotent task meta.
 	if isTerminalTaskStatus(nodeStatus) && nodeStatus != "cancelled" {
 		writeError(w, http.StatusConflict, "cannot cancel terminal task: "+nodeStatus)
+		cancelFail("cannot cancel terminal task: " + nodeStatus)
 		return
 	}
 
@@ -3393,14 +3595,17 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 	taskData, err := readTaskMetaFirst(h, r.Context(), taskID, team)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "read task meta: "+err.Error())
+		cancelFail("read task meta: " + err.Error())
 		return
 	}
 	if taskData == nil {
 		writeError(w, http.StatusNotFound, "task meta not found")
+		cancelFail("task meta not found")
 		return
 	}
 	if str(taskData["task_id"]) != taskID || str(taskData["project_id"]) != projectID {
 		writeError(w, http.StatusNotFound, "task meta not found")
+		cancelFail("task meta not found (ownership mismatch)")
 		return
 	}
 	persistedSubmissionID, _ := taskData["submission_id"].(string)
@@ -3408,10 +3613,12 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 	requestedSubmissionID := strings.TrimSpace(reqBody.SubmissionID)
 	if persistedSubmissionID != "" && requestedSubmissionID == "" {
 		writeError(w, http.StatusConflict, "submissionId is required for the current task submission")
+		cancelFail("submissionId is required for the current task submission")
 		return
 	}
 	if requestedSubmissionID != "" && requestedSubmissionID != persistedSubmissionID {
 		writeError(w, http.StatusConflict, "submissionId does not match the current task submission")
+		cancelFail("submissionId does not match the current task submission")
 		return
 	}
 	if projectCancellation != nil &&
@@ -3419,12 +3626,14 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 			strings.TrimSpace(projectCancellation.Reason) != reason ||
 			strings.TrimSpace(projectCancellation.ReplacementTaskID) != replacementTaskID) {
 		writeError(w, http.StatusConflict, "cancel task conflicts with persisted project cancellation")
+		cancelFail("cancel task conflicts with persisted project cancellation")
 		return
 	}
 	taskStatus, _ := taskData["status"].(string)
 	taskStatus = strings.TrimSpace(taskStatus)
 	if isTerminalTaskStatus(taskStatus) && taskStatus != "cancelled" {
 		writeError(w, http.StatusConflict, "cannot cancel terminal task: "+taskStatus)
+		cancelFail("cannot cancel terminal task: " + taskStatus)
 		return
 	}
 	persistedReason, _ := taskData["cancel_reason"].(string)
@@ -3437,11 +3646,13 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 	continuationResolution = strings.TrimSpace(continuationResolution)
 	if hasContinuation && continuationStatus == "resolved" && continuationResolution != "cancelled" {
 		writeError(w, http.StatusConflict, "task continuation already resolved as a different decision")
+		cancelFail("task continuation already resolved as a different decision")
 		return
 	}
 	if taskStatus == "cancelled" && (strings.TrimSpace(persistedReason) != reason ||
 		strings.TrimSpace(persistedReplacementTaskID) != replacementTaskID) {
 		writeError(w, http.StatusConflict, "cancel task conflicts with existing cancellation")
+		cancelFail("cancel task conflicts with existing cancellation")
 		return
 	}
 	fullyResolved := taskStatus == "cancelled" && nodeStatus == "cancelled" &&
@@ -3542,6 +3753,12 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		// First attempt: stamp the audit fields, write the project node,
 		// then the task meta.
 		markAuditFields(meta, authzActor(caller), reason)
+		// Success audit: on the first attempt the entry rides the project-node
+		// write below. The retry-convergence branch (nodeStatus already
+		// "cancelled") performs no project write — the first attempt already
+		// recorded the entry — so nothing is appended there (same no-op
+		// discipline as the transition history above).
+		appendControlAction(meta, "cancel", actor, role, reason, "ok")
 		if !h.writeProjectMeta(r.Context(), w, key, meta, etag) {
 			return
 		}
@@ -3751,8 +3968,11 @@ func (h *ProjectHandler) CompleteProject(w http.ResponseWriter, r *http.Request)
 	}
 	meta := pwc.meta
 	caller := authpkg.CallerFromContext(r.Context())
+	actor, role := auditCaller(caller)
 	if meta.Status == "completed" {
 		writeError(w, http.StatusConflict, "project is already completed")
+		appendControlAction(meta, "complete", actor, role, "project is already completed", "error")
+		h.persistControlActionAudit(r.Context(), pwc.key, pwc.etag, meta)
 		return
 	}
 	graphTasks := meta.Tasks
@@ -3761,7 +3981,10 @@ func (h *ProjectHandler) CompleteProject(w http.ResponseWriter, r *http.Request)
 	}
 	for _, t := range graphTasks {
 		if !isTerminalTaskStatus(t.Status) {
-			writeError(w, http.StatusConflict, "project has non-terminal tasks (status: "+t.Status+")")
+			message := "project has non-terminal tasks (status: " + t.Status + ")"
+			writeError(w, http.StatusConflict, message)
+			appendControlAction(meta, "complete", actor, role, message, "error")
+			h.persistControlActionAudit(r.Context(), pwc.key, pwc.etag, meta)
 			return
 		}
 	}
@@ -3770,6 +3993,7 @@ func (h *ProjectHandler) CompleteProject(w http.ResponseWriter, r *http.Request)
 		meta.Loop.Status = "completed"
 	}
 	markAuditFields(meta, authzActor(caller), "")
+	appendControlAction(meta, "complete", actor, role, "", "ok")
 	if !h.writeProjectMeta(r.Context(), w, pwc.key, meta, pwc.etag) {
 		return
 	}
