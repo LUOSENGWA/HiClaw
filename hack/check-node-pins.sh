@@ -28,6 +28,14 @@ for f in openclaw-base/Dockerfile qwenpaw/Dockerfile hermes/Dockerfile manager/D
     echo "ERROR: $f must resolve Node 24 LTS from nodejs.org dist index" >&2
     fail=1
   fi
+  if ! grep -q 'required_major="24"' "$f"; then
+    echo "ERROR: $f must validate the Node 24 major (required_major=24)" >&2
+    fail=1
+  fi
+  if ! grep -q 'major.*required_major' "$f"; then
+    echo "ERROR: $f must reject a non-24 resolved/explicit major" >&2
+    fail=1
+  fi
 done
 
 if ! grep -q 'FROM node:24-bookworm-slim' deepseek-harness/Dockerfile; then
@@ -36,6 +44,10 @@ if ! grep -q 'FROM node:24-bookworm-slim' deepseek-harness/Dockerfile; then
 fi
 if ! grep -q 'NODE_MIN_VERSION=24\.22\.1' deepseek-harness/Dockerfile; then
   echo "ERROR: deepseek-harness/Dockerfile must enforce NODE_MIN_VERSION=24.22.1" >&2
+  fail=1
+fi
+if ! grep -q 'requiredMajor=24' deepseek-harness/Dockerfile; then
+  echo "ERROR: deepseek-harness/Dockerfile must reject a non-24 major" >&2
   fail=1
 fi
 

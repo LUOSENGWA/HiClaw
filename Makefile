@@ -802,6 +802,7 @@ sync-crds: ## Sync CRDs from agentteams-controller/config/crd/ to helm/agentteam
 
 check-node-pins: ## Verify Node.js 24.22.1 pins across images
 	bash hack/check-node-pins.sh
+	bash hack/tests/test-node-version-guard.sh
 
 check-crd-sync: ## Verify CRDs are in sync between controller and Helm chart
 	@if ! diff -r agentteams-controller/config/crd/ helm/agentteams/crds/ >/dev/null 2>&1; then \

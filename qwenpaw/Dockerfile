@@ -43,6 +43,7 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
 # Install the latest Node.js 24 LTS (floor: 24.22.1 for the 2026-10-21 security release).
 # By default the build resolves the latest 24.x LTS from nodejs.org and verifies its SHA-256.
 # For a byte-reproducible build, pass --build-arg NODE_VERSION=24.22.1 (or any 24.x >= floor).
+# NODE_MAJOR is fixed to 24: a 25.x/26.x override is rejected even if NODE_MAJOR=24 is passed.
 # Docker may reuse this layer: use --no-cache for a forced refresh to the latest 24 LTS.
 ARG NODE_MAJOR=24
 ARG NODE_MIN_VERSION=24.22.1
@@ -57,11 +58,31 @@ RUN set -eux; \
       arm64) node_arch="arm64" ;; \
       *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
     esac; \
+    required_major="24"; \
+    if [ "${NODE_MAJOR}" != "${required_major}" ]; then \
+      echo "NODE_MAJOR=${NODE_MAJOR} is not Node ${required_major} LTS; refusing to build" >&2; exit 1; \
+    fi; \
+    case "${NODE_MIN_VERSION}" in 24.*) ;; *) echo "NODE_MIN_VERSION=${NODE_MIN_VERSION} is not Node 24.x" >&2; exit 1 ;; esac; \
     ver="${NODE_VERSION}"; \
     if [ -z "$ver" ]; then \
       ver="$(curl -fsSL https://nodejs.org/dist/index.json | jq -r --arg p "v${NODE_MAJOR}." '[.[] | select(.lts != false) | select(.version | startswith($p))][0].version' | sed 's/^v//')"; \
     fi; \
+    ver="${ver#v}"; \
     test -n "$ver"; \
+    case "$ver" in \
+      *[!0-9.]*|*..*|.*|*.) echo "invalid Node version: $ver" >&2; exit 1 ;; \
+    esac; \
+    case "$ver" in \
+      *.*.*) ;; \
+      *) echo "invalid Node version: $ver" >&2; exit 1 ;; \
+    esac; \
+    case "$ver" in \
+      *.*.*.*) echo "invalid Node version: $ver" >&2; exit 1 ;; \
+    esac; \
+    major="${ver%%.*}"; \
+    if [ "$major" != "$required_major" ]; then \
+      echo "Node $ver is not a Node ${required_major}.x release; refusing a non-${required_major} major" >&2; exit 1; \
+    fi; \
     if [ "$(printf '%s\n%s\n' "$NODE_MIN_VERSION" "$ver" | sort -V | head -n1)" != "$NODE_MIN_VERSION" ]; then \
       echo "Node $ver is older than required floor $NODE_MIN_VERSION" >&2; exit 1; \
     fi; \

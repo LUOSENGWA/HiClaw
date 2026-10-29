@@ -7,6 +7,7 @@ on:
       - '**/Dockerfile.*'
       - 'hack/mirror-images.sh'
       - 'hack/check-node-pins.sh'
+      - 'hack/tests/test-node-version-guard.sh'
       - '.github/workflows/check-node-pins.yml'
   workflow_dispatch: ~
 
@@ -22,3 +23,5 @@ jobs:
 
       - name: Verify Node 24.22.1 pins
         run: bash hack/check-node-pins.sh
+      - name: Execute Node guards (major + floor)
+        run: bash hack/tests/test-node-version-guard.sh
