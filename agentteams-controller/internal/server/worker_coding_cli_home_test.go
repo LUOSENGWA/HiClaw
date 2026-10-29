@@ -44,20 +44,22 @@ func (f *homeFake) Exec(_ context.Context, _ string, command []string, _ time.Du
 			return f.home, "", 0, nil
 		case strings.Contains(script, "test -x "):
 			return "", "", 1, nil
-		case strings.Contains(script, "test -f "):
-			path := strings.TrimSpace(strings.SplitN(script, "test -f ", 2)[1])
+		case strings.Contains(script, "test -f "), strings.Contains(script, "test -s "):
+			if len(command) < 5 || command[3] != "sh" {
+				// A path interpolated into the script is word-split by the
+				// real shell; model that failure instead of being lenient.
+				return "", "too many arguments", 2, nil
+			}
+			path := command[len(command)-1]
 			if _, ok := f.fs[path]; ok {
 				return "", "", 0, nil
 			}
 			return "", "", 1, nil
-		case strings.Contains(script, "cat -- "):
-			path := strings.TrimSpace(strings.SplitN(script, "cat -- ", 2)[1])
-			if data, ok := f.fs[path]; ok {
-				return data, "", 0, nil
-			}
-			return "", "no such file", 1, nil
 		case strings.Contains(script, "cat "):
-			path := strings.TrimSpace(strings.SplitN(script, "cat ", 2)[1])
+			if len(command) < 5 || command[3] != "sh" {
+				return "", "No such file or directory", 1, nil
+			}
+			path := command[len(command)-1]
 			if data, ok := f.fs[path]; ok {
 				return data, "", 0, nil
 			}
@@ -236,5 +238,102 @@ func TestCodingCliHome_LegacyHomeCredential(t *testing.T) {
 	authDoc, _ := sec["auth"].(map[string]interface{})
 	if authDoc["apiKey"] != "sk-legacy" || doc["model"] != "new" {
 		t.Fatalf("migration lost fields: %v", doc)
+	}
+}
+
+// A persisted path containing a space must survive the shell round trip: the
+// handler hands the path to `sh -c` as a positional argument, so `test -f`,
+// `cat` and the auth probe never re-parse it. Regression: with `/tmp/working
+// dir`, PUT returned 200 but the following GET reported exists:false and the
+// auth probe configured:false, and the next unrelated PUT overwrote the
+// credential.
+func TestCodingCliHome_PathWithSpace(t *testing.T) {
+	exec := newHomeFake(nil)
+	exec.working = "/tmp/working dir"
+	h := homeTestHandler(t, exec)
+	const stored = "/tmp/working dir/.qwen/settings.json"
+
+	rec := putSettings(t, h, `{"model":"m1","security":{"auth":{"apiKey":"sk-spaced"}}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, ok := exec.fs[stored]; !ok {
+		t.Fatalf("settings written outside the spaced home: %v", exec.fs)
+	}
+
+	doc := getSettings(t, h)
+	if doc["exists"] != true {
+		t.Fatalf("GET exists=%v after a successful PUT into a spaced path", doc["exists"])
+	}
+	settings, _ := doc["settings"].(map[string]interface{})
+	if settings["model"] != "m1" {
+		t.Fatalf("GET lost the written model: %v", settings)
+	}
+	security, _ := settings["security"].(map[string]interface{})
+	authDoc, _ := security["auth"].(map[string]interface{})
+	apiKey, _ := authDoc["apiKey"].(map[string]interface{})
+	if apiKey["redacted"] != true || apiKey["has_value"] != true {
+		t.Fatalf("response must redact the credential, got %v", authDoc["apiKey"])
+	}
+
+	listRec := httptest.NewRecorder()
+	h.listCLIs(listRec, adminCaller(codingCliRequest(http.MethodGet, "/coding-cli", "", "name", "daily-carol")))
+	qc, _ := decodeJSON(t, listRec.Body.String())["qwen-code"].(map[string]interface{})
+	auth, _ := qc["auth"].(map[string]interface{})
+	if auth["configured"] != true || auth["method"] != "settings" {
+		t.Fatalf("auth probe with a spaced home: %v", auth)
+	}
+
+	// The sentinel keeps the stored credential and unrelated fields, and the
+	// read that backs the merge must not fall over on the spaced path.
+	if rec := putSettings(t, h, `{"security":{"auth":{"apiKey":"***"}},"env":{"KEEP":"1"}}`); rec.Code != http.StatusOK {
+		t.Fatalf("sentinel PUT status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var merged map[string]interface{}
+	if err := json.Unmarshal([]byte(exec.fs[stored]), &merged); err != nil {
+		t.Fatalf("stored settings are not JSON: %v (%q)", err, exec.fs[stored])
+	}
+	sec, _ := merged["security"].(map[string]interface{})
+	a, _ := sec["auth"].(map[string]interface{})
+	if a["apiKey"] != "sk-spaced" {
+		t.Fatalf("sentinel overwrote the credential: %v", merged)
+	}
+	if merged["model"] != "m1" {
+		t.Fatalf("merge dropped an unrelated field: %v", merged)
+	}
+	env, _ := merged["env"].(map[string]interface{})
+	if env["KEEP"] != "1" {
+		t.Fatalf("merge dropped the new field: %v", merged)
+	}
+}
+
+// Extra auth files (opencode auth.json) are probed with `test -s` on the same
+// persisted home; a spaced path must not turn a configured CLI into
+// configured:false.
+func TestCodingCliHome_ExtraAuthFileWithSpace(t *testing.T) {
+	exec := newHomeFake(map[string]string{
+		"/tmp/working dir/.local/share/opencode/auth.json": `{"synthetic":{"type":"api","key":"synthetic"}}`,
+	})
+	exec.working = "/tmp/working dir"
+	h := homeTestHandler(t, exec)
+
+	listRec := httptest.NewRecorder()
+	h.listCLIs(listRec, adminCaller(codingCliRequest(http.MethodGet, "/coding-cli", "", "name", "daily-carol")))
+	oc, _ := decodeJSON(t, listRec.Body.String())["opencode"].(map[string]interface{})
+	auth, _ := oc["auth"].(map[string]interface{})
+	if auth["configured"] != true || auth["method"] != "auth-file" {
+		t.Fatalf("extra auth file under a spaced home: %v", auth)
+	}
+	// Settings read/write on the same spaced home still round-trips.
+	putRec := httptest.NewRecorder()
+	h.putCliSettings(putRec, adminCaller(codingCliRequest(http.MethodPut, "/settings", `{"model":"oc-1"}`, "name", "daily-carol", "cli", "opencode")))
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("opencode PUT status=%d body=%s", putRec.Code, putRec.Body.String())
+	}
+	getRec := httptest.NewRecorder()
+	h.getCliSettings(getRec, adminCaller(codingCliRequest(http.MethodGet, "/settings", "", "name", "daily-carol", "cli", "opencode")))
+	doc := decodeJSON(t, getRec.Body.String())
+	if doc["exists"] != true {
+		t.Fatalf("opencode GET exists=%v body=%v", doc["exists"], doc)
 	}
 }

@@ -20,6 +20,17 @@ import (
 
 // fakeExecBackend records exec commands and file writes; canned responses
 // are provided per test.
+// shellPathArg returns the path passed as the last positional argument of a
+// `sh -c '<script>' sh <path>` invocation. Paths handed to the shell as
+// positional arguments never need quoting, so tests assert on this argument
+// instead of on the script text.
+func shellPathArg(cmd []string) string {
+	if len(cmd) >= 5 && cmd[0] == "sh" && cmd[1] == "-c" {
+		return cmd[len(cmd)-1]
+	}
+	return ""
+}
+
 type fakeExecBackend struct {
 	mu         sync.Mutex
 	commands   [][]string

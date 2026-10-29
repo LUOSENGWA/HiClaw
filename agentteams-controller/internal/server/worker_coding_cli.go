@@ -376,13 +376,13 @@ func (h *CodingCliHandler) probeCLIAuth(ctx context.Context, eb codingCliExecer,
 	}
 	// Extra auth files (opencode auth.json): check existence.
 	for _, f := range spec.ExtraAuthFiles {
-		if _, _, exit, err := eb.Exec(ctx, name, []string{"sh", "-c", "test -s " + expandHomePath(f, home)}, codingCliExecTimeout); err == nil && exit == 0 {
+		if _, _, exit, err := eb.Exec(ctx, name, shellTestNonEmpty(expandHomePath(f, home)), codingCliExecTimeout); err == nil && exit == 0 {
 			return map[string]interface{}{"configured": true, "method": "auth-file"}
 		}
 	}
 	// Settings credentials: Qwen's fixed path and OpenCode's provider API keys.
 	probePath := settingsPath
-	if _, _, exit, err := eb.Exec(ctx, name, []string{"sh", "-c", "test -f " + probePath}, codingCliExecTimeout); err != nil || exit != 0 {
+	if _, _, exit, err := eb.Exec(ctx, name, shellTestFile(probePath), codingCliExecTimeout); err != nil || exit != 0 {
 		// Compatibility: credentials that only exist in the legacy $HOME
 		// location still count as configured.
 		if legacyPath == "" {
@@ -390,8 +390,8 @@ func (h *CodingCliHandler) probeCLIAuth(ctx context.Context, eb codingCliExecer,
 		}
 		probePath = legacyPath
 	}
-	if _, _, exit, err := eb.Exec(ctx, name, []string{"sh", "-c", "test -f " + probePath}, codingCliExecTimeout); err == nil && exit == 0 {
-		out, _, cexit, cerr := eb.Exec(ctx, name, []string{"sh", "-c", "cat " + probePath}, codingCliExecTimeout)
+	if _, _, exit, err := eb.Exec(ctx, name, shellTestFile(probePath), codingCliExecTimeout); err == nil && exit == 0 {
+		out, _, cexit, cerr := eb.Exec(ctx, name, shellCatFile(probePath), codingCliExecTimeout)
 		if cerr == nil && cexit == 0 {
 			var doc map[string]interface{}
 			if json.Unmarshal([]byte(out), &doc) == nil {
@@ -475,7 +475,7 @@ printf '%s/settings.json' "${dir%/}"`
 			return contents, filePath, 0, nil
 		}
 	} else {
-		contents, _, exitCode, err = eb.Exec(ctx, name, []string{"sh", "-c", "cat " + filePath}, codingCliExecTimeout)
+		contents, _, exitCode, err = eb.Exec(ctx, name, shellCatFile(filePath), codingCliExecTimeout)
 		if err == nil && exitCode == 0 {
 			return contents, filePath, 0, nil
 		}
@@ -485,7 +485,7 @@ printf '%s/settings.json' "${dir%/}"`
 	if rerr == nil && rawHome != "" {
 		legacy := expandHomePath(spec.SettingsPath, rawHome)
 		if legacy != filePath {
-			if legacyContents, _, legacyExit, legacyErr := eb.Exec(ctx, name, []string{"sh", "-c", "cat " + legacy}, codingCliExecTimeout); legacyErr == nil && legacyExit == 0 {
+			if legacyContents, _, legacyExit, legacyErr := eb.Exec(ctx, name, shellCatFile(legacy), codingCliExecTimeout); legacyErr == nil && legacyExit == 0 {
 				// The caller writes back to filePath, migrating the
 				// legacy settings on the first update.
 				return legacyContents, filePath, 0, nil
@@ -628,6 +628,19 @@ func (h *CodingCliHandler) shellHome(ctx context.Context, eb codingCliExecer, na
 	}
 	return strings.TrimSpace(out), nil
 }
+
+// shellArgWithPath builds a `sh -c` invocation that receives the resolved
+// path as a positional argument and quotes it inside the script, so spaces or
+// shell metacharacters in a home directory never change the meaning of the
+// command. (Interpolating the path into the script is what broke
+// `/tmp/working dir`.)
+func shellArgWithPath(script, path string) []string {
+	return []string{"sh", "-c", script, "sh", path}
+}
+
+func shellTestFile(path string) []string     { return shellArgWithPath(`test -f "$1"`, path) }
+func shellTestNonEmpty(path string) []string { return shellArgWithPath(`test -s "$1"`, path) }
+func shellCatFile(path string) []string      { return shellArgWithPath(`cat -- "$1"`, path) }
 
 // expandHomePath replaces the leading "~" of a spec path with home.
 func expandHomePath(p, home string) string {
