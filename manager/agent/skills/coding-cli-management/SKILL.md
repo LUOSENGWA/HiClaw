@@ -195,6 +195,81 @@ preserved). The controller probe/settings use the same effective home. A missing
 binary still exits `125` with an actionable message.
 ---
 
+## Step 1: First-Time Detection and Explicit Enablement
+
+Run this in the **delegating agent's own environment** (Manager, team Leader, or
+authorized Worker running this skill) when `~/coding-cli-config.json` is missing,
+after that agent's home was recreated/restored, or when the available CLI set may
+have changed. It is **not** the Worker install surface: installing a CLI through
+the management tab / `POST /api/v1/workers/{name}/coding-cli/{cli}/install`
+puts the binary in a **Worker** container; it does not create this file and does
+not enable delegation for the agent running this skill.
+
+```bash
+bash /opt/agentteams/agent/skills/coding-cli-management/scripts/detect-available-cli.sh
+```
+
+**If no CLIs are available** (`available` array is empty), record an explicit
+decline and continue with normal task assignment (the Worker codes on its own):
+
+```bash
+tmp="$(mktemp)"
+printf '%s\n' '{"enabled":false,"cli":null,"confirmed_at":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > "$tmp"
+mv "$tmp" ~/coding-cli-config.json
+```
+
+**If CLIs are available**, ask the admin through the primary channel or Matrix
+DM — in the language the admin used — and wait for an explicit choice:
+
+> I found these AI coding CLI tools available in my environment: [list]. Do you
+> want CLI delegation enabled? Workers will generate coding prompts and I will
+> run the CLI to make the changes. The CLI runs unattended: `qwen --yolo`
+> approves all tool calls, `opencode --auto` still enforces explicit deny rules,
+> and `qodercli --yolo` becomes read-only unless the workspace is trusted; the
+> workspace and timeout are not permission boundaries. See the Execution
+> boundary section for sandbox, approval-tier and budget options. Reply with the
+> tool name (claude/gemini/qodercli/qwen/opencode) to enable, or "no" to have
+> Workers code on their own.
+
+On an explicit reply:
+
+- Tool name (`claude` / `gemini` / `qodercli` / `qwen` / `opencode`):
+
+  ```bash
+  tmp="$(mktemp)"
+  printf '%s\n' '{"enabled":true,"cli":"<chosen-tool>","confirmed_at":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > "$tmp"
+  mv "$tmp" ~/coding-cli-config.json
+  ```
+
+- `"no"` or any decline:
+
+  ```bash
+  tmp="$(mktemp)"
+  printf '%s\n' '{"enabled":false,"cli":null,"confirmed_at":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > "$tmp"
+  mv "$tmp" ~/coding-cli-config.json
+  ```
+
+**No automatic enablement.** Availability or a successful Worker-side install is
+not consent; only the admin's explicit choice above writes `enabled: true`.
+Any future UI/API that enables delegation must write this same file
+(`enabled`, `cli`, `confirmed_at`) in the delegating agent's home; installing a
+CLI in a Worker is a different operation and is not a substitute.
+
+**Delegating-agent scope.** The managed
+`/api/v1/workers/{name}/coding-cli/...` endpoints (install / settings / probe)
+manage CLIs **inside Worker containers only**. When this skill runs in a Manager
+or team Leader, the CLI must already be present in that agent's own container
+(platform image or a manual install by the operator); there is no managed
+install surface for non-Worker agents yet. Worker-side delegation through the
+endpoints above is unaffected.
+
+**Re-run detection** when the file is missing, after the delegating agent's home
+is recreated/restored, or when the CLI set changes. Worker recreation no longer
+wipes an install made through the persisted-home flow, but the delegation config
+still lives in the delegating agent's own home and must exist before Step 2.
+
+---
+
 ## Step 2: Assigning a Coding Task (CLI mode enabled)
 
 When `coding-cli-config.json` has `enabled: true`:
