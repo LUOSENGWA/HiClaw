@@ -8,6 +8,24 @@
 
 set -e
 
+# Coding-CLI home: QwenPaw only persists QWENPAW_WORKING_DIR (/app/working)
+# plus .backups/.secret — so use it as HOME for the CLI there. OpenClaw/Hermes
+# have no QWENPAW_WORKING_DIR; their $HOME is the MinIO-synced agent home.
+_orig_home="${HOME:-}"
+if [ -n "${QWENPAW_WORKING_DIR:-}" ]; then
+    HOME="$QWENPAW_WORKING_DIR"
+    export HOME
+    if [ -n "$_orig_home" ] && [ -f "$_orig_home/.gitconfig" ] && [ -z "${GIT_CONFIG_GLOBAL:-}" ]; then
+        GIT_CONFIG_GLOBAL="$_orig_home/.gitconfig"
+        export GIT_CONFIG_GLOBAL
+    fi
+fi
+_cli_prefix="${AGENTTEAMS_CODING_CLI_PREFIX:-${QWENPAW_WORKING_DIR:-$HOME}/.coding-cli}"
+if [ -d "$_cli_prefix/bin" ]; then
+    PATH="$_cli_prefix/bin:$PATH"
+    export PATH
+fi
+
 cli=""
 workspace=""
 prompt_file=""
@@ -255,22 +273,20 @@ if [ -f "$marker_file" ]; then
     # Expired marker, or matching processor AND run ID -> proceed.
 fi
 
-# Pre-flight: the configured CLI binary must be on PATH. If it is missing here
-# even though the config says delegation is enabled, the most common cause is a
-# worker RECREATION: the CLI is installed into the container's ephemeral layer
-# (npm install -g, i.e. the image layer at $npm prefix), which container
-# recreation wipes, while the auth config in the persistent agent home
-# (~/.qwen/settings.json) survives. Fail fast with an actionable message
-# instead of a confusing "command not found" deep inside the run.
+# Pre-flight: the configured CLI binary must be on PATH. The worker image
+# bakes in the default Qwen Code CLI (worker/Dockerfile, QWEN_CODE_VERSION),
+# so a plain container recreation keeps it. A missing binary here means the
+# image does not carry this CLI (or it was uninstalled): install/upgrade via
+# POST /api/v1/workers/{name}/coding-cli/$cli/install and retry. Auth settings
+# live in the agent home; probe the settings endpoint after a recreation.
 if ! command -v "$cli" >/dev/null 2>&1; then
     fail_run blocked cli-missing 125 \
         "[run-coding-cli] ERROR: coding CLI '$cli' is configured but not on PATH." \
-        "[run-coding-cli] Usual cause: the worker was recreated and the CLI install" \
-        "[run-coding-cli] (npm -g, container ephemeral layer) was wiped. Re-run the install" \
-        "[run-coding-cli] endpoint (POST /api/v1/workers/{name}/coding-cli/$cli/install)," \
-        "[run-coding-cli] then retry. Auth settings are written container-local by that" \
-        "[run-coding-cli] surface and may not survive a recreation — probe settings and" \
-        "[run-coding-cli] re-apply via the settings endpoint if the probe shows them missing."
+        "[run-coding-cli] The worker image bakes in Qwen Code (QWEN_CODE_VERSION);" \
+        "[run-coding-cli] another CLI/version is not in this image. Install/upgrade via" \
+        "[run-coding-cli] POST /api/v1/workers/{name}/coding-cli/$cli/install, then retry." \
+        "[run-coding-cli] Auth settings live in the agent home — probe settings after a" \
+        "[run-coding-cli] recreation and re-apply if the probe shows them missing."
 fi
 
 # Governance flags are defined by the qwen runner; other runners have no
@@ -280,10 +296,24 @@ if [ "$cli" != "qwen" ] && { [ -n "$g_model" ] || [ -n "$g_allowed_tools" ] || [
 fi
 
 # Optional per-runner budget/boundary fields from the delegating agent's
-# config (default ~/coding-cli-config.json, override with CODING_CLI_CONFIG
-# for tests). Only the qwen case consumes them today; absent/0/false -> no
-# extra flags.
-config_file="${CODING_CLI_CONFIG:-${HOME}/coding-cli-config.json}"
+# control config. The HOME override above moves HOME to the persisted
+# runtime home (CLI installation and auth belong there); the control
+# config belongs to the delegating agent, so its default path is resolved
+# against the ORIGINAL home captured before that override — otherwise an
+# existing config in the original home would be hidden by the move.
+# Backward compatible: a config created in the effective (persisted) home
+# after the move is still honoured when the original home has none.
+# Override with CODING_CLI_CONFIG for tests. Only the qwen case consumes
+# these today; absent/0/false -> no extra flags.
+if [ -n "${CODING_CLI_CONFIG:-}" ]; then
+    config_file="$CODING_CLI_CONFIG"
+elif [ -n "${_orig_home:-}" ] && [ -f "${_orig_home}/coding-cli-config.json" ]; then
+    config_file="${_orig_home}/coding-cli-config.json"
+elif [ -f "${HOME}/coding-cli-config.json" ]; then
+    config_file="${HOME}/coding-cli-config.json"
+else
+    config_file="${_orig_home:-$HOME}/coding-cli-config.json"
+fi
 max_session_turns=""
 sandbox_setting=""
 approval_mode_setting=""

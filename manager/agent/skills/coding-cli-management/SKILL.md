@@ -167,73 +167,106 @@ If a Manager/Leader runs the CLI **on behalf of** a Worker, it must return the
 `report_progress` / `submit_task` for its own task. This keeps the workflow
 view = the existing task's status + history (dispatch/completed/blocked/cancelled).
 
-## Persistence and re-install after worker recreation
+## Persistence: installs go to the runtime's persisted home
 
-The CLI binary and its `npm install -g` payload live in the worker container's
-**ephemeral layer** (the image layer at `$npm prefix`, e.g. `/usr/local/lib/node_modules`) —
-**not** in the persistent agent home. A worker **recreation** (image upgrade, a spec
-change, or any controller-driven container rebuild, e.g. an LLM-runtime parameter
-change) wipes that layer, so the CLI disappears even though the delegation config
-and the auth settings survive:
+Coding CLIs are **not installed by default** and the worker image does not bake
+them in. The management tab / API installs on demand:
 
-- `~/coding-cli-config.json` is in the delegating agent's own home → it survives.
-- The CLI binary (npm -g) is in the **image layer** → it does **not** survive.
-- `~/.qwen/settings.json` (auth) sits in the worker's **agent home** — a persistent
-  host bind (embedded) / volume (k8s) that a recreation re-binds, so the file
-  **survives a same-worker recreation**. Field-verified 2026-10-11 on the Pi
-  embedded stack: after recreation the probe still reported
-  `auth.configured:true, method:settings` and a re-installed CLI ran without
-  re-applying auth. The caveat: the install surface does not force a MinIO push,
-  so a **fresh** home (new container identity, restored from object storage into
-  an empty home) starts without it — the settings probe is the arbiter either
-  way.
+```
+POST /api/v1/workers/{name}/coding-cli/{cli}/install   {"action":"install","version":"latest"}
+```
 
-Consequence: after any worker recreation, re-run the install endpoint
-(`POST /api/v1/workers/{name}/coding-cli/{cli}/install`) before delegating again,
-then **probe** the settings — if the auth is gone, re-apply it via the settings
-endpoint. `run-coding-cli.sh`
-fails fast with an actionable re-install message (exit `125`) if the configured
-binary is missing on PATH, so a wiped install is self-diagnosing rather than a
-confusing mid-run "command not found".
+`npm install -g --prefix "$CLI_HOME/.coding-cli"` — no version pin: the tab/API
+passes a dist-tag (`latest`, `beta`, …) or an explicit version; upgrades use the
+same route.
 
-**Scope note — the managed install surface is worker-scoped.** The
-`/api/v1/workers/{name}/coding-cli/…` endpoints (install / settings / probe)
-manage CLIs **inside worker containers only**. When the delegating agent is a
-Manager or a team Leader, the CLI must already be present in *that* agent's own
-container (platform image or a manual `npm install -g` by the operator) — there
-is no managed install surface for non-worker agents yet (Phase 1 scope, tracked
-as a follow-up). Worker-side delegation via the endpoints above is unaffected.
+**What is `CLI_HOME`?** It is the runtime's *persisted* home:
 
-## Step 1: First-Time Detection (before assigning a coding task)
+| runtime | CLI_HOME | why |
+|---|---|---|
+| **QwenPaw** | `$QWENPAW_WORKING_DIR` (default `/app/working`) | QwenPaw only persists its three mounted dirs: `/app/working` (data), `/app/working.backups`, `/app/working.secret`; `$HOME` (`/root/...`) is wiped on recreation. |
+| **OpenClaw / Hermes** | `$HOME` (`/root/agentteams-fs/agents/<name>`) | the worker entrypoint mirrors HOME to MinIO; `.coding-cli` is not excluded, so it survives recreation. |
 
-Run when `~/coding-cli-config.json` does not exist — **or after any worker
-recreation** (the detect step re-establishes what is actually on PATH):
+`run-coding-cli.sh` and `detect-available-cli.sh` resolve the same home
+(`QWENPAW_WORKING_DIR` first, then `$HOME`), prepend
+`${AGENTTEAMS_CODING_CLI_PREFIX:-$CLI_HOME/.coding-cli}/bin` to PATH, and set
+HOME to `QWENPAW_WORKING_DIR` for the CLI on QwenPaw (with `GIT_CONFIG_GLOBAL`
+preserved). The controller probe/settings use the same effective home. A missing
+binary still exits `125` with an actionable message.
+---
+
+## Step 1: First-Time Detection and Explicit Enablement
+
+Run this in the **delegating agent's own environment** (Manager, team Leader, or
+authorized Worker running this skill) when `~/coding-cli-config.json` is missing,
+after that agent's home was recreated/restored, or when the available CLI set may
+have changed. It is **not** the Worker install surface: installing a CLI through
+the management tab / `POST /api/v1/workers/{name}/coding-cli/{cli}/install`
+puts the binary in a **Worker** container; it does not create this file and does
+not enable delegation for the agent running this skill.
 
 ```bash
 bash /opt/agentteams/agent/skills/coding-cli-management/scripts/detect-available-cli.sh
 ```
 
-**If no CLIs are available** (`available` array is empty):
+**If no CLIs are available** (`available` array is empty), record an explicit
+decline and continue with normal task assignment (the Worker codes on its own):
+
 ```bash
-echo '{"enabled":false,"cli":null,"confirmed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' \
-  > ~/coding-cli-config.json
+tmp="$(mktemp)"
+printf '%s\n' '{"enabled":false,"cli":null,"confirmed_at":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > "$tmp"
+mv "$tmp" ~/coding-cli-config.json
 ```
-Proceed with normal task assignment (Worker codes on their own).
 
-**If CLIs are available**, ask the admin via the primary channel or Matrix DM — **in the language the admin used**:
-> I found the following AI coding CLI tools available: [list]. Would you like to enable CLI delegation mode? Workers will generate coding prompts, and I'll use the CLI tool to make the code changes. Note: the CLI runs unattended — `qwen --yolo` auto-approves all tool calls, `opencode --auto` still enforces explicit deny rules, and `qodercli --yolo` silently becomes read-only unless the workspace is trusted; the workspace and the timeout are not permission boundaries. On a local or shared machine, consider the sandbox tier for Qwen Code (`--sandbox`, Docker-backed, off by default) and turn/wall budgets; on OpenCode there is no native sandbox, so prefer an isolated execution environment or tight deny rules. Reply with the tool name (claude/gemini/qodercli/qwen/opencode) to enable, or 'no' to have workers code on their own.
+**If CLIs are available**, ask the admin through the primary channel or Matrix
+DM — in the language the admin used — and wait for an explicit choice:
 
-On admin reply:
+> I found these AI coding CLI tools available in my environment: [list]. Do you
+> want CLI delegation enabled? Workers will generate coding prompts and I will
+> run the CLI to make the changes. The CLI runs unattended: `qwen --yolo`
+> approves all tool calls, `opencode --auto` still enforces explicit deny rules,
+> and `qodercli --yolo` becomes read-only unless the workspace is trusted; the
+> workspace and timeout are not permission boundaries. See the Execution
+> boundary section for sandbox, approval-tier and budget options. Reply with the
+> tool name (claude/gemini/qodercli/qwen/opencode) to enable, or "no" to have
+> Workers code on their own.
+
+On an explicit reply:
+
 - Tool name (`claude` / `gemini` / `qodercli` / `qwen` / `opencode`):
+
   ```bash
-  echo '{"enabled":true,"cli":"<chosen-tool>","confirmed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' \
-    > ~/coding-cli-config.json
+  tmp="$(mktemp)"
+  printf '%s\n' '{"enabled":true,"cli":"<chosen-tool>","confirmed_at":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > "$tmp"
+  mv "$tmp" ~/coding-cli-config.json
   ```
-- `"no"` or decline:
+
+- `"no"` or any decline:
+
   ```bash
-  echo '{"enabled":false,"cli":null,"confirmed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' \
-    > ~/coding-cli-config.json
+  tmp="$(mktemp)"
+  printf '%s\n' '{"enabled":false,"cli":null,"confirmed_at":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > "$tmp"
+  mv "$tmp" ~/coding-cli-config.json
   ```
+
+**No automatic enablement.** Availability or a successful Worker-side install is
+not consent; only the admin's explicit choice above writes `enabled: true`.
+Any future UI/API that enables delegation must write this same file
+(`enabled`, `cli`, `confirmed_at`) in the delegating agent's home; installing a
+CLI in a Worker is a different operation and is not a substitute.
+
+**Delegating-agent scope.** The managed
+`/api/v1/workers/{name}/coding-cli/...` endpoints (install / settings / probe)
+manage CLIs **inside Worker containers only**. When this skill runs in a Manager
+or team Leader, the CLI must already be present in that agent's own container
+(platform image or a manual install by the operator); there is no managed
+install surface for non-Worker agents yet. Worker-side delegation through the
+endpoints above is unaffected.
+
+**Re-run detection** when the file is missing, after the delegating agent's home
+is recreated/restored, or when the CLI set changes. Worker recreation no longer
+wipes an install made through the persisted-home flow, but the delegation config
+still lives in the delegating agent's own home and must exist before Step 2.
 
 ---
 
