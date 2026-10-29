@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_MC_ALIAS = "agentteams"
 COMPARE_CONTENT_MAX_BYTES = 20 * 1024 * 1024
 
+# Keep at least this much free space after restoring protected files; below
+# this boundary the pull fails closed before the destructive mirror starts.
+PROTECTED_RESTORE_HEADROOM_BYTES = 1024 * 1024
+
 #: Persisted push manifest (#1391): the authority for "what did we push
 #: last", so a restart can tell unpushed local writes from pulled state
 #: without trusting mtimes.
@@ -268,9 +272,25 @@ class FileSync:
         for rel, content in protected.items():
             path = base / rel
             try:
+                # With the --exclude above this is the normal case: mc never
+                # touched the dirty file, so writing it again would at best
+                # waste space and at worst truncate it on a full disk.
+                if path.is_file() and path.read_bytes() == content:
+                    continue
+            except OSError:
+                pass
+            tmp_path = path.with_name(
+                f".{path.name}.sync-restore-{os.getpid()}"
+            )
+            try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(content)
+                tmp_path.write_bytes(content)
+                os.replace(tmp_path, path)
             except OSError as exc:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
                 logger.warning(
                     "unpushed local write not restored component=sync "
                     "worker=%s path=%s error=%s",
@@ -358,6 +378,25 @@ class FileSync:
         # last pushed manifest are captured here and restored afterwards.
         root_key = self._root_key(local_dir)
         protected = self._protected_files(root_key, local_dir)
+        if protected:
+            # The old implementation captured dirty files in memory, started
+            # the destructive mirror, and only restored in ``finally``.  If
+            # the mirror filled the disk, the restore write hit ENOSPC and
+            # truncated the only copy.  Refuse to start in that case.
+            protected_bytes = sum(len(content) for content in protected.values())
+            try:
+                free_bytes = shutil.disk_usage(local_dir).free
+            except OSError:
+                free_bytes = None
+            if (
+                free_bytes is not None
+                and free_bytes < protected_bytes + PROTECTED_RESTORE_HEADROOM_BYTES
+            ):
+                raise RuntimeError(
+                    "refusing destructive mirror: insufficient free space for "
+                    f"{len(protected)} unpushed file(s) "
+                    f"({protected_bytes} bytes required, {free_bytes} free)"
+                )
         logger.info(
             "mirroring storage prefix component=sync worker=%s remote=%s local=%s"
             " protected=%s",
@@ -366,14 +405,19 @@ class FileSync:
             local_dir,
             len(protected),
         )
+        # Exclude dirty paths from mc itself.  Restoring from memory is only a
+        # fallback for an mc implementation that ignores excludes; it must not
+        # be the only thing standing between a disk-full pull and data loss.
+        exclude_args: List[str] = ["--exclude", "credentials/**"]
+        for rel in sorted(protected):
+            exclude_args.extend(("--exclude", rel))
         try:
             self._mc(
                 "mirror",
                 remote,
                 str(local_dir) + "/",
                 "--overwrite",
-                "--exclude",
-                "credentials/**",
+                *exclude_args,
             )
         except subprocess.CalledProcessError as exc:
             if _looks_like_missing_object_error(exc.stderr):

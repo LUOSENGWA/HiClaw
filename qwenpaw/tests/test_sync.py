@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import subprocess
+import types
 from pathlib import Path
 
 import pytest
@@ -906,3 +907,103 @@ def test_push_directories_records_pre_mirror_snapshot(tmp_path: Path, monkeypatc
     assert sync.sync_status()["unpushed"] == [
         {"root": "worker", "path": "data/notes.txt", "status": "modified"}
     ]
+
+
+def test_mirror_all_excludes_unpushed_file_from_mirror(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sync = _sync(tmp_path)
+    sync.local_dir.mkdir(parents=True)
+    state = sync.local_dir / "state.txt"
+    state.write_text("local-new", encoding="utf-8")
+    _write_manifest(
+        sync,
+        {"state.txt": {"sha256": hashlib.sha256(b"old-pushed").hexdigest(),
+                       "pushed_at": 1.0}},
+    )
+    monkeypatch.setattr(sync, "ensure_alias", lambda: None)
+    commands = []
+
+    def fake_mc(*args, **_kwargs):
+        commands.append(args)
+        if args and args[0] == "mirror" and "agents/worker-a/" in args[1]:
+            # mc honours --exclude; the fake reproduces that behaviour so a
+            # missing exclude would expose the overwrite path.
+            if "state.txt" not in args:
+                state.write_text("remote-old", encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(sync, "_mc", fake_mc)
+
+    sync.mirror_all()
+
+    assert state.read_text(encoding="utf-8") == "local-new"
+    excluded_pairs = {
+        (command[index], command[index + 1])
+        for command in commands
+        for index in range(len(command) - 1)
+    }
+    assert ("--exclude", "state.txt") in excluded_pairs
+
+
+def test_mirror_all_aborts_before_destructive_mirror_without_restore_space(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sync = _sync(tmp_path)
+    sync.local_dir.mkdir(parents=True)
+    state = sync.local_dir / "state.txt"
+    original = b"x" * (12 * 1024 * 1024)
+    state.write_bytes(original)
+    _write_manifest(
+        sync,
+        {"state.txt": {"sha256": hashlib.sha256(b"old-pushed").hexdigest(),
+                       "pushed_at": 1.0}},
+    )
+    monkeypatch.setattr(sync, "ensure_alias", lambda: None)
+    monkeypatch.setattr(
+        "qwenpaw_worker.sync.shutil.disk_usage",
+        lambda _path: types.SimpleNamespace(free=1024),
+    )
+    commands = []
+
+    def fake_mc(*args, **_kwargs):
+        commands.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(sync, "_mc", fake_mc)
+
+    with pytest.raises(RuntimeError, match="refusing destructive mirror"):
+        sync.mirror_all()
+
+    assert state.read_bytes() == original
+    assert commands == []
+
+
+def test_partial_mirror_failure_keeps_unpushed_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sync = _sync(tmp_path)
+    sync.local_dir.mkdir(parents=True)
+    state = sync.local_dir / "state.txt"
+    state.write_text("local-new", encoding="utf-8")
+    _write_manifest(
+        sync,
+        {"state.txt": {"sha256": hashlib.sha256(b"old-pushed").hexdigest(),
+                       "pushed_at": 1.0}},
+    )
+    monkeypatch.setattr(sync, "ensure_alias", lambda: None)
+
+    def fake_mc(*args, **_kwargs):
+        if args and args[0] == "mirror" and "agents/worker-a/" in args[1]:
+            assert "state.txt" in args
+            raise subprocess.CalledProcessError(
+                1, args, output="", stderr="No space left on device"
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(sync, "_mc", fake_mc)
+
+    with pytest.raises(RuntimeError, match="mirror storage failed"):
+        sync.mirror_all()
+
+    assert state.read_text(encoding="utf-8") == "local-new"
