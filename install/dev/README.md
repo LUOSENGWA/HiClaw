@@ -33,6 +33,21 @@ cat agentteams-embedded_pr-1428-<sha>.tar | ssh swrp51@192.168.31.8 'docker load
 
 Then run the upgrade script with `--controller-image <tag>` (and `--higress-backfill-dir` if the gateway plugin set is missing).
 
+## Failure handling
+
+Every component build is propagated: a failing `make` aborts the script with a
+non-zero exit before it writes `build-manifest.json`, before `--save`/`--push`,
+and before printing `done`. This includes `--component all` (a later component
+cannot mask an earlier failure). A pre-existing target tag is not a success
+signal; the script removes a stale manifest at start and only moves a new one
+into place after all requested builds succeed.
+
+Regression:
+
+```bash
+bash install/dev/tests/test-build-main-failure.sh
+```
+
 ## Cross-platform builds need QEMU binfmt
 
 On an x86 host, `--platform linux/arm64` fails with `exec format error` until arm64 emulation is registered:

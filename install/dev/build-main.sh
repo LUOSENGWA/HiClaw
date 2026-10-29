@@ -12,7 +12,7 @@
 #   install/dev/build-main.sh --ref origin/main --component controller \
 #     --platform linux/amd64 --tag agentteams-controller:dev --push
 # ============================================================================
-set -u
+set -euo pipefail
 
 REF="origin/main"
 COMPONENT="controller"
@@ -96,8 +96,12 @@ SHA="$(git rev-parse --short "$REF")"
 WT="$(mktemp -d)/agentteams-build-${SHA}-$$"
 CTRL_TAG="${TAG}-controller"
 MANIFEST="build-manifest.json"
+# A failed build must not leave an earlier successful manifest looking current.
+rm -f "$MANIFEST"
+TMP_MANIFEST="$(mktemp)"
 
 cleanup() {
+    rm -f "$TMP_MANIFEST"
     if [ "$KEEP_WORKTREE" = "1" ]; then
         echo "worktree kept: $WT" >&2
     else
@@ -171,24 +175,38 @@ build_hermes_worker() {
         LOCAL_HERMES_WORKER="$TAG"
 }
 
+run_build() {
+    local label="$1"
+    shift
+    echo "==> build: $label"
+    if ! "$@"; then
+        echo "ERROR: component build failed: $label; refusing manifest/save/push/success" >&2
+        exit 5
+    fi
+}
+
 case "$COMPONENT" in
     controller)
-        if [ "$FLAVOR" = "embedded" ]; then build_embedded; else build_controller; fi
+        if [ "$FLAVOR" = "embedded" ]; then
+            run_build "controller (embedded)" build_embedded
+        else
+            run_build controller build_controller
+        fi
         ;;
-    manager) build_manager ;;
-    manager-qwenpaw) build_manager_qwenpaw ;;
-    worker) build_worker ;;
-    qwenpaw-worker) build_qwenpaw_worker ;;
-    hermes-worker) build_hermes_worker ;;
+    manager) run_build manager build_manager ;;
+    manager-qwenpaw) run_build manager-qwenpaw build_manager_qwenpaw ;;
+    worker) run_build worker build_worker ;;
+    qwenpaw-worker) run_build qwenpaw-worker build_qwenpaw_worker ;;
+    hermes-worker) run_build hermes-worker build_hermes_worker ;;
     dashboard)
         [ -n "$DASHBOARD_CONTEXT" ] || { echo "ERROR: set DASHBOARD_CONTEXT to the agentteams-dashboard source tree" >&2; exit 3; }
-        make -C "$WT" build-dashboard DASHBOARD_CONTEXT="$DASHBOARD_CONTEXT" DASHBOARD_IMAGE="$TAG"
+        run_build dashboard make -C "$WT" build-dashboard DASHBOARD_CONTEXT="$DASHBOARD_CONTEXT" DASHBOARD_IMAGE="$TAG"
         ;;
     all)
-        build_controller
-        build_manager
-        build_worker
-        build_qwenpaw_worker
+        run_build controller build_controller
+        run_build manager build_manager
+        run_build worker build_worker
+        run_build qwenpaw-worker build_qwenpaw_worker
         ;;
     *) echo "ERROR: unknown component: $COMPONENT" >&2; exit 2 ;;
 esac
@@ -210,7 +228,8 @@ fi
     echo "  \"image_id\": \"$(docker image inspect --format '{{.Id}}' "$TAG")\","
     echo "  \"built_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
     echo "}"
-} > "$MANIFEST"
+} > "$TMP_MANIFEST"
+mv "$TMP_MANIFEST" "$MANIFEST"
 echo "==> manifest: $MANIFEST"
 
 if [ "$SAVE" = "1" ]; then
