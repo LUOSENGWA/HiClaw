@@ -90,6 +90,21 @@ case "$1" in
         ;;
     inspect)
         fmt="$3"
+        # OomKillDisable defaults: an unset *bool renders <nil>, docker create
+        # stores false. Keep these scenarios separate from the full boundary set.
+        if [ "${STUB_SCENARIO:-ok}" = "boundary_nil_false" ] || [ "${STUB_SCENARIO:-ok}" = "boundary_true_false" ]; then
+            case "$fmt" in
+                *"{{.HostConfig.OomKillDisable}}"*)
+                    case "$4" in
+                        *-old*)
+                            [ "${STUB_SCENARIO:-ok}" = "boundary_true_false" ] && echo "true" || echo "<nil>"
+                            ;;
+                        *) echo "false" ;;
+                    esac
+                    exit 0
+                    ;;
+            esac
+        fi
         # scenario overrides (boundary / unsupported_sysctl); everything else
         # falls through to the standard answers below
         if [ "${STUB_SCENARIO:-ok}" = "boundary" ]; then
@@ -107,7 +122,18 @@ case "$1" in
                 *"{{.Config.Domainname}}"*) echo "example.com"; exit 0 ;;
                 *"{{.Config.StopSignal}}"*) echo "SIGQUIT"; exit 0 ;;
                 *"{{.Config.StopTimeout}}"*) echo "30"; exit 0 ;;
-                *"{{.HostConfig.OomKillDisable}}"*) echo "true"; exit 0 ;;
+                *"{{.HostConfig.OomKillDisable}}"*)
+                    case "${STUB_SCENARIO:-ok}" in
+                        boundary_nil_false)
+                            case "$4" in *-old) echo "<nil>" ;; *) echo "false" ;; esac
+                            ;;
+                        boundary_true_false)
+                            case "$4" in *-old) echo "true" ;; *) echo "false" ;; esac
+                            ;;
+                        *) echo "true" ;;
+                    esac
+                    exit 0
+                    ;;
                 *"{{.HostConfig.CgroupnsMode}}"*) echo "host"; exit 0 ;;
             esac
         elif [ "${STUB_SCENARIO:-ok}" = "unsupported_sysctl" ]; then
@@ -594,6 +620,20 @@ assert_contains_fixed '"unsupported_runtime":["mac_address"]' "${OUT}" "mac pref
 run_case unsupported_hostname preflight --env-file "${ENV_FILE}" --backup-dir "${TMP}/b718" --json
 assert_eq "${RC}" "3" "hostname preflight rc"
 assert_contains_fixed '"unsupported_runtime":["hostname"]' "${OUT}" "hostname preflight json"
+
+# 7.18 old docker-run default renders <nil>, docker create stores false: same boundary
+run_case boundary_nil_false controller --yes --prepare-only --controller-image example/controller:new \
+    --env-file "${ENV_FILE}" --backup-dir "${TMP}/b718" --state-file "${TMP}/b718/state.json" --timeout 4
+assert_eq "${RC}" "0" "oom nil/false prepare rc"
+assert_contains 'boundary preserved' "${OUT}" "oom nil/false preserved"
+assert_not_contains 'boundary mismatch: oom_kill_disable' "${OUT}" "oom nil/false no mismatch"
+
+# 7.19 explicit true vs false is still a real mismatch
+run_case boundary_true_false controller --yes --prepare-only --controller-image example/controller:new \
+    --env-file "${ENV_FILE}" --backup-dir "${TMP}/b719" --state-file "${TMP}/b719/state.json" --timeout 4
+assert_eq "${RC}" "3" "oom true/false rc"
+assert_contains 'boundary mismatch: oom_kill_disable' "${OUT}" "oom true/false mismatch"
+assert_not_contains '^start ' "${REC}" "oom true/false never starts replacement"
 
 # 8. status --json
 run_case ok status --state-file "${TMP}/b5/state.json" --json

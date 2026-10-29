@@ -390,7 +390,7 @@ boundary_profile() {
     local groups seopts capadds capdrops tmpfs ulimits devices shm domain stopsig stoptimeout oomkill cgroupns
     user="$(inspect_fmt '{{.Config.User}}' "${ctr}")"
     workdir="$(inspect_fmt '{{.Config.WorkingDir}}' "${ctr}")"
-    ro="$(inspect_fmt '{{.HostConfig.ReadonlyRootfs}}' "${ctr}")"
+    ro="$(normalize_bool "$(inspect_fmt '{{.HostConfig.ReadonlyRootfs}}' "${ctr}")")"
     mem="$(inspect_fmt '{{.HostConfig.Memory}}' "${ctr}")"
     memswap="$(inspect_fmt '{{.HostConfig.MemorySwap}}' "${ctr}")"
     cpus="$(inspect_fmt '{{.HostConfig.NanoCpus}}' "${ctr}")"
@@ -398,8 +398,8 @@ boundary_profile() {
     cpushares="$(inspect_fmt '{{.HostConfig.CpuShares}}' "${ctr}")"
     cpuset="$(inspect_fmt '{{.HostConfig.CpusetCpus}}' "${ctr}")"
     pids="$(inspect_fmt '{{.HostConfig.PidsLimit}}' "${ctr}")"
-    init="$(inspect_fmt '{{.HostConfig.Init}}' "${ctr}")"
-    priv="$(inspect_fmt '{{.HostConfig.Privileged}}' "${ctr}")"
+    init="$(normalize_bool "$(inspect_fmt '{{.HostConfig.Init}}' "${ctr}")")"
+    priv="$(normalize_bool "$(inspect_fmt '{{.HostConfig.Privileged}}' "${ctr}")")"
     groups="$(inspect_fmt '{{range .HostConfig.GroupAdd}}{{println .}}{{end}}' "${ctr}" | join_us)"
     seopts="$(inspect_fmt '{{range .HostConfig.SecurityOpt}}{{println .}}{{end}}' "${ctr}" | join_us)"
     capadds="$(inspect_fmt '{{range .HostConfig.CapAdd}}{{println .}}{{end}}' "${ctr}" | join_us)"
@@ -411,7 +411,7 @@ boundary_profile() {
     domain="$(inspect_fmt '{{.Config.Domainname}}' "${ctr}")"
     stopsig="$(inspect_fmt '{{.Config.StopSignal}}' "${ctr}")"
     stoptimeout="$(inspect_fmt '{{.Config.StopTimeout}}' "${ctr}")"
-    oomkill="$(inspect_fmt '{{.HostConfig.OomKillDisable}}' "${ctr}")"
+    oomkill="$(normalize_bool "$(inspect_fmt '{{.HostConfig.OomKillDisable}}' "${ctr}")")"
     cgroupns="$(inspect_fmt '{{.HostConfig.CgroupnsMode}}' "${ctr}")"
     printf 'user=%s\nworkdir=%s\nreadonly_rootfs=%s\nmemory=%s\nmemory_swap=%s\ncpus=%s\ncpu_shares=%s\ncpuset_cpus=%s\npids_limit=%s\ninit=%s\nprivileged=%s\ngroup_add=%s\nsecurity_opt=%s\ncap_add=%s\ncap_drop=%s\ntmpfs=%s\nulimit=%s\ndevices=%s\nshm_size=%s\ndomainname=%s\nstop_signal=%s\nstop_timeout=%s\noom_kill_disable=%s\ncgroupns=%s\n' \
         "${user}" "${workdir}" "${ro}" "${mem}" "${memswap}" "${cpus}" "${cpushares}" "${cpuset}" \
@@ -560,6 +560,17 @@ unsupported_boundary() {
     printf '%s' "${out% }"
 }
 
+normalize_bool() {
+    # Docker templates render an unset *bool pointer as <nil>; docker create
+    # stores the same setting as false. Normalize the unset/false spellings but
+    # keep explicit true distinct (it changes --oom-kill-disable semantics).
+    case "$1" in
+        true) printf 'true' ;;
+        ''|false|'<nil>'|'<no value>') printf 'false' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 value_is_default() {
     # 1 when <key> holds a default/unset representation, so that cosmetic
     # differences between "unset" spellings (0 / false / "" / []) do not
@@ -567,8 +578,8 @@ value_is_default() {
     # are never folded into the default
     local key="$1" val="$2"
     case "${key}" in
-        readonly_rootfs|init|privileged)
-            case "${val}" in ''|false|'<no value>') return 0 ;; *) return 1 ;; esac ;;
+        readonly_rootfs|init|privileged|oom_kill_disable)
+            case "${val}" in ''|false|'<nil>'|'<no value>') return 0 ;; *) return 1 ;; esac ;;
         memory|memory_swap|cpu_shares|pids_limit|cpus)
             case "${val}" in ''|0|'<no value>') return 0 ;; *) return 1 ;; esac ;;
         *)
@@ -610,7 +621,7 @@ boundary_summary_keys() {
         val="${line#*=}"
         case "${key}" in
             user|workdir|cpuset_cpus) [ -n "${val}" ] && out="${out}${key} " ;;
-            readonly_rootfs|init|privileged) [ "${val}" = "true" ] && out="${out}${key} " ;;
+            readonly_rootfs|init|privileged|oom_kill_disable) [ "${val}" = "true" ] && out="${out}${key} " ;;
             cpus) [ -n "${val}" ] && [ "${val}" != "0" ] && out="${out}${key} " ;;
             memory|memory_swap|cpu_shares|pids_limit)
                 case "${val}" in ''|0) : ;; *) out="${out}${key} " ;; esac
@@ -1484,6 +1495,12 @@ while [ $# -gt 0 ]; do
         *) die "unknown option: $1" "${EXIT_USAGE}" ;;
     esac
 done
+
+# Test seam: allow a regression test to source the boundary functions without
+# executing the CLI. Not used by the CLI path.
+if [ "${AGENTTEAMS_UPGRADE_FUNCTIONS_ONLY:-}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 case "${COMMAND}" in
     preflight) cmd_preflight ;;

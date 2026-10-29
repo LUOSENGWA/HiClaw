@@ -173,7 +173,13 @@ therefore carries the current container's boundary over into the new one:
 - `--prepare-only` runs exactly that cycle — create, verify, discard the new
   container, restore the old one — and exits 0 with `boundary preserved: ...`
   without starting anything. Use it as a pre-check before a real upgrade.
-- `--controller-name <name>` targets a controller container with a
+
+- `OomKillDisable` is a `*bool`: an unset value renders `<nil>` on an ordinary
+  `docker run` container, while `docker create` stores `false`. The verifier
+  normalizes unset/false to the same default but keeps explicit `true`
+  distinct; the real-engine regression is
+  `bash install/tests/test-upgrade-boundary-real.sh` (skips without a
+  daemon/cached image, or when the daemon rejects `--oom-kill-disable`).- `--controller-name <name>` targets a controller container with a
   non-default name; the preserved-boundary logic applies identically.
 
 This is the same failure mode class as the gateway note above: the health
