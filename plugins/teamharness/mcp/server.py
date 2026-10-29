@@ -30,7 +30,7 @@ from mcp.artifact import filesync, publish, sync
 
 from mcp.common import config, constants, errors, identity, io, payload, paths, refs, tool_schemas
 
-from mcp.lifecycle import signal_events, taskflow, transitions
+from mcp.lifecycle import review, signal_events, taskflow, transitions
 
 from mcp.project import flow, state
 
@@ -44,9 +44,9 @@ from mcp import roomflow_tool
 
 refs.register_modules((
     constants, tool_schemas, paths, config, io, payload, errors, identity,
-    transitions, signal_events, taskflow, state, flow, filesync, publish,
-    sync, mention, matrix, rooms, notify, route, message, message_tool,
-    roomflow_tool,
+    transitions, signal_events, review, taskflow, state, flow, filesync,
+    publish, sync, mention, matrix, rooms, notify, route, message,
+    message_tool, roomflow_tool,
 ))
 
 # Every test loads its own server instance (function-scoped) and the bind
@@ -55,7 +55,7 @@ refs.register_modules((
 # instance stay visible at every proxy call site.
 refs.bind(globals())
 
-from mcp.common.config import _load_runtime_config, _section
+from mcp.common.config import _load_runtime_config, _protocol_enforce_enabled, _section
 from mcp.common.constants import MESSAGE_TOOL_BLOCKED_ROLES, TOOL_NAMES
 from mcp.common.tool_schemas import TOOL_SCHEMAS
 from mcp.lifecycle.transitions import _append_transition_history, _assert_transition, _transition_actor

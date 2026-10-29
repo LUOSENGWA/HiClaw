@@ -9,7 +9,15 @@ from typing import Any
 # and `import mcp.server` (package) modes. Level-2 relatives would fail in
 # the top-level mode the in-repo tests use.
 from mcp.common import refs
-from mcp.common.constants import TASK_HISTORY_LIMIT, TERMINAL_TASK_STATUSES, TRANSITIONS
+from mcp.common.constants import (
+    ATTENTION_STALL_BLOCKED,
+    ATTENTION_STALL_FROZEN,
+    DECISION_STATUS_VALUES,
+    DEFAULT_DECISION_STATUS,
+    TASK_HISTORY_LIMIT,
+    TERMINAL_TASK_STATUSES,
+    TRANSITIONS,
+)
 from mcp.common.io import _read_json, _safe_read_bytes, _utc_timestamp
 from mcp.common.paths import _project_dir, _project_state_path, _task_state_path
 from .signal_events import _emit_signal_event
@@ -271,3 +279,103 @@ def _append_transition_history(
     if len(history) > TASK_HISTORY_LIMIT:
         history = history[-TASK_HISTORY_LIMIT:]
     task["history"] = history
+
+
+# W2 protocol sub-state (issue #1451 W2): decision_status overlays the
+# nine runtime states; only the protocol layer writes it. The attention
+# stall chain is the convergence point that writes "blocked"; "frozen"
+# is released only through the approval channel (review.py / the
+# resolved kind=approval attention record).
+def _decision_status_of(task: dict[str, Any]) -> str:
+    """Read the decision_status sub-state, defaulting to 'open' for tasks
+    written before the W2 protocol layer existed."""
+    status = str(task.get("decision_status") or "").strip()
+    return status if status in DECISION_STATUS_VALUES else DEFAULT_DECISION_STATUS
+
+
+def _set_decision_status(
+    task: dict[str, Any],
+    new_status: str,
+    *,
+    reason: str,
+    source: str,
+    actor: str = "",
+) -> None:
+    """Write the decision_status sub-state. A history entry is appended
+    when the task enters blocked/frozen, or leaves them back to open
+    (decision_status_history: ts / from / to / reason / source, plus
+    actor when known). Mutates in place; the caller persists the task."""
+    if new_status not in DECISION_STATUS_VALUES:
+        raise ValueError(f"unknown decision_status: {new_status}")
+    current = _decision_status_of(task)
+    if current == new_status:
+        return
+    task["decision_status"] = new_status
+    if new_status in ("blocked", "frozen") or (
+        current in ("blocked", "frozen") and new_status == "open"
+    ):
+        history = task.get("decision_status_history")
+        if not isinstance(history, list):
+            history = []
+        entry: dict[str, Any] = {
+            "ts": _utc_timestamp(),
+            "from": current,
+            "to": new_status,
+            "reason": reason,
+            "source": source,
+        }
+        if actor:
+            entry["actor"] = actor
+        history.append(entry)
+        task["decision_status_history"] = history
+
+
+def _attention_stall_escalate(task: dict[str, Any], record: dict[str, Any]) -> str:
+    """Escalate decision_status after a stall increment: >=
+    ATTENTION_STALL_FROZEN -> frozen, >= ATTENTION_STALL_BLOCKED ->
+    blocked (monotonic: frozen never demotes to blocked). Only the
+    protocol layer's stall chain writes these values; sub-states set by
+    other writers (paused / spec_conflict) are left alone."""
+    stall = int(record.get("stall_count") or 0)
+    current = _decision_status_of(task)
+    if current not in ("open", "blocked", "frozen"):
+        return current
+    if stall >= ATTENTION_STALL_FROZEN:
+        target = "frozen"
+    elif stall >= ATTENTION_STALL_BLOCKED:
+        target = "blocked"
+    else:
+        return current
+    if current == target:
+        return current
+    _set_decision_status(
+        task,
+        target,
+        reason=f"attention stalled {stall} times without an answer",
+        source=f"attention:{str(record.get('kind') or 'unknown')}",
+    )
+    return _decision_status_of(task)
+
+
+def _attention_resolved_status(
+    task: dict[str, Any],
+    record: dict[str, Any],
+    *,
+    actor: str = "",
+) -> None:
+    """Zero the stall counter when the attention answer arrives and
+    return a stall-driven blocked/frozen sub-state to open (with a
+    history entry, so an unfreeze is audited). Non-stall sub-states are
+    left alone."""
+    record["stall_count"] = 0
+    current = _decision_status_of(task)
+    if current not in ("blocked", "frozen"):
+        return
+    reason = "unfrozen by approval record" if current == "frozen" else "attention answer received"
+    _set_decision_status(
+        task,
+        "open",
+        reason=reason,
+        source=f"attention:{str(record.get('kind') or 'unknown')}",
+        actor=actor,
+    )
