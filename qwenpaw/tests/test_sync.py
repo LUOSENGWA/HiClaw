@@ -777,3 +777,132 @@ def test_push_paths_noop_records_baseline_for_later_edit(
     restarted.mirror_all()
 
     assert state.read_text(encoding="utf-8") == "unpushed-edit"
+
+
+def test_upload_then_local_write_keeps_new_edit_dirty(tmp_path: Path, monkeypatch) -> None:
+    """A local write landing while `mc cp` runs must stay dirty.
+
+    The manifest baseline has to be the content that actually reached the
+    remote; a re-read at record time would record the unuploaded edit as
+    pushed and the next mirror would replace it with the remote copy.
+    """
+    sync = _sync(tmp_path)
+    sync.local_dir.mkdir(parents=True)
+    state = sync.local_dir / "state.txt"
+    state.write_text("uploaded-snapshot", encoding="utf-8")
+    remote = _FakeRemote()
+
+    monkeypatch.setattr(sync, "ensure_alias", lambda: None)
+    monkeypatch.setattr(sync, "_cat_bytes", remote.cat)
+
+    def fake_mc(*args, **_kwargs):
+        if args and args[0] == "cp":
+            remote.objects[args[2]] = Path(args[1]).read_bytes()
+            # A concurrent writer lands after the bytes left for the upload
+            # but before the manifest entry is recorded.
+            Path(args[1]).write_text(
+                "new-local-edit-after-upload", encoding="utf-8"
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(sync, "_mc", fake_mc)
+
+    assert sync.push_paths([state]) == ["state.txt"]
+    manifest = json.loads(sync.sync_state_path.read_text(encoding="utf-8"))
+    assert manifest["roots"]["worker"]["state.txt"]["sha256"] == (
+        hashlib.sha256(b"uploaded-snapshot").hexdigest()
+    )
+    assert sync.sync_status()["unpushed"] == [
+        {"root": "worker", "path": "state.txt", "status": "modified"}
+    ]
+
+    # Process restart: the remote still only holds the uploaded content.
+    restarted = _sync(tmp_path)
+    monkeypatch.setattr(restarted, "ensure_alias", lambda: None)
+    monkeypatch.setattr(restarted, "_mc", remote.mc)
+    monkeypatch.setattr(restarted, "_cat_bytes", remote.cat)
+
+    restarted.mirror_all()
+
+    assert state.read_text(encoding="utf-8") == "new-local-edit-after-upload"
+
+
+def test_remote_equal_then_local_write_keeps_new_edit_dirty(tmp_path: Path, monkeypatch) -> None:
+    """The remote-equal no-op must record the compared bytes, not a re-read.
+
+    A write landing between the remote comparison and the manifest record
+    must stay dirty, or the next mirror overwrites it with the (identical)
+    remote copy.
+    """
+    sync = _sync(tmp_path)
+    sync.local_dir.mkdir(parents=True)
+    state = sync.local_dir / "state.txt"
+    state.write_text("uploaded-snapshot", encoding="utf-8")
+    remote = _FakeRemote()
+    remote.objects["agents/worker-a/state.txt"] = b"uploaded-snapshot"
+
+    monkeypatch.setattr(sync, "ensure_alias", lambda: None)
+    monkeypatch.setattr(sync, "_mc", remote.mc)
+
+    def fake_cat_bytes(key):
+        data = remote.cat(key)
+        if data is not None:
+            # A concurrent writer lands after the remote comparison but
+            # before the manifest entry is recorded.
+            state.write_text("new-local-edit-after-upload", encoding="utf-8")
+        return data
+
+    monkeypatch.setattr(sync, "_cat_bytes", fake_cat_bytes)
+
+    assert sync.push_paths([state]) == []
+    manifest = json.loads(sync.sync_state_path.read_text(encoding="utf-8"))
+    assert manifest["roots"]["worker"]["state.txt"]["sha256"] == (
+        hashlib.sha256(b"uploaded-snapshot").hexdigest()
+    )
+    assert sync.sync_status()["unpushed"] == [
+        {"root": "worker", "path": "state.txt", "status": "modified"}
+    ]
+
+    restarted = _sync(tmp_path)
+    monkeypatch.setattr(restarted, "ensure_alias", lambda: None)
+    monkeypatch.setattr(restarted, "_mc", remote.mc)
+    monkeypatch.setattr(restarted, "_cat_bytes", remote.cat)
+
+    restarted.mirror_all()
+
+    assert state.read_text(encoding="utf-8") == "new-local-edit-after-upload"
+
+
+def test_push_directories_records_pre_mirror_snapshot(tmp_path: Path, monkeypatch) -> None:
+    """A write landing during `mc mirror` must stay dirty.
+
+    Directory pushes record per-file hashes captured before the mirror
+    runs; recording after the mirror would hash the unuploaded edit.
+    """
+    sync = _sync(tmp_path)
+    sync.local_dir.mkdir(parents=True)
+    work = sync.local_dir / "data"
+    note = work / "notes.txt"
+    note.parent.mkdir(parents=True)
+    note.write_text("before-mirror", encoding="utf-8")
+    remote = _FakeRemote()
+
+    monkeypatch.setattr(sync, "ensure_alias", lambda: None)
+    monkeypatch.setattr(sync, "_cat_bytes", remote.cat)
+
+    def fake_mc(*args, **_kwargs):
+        if args and args[0] == "mirror":
+            # A concurrent writer lands while the mirror runs.
+            note.write_text("after-mirror", encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(sync, "_mc", fake_mc)
+
+    assert sync.push_directories([work]) == ["data"]
+    manifest = json.loads(sync.sync_state_path.read_text(encoding="utf-8"))
+    assert manifest["roots"]["worker"]["data/notes.txt"]["sha256"] == (
+        hashlib.sha256(b"before-mirror").hexdigest()
+    )
+    assert sync.sync_status()["unpushed"] == [
+        {"root": "worker", "path": "data/notes.txt", "status": "modified"}
+    ]

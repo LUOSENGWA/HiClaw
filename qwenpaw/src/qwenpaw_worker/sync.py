@@ -224,16 +224,18 @@ class FileSync:
                 exc,
             )
 
-    def _record_pushed(self, root: str, rel: str, path: Path) -> None:
+    def _record_pushed(self, root: str, rel: str, sha256: str) -> None:
+        # #1391: the baseline must be the content that was actually pushed
+        # (uploaded bytes, or the remote copy verified as equal), never a
+        # re-read of the local file at record time — a write landing in
+        # that window would be recorded as pushed and silently overwritten
+        # by the next pull.
         state = self._load_sync_state()
         files = state.setdefault("roots", {}).setdefault(root, {})
-        try:
-            files[rel] = {
-                "sha256": _sha256_file(path),
-                "pushed_at": time.time(),
-            }
-        except OSError:
-            return
+        files[rel] = {
+            "sha256": sha256,
+            "pushed_at": time.time(),
+        }
         state["updated_at"] = time.time()
         self._save_sync_state(state)
 
@@ -425,21 +427,43 @@ class FileSync:
             except ValueError:
                 raise ValueError(f"path is outside worker storage root: {path}") from None
             key = f"{self.remote_prefix}/{rel.as_posix()}"
+            data: Optional[bytes] = None
             if path.stat().st_size <= COMPARE_CONTENT_MAX_BYTES:
+                # #1391: snapshot the bytes before any compare or upload;
+                # the baseline is derived from this content, never from a
+                # re-read at record time.
+                data = path.read_bytes()
+                local_sha = hashlib.sha256(data).hexdigest()
                 remote = self._cat_bytes(key)
-                if remote == path.read_bytes():
+                if remote == data:
                     # #1391: the remote already holds this exact content, so
                     # the upload is a no-op — but the manifest still needs the
                     # baseline, otherwise the next local edit looks untracked
                     # and a pull may overwrite it.
-                    self._record_pushed("worker", rel.as_posix(), path)
+                    self._record_pushed("worker", rel.as_posix(), local_sha)
                     continue
+            else:
+                # Large file: no content compare or post-upload read-back —
+                # downloading a big object just to hash it is what the size
+                # threshold exists to avoid. The pre-upload snapshot is the
+                # best available baseline; a write landing during the upload
+                # can still mix into the uploaded object, a known window this
+                # change does not close.
+                local_sha = _sha256_file(path)
             try:
                 self._mc("cp", str(path), self._object_path(key), check=True)
             except subprocess.CalledProcessError as exc:
                 raise RuntimeError(f"persist migrated state failed: {_mc_error_message(exc)}") from None
+            if data is not None:
+                # #1391: bind the baseline to what the remote actually holds
+                # after the upload. A local write that landed while `mc cp`
+                # ran is not in the remote and must stay dirty; a failed or
+                # empty read-back falls back to the pre-upload snapshot.
+                remote_after = self._cat_bytes(key)
+                if remote_after is not None and remote_after != data:
+                    local_sha = hashlib.sha256(remote_after).hexdigest()
             pushed.append(rel.as_posix())
-            self._record_pushed("worker", rel.as_posix(), path)
+            self._record_pushed("worker", rel.as_posix(), local_sha)
         return pushed
 
     def push_directories(self, directories: Iterable[Path]) -> List[str]:
@@ -461,6 +485,16 @@ class FileSync:
             # excluded from the mirror and reported as conflicts; the rest
             # of the directory still pushes.
             conflicts = self._directory_conflicts(directory)
+            # #1391: capture each file's hash before the mirror runs so the
+            # baseline is the content that gets uploaded, not a re-read
+            # after the mirror (a write landing in the mirror window would
+            # otherwise be recorded as pushed).
+            snapshots: List[tuple[str, str]] = []
+            for path in sorted(directory.rglob("*")):
+                if not path.is_file() or path.is_symlink():
+                    continue
+                rel_to_dir = path.relative_to(directory).as_posix()
+                snapshots.append((rel_to_dir, _sha256_file(path)))
             extra_args: List[str] = []
             for conflict in conflicts:
                 extra_args.extend(["--exclude", conflict])
@@ -486,16 +520,13 @@ class FileSync:
                     ",".join(conflicts[:10]),
                 )
             conflict_set = set(conflicts)
-            for path in sorted(directory.rglob("*")):
-                if not path.is_file() or path.is_symlink():
-                    continue
-                rel_to_dir = path.relative_to(directory).as_posix()
+            for rel_to_dir, sha256 in snapshots:
                 if rel_to_dir in conflict_set:
                     continue
                 self._record_pushed(
                     "worker",
                     f"{rel.as_posix()}/{rel_to_dir}",
-                    path,
+                    sha256,
                 )
             mirrored.append(rel.as_posix())
         return mirrored
@@ -549,21 +580,40 @@ def push_local(sync: FileSync, since: float = 0) -> List[str]:
 
         key = f"{sync.remote_prefix}/{rel.as_posix()}"
         try:
+            data: Optional[bytes] = None
             if stat.st_size <= COMPARE_CONTENT_MAX_BYTES:
+                # #1391: snapshot the bytes before any compare or upload;
+                # the baseline is derived from this content, never from a
+                # re-read at record time.
+                data = path.read_bytes()
+                local_sha = hashlib.sha256(data).hexdigest()
                 remote = sync._cat_bytes(key)
-                if remote == path.read_bytes():
+                if remote == data:
                     # #1391: no upload needed, but the background push is the
                     # only writer that knows this content is now the remote
                     # baseline; record it so a later local edit survives the
                     # next mirror.
-                    sync._record_pushed("worker", rel.as_posix(), path)
+                    sync._record_pushed("worker", rel.as_posix(), local_sha)
                     continue
+            else:
+                # Large file: no content compare or post-upload read-back;
+                # the pre-upload snapshot is the best available baseline
+                # (a write landing during the upload is a known window
+                # this change does not close).
+                local_sha = _sha256_file(path)
             sync._mc("cp", str(path), sync._object_path(key), check=True)
+            if data is not None:
+                # #1391: bind the baseline to what the remote actually holds
+                # after the upload; a failed or empty read-back falls back
+                # to the pre-upload snapshot.
+                remote_after = sync._cat_bytes(key)
+                if remote_after is not None and remote_after != data:
+                    local_sha = hashlib.sha256(remote_after).hexdigest()
             pushed.append(rel.as_posix())
             # #1391: background uploads are pushes too — without the manifest
             # entry the next startup mirror cannot tell a later unpushed edit
             # from stale pulled state.
-            sync._record_pushed("worker", rel.as_posix(), path)
+            sync._record_pushed("worker", rel.as_posix(), local_sha)
         except Exception as exc:
             logger.debug("push_local failed component=sync file=%s error_type=%s", rel, type(exc).__name__)
 
