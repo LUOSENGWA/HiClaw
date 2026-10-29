@@ -55,6 +55,21 @@ case "$1" in
     info)
         exit 0
         ;;
+    image)
+        # docker image inspect --format <fmt> <ref>  -> $4 = fmt, $5 = ref
+        fmt="$4"
+        case "${STUB_SCENARIO:-ok}" in
+            image_inspect_fail) exit 1 ;;
+        esac
+        case "$fmt" in
+            *"{{.Id}}"*) echo "sha256:imageid" ;;
+            *RepoDigests*)
+                [ "${STUB_SCENARIO:-ok}" = "image_no_digest" ] && exit 0
+                printf 'example/controller@sha256:aaa\nexample/controller@sha256:bbb\n'
+                ;;
+        esac
+        exit 0
+        ;;
     inspect)
         fmt="$3"
         # scenario overrides (boundary / unsupported_sysctl); everything else
@@ -337,6 +352,25 @@ assert_contains '^stop ' "${REC}" "backup yes stop"
 assert_contains '^cp ' "${REC}" "backup yes cp"
 [ -f "${TMP}/b5/state.json" ] || { echo "FAIL backup yes: state.json missing"; cat "${OUT}"; exit 1; }
 assert_contains '"status":"done"' "${TMP}/b5/state.json" "backup yes state"
+# 5a. the image inventory records the image reference, the image ID and the
+# repository digests (never a container ID / never an empty reference)
+assert_contains 'agentteams-controller: image=example/controller:old id=sha256:imageid digests=example/controller@sha256:aaa,example/controller@sha256:bbb' "${TMP}/b5/images.txt" "backup inventory line"
+
+# 5b. a custom --controller-name is inventoried under that name
+run_case ok backup --yes --controller-name owned-ctrl --env-file "${ENV_FILE}" --backup-dir "${TMP}/b5c" --state-file "${TMP}/b5c/state.json"
+assert_eq "${RC}" "0" "backup custom-name rc"
+assert_contains 'owned-ctrl: image=example/controller:old id=sha256:imageid' "${TMP}/b5c/images.txt" "custom-name inventory line"
+
+# 5c. a local-only image (no repo digest) records digests=none
+run_case image_no_digest backup --yes --env-file "${ENV_FILE}" --backup-dir "${TMP}/b5n" --state-file "${TMP}/b5n/state.json"
+assert_eq "${RC}" "0" "backup no-digest rc"
+assert_contains 'digests=none' "${TMP}/b5n/images.txt" "no-digest inventory"
+
+# 5d. an image-inspect failure fails the backup instead of writing an empty line
+run_case image_inspect_fail backup --yes --env-file "${ENV_FILE}" --backup-dir "${TMP}/b5f" --state-file "${TMP}/b5f/state.json"
+assert_eq "${RC}" "3" "backup image-fail rc"
+assert_contains 'image inventory failed' "${OUT}" "image-fail message"
+assert_contains '"status":"failed"' "${TMP}/b5f/state.json" "image-fail state"
 
 # 5.1 docker stop fails: no copy, nonzero, failed state, controller left as-is
 run_case stop_fail backup --yes --env-file "${ENV_FILE}" --backup-dir "${TMP}/b51" --state-file "${TMP}/b51/state.json"

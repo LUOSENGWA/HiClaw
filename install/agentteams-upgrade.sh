@@ -1002,14 +1002,38 @@ cmd_plan() {
 # ---------------------------------------------------------------------------
 # backup
 # ---------------------------------------------------------------------------
+# record_images writes the image inventory used to restore a container later.
+#
+# The image reference lives on the *container* (.Config.Image) while the image
+# ID and the repository digests live on the *image*; asking a container for
+# .RepoDigests is an error (and a container .Id is the container ID, not the
+# image). Failures are propagated: an inventory that silently records an empty
+# reference is worse than a failed backup.
 record_images() {
-    local out="${BACKUP_DIR}/images.txt" name val
+    local out="${BACKUP_DIR}/images.txt" name img imgid digests
     : > "${out}"
-    for name in agentteams-controller agentteams-manager agentteams-dashboard; do
-        if container_exists "${name}"; then
-            val="$(inspect_fmt '{{.Config.Image}} {{.Id}} {{index .RepoDigests 0}}' "${name}")"
-            printf '%s: %s\n' "${name}" "${val}" >> "${out}"
+    for name in "${CONTROLLER_NAME}" agentteams-manager agentteams-dashboard; do
+        container_exists "${name}" || continue
+        if ! img="$("${DOCKER_CMD}" inspect --format '{{.Config.Image}}' "${name}" 2>/dev/null)"; then
+            err "cannot read the image reference of container ${name}"
+            return 1
         fi
+        if [ -z "${img}" ]; then
+            err "container ${name} reports an empty image reference"
+            return 1
+        fi
+        if ! imgid="$("${DOCKER_CMD}" image inspect --format '{{.Id}}' "${img}" 2>/dev/null)"; then
+            err "cannot inspect image ${img} (referenced by ${name})"
+            return 1
+        fi
+        if ! digests="$("${DOCKER_CMD}" image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${img}" 2>/dev/null)"; then
+            err "cannot read the repository digests of image ${img}"
+            return 1
+        fi
+        digests="$(printf '%s' "${digests}" | paste -sd, - 2>/dev/null)"
+        # A locally built image legitimately has no repository digest.
+        [ -n "${digests}" ] || digests="none"
+        printf '%s: image=%s id=%s digests=%s\n' "${name}" "${img}" "${imgid}" "${digests}" >> "${out}"
     done
 }
 
@@ -1080,7 +1104,10 @@ cmd_backup() {
         write_state "backup" "failed" "docker cp kine failed; ${rec}"
         die "docker cp kine failed" "${EXIT_GATE}"
     fi
-    record_images
+    if ! record_images; then
+        write_state "backup" "failed" "image inventory failed"
+        die "image inventory failed; the kine copy is complete but the recorded images are incomplete" "${EXIT_GATE}"
+    fi
 
     if [ "${stopped}" = "1" ]; then
         if ! "${DOCKER_CMD}" start "${CONTROLLER_NAME}" >/dev/null 2>&1; then
