@@ -115,6 +115,20 @@ def _assert_no_plugin_not_found(result: subprocess.CompletedProcess, payload: di
 
 
 @pytest.fixture(scope="module")
+def staged_bundle(tmp_path_factory) -> Path:
+    """A copy of the bundle owned by the running process.
+
+    OpenClaw's discovery rejects a plugin directory whose ownership differs
+    from the running user ("suspicious ownership"), so a checkout owned by
+    another uid is not a valid plugin root. Real deployments extract the
+    bundle as the runtime user; copying here reproduces that condition.
+    """
+    destination = tmp_path_factory.mktemp("staged") / BUNDLE.name
+    shutil.copytree(BUNDLE, destination)
+    return destination
+
+
+@pytest.fixture(scope="module")
 def scratch_home(tmp_path_factory) -> tuple[Path, Path]:
     """Empty HOME with the config at the pinned runtime's default path."""
     home = tmp_path_factory.mktemp("openclaw-home")
@@ -133,24 +147,27 @@ def test_openclaw_binary_reports_expected_version(scratch_home):
         )
 
 
-def test_install_registers_loadable_plugin(scratch_home):
+def test_install_registers_loadable_plugin(scratch_home, staged_bundle):
     home, config = scratch_home
     workspace = home.parent / f"{home.name}-workspace"
     env = _isolated_env(home)
-    result = _run_script(INSTALL, "--config", str(config), "--workspace", str(workspace), env=env)
+    adapter = staged_bundle / "adapters" / "openclaw"
+    result = _run_script(
+        adapter / "install.sh", "--config", str(config), "--workspace", str(workspace), env=env
+    )
     assert result.returncode == 0, result.stderr
     assert workspace.is_dir(), "--workspace directory was not created"
 
     # The registration install.sh wrote is the one native discovery resolves.
     cfg = json.loads(config.read_text())
     assert PLUGIN_ID in cfg["plugins"]["allow"]
-    assert str(OPENCLAW_ADAPTER) in cfg["plugins"]["load"]["paths"]
+    assert str(adapter) in cfg["plugins"]["load"]["paths"]
     assert cfg["plugins"]["entries"][PLUGIN_ID]["enabled"] is True
-    assert cfg["mcp"]["servers"]["teamharness"]["cwd"] == str(BUNDLE)
+    assert cfg["mcp"]["servers"]["teamharness"]["cwd"] == str(staged_bundle)
 
     # The loadable entry exists where discovery looks (adapter dir is the
     # staged plugin root registered in plugins.load.paths).
-    assert (OPENCLAW_ADAPTER / "index.mjs").is_file()
+    assert (adapter / "index.mjs").is_file()
 
     result = _openclaw(home, "plugins", "list", "--json")
     assert result.returncode == 0, result.stderr
@@ -163,19 +180,20 @@ def test_install_registers_loadable_plugin(scratch_home):
     _assert_no_plugin_not_found(result, payload)
 
 
-def test_uninstall_removes_plugin_and_warnings_do_not_return(scratch_home):
+def test_uninstall_removes_plugin_and_warnings_do_not_return(scratch_home, staged_bundle):
     home, config = scratch_home
     env = _isolated_env(home)
+    adapter = staged_bundle / "adapters" / "openclaw"
 
     # Make the state deterministic regardless of test order.
-    result = _run_script(INSTALL, "--config", str(config), env=env)
+    result = _run_script(adapter / "install.sh", "--config", str(config), env=env)
     assert result.returncode == 0, result.stderr
 
-    result = _run_script(UNINSTALL, "--config", str(config), env=env)
+    result = _run_script(adapter / "uninstall.sh", "--config", str(config), env=env)
     assert result.returncode == 0, result.stderr
     cfg = json.loads(config.read_text())
     assert PLUGIN_ID not in cfg.get("plugins", {}).get("allow", [])
-    assert str(OPENCLAW_ADAPTER) not in cfg.get("plugins", {}).get("load", {}).get("paths", [])
+    assert str(adapter) not in cfg.get("plugins", {}).get("load", {}).get("paths", [])
     assert PLUGIN_ID not in cfg.get("plugins", {}).get("entries", {})
     assert "teamharness" not in cfg.get("mcp", {}).get("servers", {})
 
