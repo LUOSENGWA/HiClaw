@@ -188,9 +188,15 @@ async def _start_wake_queue() -> None:
     any wakes queued by the previous process.
     """
     from qwen_code_bridge import wake_queue
-    from qwen_code_bridge.dispatch import mark_wake_delivered
+    from qwen_code_bridge.dispatch import (
+        mark_wake_delivered,
+        wake_is_delivered,
+    )
 
-    wake_queue.ensure_running(on_delivered=mark_wake_delivered)
+    wake_queue.ensure_running(
+        on_delivered=mark_wake_delivered,
+        is_delivered=wake_is_delivered,
+    )
     logger.info(
         "wake queue started (pending=%d)", len(wake_queue.pending())
     )

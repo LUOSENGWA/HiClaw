@@ -508,6 +508,15 @@ def mark_wake_delivered(task_id: str) -> None:
         pass
 
 
+def wake_is_delivered(task_id: str) -> bool:
+    """Queue callback: has this task's wake already been delivered?
+
+    Read from the task file (the durable state), so a record that survived a
+    crash after delivery is dropped instead of re-injecting the text."""
+    task = load_task(task_id) or {}
+    return str(task.get("wake_status") or "") == "sent"
+
+
 def _queue_wake(
     task: dict[str, Any],
     wake: dict[str, Any],
@@ -517,6 +526,10 @@ def _queue_wake(
     error: str,
 ) -> None:
     """Persist one wake into the durable queue (shared by both call sites)."""
+    # A task whose wake was already delivered must never be queued again: the
+    # durable retry would re-inject the same text (the duplicate-wake reports).
+    if str(task.get("wake_status") or "") == "sent":
+        return
     wake_queue.enqueue(
         {
             "task_id": str(task.get("task_id") or ""),

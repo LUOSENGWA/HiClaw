@@ -58,6 +58,7 @@ _lock: Optional[asyncio.Lock] = None
 _loop_task: Optional[asyncio.Task] = None
 _sender: Optional[Callable[..., None]] = None
 _on_delivered: Optional[Callable[[str], None]] = None
+_is_delivered: Callable[[str], bool] | None = None
 
 
 def _path() -> Path:
@@ -178,6 +179,15 @@ def chat_is_busy(base_url: str, agent_id: str, chat_id: str) -> bool:
         return False
 
 
+#: A wake that still cannot be delivered after this many attempts is dropped:
+#: an unbounded retry loop re-injects the same text (the 2026-10-30 duplicate
+#: wake reports) and never converges.
+MAX_ATTEMPTS = 10
+#: 409 means the chat accepted a run already; retry briefly and bounded, do
+#: not burn the failure backoff.
+MAX_BUSY_RETRIES = 20
+
+
 def _due(now: float) -> list[dict[str, Any]]:
     return [
         r for r in load() if float(r.get("next_at") or 0.0) <= now
@@ -220,8 +230,15 @@ def _reschedule(record: dict[str, Any], now: float, error: str) -> None:
     _save(records)
 
 
-async def drain_once(sender: Callable[..., None] | None = None) -> dict[str, int]:
-    """Try every due record once; returns counters (mostly for tests)."""
+async def drain_once(
+    sender: Callable[..., None] | None = None,
+    is_delivered: Callable[[str], bool] | None = None,
+) -> dict[str, int]:
+    """Try every due record once; returns counters (mostly for tests).
+
+    ``is_delivered`` (or the wired callback) drops records whose task already
+    reports its wake as sent — the durable-retry duplicate guard."""
+    check_delivered = is_delivered if is_delivered is not None else _is_delivered
     stats = {"sent": 0, "failed": 0, "dropped": 0, "busy": 0}
     now = time.time()
     due = _due(now)
@@ -233,6 +250,24 @@ async def drain_once(sender: Callable[..., None] | None = None) -> dict[str, int
         due = _due(time.time())
         for record in due:
             task_id = str(record.get("task_id") or "")
+            if check_delivered is not None:
+                try:
+                    if check_delivered(task_id):
+                        _remove(task_id)
+                        stats["dropped"] += 1
+                        logger.info(
+                            "wake dropped (already delivered): task=%s", task_id
+                        )
+                        continue
+                except Exception:
+                    pass  # a broken check must not stop delivery
+            if int(record.get("attempts") or 0) >= MAX_ATTEMPTS:
+                _remove(task_id)
+                stats["dropped"] += 1
+                logger.warning(
+                    "wake dropped after %s attempts: task=%s", MAX_ATTEMPTS, task_id
+                )
+                continue
             created = float(record.get("created_at") or 0.0)
             if created and now - created > MAX_AGE_S:
                 _remove(task_id)
@@ -246,6 +281,15 @@ async def drain_once(sender: Callable[..., None] | None = None) -> dict[str, int
                 str(record.get("chat_id") or ""),
             )
             if busy:
+                if int(record.get("busy_retries") or 0) >= MAX_BUSY_RETRIES:
+                    _remove(task_id)
+                    stats["dropped"] += 1
+                    logger.warning(
+                        "wake dropped after %s busy retries: task=%s",
+                        MAX_BUSY_RETRIES,
+                        task_id,
+                    )
+                    continue
                 _reschedule_busy(record, time.time())
                 stats["busy"] += 1
                 logger.debug(
@@ -267,6 +311,22 @@ async def drain_once(sender: Callable[..., None] | None = None) -> dict[str, int
                     approval_level=str(record.get("approval_level") or ""),
                 )
             except Exception as exc:
+                # A 409 means a chat run is already in progress: retry soon
+                # and bounded, not with the failure backoff.
+                if "409" in str(exc):
+                    if int(record.get("busy_retries") or 0) >= MAX_BUSY_RETRIES:
+                        _remove(task_id)
+                        stats["dropped"] += 1
+                        logger.warning(
+                            "wake dropped after %s busy retries: task=%s",
+                            MAX_BUSY_RETRIES,
+                            task_id,
+                        )
+                        continue
+                    _reschedule_busy(record, time.time())
+                    stats["busy"] += 1
+                    logger.info("wake deferred (409): task=%s", task_id)
+                    continue
                 _reschedule(record, time.time(), str(exc))
                 stats["failed"] += 1
                 logger.info(
@@ -311,11 +371,14 @@ def _default_sender() -> Callable[..., None]:
 def ensure_running(
     sender: Callable[..., None] | None = None,
     on_delivered: Callable[[str], None] | None = None,
+    is_delivered: Callable[[str], bool] | None = None,
 ) -> None:
     """Start the drain loop once (no-op when already running / no loop)."""
-    global _loop_task, _sender, _on_delivered
+    global _loop_task, _sender, _on_delivered, _is_delivered
     if sender is not None:
         _sender = sender
+    if is_delivered is not None:
+        _is_delivered = is_delivered
     if on_delivered is not None:
         _on_delivered = on_delivered
     if _loop_task is not None and not _loop_task.done():
@@ -337,6 +400,8 @@ def stop() -> None:
 
 __all__ = [
     "BACKOFF_S",
+    "MAX_ATTEMPTS",
+    "MAX_BUSY_RETRIES",
     "MAX_AGE_S",
     "QUEUE_FILE",
     "discard",

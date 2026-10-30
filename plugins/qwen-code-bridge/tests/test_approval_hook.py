@@ -109,6 +109,31 @@ def test_git_commit_quoted_semicolon_allow(tmp_path):
     assert _decision(out) == "allow"
 
 
+# 5b. sed scripts can execute commands / write files → deny (exec-script-program)
+def test_sed_script_execution_deny(tmp_path):
+    for command in (
+        "sed '1e touch /tmp/qcb-marker' f",
+        "sed 's/.*/x/e' f",
+        "sed '1w /tmp/qcb-marker' f",
+        "sed -f script.sed f",
+    ):
+        out = _run_hook(
+            _shell_payload(command, tmp_path), roots=[str(tmp_path)]
+        )
+        assert _decision(out) == "deny", command
+        assert "exec-script-program" in _reason(out), command
+
+
+# 5c. find writing actions → deny (find-action)
+def test_find_fprint_deny(tmp_path):
+    out = _run_hook(
+        _shell_payload("find . -fprint marker.txt", tmp_path),
+        roots=[str(tmp_path)],
+    )
+    assert _decision(out) == "deny"
+    assert "find-action" in _reason(out)
+
+
 # 6. run roots missing from the environment → fail closed
 def test_missing_roots_fail_closed(tmp_path):
     out = _run_hook(

@@ -211,7 +211,54 @@ def test_bash_c_deny():
 
 def test_sed_inplace_deny():
     d = approval.decide("shell", {"command": "sed -i s/a/b/ f"}, [ROOT])
-    assert d["behavior"] == "deny" and d["rule"] == "sed-inplace"
+    assert d["behavior"] == "deny" and d["rule"] == "exec-script-program"
+
+
+def test_sed_script_execution_deny():
+    """sed scripts can run commands / write files; no flag check is enough."""
+    for command in (
+        "sed '1e id' f",            # execute shell
+        "sed 's/.*/x/e' f",         # s///e executes the replacement
+        "sed '1w /tmp/marker' f",   # write an arbitrary file
+        "sed 's/x/y/w /tmp/marker' f",
+        "sed '1r /etc/passwd' f",   # read an arbitrary file into the stream
+        "sed -f script.sed f",      # script file
+        "sed --expression='1e id' f",
+    ):
+        d = approval.decide("shell", {"command": command}, [ROOT])
+        assert d["behavior"] == "deny", command
+        assert d["rule"] == "exec-script-program", command
+
+
+def test_find_writing_actions_deny():
+    for command in (
+        "find . -fprint /tmp/marker",
+        "find . -fprintf /tmp/marker '%p'",
+        "find . -fls /tmp/marker",
+        "find . -execdir rm {} +",
+        "find . -okdir rm {} +",
+        "find . -delete",
+    ):
+        d = approval.decide("shell", {"command": command}, [ROOT])
+        # Several rules can legitimately deny a writing action (a metacharacter
+        # or an out-of-root path may fire first); the behaviour is what matters.
+        assert d["behavior"] == "deny", command
+
+
+def test_find_plain_listing_still_allowed():
+    d = approval.decide("shell", {"command": "find . -name '*.py'"}, [ROOT])
+    assert d["behavior"] == "allow"
+
+
+def test_git_output_flag_deny():
+    """git log/diff --output writes a file even though the subcommand is read-only."""
+    for command in (
+        "git log --output=/tmp/marker",
+        "git diff --output /tmp/marker",
+    ):
+        d = approval.decide("shell", {"command": command}, [ROOT])
+        assert d["behavior"] == "deny", command
+        assert d["rule"] == "git-flag-forbidden", command
 
 
 def test_find_exec_deny():

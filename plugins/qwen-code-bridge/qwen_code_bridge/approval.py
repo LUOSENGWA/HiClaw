@@ -35,7 +35,10 @@ Shell policy (fail closed, #1411):
    (``outside-root-cwd``).
 4. Path-like argv (absolute, ``./``, ``../``, ``~/``, contains ``/``)
    must ``realpath`` into the roots — symlinks included
-   (``outside-root``).  Secret-ish paths are refused everywhere.
+   (``outside-root``).  Secret-ish paths are refused everywhere.  Programs
+   whose arguments are a program (``sed``) are denied outright: their scripts
+   can execute commands (``e``/``s///e``) or write files (``w``/``W``/``s///w``,
+   ``-f``), which no flag check can rule out.
 5. Unconstrained interpreters (``sh``/``bash``/``python*``/``node`` …)
    and destructive utilities are hard-denied (``exec-denied``);
    anything else escalates (deny by default, overridable via
@@ -115,12 +118,19 @@ _DENY_PROGRAMS = frozenset({
 #: argv[0] programs auto-approved inside the run roots (read-only file
 #: inspection and the test runner).  ``git`` is validated separately.
 _ALLOW_PROGRAMS = frozenset({
-    "cat", "head", "tail", "wc", "ls", "sed", "grep", "rg", "find",
+    "cat", "head", "tail", "wc", "ls", "grep", "rg", "find",
     "pwd", "pytest",
 })
 
+#: Programs whose *arguments are a program*: they can execute commands or
+#: write files regardless of flags, so no static flag check makes them safe.
+#: ``sed`` is here because scripts can run commands (``e``, ``s///e``) and
+#: write files (``w``/``W``/``s///w``), and ``-f`` loads arbitrary scripts —
+#: a read-only subset is not decidable without a full parser.
+_DENY_SCRIPT_PROGRAMS = frozenset({"sed"})
+
 #: git flag tokens forbidden for every subcommand (config/dir overrides).
-_GIT_FORBIDDEN_FLAGS = frozenset({"-c", "-C", "--exec"})
+_GIT_FORBIDDEN_FLAGS = frozenset({"-c", "-C", "--exec", "--output", "-O"})
 #: git branch: the only accepted flags (read-only listing).
 _GIT_BRANCH_LIST_FLAGS = frozenset({"--list", "-a", "-v"})
 
@@ -280,23 +290,22 @@ def _git_verdict(args: list[str]) -> tuple[str, str, str] | None:
     )
 
 
-def _sed_has_inplace(args: list[str]) -> bool:
-    for a in args:
-        if a == "-" or not a.startswith("-"):
-            continue
-        if a.startswith("--"):
-            if a.startswith("--in-place"):
-                return True
-        elif "i" in a[1:]:
-            return True
-    return False
+#: find actions that execute commands or write files (the flag may be
+#: abbreviated: find accepts any unambiguous prefix, so match by prefix).
+_FIND_ACTION_PREFIXES = (
+    "-exec",
+    "-execdir",
+    "-ok",
+    "-okdir",
+    "-delete",
+    "-fprint",
+    "-fprintf",
+    "-fls",
+)
 
 
 def _find_has_action(args: list[str]) -> bool:
-    return any(
-        a.startswith("-exec") or a.startswith("-delete") or a.startswith("-ok")
-        for a in args
-    )
+    return any(a.startswith(_FIND_ACTION_PREFIXES) for a in args)
 
 
 def _rg_has_pre(args: list[str]) -> bool:
@@ -366,9 +375,16 @@ def _classify_shell(tool_input: Any, root_list: list[str]) -> dict[str, Any]:
         # ``git commit -m <message>``: the message is data, not a path.
         if len(argv) == 4 and argv[1] == "commit" and argv[2] == "-m":
             skip_message = True
-    elif prog == "sed" and _sed_has_inplace(argv[1:]):
+    elif prog in _DENY_SCRIPT_PROGRAMS:
         return _result(
-            RISK_DENY, "sed-inplace", "sed in-place edit not allowed", argv[0]
+            RISK_DENY,
+            "exec-script-program",
+            (
+                f"{prog} is not auto-approved: its scripts can execute commands "
+                "or write files (e/E, w/W, r, s///e, s///w, -f); use edit_file/"
+                "apply_patch or request explicit review"
+            ),
+            argv[0],
         )
     elif prog == "find" and _find_has_action(argv[1:]):
         return _result(

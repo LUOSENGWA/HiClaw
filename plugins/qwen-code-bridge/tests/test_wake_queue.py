@@ -58,7 +58,12 @@ def test_drain_success_removes_and_calls_callback() -> None:
     assert calls and calls[0][2] == "AUTO"
 
 
-def test_drain_failure_reschedules_with_backoff() -> None:
+def test_drain_409_defers_as_busy() -> None:
+    """A 409 means a chat run is already in progress: retry soon, bounded.
+
+    Treating it as a failure used to re-inject the same text with the failure
+    backoff (the duplicate-wake reports)."""
+
     def sender(*_args, **_kwargs):
         raise RuntimeError("wake inject failed: http 409")
 
@@ -67,13 +72,51 @@ def test_drain_failure_reschedules_with_backoff() -> None:
 
     stats = asyncio.run(wake_queue.drain_once(sender))
 
+    assert stats == {"sent": 0, "failed": 0, "dropped": 0, "busy": 1}
+    record = wake_queue.load()[0]
+    assert record["busy_retries"] == 1
+    assert record["next_at"] <= before + wake_queue.BUSY_RETRY_S + 1
+    assert "attempts" not in record or record["attempts"] == 0
+
+
+def test_drain_failure_reschedules_with_backoff() -> None:
+    def sender(*_args, **_kwargs):
+        raise RuntimeError("wake inject failed: connection refused")
+
+    wake_queue.enqueue({"task_id": _task("c2"), "text": "done", "session_id": "s"})
+    before = time.time()
+
+    stats = asyncio.run(wake_queue.drain_once(sender))
+
     assert stats == {"sent": 0, "failed": 1, "dropped": 0, "busy": 0}
-    records = wake_queue.load()
-    assert len(records) == 1
-    record = records[0]
+    record = wake_queue.load()[0]
     assert record["attempts"] == 1
     assert record["next_at"] >= before + wake_queue.BACKOFF_S[0]
-    assert "409" in record["last_error"]
+
+
+def test_drain_drops_an_already_delivered_wake() -> None:
+    """After a crash, a record whose task already reports 'sent' is dropped."""
+    calls = []
+    wake_queue.enqueue({"task_id": _task("x"), "text": "done", "session_id": "s"})
+
+    stats = asyncio.run(
+        wake_queue.drain_once(
+            lambda *a, **k: calls.append(a), is_delivered=lambda task_id: True
+        )
+    )
+
+    assert stats == {"sent": 0, "failed": 0, "dropped": 1, "busy": 0}
+    assert wake_queue.load() == []
+    assert calls == []
+
+
+def test_drain_drops_after_max_attempts() -> None:
+    wake_queue.enqueue(
+        {"task_id": _task("m"), "text": "done", "session_id": "s", "attempts": wake_queue.MAX_ATTEMPTS}
+    )
+    stats = asyncio.run(wake_queue.drain_once(lambda *a, **k: None))
+    assert stats["dropped"] == 1
+    assert wake_queue.load() == []
 
 
 def test_drain_drops_after_max_age() -> None:
