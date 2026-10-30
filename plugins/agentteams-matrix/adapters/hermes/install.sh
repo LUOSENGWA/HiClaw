@@ -31,9 +31,10 @@
 # version numbers; it resolves the target runtime's capability in this
 # order (the first decisive source wins):
 #
-#   1. tree probe — a located Hermes root (--hermes-root, then
-#      HERMES_HOME, then an importable `gateway` package, then the
-#      `hermes` executable's prefix) whose Matrix adapter source
+#   1. tree probe — a located Hermes SDK root (--hermes-root, or an
+#      implicitly discovered install: an importable `gateway` package, the
+#      `hermes` executable's venv, or a conventional Worker venv). Matrix
+#      adapter source
 #      detects as full or basic. Ground truth: it outranks
 #      --hermes-capabilities and the version table. A root that exists
 #      but has no detectable Matrix shape is not a successful probe —
@@ -69,10 +70,11 @@
 #                          `hermes --version` probe. Consulted only when
 #                          the tree probe and --hermes-capabilities do
 #                          not decide (see the resolution order above).
-#   --hermes-root <path>   root of the target Hermes install to probe
-#                          (overrides HERMES_HOME). The directory must
-#                          exist; its Matrix adapter source decides the
-#                          capability.
+#   --hermes-root <path>   root of the target Hermes SDK install to probe.
+#                          The directory must exist; its Matrix adapter
+#                          source decides the capability. HERMES_HOME is
+#                          NOT a source root: the Worker sets it to its
+#                          state directory (${WORKSPACE}/.hermes).
 #   --hermes-capabilities <full|basic>
 #                          explicit capability declaration for the
 #                          target runtime. Outranks the verified
@@ -134,10 +136,11 @@ case the dropped settings are recorded in
 
 Runtime capability is resolved in this order (first decisive source
 wins):
-  1. tree probe — a located Hermes root (--hermes-root, then
-     HERMES_HOME, then an importable `gateway` package, then the
-     `hermes` binary's prefix) whose Matrix adapter source detects as
-     full or basic (ground truth; outranks everything below);
+  1. tree probe — a located Hermes SDK root (--hermes-root, or an
+     implicitly discovered install: an importable `gateway` package, the
+     `hermes` binary's venv, or a conventional Worker venv) whose Matrix
+     adapter source detects as full or basic (ground truth; outranks
+     everything below). HERMES_HOME is a state directory, never a source;
   2. --hermes-capabilities full|basic — an explicit declaration;
   3. verified table — the version from --hermes-version /
      HERMES_VERSION / `hermes --version`, matched by tag or by package
@@ -479,53 +482,64 @@ def _has_known_matrix_shape(root):
     )
 
 
-def locate_hermes_root():
-    """Locate a Hermes root to probe, or None.
+def implicit_hermes_roots():
+    """Candidate SDK roots discovered without an explicit override.
 
-    Order: --hermes-root / HERMES_HOME (explicit; a missing directory
-    is a hard error) -> an importable `gateway` package -> the `hermes`
-    executable's prefix. Implicit candidates are accepted only when a
-    known Matrix shape is detectable — the probe never guesses."""
-    explicit = (hermes_root_arg or os.environ.get("HERMES_HOME", "")).strip()
-    if explicit:
-        path = Path(explicit).expanduser()
-        if not path.is_dir():
-            fail(
-                f"hermes root {explicit} (from --hermes-root / HERMES_HOME) "
-                "is not a directory"
-            )
-        return path
+    HERMES_HOME is deliberately absent: the Worker entrypoint sets it to
+    ${WORKSPACE}/.hermes, the runtime's STATE directory (config.yaml,
+    sessions). It is never an SDK tree."""
     try:
         spec = importlib.util.find_spec("gateway")
     except Exception:
         spec = None
     if spec is not None and spec.submodule_search_locations:
-        candidate = Path(next(iter(spec.submodule_search_locations))).resolve().parent
-        if _has_known_matrix_shape(candidate):
-            return candidate
+        yield Path(next(iter(spec.submodule_search_locations))).resolve().parent
     hermes_bin = shutil.which("hermes")
     if hermes_bin:
-        candidate = Path(hermes_bin).resolve().parent.parent
+        # <venv>/bin/hermes -> <venv>; the site-packages candidate below is
+        # the one that usually carries the SDK tree.
+        yield Path(hermes_bin).resolve().parent.parent
+    for site_packages in sorted(Path("/opt/venv/hermes").glob("lib/python*/site-packages")):
+        yield site_packages
+
+
+def locate_hermes_root():
+    """(root, explicit): an SDK root to probe, or (None, False).
+
+    Only --hermes-root is explicit (a missing directory is a hard error).
+    Implicit candidates (importable package, the hermes executable's venv, a
+    conventional Worker venv) count only when a known Matrix shape is
+    detectable; otherwise there is simply no evidence and the version table
+    decides."""
+    explicit = (hermes_root_arg or "").strip()
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.is_dir():
+            fail(f"hermes root {explicit} (from --hermes-root) is not a directory")
+        return path, True
+    for candidate in implicit_hermes_roots():
         if _has_known_matrix_shape(candidate):
-            return candidate
-    return None
+            return candidate, False
+    return None, False
 
 
 def resolve_capabilities(runtime_version):
     """(capability, source, root): capability is "full", "basic" or
     None (unknown); source is the human-readable evidence."""
-    root = locate_hermes_root()
+    root, explicit = locate_hermes_root()
     if root is not None:
         capability = probe_tree_capabilities(root)
         if capability is not None:
             return capability, f"tree probe {root}", root
-        # A located tree without a detectable Matrix shape is not a
-        # successful probe: never guess. The explicit declaration still
-        # applies; the version table does not, because the version
-        # string may describe a different install than the located tree.
         if capabilities_arg:
             return capabilities_arg, "--hermes-capabilities", root
-        return None, f"tree probe {root} (no known Matrix shape)", root
+        if explicit:
+            # An operator-supplied root without a detectable Matrix shape is
+            # not a successful probe: never guess.
+            return None, f"tree probe {root} (no known Matrix shape)", root
+        # An implicit candidate without a shape proves nothing (the runtime
+        # may simply not be importable from this interpreter): fall through
+        # to the version evidence instead of calling the generation unknown.
     if capabilities_arg:
         return capabilities_arg, "--hermes-capabilities", None
     normalized = normalize_version(runtime_version)

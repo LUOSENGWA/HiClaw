@@ -85,7 +85,12 @@ def _python() -> str:
     return sys.executable or shutil.which("python3") or "python3"
 
 
-def _env(tmp_path: Path, bundle_dir: Path | None = None, path: str | None = None) -> dict:
+def _env(
+    tmp_path: Path,
+    bundle_dir: Path | None = None,
+    path: str | None = None,
+    **overrides: str,
+) -> dict:
     env = dict(os.environ)
     env["HOME"] = str(tmp_path)
     if bundle_dir is not None:
@@ -95,6 +100,9 @@ def _env(tmp_path: Path, bundle_dir: Path | None = None, path: str | None = None
     env.pop("HERMES_HOME", None)
     if path is not None:
         env["PATH"] = path
+    for key, value in overrides.items():
+        if value is not None:
+            env[key] = value
     return env
 
 
@@ -907,16 +915,16 @@ def test_explicit_missing_hermes_root_is_an_error(tmp_path):
     assert not _config_path(tmp_path).exists()
 
 
-def test_hermes_home_env_root_is_probed(tmp_path):
-    # HERMES_HOME is the documented location probe (no --hermes-root).
+def test_hermes_home_is_never_probed_as_an_sdk_root(tmp_path):
+    """HERMES_HOME is the runtime STATE directory (Worker: ${WORKSPACE}/.hermes).
+
+    A real SDK tree placed there is not evidence: with an unknown version the
+    installer must still fail closed rather than probe the state path.
+    """
     tree = _fake_hermes_tree(tmp_path, "new", adapter_keys=FULL_ADAPTER_KEYS)
-    env = _env(tmp_path)
-    env["HERMES_HOME"] = str(tree)
-    result = _run(INSTALL, ["--config", str(_config_path(tmp_path))], env)
-    assert result.returncode == 0, result.stdout
-    block = yaml.safe_load(_config_path(tmp_path).read_text(encoding="utf-8"))["platforms"]["matrix"]
-    assert set(block["extra"]) == set(_projected_extra().keys())
-    assert "tree probe" in result.stdout
+    result = _install(tmp_path, ["--hermes-version", "v2099.1.1"], HERMES_HOME=str(tree))
+    assert result.returncode != 0, result.stdout
+    assert "unknown Hermes generation" in result.stderr, result.stderr
 
 
 def test_allow_partial_marker_records_drop_and_capability(tmp_path):
@@ -986,3 +994,80 @@ def test_v20269_runtime_installer_and_adapter_readback(tmp_path, tmp_path_factor
     assert probe["allowed_user_ids"] == sorted(
         set(list(m["allow_from"]) + list(m["group_allow_from"]))
     )
+
+
+# ---------------------------------------------------------------------------
+# Worker environment: HERMES_HOME is a state directory, never an SDK root
+# ---------------------------------------------------------------------------
+
+
+def _fake_install_root(tmp_path: Path, shape: str) -> Path:
+    """A directory that looks like an installed Hermes importable via PYTHONPATH."""
+    root = tmp_path / "fake-install"
+    (root / "gateway").mkdir(parents=True, exist_ok=True)
+    (root / "gateway" / "__init__.py").write_text("", encoding="utf-8")
+    if shape == "full":
+        adapter = root / "plugins" / "platforms" / "matrix" / "adapter.py"
+        adapter.parent.mkdir(parents=True, exist_ok=True)
+        adapter.write_text(
+            'config.extra.get("homeserver")\n'
+            'config.extra.get("allowed_users")\n'
+            'config.extra.get("allowed_rooms")\n'
+            'config.extra.get("require_mention")\n',
+            encoding="utf-8",
+        )
+    elif shape == "basic":
+        legacy = root / "gateway" / "platforms" / "matrix.py"
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text('config.extra.get("homeserver")\n', encoding="utf-8")
+    return root
+
+
+def test_worker_state_directory_is_not_an_sdk_root(tmp_path):
+    """The Worker entrypoint sets HERMES_HOME to ${WORKSPACE}/.hermes (state).
+
+    That directory must never be probed as an SDK tree: with a supported
+    version the installer has to project the full contract from the verified
+    version evidence even when the state directory exists.
+    """
+    state = tmp_path / "workspace" / ".hermes"
+    state.mkdir(parents=True)
+    (state / "config.yaml").write_text("platforms: {}\n", encoding="utf-8")
+
+    result = _install(
+        tmp_path,
+        ["--hermes-version", "v2026.9.24"],
+        HERMES_HOME=str(state),
+        PYTHONPATH=str(tmp_path / "no-sdk-here"),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "unknown Hermes generation" not in result.stderr
+    block = yaml.safe_load(_config_path(tmp_path).read_text(encoding="utf-8"))["platforms"]["matrix"]
+    assert set(block["extra"]) == set(_projected_extra())
+    # The marker is written only for a reduced projection; a full projection
+    # needs no record, so the success above is the evidence.
+
+
+def test_shapeless_importable_package_falls_back_to_the_table(tmp_path):
+    """An importable `gateway` without a Matrix shape is no evidence at all."""
+    root = _fake_install_root(tmp_path, "none")
+    result = _install(
+        tmp_path,
+        ["--hermes-version", "v2026.9.24"],
+        PYTHONPATH=str(root),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "unknown Hermes generation" not in result.stderr
+
+
+def test_implicit_install_probe_decides_a_calendar_tag(tmp_path):
+    """A discovered install with the plugin adapter outranks the version table."""
+    root = _fake_install_root(tmp_path, "full")
+    result = _install(
+        tmp_path,
+        ["--hermes-version", "v2099.1.1"],
+        PYTHONPATH=str(root),
+    )
+    assert result.returncode == 0, result.stderr
+    block = yaml.safe_load(_config_path(tmp_path).read_text(encoding="utf-8"))["platforms"]["matrix"]
+    assert set(block["extra"]) == set(_projected_extra())
