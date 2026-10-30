@@ -5,7 +5,7 @@
   "description": "OpenClaw channel plugin bridging AgentTeams Matrix traffic through the Python sidecar (no Matrix logic in TypeScript).",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

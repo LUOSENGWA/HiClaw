@@ -84,7 +84,8 @@ file is intentionally not part of this scaffold.
 
 ## Developing
 
-Node 20+. `openclaw` is a peer dependency (do not vendor it).
+Node 24 LTS (24.22.x; the `openclaw` peer's install scripts require Node 24).
+`openclaw` is a peer dependency (do not vendor it).
 
 ```sh
 npm install
@@ -92,8 +93,8 @@ npm run typecheck   # tsc --noEmit
 npm test            # tsc -p tsconfig.json && node --test dist/test/sidecar-client.test.js
 ```
 
-The test script compiles first because stock `node --test` does not execute
-`.ts` sources on Node 20/22; the compiled layout is `dist/src` + `dist/test`.
+The test script compiles first because `node --test` resolves the ESM `./x.js`
+specifiers against the compiled layout (`dist/src` + `dist/test`).
 
 ## Limitations / open questions
 
@@ -119,7 +120,8 @@ The test script compiles first because stock `node --test` does not execute
    semantics after a terminal close (client never auto-reconnects), typing
    direction (server→client only today), edit/react frames, media
    upload/download over the sidecar, and a health/ping frame.
-5. **Gates not run in the authoring environment**: `npm install` /
-   `tsc --noEmit` / `node --test` were not executed where this package was
-   written (no Node in that environment). Run the three commands above on a
-   Node 20+ host before merging.
+5. **Gate status**: `npm install` / `npm run typecheck` / `npm test`
+   (`tsc -p tsconfig.json && node --test`) were run on Node 24 LTS
+   (v24.22.2) with a plain `npm install` (the `openclaw` peer's install
+   scripts succeed on 24): typecheck clean, 8/8 tests pass. Re-run the
+   three commands against the installed peer (v2026.10.9) before merging.
