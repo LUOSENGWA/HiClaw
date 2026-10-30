@@ -442,7 +442,7 @@ jobs:
           # dl.min.io is gone (410); this is the same mc release the
           # repo-standard S3 backend test pins (test/e2e/external-s3-backend.sh).
           curl -fSL -o /usr/local/bin/mc \
-            https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.RELEASE.2025-08-13T08-35-41Z
+            https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z
           sudo chmod +x /usr/local/bin/mc
           # embedded mode execs kube-apiserver by name; it must be on PATH.
           curl -fSL -o /usr/local/bin/kube-apiserver \
@@ -524,62 +524,42 @@ jobs:
           cat /tmp/at-e2e/controller.log >&2
           exit 1
 
-      - name: Add the role-boundary identities and restart the controller
+      - name: Mint the role-boundary tokens (worker / manager)
         env:
           E2E_K8S_NAMESPACE: default
         run: |
-          # The Loop e2e asserts the worker/manager authorization boundary
-          # with identities from the embedded kube-apiserver's static token
-          # file (--token-auth-file), which kube-apiserver reads at STARTUP
-          # only — so the two identities need a controller (and apiserver)
-          # restart. The token file is written only-if-absent by the
-          # apiserver bootstrap, so appending here never clobbers the admin
-          # line; etcd (kine), the CRDs and the object store all survive
-          # under AGENTTEAMS_DATA_DIR / the bucket.
-          WORKER_TOKEN="$(openssl rand -hex 32)"
-          MANAGER_TOKEN="$(openssl rand -hex 32)"
-          printf '%s,system:serviceaccount:%s:agentteams-worker-e2e,worker-e2e,""\n' \
-            "$WORKER_TOKEN" "$E2E_K8S_NAMESPACE" >> /tmp/at-e2e/data/pki/token.csv
-          printf '%s,system:serviceaccount:%s:agentteams-manager,mgr-e2e,""\n' \
-            "$MANAGER_TOKEN" "$E2E_K8S_NAMESPACE" >> /tmp/at-e2e/data/pki/token.csv
-          printf '%s' "$WORKER_TOKEN" > /tmp/at-e2e/e2e-worker-token
-          printf '%s' "$MANAGER_TOKEN" > /tmp/at-e2e/e2e-manager-token
-          # Stop the controller; the embedded apiserver is its subprocess
-          # and exits with it (pkill is the belt for a slow shutdown).
-          kill "$(cat /tmp/at-e2e/controller.pid)" 2>/dev/null || true
-          sleep 2
-          pkill -x kube-apiserver 2>/dev/null || true
-          sleep 1
-          # Start again with the identical env (appending to the same log
-          # so the stop step shows both runs).
-          AGENTTEAMS_KUBE_MODE=embedded \
-          AGENTTEAMS_MATRIX_APPSERVICE_ENABLED=0 \
-          AGENTTEAMS_DATA_DIR=/tmp/at-e2e/data \
-          AGENTTEAMS_CONFIG_DIR=/tmp/at-e2e/config \
-          AGENTTEAMS_CRD_DIR="$GITHUB_WORKSPACE/agentteams-controller/config/crd" \
-          AGENTTEAMS_HTTP_ADDR=127.0.0.1:18090 \
-          AGENTTEAMS_FS_ENDPOINT=http://127.0.0.1:9000 \
-          AGENTTEAMS_FS_ACCESS_KEY="$MINIO_ROOT_USER" \
-          AGENTTEAMS_FS_SECRET_KEY="$MINIO_ROOT_PASSWORD" \
-          AGENTTEAMS_FS_BUCKET=agentteams-storage \
-          AGENTTEAMS_STORAGE_PREFIX=agentteams/agentteams-storage \
-          AGENTTEAMS_MATRIX_URL=http://127.0.0.1:9000 \
-          nohup /tmp/agentteams-controller >> /tmp/at-e2e/controller.log 2>&1 &
-          echo $! > /tmp/at-e2e/controller.pid
-          # Re-wait: healthz from process start, CLI token after the init
-          # loop. The token is re-minted on every startup; the test step
-          # reads the file fresh, so it picks up the new value.
-          curl --retry-connrefused --retry-delay 1 --retry 60 -f \
-            http://127.0.0.1:18090/healthz
-          for _ in $(seq 1 120); do
-            if [ -s /var/run/agentteams/cli-token ]; then
-              exit 0
-            fi
-            sleep 1
+          # The controller's auth plane and the embedded kube-apiserver's
+          # auth plane accept DIFFERENT token kinds (measured on this head):
+          #   - the apiserver authenticates only its static --token-auth-file
+          #     entries (the controller's CLI token is a ServiceAccount token
+          #     and gets 401 there);
+          #   - the controller validates via TokenReview with the
+          #     "agentteams-controller" audience, so it needs ServiceAccount
+          #     tokens carrying that audience (a static token gets 401).
+          # The Loop e2e therefore uses the static admin token for the k8s
+          # API and ServiceAccount tokens for the controller's role boundary.
+          # Roles are derived from the SA NAME (internal/auth/prefix.go), so
+          # agentteams-worker-e2e -> worker and agentteams-manager -> manager.
+          ADMIN_TOKEN="$(head -1 /tmp/at-e2e/data/pki/token.csv | cut -d, -f1)"
+          API="https://127.0.0.1:6443"
+          CA="/tmp/at-e2e/data/pki/ca.crt"
+          for sa in agentteams-worker-e2e agentteams-manager; do
+            curl -sk -m 10 --cacert "$CA" -H "Authorization: Bearer $ADMIN_TOKEN" \
+              -H 'Content-Type: application/json' -X POST \
+              "$API/api/v1/namespaces/$E2E_K8S_NAMESPACE/serviceaccounts" \
+              -d "{\"apiVersion\":\"v1\",\"kind\":\"ServiceAccount\",\"metadata\":{\"name\":\"$sa\"}}" \
+              -o /dev/null
           done
-          echo "CLI token never reappeared after the restart; controller log:" >&2
-          cat /tmp/at-e2e/controller.log >&2
-          exit 1
+          mint() {
+            curl -sk -m 10 --cacert "$CA" -H "Authorization: Bearer $ADMIN_TOKEN" \
+              -H 'Content-Type: application/json' -X POST \
+              "$API/api/v1/namespaces/$E2E_K8S_NAMESPACE/serviceaccounts/$1/token" \
+              -d '{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","spec":{"audiences":["agentteams-controller"]}}' \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["token"])'
+          }
+          mint agentteams-worker-e2e > /tmp/at-e2e/e2e-worker-token
+          mint agentteams-manager > /tmp/at-e2e/e2e-manager-token
+          test -s /tmp/at-e2e/e2e-worker-token && test -s /tmp/at-e2e/e2e-manager-token
 
       - name: Run the loop pause/resume e2e tests
         env:
@@ -600,11 +580,16 @@ jobs:
           E2E_K8S_NAMESPACE: default
         run: |
           export E2E_CONTROLLER_TOKEN="$(cat /var/run/agentteams/cli-token)"
-          # The Loop CR is created through the embedded apiserver with the
-          # admin CLI token (the same value as /var/run/agentteams/cli-token).
-          export E2E_K8S_TOKEN="$(cat /var/run/agentteams/cli-token)"
-          # Role-boundary identities appended to the apiserver token file
-          # in the previous step (worker "e2e" / manager).
+          # The Loop CR is created through the embedded apiserver, which
+          # authenticates via its static token file (--token-auth-file). The
+          # controller's CLI token is a ServiceAccount token and the
+          # embedded apiserver rejects it on the k8s API (401 Unauthorized,
+          # measured on 0346932f+): use the admin identity from the token
+          # file instead. The role-boundary identities below are appended to
+          # the same file, so they authenticate the same way.
+          export E2E_K8S_TOKEN="$(head -1 /tmp/at-e2e/data/pki/token.csv | cut -d, -f1)"
+          # Role-boundary ServiceAccount tokens minted in the previous step
+          # (audience "agentteams-controller"; roles derived from the SA name).
           export E2E_K8S_WORKER_TOKEN="$(cat /tmp/at-e2e/e2e-worker-token)"
           export E2E_K8S_MANAGER_TOKEN="$(cat /tmp/at-e2e/e2e-manager-token)"
           python -m pytest plugins/tests/teamharness/e2e -q -rs
