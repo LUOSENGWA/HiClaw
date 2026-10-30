@@ -13,13 +13,16 @@
 # stub alone is necessary but not sufficient — the cassette
 # is the next-version drift guard.
 #
-# Family selection is the wrapper's own rule: qwen --version (parsed) vs
-# CODING_CLI_JSON_BOUNDARY (default 0.25.3) via sort -V; detection
-# failure or empty -> legacy family. The >= boundary family compares the
-# -o json stdout event array; the legacy family compares the native
-# --json-file FILE content. Baselines are version-conditionally enabled:
-# the active family is replayed; the inactive family's baseline is
-# reported (a placeholder reports a SKIP, no red).
+# Family selection is the wrapper's own rule: with NO explicit
+# CODING_CLI_JSON_BOUNDARY the json-out family is active for EVERY version
+# (capture is the wrapper's default — measured 2026-10-30: no published
+# qwen writes the native --json-file file in headless one-shot mode); with
+# an override, qwen --version (parsed) vs the override via sort -V,
+# detection failure or empty -> legacy family. The json-out family compares
+# the -o json stdout event array; the legacy family compares the native
+# --json-file FILE content. Baselines are conditionally enabled: the active
+# family is replayed; the inactive family's baseline is reported (a
+# placeholder or an unsupported baseline reports a SKIP, no red).
 #
 # The replay hits the RAW CLI, not the wrapper: the cassette guards the
 # CLI's output shape, so a wrapper revert cannot mis-key the baseline
@@ -42,20 +45,36 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 0
 fi
 
-boundary="${CODING_CLI_JSON_BOUNDARY:-0.25.3}"
+boundary="${CODING_CLI_JSON_BOUNDARY:-}"
 qwen_version="$(qwen --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" || true
-if [ -n "${qwen_version}" ] && [ "$(printf '%s\n%s\n' "${boundary}" "${qwen_version}" | sort -V | tail -1)" = "${qwen_version}" ]; then
+# The wrapper's rule: no explicit override -> the json-out (capture) family
+# for every version; with an override, the detected version vs the override
+# (sort -V), detection failure or empty -> legacy family.
+if [ -z "${boundary}" ]; then
+    family="json-out"
+elif [ -n "${qwen_version}" ] && [ "$(printf '%s\n%s\n' "${boundary}" "${qwen_version}" | sort -V | tail -1)" = "${qwen_version}" ]; then
     family="json-out"
 else
     family="legacy"
 fi
-echo "cassette replay: qwen ${qwen_version:-unknown} -> active family ${family} (boundary ${boundary})"
+echo "cassette replay: qwen ${qwen_version:-unknown} -> active family ${family} (boundary ${boundary:-default: capture for every version})"
 
 meta_get() {
     python3 -c 'import json, sys
 m = json.load(open(sys.argv[1]))
 v = m.get(sys.argv[2], "")
 print(v if v is not None else "")' "$1" "$2"
+}
+
+# One-line summary of a meta's "evidence" object, for SKIP messages that
+# must name the settled measurement (unsupported baselines).
+evidence_line() {
+    python3 -c 'import json, sys
+e = json.load(open(sys.argv[1])).get("evidence", {})
+tv = ", ".join(e.get("tested_versions", []))
+print("no published qwen writes the native --json-file file in headless one-shot mode (tested "
+      + tv + " on " + str(e.get("tested_at", "unknown")) + " by " + str(e.get("tested_by", "unknown")) + ")")' "$1" 2>/dev/null \
+        || echo "evidence in $(basename "$1")"
 }
 
 case "${family}" in
@@ -67,20 +86,29 @@ case "${family}" in
         other_file="${CASSETTES}/qwen-json-out.meta.json";               other_family="json-out" ;;
 esac
 
-# Inactive family: report its baseline state (version-conditionally
-# enabled) — a placeholder is a SKIP report, never red.
-if [ -f "${other_file}" ] && [ "$(meta_get "${other_file}" status)" = "placeholder" ]; then
-    echo "[SKIP] cassette family ${other_family}: baseline is a placeholder — $(meta_get "${other_file}" note | cut -c1-120)"
+# Inactive family: report its baseline state (conditionally enabled) —
+# a placeholder or an unsupported baseline is a SKIP report, never red.
+if [ -f "${other_file}" ]; then
+    case "$(meta_get "${other_file}" status)" in
+        placeholder)
+            echo "[SKIP] cassette family ${other_family}: baseline is a placeholder — $(meta_get "${other_file}" note | cut -c1-120)" ;;
+        unsupported)
+            echo "[SKIP] cassette family ${other_family}: baseline is unsupported — $(evidence_line "${other_file}")" ;;
+    esac
 fi
 
 if [ ! -f "${meta_file}" ] || [ ! -f "${stdout_file}" ]; then
     echo "FAIL replay: baseline files missing for family ${family} (${meta_file}, ${stdout_file})"
     exit 1
 fi
-if [ "$(meta_get "${meta_file}" status)" = "placeholder" ]; then
-    echo "[SKIP] replay family ${family}: baseline is a placeholder — $(meta_get "${meta_file}" note | cut -c1-120)"
-    exit 0
-fi
+case "$(meta_get "${meta_file}" status)" in
+    placeholder)
+        echo "[SKIP] replay family ${family}: baseline is a placeholder — $(meta_get "${meta_file}" note | cut -c1-120)"
+        exit 0 ;;
+    unsupported)
+        echo "[SKIP] replay family ${family}: baseline is unsupported — $(evidence_line "${meta_file}")"
+        exit 0 ;;
+esac
 
 meta_prompt="$(meta_get "${meta_file}" prompt)"
 meta_rc="$(meta_get "${meta_file}" exit_code)"

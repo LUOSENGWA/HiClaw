@@ -18,16 +18,18 @@
 #      (the timeout-detection half of success/failure/timeout verification).
 #   5. failure     — the runner exits non-zero: the code is propagated and NO
 #      TIMEOUT is reported (the failure-detection half).
-#   6. json-file   — dual-branch contract. Default (the stub reports no
-#      version): the LEGACY branch — the runner argv carries --json-file
-#      with the wrapper's unique per-run capture path (NOT the target), and
-#      the stub's write of that argv path is what the wrapper validates and
-#      moves onto the target. With QWEN_STUB_VERSION at/above the boundary
-#      (default 0.25.3, override CODING_CLI_JSON_BOUNDARY): the JSON-OUT
-#      branch — the argv carries -o json and NOT --json-file, and the
-#      wrapper's own stdout capture lands the file. The stub models the
-#      version it claims, so a hardcoded legacy semantic can no longer mask
-#      a CLI output drift.
+#   6. json-file   — the capture (json-out) branch is the default for EVERY
+#      version (measured 2026-10-30: no published qwen writes the native
+#      --json-file file in headless one-shot mode): with no explicit
+#      CODING_CLI_JSON_BOUNDARY the argv carries -o json and NOT
+#      --json-file, and the wrapper's own stdout capture lands the file —
+#      asserted for the version-less stub (6), 0.26.3 (6b) and 0.25.2 (6c).
+#      With an explicit override (6d: CODING_CLI_JSON_BOUNDARY=0.25.3 and
+#      stub 0.25.2) the LEGACY pass-through is exercised — the argv carries
+#      --json-file with the wrapper's unique per-run capture path (NOT the
+#      target), and a stub that writes no file fails the run loudly
+#      (json-file-assertion). The stub models the version it claims, so a
+#      hardcoded legacy semantic can no longer mask a CLI output drift.
 #   7. cli-missing — a wiped install fails fast (exit 125) with the
 #      re-install hint.
 #   8. distinct-home — a config in the delegating agent's ORIGINAL home
@@ -39,25 +41,29 @@
 #      is still read (backward compat for configs created after the move).
 #  10. both homes — different configs in both homes: the original home
 #      wins.
-#   8. empty-json  — the json-out branch exits 0 with ZERO bytes of stdout
+#  11. empty-json  — the capture branch exits 0 with ZERO bytes of stdout
 #      (the 0.25.3-style drift): the run must FAIL (json-file-assertion), be
 #      recorded as not-ok, and leave no audit file at the target.
-#   9. bad-json    — the json-out branch exits 0 with malformed stdout: same
+#  12. bad-json    — the capture branch exits 0 with malformed stdout: same
 #      contract — the run fails and the target stays clean.
-#   10. write-fail — the --json-file target sits under a regular file, so the
+#  13. write-fail — the --json-file target sits under a regular file, so the
 #      validated capture cannot be moved into place: the run fails
 #      (json-capture-failed) and no ok is recorded.
-#   11. stale-target — legacy: a VALID audit pre-written at the target by a
-#      previous run, and a CLI (0.24.0-style) that exits 0 without writing
-#      anything: the run must FAIL (json-file-assertion), the record must
-#      not be ok, and the old file must be left untouched (neither consumed
-#      nor deleted) — the maintainer's false-success repro.
-#   12. legacy-ok   — the stub writes the per-run capture the CLI was told
-#      to write; the wrapper validates it and moves it onto the target
-#      (exit 0, target content = the stub's, assert=pass in the event log).
-#   13. legacy-fail — the legacy CLI exits 7 without writing: the code is
-#      propagated, no capture tmp is left behind, and a pre-existing target
-#      is left untouched.
+#  14. stale-target — legacy (explicit override): a VALID audit pre-written
+#      at the target by a previous run, and a CLI (0.24.0-style) that exits
+#      0 without writing anything: the run must FAIL (json-file-assertion),
+#      the record must not be ok, and the old file must be left untouched
+#      (neither consumed nor deleted) — the maintainer's false-success repro.
+#  15. legacy-ok   — legacy (explicit override): the stub writes the
+#      per-run capture the CLI was told to write; the wrapper validates it
+#      and moves it onto the target (exit 0, target content = the stub's,
+#      assert=pass in the event log).
+#  16. legacy-fail — legacy (explicit override): the legacy CLI exits 7
+#      without writing: the code is propagated, no capture tmp is left
+#      behind, and a pre-existing target is left untouched.
+# The legacy cases pin CODING_CLI_JSON_BOUNDARY=0.25.3 explicitly — since
+# the default is capture for every version, the pass-through is otherwise
+# unreachable.
 #
 # jq is optional: the config-driven budget/sandbox assertions are skipped (with
 # a note) when jq is absent, matching the detect suite's "skip when a
@@ -74,6 +80,13 @@ fi
 HAS_JQ=0
 command -v jq >/dev/null 2>&1 && HAS_JQ=1
 
+# The legacy pass-through is reachable ONLY through an explicit
+# CODING_CLI_JSON_BOUNDARY override (the wrapper's default is capture for
+# every version): pin the ambient value to "no override" so a case's branch
+# cannot depend on the surrounding environment; the legacy cases set the
+# override explicitly on their run_qwen call.
+CODING_CLI_JSON_BOUNDARY=""
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP}"' EXIT
 
@@ -85,8 +98,9 @@ trap 'rm -rf "${TMP}"' EXIT
 # (json-out: zero-byte stdout, exit 0 — the drift that used to record ok with
 # a zero-byte audit) / bad-json (json-out: malformed stdout, exit 0). The
 # version the wrapper's branch detection reads is selected by
-# QWEN_STUB_VERSION — unset means the stub prints no version at all
-# (detection falls to the legacy branch, the pre-upgrade default). No real
+# QWEN_STUB_VERSION — unset means the stub prints no version at all (with no
+# CODING_CLI_JSON_BOUNDARY override the wrapper's default is the capture
+# branch; with an override set, detection failure falls to legacy). No real
 # runner required, so this runs in CI.
 STUB_BIN="${TMP}/bin"
 STUB_ARGS="${TMP}/qwen-args.txt"
@@ -94,7 +108,8 @@ mkdir -p "${STUB_BIN}"
 cat > "${STUB_BIN}/qwen" <<'STUB'
 #!/bin/bash
 # --version: echo QWEN_STUB_VERSION when set (the wrapper's branch detection
-# parses it). Unset -> no output, i.e. detection falls to the legacy branch.
+# parses it). Unset -> no output (with no boundary override the wrapper
+# still takes the capture branch — its default for every version).
 # Exit before the argv record so the detection probe never overwrites the
 # real run's argv capture.
 if [ "${1:-}" = "--version" ]; then
@@ -186,6 +201,10 @@ run_qwen_distinct_home() {
     bash "${RUN_SCRIPT}" --cli qwen --workspace "${workspace}" --prompt-file "${prompt}" "${@:3}" 2>&1
 }
 
+# The shared runs.jsonl index the json cases inspect (each failing run
+# appends exactly one record, so the LAST line is that run's record).
+runs_jsonl="${workspace}/coding-cli-logs/runs.jsonl"
+
 # --- case 1: flag passthrough always; config-driven budget/sandbox iff jq -----
 cfg1="${TMP}/cfg1.json"
 if [ "${HAS_JQ}" = "1" ]; then
@@ -269,59 +288,35 @@ if ! grep -q "exit code 7" <<<"${out}"; then
     fail=1
 fi
 
-# --- case 6: --json-file contract, dual-branch -------------------------------
-# default (no QWEN_STUB_VERSION): detection falls to the LEGACY branch — the
-# flag reaches the runner argv and the runner's file lands on disk (the
-# pre-drift behavior, asserted exactly as before).
-# QWEN_STUB_VERSION at/above the boundary (default 0.25.3): the JSON-OUT
-# branch — argv carries -o json and NOT --json-file, and the wrapper's own
-# stdout capture is what lands the file (the stub writes none).
+# --- case 6: --json-file contract — capture is the default -------------------
+# default (no QWEN_STUB_VERSION, no CODING_CLI_JSON_BOUNDARY): the JSON-OUT
+# (capture) branch for EVERY version — argv carries -o json and NOT
+# --json-file, and the wrapper's own stdout capture is what lands the file
+# (the stub writes none).
 json_out="${TMP}/json-out/result.json"
 mkdir -p "$(dirname "${json_out}")"
 rm -f "${STUB_ARGS}" "${json_out}"
 out="$(CFG="" run_qwen --json-file "${json_out}")"
-if [ -n "${QWEN_STUB_VERSION:-}" ] && [ "$(printf '%s\n%s\n' "${CODING_CLI_JSON_BOUNDARY:-0.25.3}" "${QWEN_STUB_VERSION}" | sort -V | tail -1)" = "${QWEN_STUB_VERSION}" ]; then
-    if ! have_arg "-o" || ! have_arg "json"; then
-        echo "FAIL case6-json-out: -o json should reach the runner argv (got: $(argv_show))"
+if ! have_arg "-o" || ! have_arg "json"; then
+    echo "FAIL case6-json-out: -o json should reach the runner argv (got: $(argv_show))"
+    fail=1
+fi
+if have_arg "--json-file"; then
+    echo "FAIL case6-json-out: --json-file must NOT reach the runner argv without a boundary override (got: $(argv_show))"
+    fail=1
+fi
+if [ ! -f "${json_out}" ]; then
+    echo "FAIL case6-json-out: the wrapper's stdout capture did not land ${json_out}"
+    fail=1
+fi
+# The contract is a PARSEABLE audit file, not just a present one.
+if command -v python3 >/dev/null 2>&1; then
+    if ! python3 -m json.tool "${json_out}" >/dev/null 2>&1; then
+        echo "FAIL case6-json-out: the captured audit at ${json_out} is not parseable JSON"
         fail=1
-    fi
-    if have_arg "--json-file"; then
-        echo "FAIL case6-json-out: --json-file must NOT reach the runner argv at/above the boundary (got: $(argv_show))"
-        fail=1
-    fi
-    if [ ! -f "${json_out}" ]; then
-        echo "FAIL case6-json-out: the wrapper's stdout capture did not land ${json_out}"
-        fail=1
-    fi
-    # The contract is a PARSEABLE audit file, not just a present one.
-    if command -v python3 >/dev/null 2>&1; then
-        if ! python3 -m json.tool "${json_out}" >/dev/null 2>&1; then
-            echo "FAIL case6-json-out: the captured audit at ${json_out} is not parseable JSON"
-            fail=1
-        fi
-    else
-        echo "SKIP case6-json-out parse assertion (python3 absent)"
     fi
 else
-    # The legacy CLI receives the wrapper's unique per-run capture path, not
-    # the target; the stub writes the argv path (real-CLI behavior) and the
-    # wrapper validates that capture and moves it onto the target.
-    if ! have_arg "--json-file"; then
-        echo "FAIL case6-legacy: --json-file should reach the runner argv (got: $(argv_show))"
-        fail=1
-    fi
-    cap_path="$(awk 'flag {print; exit} /^--json-file$/ {flag=1}' "${STUB_ARGS}" 2>/dev/null)"
-    case "${cap_path:-}" in
-        "${json_out}".run-*.tmp) : ;;
-        *)
-            echo "FAIL case6-legacy: the CLI should receive the unique per-run capture path, not the target (argv --json-file value: ${cap_path:-<none>})"
-            fail=1
-            ;;
-    esac
-    if [ ! -f "${json_out}" ]; then
-        echo "FAIL case6-legacy: the validated capture did not land at ${json_out}"
-        fail=1
-    fi
+    echo "SKIP case6-json-out parse assertion (python3 absent)"
 fi
 
 # --- case 6b: the same contract as seen by 0.26.3 ---------------------------
@@ -357,6 +352,92 @@ if command -v python3 >/dev/null 2>&1; then
     fi
 else
     echo "SKIP case6b-json-out-0263 parse assertion (python3 absent)"
+fi
+
+# --- case 6c: the same contract as seen by 0.25.2 ---------------------------
+# The default must NOT route 0.25.2 to the legacy pass-through: the old
+# 0.25.3 boundary misrouted it into a branch that cannot produce a file
+# (measured 2026-10-30: 0.25.2 headless one-shot exits 0 and writes no
+# --json-file, with or without --yolo/-o json). With no explicit override,
+# 0.25.2 takes the capture branch exactly like 0.26.3.
+json_out3="${TMP}/json-out-0252/result.json"
+mkdir -p "$(dirname "${json_out3}")"
+rm -f "${STUB_ARGS}" "${json_out3}"
+out="$(QWEN_STUB_VERSION=0.25.2 CFG="" run_qwen --json-file "${json_out3}")"
+rc=$?
+if [ "${rc}" -ne 0 ]; then
+    echo "FAIL case6c-json-out-0252: a normal json-out run should exit 0 (got ${rc}): ${out}"
+    fail=1
+fi
+if ! have_arg "-o" || ! have_arg "json"; then
+    echo "FAIL case6c-json-out-0252: -o json should reach the runner argv for 0.25.2 (got: $(argv_show))"
+    fail=1
+fi
+if have_arg "--json-file"; then
+    echo "FAIL case6c-json-out-0252: --json-file must NOT reach the runner argv for 0.25.2 (got: $(argv_show))"
+    fail=1
+fi
+if [ ! -f "${json_out3}" ]; then
+    echo "FAIL case6c-json-out-0252: the wrapper's stdout capture did not land ${json_out3}"
+    fail=1
+fi
+if command -v python3 >/dev/null 2>&1; then
+    if ! python3 -m json.tool "${json_out3}" >/dev/null 2>&1; then
+        echo "FAIL case6c-json-out-0252: the captured audit at ${json_out3} is not parseable JSON"
+        fail=1
+    fi
+else
+    echo "SKIP case6c-json-out-0252 parse assertion (python3 absent)"
+fi
+
+# --- case 6d: an explicit override pins the legacy pass-through ------------
+# With CODING_CLI_JSON_BOUNDARY=0.25.3 and stub 0.25.2 (below it) the LEGACY
+# branch is exercised: the argv carries --json-file with the wrapper's
+# unique per-run capture path (NOT the target). A stub that writes no file
+# must fail the run loudly (json-file-assertion) — the guard for an
+# operator who pins an older CLI (no supported version writes the native
+# file, so the pin cannot produce the contract).
+json_pin="${TMP}/json-pinned/result.json"
+mkdir -p "$(dirname "${json_pin}")"
+rm -f "${STUB_ARGS}" "${json_pin}"
+out="$(CODING_CLI_JSON_BOUNDARY=0.25.3 QWEN_STUB_VERSION=0.25.2 QWEN_STUB_MODE=no-file CFG="" run_qwen --json-file "${json_pin}")"
+rc=$?
+if [ "${rc}" -eq 0 ]; then
+    echo "FAIL case6d-legacy-pinned: a pinned CLI that writes no file must fail the run (got exit 0): ${out}"
+    fail=1
+fi
+if ! have_arg "--json-file"; then
+    echo "FAIL case6d-legacy-pinned: the legacy pass-through should reach the runner argv (got: $(argv_show))"
+    fail=1
+fi
+if have_arg "-o"; then
+    echo "FAIL case6d-legacy-pinned: -o must NOT reach the runner argv on the legacy branch (got: $(argv_show))"
+    fail=1
+fi
+cap_path="$(awk 'flag {print; exit} /^--json-file$/ {flag=1}' "${STUB_ARGS}" 2>/dev/null)"
+case "${cap_path:-}" in
+    "${json_pin}".run-*.tmp) : ;;
+    *)
+        echo "FAIL case6d-legacy-pinned: the CLI should receive the unique per-run capture path, not the target (argv --json-file value: ${cap_path:-<none>})"
+        fail=1
+        ;;
+esac
+last_rec="$(tail -n 1 "${runs_jsonl}" 2>/dev/null)"
+if grep -q '"status": "ok"' <<<"${last_rec}"; then
+    echo "FAIL case6d-legacy-pinned: the run record must not be ok (got: ${last_rec})"
+    fail=1
+fi
+if ! grep -q '"reason": "json-file-assertion"' <<<"${last_rec}"; then
+    echo "FAIL case6d-legacy-pinned: the record should carry json-file-assertion (got: ${last_rec})"
+    fail=1
+fi
+if [ -e "${json_pin}" ]; then
+    echo "FAIL case6d-legacy-pinned: no audit file may land at the target when the pinned CLI writes nothing (found ${json_pin})"
+    fail=1
+fi
+if ls "${json_pin}".run-*.tmp >/dev/null 2>&1; then
+    echo "FAIL case6d-legacy-pinned: a per-run capture tmp was left behind: $(ls "${json_pin}".run-*.tmp)"
+    fail=1
 fi
 
 # --- case 7: CLI missing (recreation wiped the install) -> actionable error --
@@ -458,11 +539,12 @@ else
     echo "SKIP cases 8-10 distinct-home default config (jq absent)"
 fi
 # --- cases 11-13: the captured-JSON contract (json-out branch) -------------
-# The maintainer's repro: a CLI at/above the boundary that exits 0 with an
-# unusable capture must NOT be recorded as ok with a zero-byte/invalid
-# audit at the target. Each failing run appends exactly one record, so the
-# LAST line of the shared runs.jsonl is this run's record.
-runs_jsonl="${workspace}/coding-cli-logs/runs.jsonl"
+# The maintainer's repro: a CLI that exits 0 with an unusable capture must
+# NOT be recorded as ok with a zero-byte/invalid audit at the target. The
+# capture branch is the default for every version (these cases run the
+# 0.26.3 stub with no explicit boundary override). Each failing run appends
+# exactly one record, so the LAST line of the shared runs.jsonl (defined
+# before case 1) is this run's record.
 
 # --- case 11: empty capture (exit 0, zero-byte stdout) -> fail, no target --
 json_empty="${TMP}/json-empty/result.json"
@@ -536,13 +618,15 @@ if ! grep -q '"reason": "json-capture-failed"' <<<"${last_rec}"; then
     fail=1
 fi
 
-# --- cases 14-16: the legacy per-run capture contract ----------------------
+# --- cases 14-16: the legacy per-run capture contract (explicit override) --
 # The maintainer's repro on the legacy branch: a CLI that exits 0 without
 # writing its --json-file output used to be recorded as ok with a VALID audit
 # left by a previous run at the target. The wrapper now names a unique
 # per-run capture for the CLI, validates that capture, and only then moves it
 # onto the target — so the assertion is against THIS run's output, and a
-# stale target can neither pass nor be touched.
+# stale target can neither pass nor be touched. Since the capture branch is
+# now the default for every version, each case below pins
+# CODING_CLI_JSON_BOUNDARY=0.25.3 explicitly (0.24.0 < 0.25.3 -> legacy).
 
 # --- case 14: stale target + a CLI that writes nothing -> fail, old file ---
 # left untouched (neither consumed as this run's artifact nor deleted).
@@ -550,7 +634,7 @@ json_stale="${TMP}/json-stale/result.json"
 mkdir -p "$(dirname "${json_stale}")"
 echo '{"stale":true}' > "${json_stale}"
 rm -f "${STUB_ARGS}"
-out="$(QWEN_STUB_VERSION=0.24.0 QWEN_STUB_MODE=no-file CFG="" run_qwen --json-file "${json_stale}")"
+out="$(CODING_CLI_JSON_BOUNDARY=0.25.3 QWEN_STUB_VERSION=0.24.0 QWEN_STUB_MODE=no-file CFG="" run_qwen --json-file "${json_stale}")"
 rc=$?
 if [ "${rc}" -eq 0 ]; then
     echo "FAIL case 14: a stale target must not make a no-op run exit 0 (got exit 0): ${out}"
@@ -579,7 +663,7 @@ fi
 json_ok="${TMP}/json-legacy/result.json"
 mkdir -p "$(dirname "${json_ok}")"
 rm -f "${STUB_ARGS}" "${json_ok}"
-out="$(QWEN_STUB_VERSION=0.24.0 CFG="" run_qwen --json-file "${json_ok}")"
+out="$(CODING_CLI_JSON_BOUNDARY=0.25.3 QWEN_STUB_VERSION=0.24.0 CFG="" run_qwen --json-file "${json_ok}")"
 rc=$?
 if [ "${rc}" -ne 0 ]; then
     echo "FAIL case 15: a normal legacy run should exit 0 (got ${rc}): ${out}"
@@ -614,7 +698,7 @@ json_fail7="${TMP}/json-fail7/result.json"
 mkdir -p "$(dirname "${json_fail7}")"
 echo '{"stale":true}' > "${json_fail7}"
 rm -f "${STUB_ARGS}"
-out="$(QWEN_STUB_VERSION=0.24.0 QWEN_STUB_MODE=fail CFG="" run_qwen --json-file "${json_fail7}")"
+out="$(CODING_CLI_JSON_BOUNDARY=0.25.3 QWEN_STUB_VERSION=0.24.0 QWEN_STUB_MODE=fail CFG="" run_qwen --json-file "${json_fail7}")"
 rc=$?
 if [ "${rc}" -ne 7 ]; then
     echo "FAIL case 16: the runner's exit code 7 must be propagated (got ${rc}): ${out}"

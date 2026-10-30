@@ -422,26 +422,40 @@ case "$cli" in
             qwen_args+=(--bare)
         fi
         # --json-file: the wrapper's external contract is "the run ends with
-        # a parseable JSON audit file at <path>". qwen-code 0.25.3 turned the
-        # native --json-file into a dual-output flag that silently writes no
-        # file in headless one-shot mode (verified 2026-10-19: exit 0, text
-        # stdout, no file), so the mechanism is picked per detected CLI
-        # version (sort -V; boundary default 0.25.3, override
-        # CODING_CLI_JSON_BOUNDARY; detection failure/empty -> legacy, which
-        # is also how a version-less stub lands):
-        #   legacy   : original passthrough, byte-identical to the pre-drift
-        #              wrapper — the CLI itself writes the file; the post-run
-        #              assertion below proves it landed.
-        #   json-out : -o json (the stdout event array — NOT stream-json) and
-        #              the wrapper captures the file itself; stderr is
-        #              diverted so the captured JSON stays pure.
+        # a parseable JSON audit file at <path>". Measured 2026-10-30 with
+        # the real CLI (headless one-shot, isolated HOME with a working
+        # ~/.qwen/settings.json): NO published qwen writes the native
+        # --json-file file — 0.24.7, 0.25.0, 0.25.1 and 0.25.2 all exit 0
+        # and produce no file (--yolo and -o json change nothing), matching
+        # the previously known 0.25.3 and 0.26.3; 0.25.1/0.25.2 --help
+        # already describe --json-file as dual output (TUI renders on
+        # stdout, JSON events go to the file) that never lands headless.
+        # The capture branch is therefore the DEFAULT for every version,
+        # and the pass-through is reachable only through an explicit
+        # operator override (CODING_CLI_JSON_BOUNDARY) pinning an older
+        # CLI — a branch with no supported version, whose post-run
+        # assertion fails loudly (JSON-FILE-DRIFT) when the file does not
+        # land:
+        #   json-out : -o json (the stdout event array — NOT stream-json)
+        #              and the wrapper captures the file itself; stderr is
+        #              diverted so the captured JSON stays pure. Default
+        #              for every version, including one the detection
+        #              probe cannot read.
+        #   legacy   : original passthrough — the CLI itself writes the
+        #              file. Reached only when CODING_CLI_JSON_BOUNDARY is
+        #              set and the detected version sorts below it (or
+        #              detection fails with the override set).
         json_branch="none"
         qwen_version=""
         json_cap_tmp=""
         if [ -n "${g_json_file}" ]; then
             qwen_version="$(qwen --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" || true
-            json_boundary="${CODING_CLI_JSON_BOUNDARY:-0.25.3}"
-            if [ -n "${qwen_version}" ] && [ "$(printf '%s\n%s\n' "${json_boundary}" "${qwen_version}" | sort -V | tail -1)" = "${qwen_version}" ]; then
+            if [ -z "${CODING_CLI_JSON_BOUNDARY:-}" ]; then
+                # No explicit boundary override: capture is the default
+                # for every version (see the measured facts above).
+                json_branch="json-out"
+                qwen_args+=(-o json)
+            elif [ -n "${qwen_version}" ] && [ "$(printf '%s\n%s\n' "${CODING_CLI_JSON_BOUNDARY}" "${qwen_version}" | sort -V | tail -1)" = "${qwen_version}" ]; then
                 json_branch="json-out"
                 qwen_args+=(-o json)
             else
@@ -621,18 +635,21 @@ if [ "$cli" = "qwen" ] && [ -n "${g_json_file}" ]; then
                 "JSON-FILE-DRIFT: the captured stdout is empty or unparseable (qwen ${qwen_version:-unknown}, json-out branch)" \
                 "[run-coding-cli] The run exited 0 but no parseable JSON audit could be delivered to" \
                 "'${g_json_file}' — the invalid capture was discarded and the target left untouched." \
-                "[run-coding-cli] Either this qwen version changed -o json's stdout semantics (compare 'qwen" \
-                "[run-coding-cli] --version' with CODING_CLI_JSON_BOUNDARY, default 0.25.3) or the CLI failed" \
-                "[run-coding-cli] to emit its structured result. Re-run verify-coding-cli.sh case g."
+                "[run-coding-cli] Either this qwen version changed -o json's stdout semantics (the" \
+                "[run-coding-cli] capture branch is the default for every version — see 'qwen --version')" \
+                "[run-coding-cli] or the CLI failed to emit its structured result." \
+                "[run-coding-cli] Re-run verify-coding-cli.sh case g."
         else
             fail_run failed json-file-assertion 1 \
                 "JSON-FILE-DRIFT: the per-run JSON capture is missing or unparseable (qwen ${qwen_version:-unknown}, legacy branch)" \
                 "[run-coding-cli] The run exited 0 but the CLI wrote no parseable JSON audit for THIS run" \
                 "[run-coding-cli] (its --json-file capture was empty or invalid); the capture was discarded" \
                 "[run-coding-cli] and a file pre-existing at '${g_json_file}' was left untouched." \
-                "[run-coding-cli] Either this qwen version drifted the --json-file semantics (compare 'qwen" \
-                "[run-coding-cli] --version' with CODING_CLI_JSON_BOUNDARY, default 0.25.3) or the CLI failed" \
-                "[run-coding-cli] to emit its structured result. Re-run verify-coding-cli.sh case g."
+                "[run-coding-cli] The legacy pass-through is only reachable through an explicit" \
+                "[run-coding-cli] CODING_CLI_JSON_BOUNDARY override — and no published qwen (0.24.7-0.26.3," \
+                "[run-coding-cli] headless one-shot) writes the native --json-file file, so this pinned CLI" \
+                "[run-coding-cli] cannot produce the contract. Unset CODING_CLI_JSON_BOUNDARY to use the" \
+                "[run-coding-cli] capture default. Re-run verify-coding-cli.sh case g."
         fi
     fi
     # A run that failed for its own reasons (CLI error, timeout) keeps no
