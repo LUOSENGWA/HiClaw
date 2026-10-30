@@ -1,36 +1,46 @@
-"""Version-gate and real-parser tests for the hermes adapter (#1458).
+"""Capability-gate and real-parser tests for the hermes adapter (#1458).
 
-The pinned Worker runtime (hermes/Dockerfile, HERMES_GIT_REF=
-v2026.4.16, "Hermes Agent v0.10.0") parses the platforms.matrix block
-with a PlatformConfig.from_dict that only reads the block's explicit
-`extra:` map — flat block keys are silently ignored. The newer
-generation (>= 0.22.5, e.g. bf0203a7) promotes flat non-typed keys but
-lets an explicit `extra:` win on a clash. These tests cover:
+The gate follows verified capabilities, not tag strings: a located
+runtime tree is probed first (its Matrix adapter source is ground
+truth), then an explicit --hermes-capabilities declaration, then a
+verified table keyed by tag or package version. Tag strings and
+package versions are not comparable across generations (the calendar
+tag v2026.9.24 is a newer generation than the semver-shaped v0.22.5,
+which declares package version 0.0.0). These tests cover:
 
-  * the shell-level strict/partial version gate: an old or unknown
-    runtime must never exit 0 while the contract requires settings
-    that runtime silently ignores; --allow-partial downgrades that to
-    a warning plus a marker file;
+  * the shell-level strict/partial capability gate: a basic-capability
+    or unknown runtime must never exit 0 while the contract requires
+    settings that runtime silently ignores or is not verified to
+    honor; unknown fails closed with guidance; --allow-partial
+    downgrades that to a warning plus a marker file;
+  * the verified table (v2026.9.24 / 0.21.5 full, v2026.4.16 / 0.10.0
+    basic), the --hermes-capabilities override, and the tree probe
+    (fake trees), including their precedence;
   * uninstall removing exactly what install writes, in both the
     nested (current) and the legacy flat shape, plus the marker;
   * loading the installer's output with the ACTUAL parser of each
-    runtime generation (no fakes), proving the projected settings
-    reach the attributes the adapters read.
+    verified runtime generation (no fakes), proving the projected
+    settings reach the attributes the adapters read.
 
 Tree resolution per generation (first match wins):
 
-  1. HERMES_PINNED_ROOT / HERMES_NEW_ROOT — path to a hermes-agent
-     checkout (v2026.4.16 / v0.22.5).
+  1. HERMES_PINNED_ROOT / HERMES_20269_ROOT / HERMES_NEW_ROOT — path
+     to a hermes-agent checkout (v2026.4.16 / v2026.9.24 / v0.22.5).
   2. HERMES_SDK_CLONE=1 — shallow-clone the tag from
      HERMES_REPO_URL (default: the Dockerfile's
      https://github.com/NousResearch/hermes-agent.git) into a temp dir.
   3. otherwise — the real-parser tests skip with this reason; the
      shell-level gate tests run unconditionally.
 
+The shell-level gate tests assume the test interpreter has no
+`gateway` package importable and no `hermes` binary on PATH, so the
+installer's tree probe finds no root.
+
 When a runtime's parser cannot be imported in the test interpreter
 (missing third-party dependencies), the pinned-tree test falls back
 to source-level assertions on the same checkout; the v0.22.5 test
-skips with the import error.
+skips with the import error; the v2026.9.24 test still asserts the
+installer output, then skips the real read-back with the import error.
 """
 
 import ast
@@ -57,11 +67,14 @@ HERMES_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 # kind -> (env var, tag, human label)
 TREE_SPECS = {
     "pinned": ("HERMES_PINNED_ROOT", "v2026.4.16", "the pinned v2026.4.16 runtime"),
+    "v20269": ("HERMES_20269_ROOT", "v2026.9.24", "the v2026.9.24 runtime (package 0.21.5)"),
     "new": ("HERMES_NEW_ROOT", "v0.22.5", "the v0.22.5 runtime"),
 }
 MARKER_REL = Path(".agentteams-matrix") / "hermes-install.json"
-# The contract settings a pre-0.22.5 runtime cannot honor (sorted).
+# The contract settings a basic-capability runtime cannot honor (sorted).
 DROPPABLE = ["allowed_rooms", "allowed_users", "require_mention"]
+# The complete extra map a full-capability projection carries.
+FULL_EXTRA_KEYS = {"homeserver", "user_id", "allowed_users", "allowed_rooms", "require_mention"}
 
 
 def _bash() -> str:
@@ -79,6 +92,7 @@ def _env(tmp_path: Path, bundle_dir: Path | None = None, path: str | None = None
         env["AGENTTEAMS_BUNDLE_DIR"] = str(bundle_dir)
     env.pop("AGENTTEAMS_MATRIX_ACCESS_TOKEN", None)
     env.pop("HERMES_VERSION", None)
+    env.pop("HERMES_HOME", None)
     if path is not None:
         env["PATH"] = path
     return env
@@ -98,6 +112,11 @@ def _run(script: Path, args: list, env: dict) -> subprocess.CompletedProcess:
 
 def _config_path(tmp_path: Path) -> Path:
     return tmp_path / "config.yaml"
+
+
+def _marker_path(tmp_path: Path) -> Path:
+    """The install marker the adapter writes next to the runtime config."""
+    return _config_path(tmp_path).parent / MARKER_REL
 
 
 def _bare_path(tmp_path: Path) -> str:
@@ -147,22 +166,26 @@ def test_strict_gate_old_runtime_names_unhonorables(tmp_path):
     assert not _config_path(tmp_path).exists(), "strict failure must write nothing"
     for setting in DROPPABLE:
         assert setting in result.stderr, f"gate must name {setting!r}: {result.stderr}"
+    assert "basic" in result.stderr, f"gate must name the capability: {result.stderr}"
     assert "0.22.5" in result.stderr
     assert "--allow-partial" in result.stderr
 
 
-def test_unknown_version_is_treated_as_old(tmp_path):
+def test_unknown_version_fails_closed_with_guidance(tmp_path):
     result = _run(INSTALL, ["--config", str(_config_path(tmp_path))], _hermetic_env(tmp_path))
     assert result.returncode != 0, result.stdout
     for setting in DROPPABLE:
         assert setting in result.stderr, f"gate must name {setting!r}: {result.stderr}"
     assert "unknown" in result.stderr.lower()
+    assert "--hermes-capabilities" in result.stderr, f"gate must offer the override: {result.stderr}"
+    assert "--allow-partial" in result.stderr
     assert not _config_path(tmp_path).exists()
 
 
-def test_calendar_tag_is_treated_as_old(tmp_path):
-    # 2026.4.16 without the v prefix is still the calendar (pre-0.x)
-    # series: leading component >= 1000 counts as pre-0.22.5.
+def test_calendar_tag_is_treated_as_basic(tmp_path):
+    # 2026.4.16 without the v prefix is the same verified basic
+    # generation as tag v2026.4.16: the table keys on the normalised
+    # string.
     result = _install(tmp_path, ["--hermes-version", "2026.4.16"])
     assert result.returncode != 0, result.stdout
     for setting in DROPPABLE:
@@ -397,7 +420,7 @@ except Exception as exc:
     raise SystemExit(0)
 if __BUILD_ADAPTER__:
     try:
-        mod = importlib.import_module("gateway.platforms.matrix")
+        mod = importlib.import_module(__ADAPTER_MODULE__)
         built = None
         built_name = None
         for name in dir(mod):
@@ -421,6 +444,11 @@ if __BUILD_ADAPTER__:
             result["built"] = built_name
             result["homeserver"] = getattr(built, "_homeserver", None)
             result["user_id"] = getattr(built, "_user_id", None)
+            result["require_mention"] = getattr(built, "_require_mention", None)
+            result["allowed_rooms"] = sorted(getattr(built, "_allowed_rooms", []) or [])
+            result["allowed_user_ids"] = sorted(
+                getattr(built, "_allowed_user_ids", []) or []
+            )
         else:
             result["build_error"] = "no single-required-arg *Adapter class could be constructed"
     except Exception as exc:
@@ -463,16 +491,27 @@ def _resolve_tree(kind: str, tmp_path_factory) -> Path:
     )
 
 
-def _parser_probe(tree: Path, block: dict, build_adapter: bool) -> dict:
+def _parser_probe(
+    tree: Path,
+    block: dict,
+    build_adapter: bool,
+    adapter_module: str = "gateway.platforms.matrix",
+) -> dict:
     """Run the real PlatformConfig.from_dict of *tree* on *block*.
 
-    A subprocess keeps the two runtime trees out of the test
-    interpreter's sys.modules; PYTHONPATH points only at the tree.
-    Returns {"import_error"/"from_dict_error"/"error": ...} when the
-    real parser cannot run here, otherwise the parsed view plus — when
-    build_adapter — the constructed adapter's read attributes.
+    A subprocess keeps the runtime trees out of the test interpreter's
+    sys.modules; PYTHONPATH points only at the tree. Returns
+    {"import_error"/"from_dict_error"/"error": ...} when the real
+    parser cannot run here, otherwise the parsed view plus — when
+    build_adapter — the constructed adapter's read attributes
+    (homeserver, user_id, and, on full-capability adapters,
+    require_mention / allowed_rooms / allowed_user_ids).
+    *adapter_module* selects the adapter module: gateway.platforms.
+    matrix on the basic generation, plugins.platforms.matrix.adapter
+    on the full generations.
     """
     probe = _PROBE_TEMPLATE.replace("__BUILD_ADAPTER__", "True" if build_adapter else "False")
+    probe = probe.replace("__ADAPTER_MODULE__", repr(adapter_module))
     proc = subprocess.run(
         [_python(), "-c", probe],
         input=json.dumps(block),
@@ -614,3 +653,336 @@ def test_new_runtime_parser_consumes_all_projected_settings(tmp_path, tmp_path_f
     conflicting["homeserver"] = "https://flat-must-lose.example"
     probe2 = _parser_probe(tree, conflicting, build_adapter=False)
     assert probe2["extra"].get("homeserver") == m["homeserver"]
+
+
+# ---------------------------------------------------------------------------
+# Capability gate: verified full-generation versions
+# ---------------------------------------------------------------------------
+
+
+def _projected_extra():
+    m = CONTRACT_MATRIX
+    return {
+        "homeserver": m["homeserver"],
+        "user_id": m["user_id"],
+        "allowed_users": list(
+            dict.fromkeys(list(m["allow_from"]) + list(m["group_allow_from"]))
+        ),
+        "allowed_rooms": list(m["rooms"]),
+        "require_mention": bool(m["require_mention"]),
+    }
+
+
+def test_full_calendar_tag_v2026_9_24_projects_all_settings(tmp_path):
+    # Maintainer P1 on 69028019: tag v2026.9.24 (package 0.21.5) has a
+    # Matrix adapter that reads all three keys; the installer must
+    # accept the tag and project the complete contract.
+    result = _install(tmp_path, ["--hermes-version", "v2026.9.24"])
+    assert result.returncode == 0, result.stdout
+    block = yaml.safe_load(_config_path(tmp_path).read_text(encoding="utf-8"))["platforms"]["matrix"]
+    assert block["extra"] == _projected_extra()
+    assert set(block["extra"]) == set(FULL_EXTRA_KEYS)
+    assert not _marker_path(tmp_path).exists(), "full projection must not record a drop"
+    assert "capabilities full" in result.stdout
+
+
+def test_package_version_0_21_5_projects_all_settings(tmp_path):
+    # Package versions are first-class table keys: 0.21.5 is the
+    # release of tag v2026.9.24.
+    result = _install(tmp_path, ["--hermes-version", "0.21.5"])
+    assert result.returncode == 0, result.stdout
+    block = yaml.safe_load(_config_path(tmp_path).read_text(encoding="utf-8"))["platforms"]["matrix"]
+    assert set(block["extra"]) == set(_projected_extra().keys())
+    assert not _marker_path(tmp_path).exists()
+
+
+def test_full_generation_with_allow_partial_drops_nothing(tmp_path):
+    # A full-capability runtime honours every contract setting, so
+    # --allow-partial must change nothing and record nothing.
+    result = _install(
+        tmp_path, ["--hermes-version", "v2026.9.24", "--allow-partial"]
+    )
+    assert result.returncode == 0, result.stdout
+    assert "WARNING" not in result.stderr, result.stderr
+    block = yaml.safe_load(_config_path(tmp_path).read_text(encoding="utf-8"))["platforms"]["matrix"]
+    assert set(block["extra"]) == set(_projected_extra().keys())
+    assert not _marker_path(tmp_path).exists(), "full projection must not record a drop"
+
+
+def test_unknown_version_string_fails_closed_with_guidance(tmp_path):
+    result = _run(
+        INSTALL,
+        ["--config", str(_config_path(tmp_path)), "--hermes-version", "v2099.1.1"],
+        _hermetic_env(tmp_path),
+    )
+    assert result.returncode != 0, result.stdout
+    assert "unknown Hermes generation" in result.stderr
+    assert "v2099.1.1" in result.stderr
+    for setting in DROPPABLE:
+        assert setting in result.stderr, f"gate must name {setting!r}: {result.stderr}"
+    assert "--hermes-capabilities" in result.stderr
+    assert "--allow-partial" in result.stderr
+    assert not _config_path(tmp_path).exists()
+
+
+def test_capabilities_basic_declaration_fails_strict(tmp_path):
+    # Declared capabilities are the same gate as the table: a
+    # basic declaration against the full contract is a hard failure.
+    result = _run(
+        INSTALL,
+        [
+            "--config",
+            str(_config_path(tmp_path)),
+            "--hermes-version",
+            "v2026.9.24",
+            "--hermes-capabilities",
+            "basic",
+        ],
+        _hermetic_env(tmp_path),
+    )
+    assert result.returncode != 0, result.stdout
+    for setting in DROPPABLE:
+        assert setting in result.stderr, f"gate must name {setting!r}: {result.stderr}"
+    assert "--allow-partial" in result.stderr
+    assert not _config_path(tmp_path).exists()
+
+
+def test_capabilities_full_declaration_succeeds_without_version(tmp_path):
+    # The operator states what the runtime supports; no version needed.
+    result = _run(
+        INSTALL,
+        ["--config", str(_config_path(tmp_path)), "--hermes-capabilities", "full"],
+        _hermetic_env(tmp_path),
+    )
+    assert result.returncode == 0, result.stdout
+    block = yaml.safe_load(_config_path(tmp_path).read_text(encoding="utf-8"))["platforms"]["matrix"]
+    assert set(block["extra"]) == set(_projected_extra().keys())
+    assert "capabilities full" in result.stdout
+
+
+def test_invalid_capabilities_value_is_rejected(tmp_path):
+    result = _run(
+        INSTALL,
+        ["--config", str(_config_path(tmp_path)), "--hermes-capabilities", "maybe"],
+        _hermetic_env(tmp_path),
+    )
+    assert result.returncode == 2
+    assert "full|basic" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Capability gate: read-only tree probe
+# ---------------------------------------------------------------------------
+
+
+def _fake_hermes_tree(tmp_path, layout, adapter_keys=()):
+    """A minimal runtime tree whose shape the installer can probe.
+
+    layout: "new" (plugins/platforms/matrix/adapter.py), "old"
+    (gateway/platforms/matrix.py) or "none" (empty directory).
+    adapter_keys: config.extra keys the new-layout adapter reads.
+    """
+    root = tmp_path / f"fake-{layout}"
+    root.mkdir()
+    if layout == "new":
+        adapter_dir = root / "plugins" / "platforms" / "matrix"
+        adapter_dir.mkdir(parents=True)
+        lines = ["class MatrixAdapter:", "    def __init__(self, config):"]
+        for key in adapter_keys:
+            lines.append(
+                '        self._%s = _extra_csv_set(config, "%s", "ENV_%s")'
+                % (key, key, key.upper())
+            )
+        (adapter_dir / "adapter.py").write_text("\n".join(lines) + "\n")
+    elif layout == "old":
+        old_dir = root / "gateway" / "platforms"
+        old_dir.mkdir(parents=True)
+        (old_dir / "matrix.py").write_text("MATRIX_REQUIRE_MENTION = 1\n")
+    return root
+
+
+FULL_ADAPTER_KEYS = ("homeserver", "user_id", "allowed_rooms", "allowed_users", "require_mention")
+
+
+def test_tree_probe_full_beats_verified_table(tmp_path):
+    # Ground truth over the table: a full-capability tree with the
+    # v2026.4.16 version string installed is full.
+    tree = _fake_hermes_tree(tmp_path, "new", adapter_keys=FULL_ADAPTER_KEYS)
+    result = _install(
+        tmp_path,
+        ["--hermes-version", "v2026.4.16", "--hermes-root", str(tree)],
+    )
+    assert result.returncode == 0, result.stdout
+    block = yaml.safe_load(_config_path(tmp_path).read_text(encoding="utf-8"))["platforms"]["matrix"]
+    assert set(block["extra"]) == set(_projected_extra().keys())
+    assert "tree probe" in result.stdout
+
+
+def test_tree_probe_full_beats_capability_declaration(tmp_path):
+    # Ground truth over the explicit declaration as well.
+    tree = _fake_hermes_tree(tmp_path, "new", adapter_keys=FULL_ADAPTER_KEYS)
+    result = _install(
+        tmp_path,
+        [
+            "--hermes-version",
+            "v2026.4.16",
+            "--hermes-root",
+            str(tree),
+            "--hermes-capabilities",
+            "basic",
+        ],
+    )
+    assert result.returncode == 0, result.stdout
+    block = yaml.safe_load(_config_path(tmp_path).read_text(encoding="utf-8"))["platforms"]["matrix"]
+    assert set(block["extra"]) == set(_projected_extra().keys())
+
+
+def test_tree_probe_legacy_layout_is_basic(tmp_path):
+    # A full-generation version string cannot paper over a
+    # legacy-layout tree: the probe reports basic and the strict
+    # gate holds.
+    tree = _fake_hermes_tree(tmp_path, "old")
+    result = _install(
+        tmp_path,
+        ["--hermes-version", "0.21.5", "--hermes-root", str(tree)],
+    )
+    assert result.returncode != 0, result.stdout
+    assert "basic" in result.stderr
+    for setting in DROPPABLE:
+        assert setting in result.stderr
+    assert "tree probe" in result.stderr
+    assert not _config_path(tmp_path).exists()
+
+
+def test_tree_probe_new_layout_without_keys_is_basic(tmp_path):
+    # An adapter.py that reads none of the three keys is a
+    # basic-capability runtime, even at a full version string.
+    tree = _fake_hermes_tree(tmp_path, "new", adapter_keys=("homeserver",))
+    result = _install(
+        tmp_path,
+        ["--hermes-version", "0.21.5", "--hermes-root", str(tree)],
+    )
+    assert result.returncode != 0, result.stdout
+    assert "basic" in result.stderr
+    assert not _config_path(tmp_path).exists()
+
+
+def test_tree_probe_no_known_shape_fails_closed(tmp_path):
+    # A located root with neither known shape is not a successful
+    # probe: the gate stays unknown and fails closed ...
+    tree = _fake_hermes_tree(tmp_path, "none")
+    result = _install(
+        tmp_path,
+        ["--hermes-version", "0.21.5", "--hermes-root", str(tree)],
+    )
+    assert result.returncode != 0, result.stdout
+    assert "unknown Hermes generation" in result.stderr
+    assert "--hermes-capabilities" in result.stderr
+    assert not _config_path(tmp_path).exists()
+
+    # ... but the explicit declaration still applies as an escape hatch.
+    result = _install(
+        tmp_path,
+        [
+            "--hermes-version",
+            "0.21.5",
+            "--hermes-root",
+            str(tree),
+            "--hermes-capabilities",
+            "full",
+        ],
+    )
+    assert result.returncode == 0, result.stdout
+    block = yaml.safe_load(_config_path(tmp_path).read_text(encoding="utf-8"))["platforms"]["matrix"]
+    assert set(block["extra"]) == set(_projected_extra().keys())
+
+
+def test_explicit_missing_hermes_root_is_an_error(tmp_path):
+    result = _install(
+        tmp_path,
+        ["--hermes-version", "v2026.9.24", "--hermes-root", str(tmp_path / "absent")],
+    )
+    assert result.returncode != 0, result.stdout
+    assert "--hermes-root" in result.stderr
+    assert not _config_path(tmp_path).exists()
+
+
+def test_hermes_home_env_root_is_probed(tmp_path):
+    # HERMES_HOME is the documented location probe (no --hermes-root).
+    tree = _fake_hermes_tree(tmp_path, "new", adapter_keys=FULL_ADAPTER_KEYS)
+    env = _env(tmp_path)
+    env["HERMES_HOME"] = str(tree)
+    result = _run(INSTALL, ["--config", str(_config_path(tmp_path))], env)
+    assert result.returncode == 0, result.stdout
+    block = yaml.safe_load(_config_path(tmp_path).read_text(encoding="utf-8"))["platforms"]["matrix"]
+    assert set(block["extra"]) == set(_projected_extra().keys())
+    assert "tree probe" in result.stdout
+
+
+def test_allow_partial_marker_records_drop_and_capability(tmp_path):
+    result = _install(
+        tmp_path, ["--hermes-version", "v2026.4.16", "--allow-partial"]
+    )
+    assert result.returncode == 0, result.stdout
+    marker = json.loads(_marker_path(tmp_path).read_text(encoding="utf-8"))
+    for key in ("adapter", "bundle", "config", "dropped", "runtime_version", "capabilities", "capability_source"):
+        assert key in marker, f"marker must record {key}: {marker}"
+    assert marker["dropped"] == DROPPABLE
+    assert marker["capabilities"] == "basic"
+    assert marker["capability_source"].startswith("verified table")
+
+
+# ---------------------------------------------------------------------------
+# v2026.9.24 real tree: installer output + adapter read-back
+# ---------------------------------------------------------------------------
+
+
+def test_v20269_runtime_installer_and_adapter_readback(tmp_path, tmp_path_factory):
+    # The tree is the v2026.9.24 source (package 0.21.5); its Matrix
+    # adapter reads allowed_rooms, allowed_users and require_mention
+    # from the extra map, so the installer must project everything.
+    tree = _resolve_tree("v20269", tmp_path_factory)
+
+    result = _install(tmp_path, ["--hermes-version", "v2026.9.24"])
+    assert result.returncode == 0, result.stdout
+    block = yaml.safe_load(_config_path(tmp_path).read_text(encoding="utf-8"))["platforms"]["matrix"]
+    m = CONTRACT_MATRIX
+    assert block["extra"] == {
+        "homeserver": m["homeserver"],
+        "user_id": m["user_id"],
+        "allowed_users": list(
+            dict.fromkeys(list(m["allow_from"]) + list(m["group_allow_from"]))
+        ),
+        "allowed_rooms": list(m["rooms"]),
+        "require_mention": bool(m["require_mention"]),
+    }
+    assert not _marker_path(tmp_path).exists()
+
+    # Read-back: build the v2026.9.24 adapter from the projected block
+    # and check the three settings survive into the adapter state.
+    probe = _parser_probe(
+        tree, block, build_adapter=True, adapter_module="plugins.platforms.matrix.adapter"
+    )
+    if probe.get("import_error") or probe.get("from_dict_error") or probe.get("error"):
+        # Dependency unavailable in this environment; the installer
+        # assertions above still stand, and the key reads are
+        # verified at source level below.
+        source = (tree / "plugins" / "platforms" / "matrix" / "adapter.py").read_text(
+            encoding="utf-8"
+        )
+        assert '_extra_csv_set(config, "allowed_rooms"' in source
+        assert '_extra_csv_set(config, "allowed_users"' in source
+        assert 'config.extra.get("require_mention"' in source
+        pytest.skip(
+            "v2026.9.24 adapter cannot be built in this container: "
+            + str(probe.get("import_error") or probe.get("from_dict_error") or probe.get("error"))
+        )
+    if "built" not in probe:
+        pytest.skip(f"v2026.9.24 adapter could not be built: {probe.get('build_error')}")
+    assert probe["homeserver"] == m["homeserver"]
+    assert probe["user_id"] == m["user_id"]
+    assert probe["require_mention"] is True
+    assert probe["allowed_rooms"] == sorted(set(m["rooms"]))
+    assert probe["allowed_user_ids"] == sorted(
+        set(list(m["allow_from"]) + list(m["group_allow_from"]))
+    )

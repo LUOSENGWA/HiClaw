@@ -33,28 +33,32 @@ src/config/zod-schema.core.ts:436.
 Hermes — the installer writes its settings into the explicit
 `extra:` map of the platforms.matrix block (gateway/config.py:445),
 the one shape both supported runtime generations consume: the
-pinned pre-0.22.5 runtime (v2026.4.16) reads
-extra = data.get("extra", {}) verbatim and silently drops flat
-block keys (#1458), while v0.22.5 (bf0203a7) promotes flat
-non-typed keys but lets an explicit `extra:` win on a clash
-(gateway/config.py:448-452). The matrix adapter reads its settings
-extra-first (gateway/platforms/_shared.py:106): homeserver at
-plugins/platforms/matrix/adapter.py:829, user_id at :831,
-allowed_rooms at :863, allowed_users at :898 (applied at
-:2611-2612), require_mention at :940; the typed token field
+basic-capability runtime (the Worker pin v2026.4.16, package
+0.10.0) reads extra = data.get("extra", {}) verbatim and silently
+drops flat block keys (#1458), while the full generation (verified
+on tags v2026.9.24 / package 0.21.5 and v0.22.5 / package 0.0.0,
+bf0203a7) promotes flat non-typed keys but lets an explicit `extra:`
+win on a clash (gateway/config.py:448-452). The matrix adapter reads
+its settings extra-first (gateway/platforms/_shared.py:106):
+homeserver at plugins/platforms/matrix/adapter.py:829 (v2026.9.24:
+:842), user_id at :831 (:844), allowed_rooms at :863 (:873),
+allowed_users at :898 (:908, applied at :2611-2612),
+require_mention at :940 (:950); the typed token field
 (gateway/config.py:411) is read at adapter.py:830. The installer
-gates on the target runtime version (--hermes-version /
-HERMES_VERSION / a `hermes --version` probe; unknown = pre-0.22.5):
-on a pre-0.22.5 runtime the allowlists and require_mention are
-refused or, with --allow-partial, dropped and recorded in a marker.
-The hermes installs below therefore declare --hermes-version
-0.22.5, except the bundle-dispatch test, which instead lets the
+gates on the target runtime's verified capability (tree probe, then
+--hermes-capabilities, then the version table keyed by tag or
+package version; unknown fails closed): on a basic-capability or
+unknown runtime the allowlists and require_mention are refused or,
+with --allow-partial, dropped and recorded in a marker. The hermes
+installs below therefore declare --hermes-version 0.22.5 (verified
+full), except the bundle-dispatch test, which instead lets the
 version gate fall back to a fake `hermes --version` binary that
 prints 0.22.5.
 
 No network access is involved and the adapters are pure file
-projectors; the only runtime interaction is the optional
-`hermes --version` probe in the hermes version gate.
+projectors; the only runtime interactions are the optional,
+read-only tree probe and the `hermes --version` probe in the hermes
+capability gate.
 """
 
 import json
@@ -708,15 +712,16 @@ def test_openclaw_groups_entry_per_room(tmp_path):
 
 def test_hermes_projection_targets_platforms_matrix_block(tmp_path):
     """The projection must land in the platforms.matrix block, not a
-    top-level matrix: block, and — since the pinned pre-0.22.5 runtime
-    (v2026.4.16) reads only the block's explicit `extra:` map
-    (gateway/config.py, extra = data.get("extra", {}); #1458) — under
-    the block's `extra:` key, not as flat block keys.
+    top-level matrix: block, and — since the pinned basic-capability
+    runtime (v2026.4.16, package 0.10.0) reads only the block's
+    explicit `extra:` map (gateway/config.py,
+    extra = data.get("extra", {}); #1458) — under the block's
+    `extra:` key, not as flat block keys.
 
     The platforms: block is parsed by PlatformConfig.from_dict
-    (gateway/config.py:781,445); v0.22.5 (bf0203a7) additionally
-    promotes flat non-typed keys but lets an explicit `extra:` win
-    (gateway/config.py:448-452). The matrix adapter reads its settings
+    (gateway/config.py:781,445); the full generation (v0.22.5,
+    bf0203a7) additionally promotes flat non-typed keys but lets an
+    explicit `extra:` win (gateway/config.py:448-452). The matrix adapter reads its settings
     extra-first (plugins/platforms/matrix/adapter.py:829,831,863,898,
     940). A top-level matrix: block would only bridge its few behavior
     keys (_YAML_BRIDGE, adapter.py:3235-3248) — homeserver, user_id

@@ -6,14 +6,55 @@
 # and merges its settings into the platforms.matrix block of the Hermes
 # config file, nested under the block's explicit `extra:` map — the one
 # shape both supported runtime generations consume (see README.md,
-# "Config shape and runtime versions"). It is a pure file projector: no
-# network access is performed; the only runtime interaction is an
-# optional `hermes --version` probe when the target version is not
-# declared via --hermes-version or HERMES_VERSION.
+# "Config shape and runtime capabilities"). It is a pure file projector:
+# no network access is performed. The only runtime interactions are a
+# best-effort, read-only tree probe of the Hermes install and an
+# optional `hermes --version` probe, both used to resolve the target
+# runtime's capability.
+#
+# Runtime capabilities (verified on upstream tags, 2026-10-30):
+#
+#   * full  — the plugin-API generation whose Matrix adapter
+#     (plugins/platforms/matrix/adapter.py) reads allowed_rooms,
+#     allowed_users and require_mention from the config's extra map.
+#     Verified on tag v2026.9.24 (package version 0.21.5) and tag
+#     v0.22.5 (package version 0.0.0).
+#   * basic — the older generation whose Matrix adapter
+#     (gateway/platforms/matrix.py) has no allowlist feature and takes
+#     require_mention only from the MATRIX_REQUIRE_MENTION env var.
+#     Verified on the Worker pin tag v2026.4.16 (package version 0.10.0).
+#
+# Tag strings and package versions are NOT comparable across
+# generations: the calendar tag v2026.9.24 is a newer generation than
+# the semver-shaped tag v0.22.5, and the latter declares package
+# version 0.0.0 in its pyproject.toml. The gate therefore never compares
+# version numbers; it resolves the target runtime's capability in this
+# order (the first decisive source wins):
+#
+#   1. tree probe — a located Hermes root (--hermes-root, then
+#      HERMES_HOME, then an importable `gateway` package, then the
+#      `hermes` executable's prefix) whose Matrix adapter source
+#      detects as full or basic. Ground truth: it outranks
+#      --hermes-capabilities and the version table. A root that exists
+#      but has no detectable Matrix shape is not a successful probe —
+#      the installer never guesses (the explicit --hermes-capabilities
+#      declaration still applies; the version table does not, because
+#      the version string may describe a different install than the
+#      located tree).
+#   2. --hermes-capabilities=full|basic — an explicit declaration.
+#   3. verified table — the version from --hermes-version /
+#      HERMES_VERSION / `hermes --version`, matched by tag or by
+#      package version: v2026.4.16 / 0.10.0 -> basic; v2026.9.24 /
+#      0.21.5 -> full; v0.22.5 / 0.0.0 -> full.
+#   4. unknown — fail closed: when the contract requires
+#      full-capability settings the installer exits non-zero with
+#      guidance (never a silent downgrade); otherwise the projection is
+#      safe as-is, and --allow-partial accepts a reduced projection.
 #
 # Usage:
 #   install.sh [--config <path>] [--dry-run] [--with-credentials]
-#              [--hermes-version <version>] [--allow-partial]
+#              [--hermes-version <version>] [--hermes-root <path>]
+#              [--hermes-capabilities full|basic] [--allow-partial]
 #
 #   --config <path>        target config file
 #                          (default: $HOME/.hermes/config.yaml)
@@ -22,28 +63,29 @@
 #                          $AGENTTEAMS_MATRIX_ACCESS_TOKEN; the config
 #                          file is written 0600 whenever it carries
 #                          credential values
-#   --hermes-version <v>   target hermes-agent version. Overrides the
-#                          HERMES_VERSION env var and the `hermes
-#                          --version` probe. An undetermined version is
-#                          treated as the pre-0.22.5 runtime (safe
-#                          default). Calendar tags (v2026.x.y) belong to
-#                          the pre-0.x "Hermes Agent" series and count
-#                          as pre-0.22.5.
-#   --allow-partial        on a pre-0.22.5 runtime, project only the
-#                          settings that runtime can honor and record
-#                          the dropped ones in
+#   --hermes-version <v>   target hermes-agent version, as a tag
+#                          (v2026.9.24) or a package version (0.21.5).
+#                          Overrides the HERMES_VERSION env var and the
+#                          `hermes --version` probe. Consulted only when
+#                          the tree probe and --hermes-capabilities do
+#                          not decide (see the resolution order above).
+#   --hermes-root <path>   root of the target Hermes install to probe
+#                          (overrides HERMES_HOME). The directory must
+#                          exist; its Matrix adapter source decides the
+#                          capability.
+#   --hermes-capabilities <full|basic>
+#                          explicit capability declaration for the
+#                          target runtime. Outranks the verified
+#                          version table; a successful tree probe
+#                          outranks it.
+#   --allow-partial        on a basic-capability runtime (or an unknown
+#                          one), project only the settings that runtime
+#                          can (or is verified to be able to) honor and
+#                          record the dropped ones in
 #                          <config dir>/.agentteams-matrix/hermes-install.json
 #                          (without it, the installer exits non-zero when
-#                          the contract requires settings that runtime
-#                          would silently ignore)
-#
-# Version support: pre-0.22.5 runtimes (including the Worker pin
-# v2026.4.16 = "Hermes Agent v0.10.0") consume enabled/token (typed) and
-# extra.{homeserver, user_id, device_id, password}; the user/room
-# allowlists and require_mention do not exist there (require_mention is
-# env-only, MATRIX_REQUIRE_MENTION). The full contract therefore
-# requires >= 0.22.5, and the installer never exits 0 while dropping
-# contract settings.
+#                          the contract requires settings the runtime
+#                          cannot honor)
 #
 # Only the keys this adapter owns are merged into the platforms.matrix
 # block; every other key in the config file is preserved, including
@@ -70,22 +112,39 @@ DRY_RUN=0
 WITH_CREDENTIALS=0
 ALLOW_PARTIAL=0
 HERMES_VERSION_ARG=""
+HERMES_ROOT_ARG=""
+HERMES_CAPABILITIES_ARG=""
 
 usage() {
   cat <<'EOF'
 Usage: install.sh [--config <path>] [--dry-run] [--with-credentials]
-                  [--hermes-version <version>] [--allow-partial]
+                  [--hermes-version <version>] [--hermes-root <path>]
+                  [--hermes-capabilities full|basic] [--allow-partial]
 
 Projects the agentteams-matrix contract onto the platforms.matrix block
 of the Hermes config file (default: $HOME/.hermes/config.yaml).
 
 Settings are written into the block's explicit `extra:` map, which both
-runtime generations consume. Pre-0.22.5 runtimes (including the Worker
-pin v2026.4.16) cannot honor allowed_users / allowed_rooms /
-require_mention; when the contract requires them the installer exits
-non-zero unless --allow-partial is passed, in which case the dropped
-settings are recorded in
+supported runtime generations consume. Basic-capability runtimes
+(including the Worker pin v2026.4.16) cannot honor allowed_users /
+allowed_rooms / require_mention; when the contract requires them the
+installer exits non-zero unless --allow-partial is passed, in which
+case the dropped settings are recorded in
 <config dir>/.agentteams-matrix/hermes-install.json.
+
+Runtime capability is resolved in this order (first decisive source
+wins):
+  1. tree probe — a located Hermes root (--hermes-root, then
+     HERMES_HOME, then an importable `gateway` package, then the
+     `hermes` binary's prefix) whose Matrix adapter source detects as
+     full or basic (ground truth; outranks everything below);
+  2. --hermes-capabilities full|basic — an explicit declaration;
+  3. verified table — the version from --hermes-version /
+     HERMES_VERSION / `hermes --version`, matched by tag or by package
+     version (v2026.4.16 / 0.10.0 = basic; v2026.9.24 / 0.21.5 = full;
+     v0.22.5 / 0.0.0 = full);
+  4. unknown — fails closed with guidance instead of silently dropping
+     contract settings; --allow-partial accepts a reduced projection.
 EOF
 }
 
@@ -115,6 +174,29 @@ while [ $# -gt 0 ]; do
       HERMES_VERSION_ARG="$2"
       shift 2
       ;;
+    --hermes-root)
+      if [ $# -lt 2 ]; then
+        echo "ERROR: --hermes-root requires a path" >&2
+        exit 2
+      fi
+      HERMES_ROOT_ARG="$2"
+      shift 2
+      ;;
+    --hermes-capabilities)
+      if [ $# -lt 2 ]; then
+        echo "ERROR: --hermes-capabilities requires a value (full or basic)" >&2
+        exit 2
+      fi
+      case "$2" in
+        full|basic) ;;
+        *)
+          echo "ERROR: --hermes-capabilities takes full|basic (got: $2)" >&2
+          exit 2
+          ;;
+      esac
+      HERMES_CAPABILITIES_ARG="$2"
+      shift 2
+      ;;
     --allow-partial)
       ALLOW_PARTIAL=1
       shift
@@ -137,10 +219,12 @@ if [ ! -f "${CONTRACT_PATH}" ]; then
   exit 1
 fi
 
-python3 - "${CONFIG_PATH}" "${CONTRACT_PATH}" "${DRY_RUN}" "${WITH_CREDENTIALS}" "${ALLOW_PARTIAL}" "${HERMES_VERSION_ARG}" <<'PY'
+python3 - "${CONFIG_PATH}" "${CONTRACT_PATH}" "${DRY_RUN}" "${WITH_CREDENTIALS}" "${ALLOW_PARTIAL}" "${HERMES_VERSION_ARG}" "${HERMES_ROOT_ARG}" "${HERMES_CAPABILITIES_ARG}" <<'PY'
+import importlib.util
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -153,15 +237,39 @@ dry_run = sys.argv[3] == "1"
 with_credentials = sys.argv[4] == "1"
 allow_partial = sys.argv[5] == "1"
 version_arg = sys.argv[6]
+hermes_root_arg = sys.argv[7]
+capabilities_arg = sys.argv[8]
 
 TOKEN_KEY = "token"
 MARKER_DIR_NAME = ".agentteams-matrix"
 MARKER_NAME = "hermes-install.json"
-FULL_CONTRACT_MINIMUM = (0, 22, 5)
-# Contract settings a pre-0.22.5 runtime cannot honor from the config
-# file: the user/room allowlists do not exist in that generation and
-# require_mention is env-only (MATRIX_REQUIRE_MENTION).
+# Contract settings a basic-capability runtime cannot honor from the
+# config file: the user/room allowlists do not exist in that
+# generation and require_mention is env-only (MATRIX_REQUIRE_MENTION).
 UNHONORABLE_SETTINGS = ("allowed_users", "allowed_rooms", "require_mention")
+# The same settings, as the full-capability generation's adapter reads
+# them from its extra map (used by the tree probe).
+FULL_CAPABILITY_KEYS = ("allowed_rooms", "allowed_users", "require_mention")
+# Verified runtime capability table, keyed by the normalised version
+# string (tag with the leading "v" stripped, or the pyproject.toml
+# package version). Verified against upstream tags on 2026-10-30:
+#   tag v2026.4.16 (Worker pin) -> package 0.10.0: basic
+#   tag v2026.9.24              -> package 0.21.5: full
+#   tag v0.22.5                 -> package 0.0.0:  full
+# Tag strings and package versions are not comparable across
+# generations (a calendar tag can be the newest generation and a
+# semver-looking tag can declare package version 0.0.0), so the gate
+# matches this table instead of comparing version numbers. It is
+# consulted only when the tree probe found no root and no explicit
+# --hermes-capabilities declaration was given.
+VERIFIED_CAPABILITIES = {
+    "2026.4.16": "basic",  # tag v2026.4.16 (Worker pin)
+    "0.10.0": "basic",     # package version declared by tag v2026.4.16
+    "2026.9.24": "full",   # tag v2026.9.24
+    "0.21.5": "full",      # package version declared by tag v2026.9.24
+    "0.22.5": "full",      # tag v0.22.5
+    "0.0.0": "full",       # package version declared by tag v0.22.5
+}
 
 CREDENTIAL_SUFFIXES = ("token", "secret", "password", "passwd", "apikey", "credentials")
 REDACTED = "<redacted>"
@@ -256,17 +364,19 @@ if not isinstance(matrix, dict) or not matrix:
 
 # contract.yaml -> config.yaml platforms.matrix block. The settings are
 # projected into the block's explicit `extra:` map — the one shape both
-# runtime generations consume:
+# supported generations consume:
 #
-#   * pre-0.22.5 (pinned v2026.4.16): PlatformConfig.from_dict reads
-#     extra = data.get("extra", {}) and ignores every other non-typed
-#     top-level key — flat settings are silently dropped (#1458);
-#   * >= 0.22.5: PlatformConfig.from_dict promotes non-typed top-level
-#     keys into extra, but an explicit `extra:` map wins on a clash, so
-#     the nested shape is authoritative there too.
+#   * basic generation (the Worker pin v2026.4.16):
+#     PlatformConfig.from_dict reads extra = data.get("extra", {}) and
+#     ignores every other non-typed top-level key — flat settings are
+#     silently dropped (#1458);
+#   * full generation (verified on v2026.9.24 and v0.22.5):
+#     PlatformConfig.from_dict promotes non-typed top-level keys into
+#     extra, but an explicit `extra:` map wins on a clash, so the
+#     nested shape is authoritative there too.
 #
 # Flat keys are therefore NOT written (see README.md, "Config shape and
-# runtime versions").
+# runtime capabilities").
 projected_extra = {}
 # homeserver — consumed via config.extra on both generations.
 if matrix.get("homeserver") is not None:
@@ -283,11 +393,13 @@ allowed_users = list(
 )
 if allowed_users:
     projected_extra["allowed_users"] = allowed_users
-# rooms -> allowed_rooms — room-ID gate, DMs exempt (>= 0.22.5 only).
+# rooms -> allowed_rooms — room-ID gate, DMs exempt (full-capability
+# runtimes only).
 rooms = list(matrix.get("rooms") or [])
 if rooms:
     projected_extra["allowed_rooms"] = rooms
-# require_mention — declared value projected as-is (>= 0.22.5 only).
+# require_mention — declared value projected as-is (full-capability
+# runtimes only; basic runtimes take it from MATRIX_REQUIRE_MENTION).
 if matrix.get("require_mention") is not None:
     projected_extra["require_mention"] = bool(matrix["require_mention"])
 
@@ -306,34 +418,10 @@ if with_credentials:
         )
 
 
-# --- Runtime version gate -------------------------------------------------
-# Resolution order: --hermes-version -> HERMES_VERSION env ->
-# `hermes --version` -> unknown. Unknown is treated as the pre-0.22.5
-# runtime (safe default): a config whose required settings the runtime
-# would silently ignore must not be written as a success.
-
-def parse_version(raw):
-    """First numeric dotted run of *raw* as an int tuple, else None.
-
-    A leading component >= 1000 is a calendar tag (v2026.4.16 = the
-    pre-0.x "Hermes Agent v0.10.0" series), which predates 0.22.5."""
-    if not raw:
-        return None
-    match = re.search(r"\d+(?:\.\d+)+", raw)
-    if not match:
-        return None
-    return tuple(int(part) for part in match.group(0).split("."))
-
-
-def is_new_runtime(version):
-    parsed = parse_version(version)
-    if parsed is None:
-        return False
-    if parsed[0] >= 1000:
-        return False
-    padded = parsed + (0,) * max(0, 3 - len(parsed))
-    return padded[:3] >= FULL_CONTRACT_MINIMUM
-
+# --- Runtime capability gate -------------------------------------------------
+# Resolution order (documented in the header comment): a successful
+# tree probe (ground truth) -> --hermes-capabilities (explicit
+# declaration) -> the verified version table -> unknown (fail closed).
 
 def detect_version():
     if version_arg:
@@ -355,32 +443,149 @@ def detect_version():
     return (proc.stdout or "").strip()
 
 
+def normalize_version(raw):
+    """First dotted numeric run of *raw* (a leading "v" is irrelevant)."""
+    if not raw:
+        return None
+    match = re.search(r"\d+(?:\.\d+)+", raw)
+    return match.group(0) if match else None
+
+
+def probe_tree_capabilities(root):
+    """Derive the capability of a located Hermes root; never guess.
+
+    "full"  — plugins/platforms/matrix/adapter.py exists and its source
+              reads all of allowed_rooms / allowed_users /
+              require_mention (the plugin-API generation, verified on
+              tags v2026.9.24 and v0.22.5);
+    "basic" — only the legacy gateway/platforms/matrix.py exists, or
+              the new-layout adapter does not read the three settings;
+    None    — neither known Matrix shape is detectable."""
+    adapter = root / "plugins" / "platforms" / "matrix" / "adapter.py"
+    if adapter.is_file():
+        source = adapter.read_text(encoding="utf-8", errors="replace")
+        if all(key in source for key in FULL_CAPABILITY_KEYS):
+            return "full"
+        return "basic"
+    if (root / "gateway" / "platforms" / "matrix.py").is_file():
+        return "basic"
+    return None
+
+
+def _has_known_matrix_shape(root):
+    return (
+        (root / "plugins" / "platforms" / "matrix" / "adapter.py").is_file()
+        or (root / "gateway" / "platforms" / "matrix.py").is_file()
+    )
+
+
+def locate_hermes_root():
+    """Locate a Hermes root to probe, or None.
+
+    Order: --hermes-root / HERMES_HOME (explicit; a missing directory
+    is a hard error) -> an importable `gateway` package -> the `hermes`
+    executable's prefix. Implicit candidates are accepted only when a
+    known Matrix shape is detectable — the probe never guesses."""
+    explicit = (hermes_root_arg or os.environ.get("HERMES_HOME", "")).strip()
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.is_dir():
+            fail(
+                f"hermes root {explicit} (from --hermes-root / HERMES_HOME) "
+                "is not a directory"
+            )
+        return path
+    try:
+        spec = importlib.util.find_spec("gateway")
+    except Exception:
+        spec = None
+    if spec is not None and spec.submodule_search_locations:
+        candidate = Path(next(iter(spec.submodule_search_locations))).resolve().parent
+        if _has_known_matrix_shape(candidate):
+            return candidate
+    hermes_bin = shutil.which("hermes")
+    if hermes_bin:
+        candidate = Path(hermes_bin).resolve().parent.parent
+        if _has_known_matrix_shape(candidate):
+            return candidate
+    return None
+
+
+def resolve_capabilities(runtime_version):
+    """(capability, source, root): capability is "full", "basic" or
+    None (unknown); source is the human-readable evidence."""
+    root = locate_hermes_root()
+    if root is not None:
+        capability = probe_tree_capabilities(root)
+        if capability is not None:
+            return capability, f"tree probe {root}", root
+        # A located tree without a detectable Matrix shape is not a
+        # successful probe: never guess. The explicit declaration still
+        # applies; the version table does not, because the version
+        # string may describe a different install than the located tree.
+        if capabilities_arg:
+            return capabilities_arg, "--hermes-capabilities", root
+        return None, f"tree probe {root} (no known Matrix shape)", root
+    if capabilities_arg:
+        return capabilities_arg, "--hermes-capabilities", None
+    normalized = normalize_version(runtime_version)
+    if normalized in VERIFIED_CAPABILITIES:
+        return VERIFIED_CAPABILITIES[normalized], f"verified table for {normalized}", None
+    if runtime_version:
+        return None, f"version {runtime_version}", None
+    return None, "no version declared or detected", None
+
+
 marker_path = config_path.parent / MARKER_DIR_NAME / MARKER_NAME
 required = [key for key in UNHONORABLE_SETTINGS if key in projected_extra]
 runtime_version = detect_version()
+capability, capability_source, probed_root = resolve_capabilities(runtime_version)
 dropped = []
-if not is_new_runtime(runtime_version) and required:
-    label = runtime_version or "unknown"
+
+if capability in ("basic", None) and required:
+    version_label = f'"{runtime_version}"' if runtime_version else '"undetermined"'
+    if capability == "basic":
+        subject = runtime_version or (f"tree at {probed_root}" if probed_root else "unknown")
+        gate = f"hermes runtime {subject} is a basic-capability runtime"
+        if capability_source.startswith("tree probe"):
+            gate += f" (evidence: {capability_source})"
+    else:
+        gate = f"unknown Hermes generation {version_label}"
     if not allow_partial:
+        if capability == "basic":
+            fail(
+                f"{gate}: its Matrix adapter cannot honor these contract "
+                f"settings: {', '.join(required)}. The installer refuses "
+                "to write a config that would silently ignore required "
+                "settings. Target a full-capability runtime (verified: "
+                "tag v2026.9.24 / package 0.21.5, tag v0.22.5) or pass "
+                "--allow-partial to project the remaining settings and "
+                f"record the dropped ones in {marker_path}."
+            )
         fail(
-            f"hermes runtime {label} (pre-0.22.5) cannot honor these "
-            f"contract settings: {', '.join(required)}. The installer "
-            "refuses to write a config that would silently ignore "
-            "required settings. Target a runtime >= 0.22.5 "
-            "(--hermes-version / HERMES_VERSION) or pass --allow-partial "
-            f"to project the remaining settings and record the dropped "
-            f"ones in {marker_path}."
+            f"{gate}; the contract requires full-capability settings "
+            f"({', '.join(required)}) that this runtime is not verified "
+            "to honor. Pass --hermes-capabilities=full|basic (or "
+            "--hermes-root) to state what it supports, or --allow-partial "
+            f"to accept a reduced projection (recorded in {marker_path})."
         )
-    dropped = required
+    dropped = list(required)
     for key in required:
         del projected_extra[key]
-    print(
-        f"WARNING: hermes runtime {label} (pre-0.22.5) cannot honor "
-        f"these contract settings; they were not written: "
-        f"{', '.join(required)} (partial projection recorded in "
-        f"{marker_path})",
-        file=sys.stderr,
-    )
+    if capability == "basic":
+        print(
+            f"WARNING: {gate}; these contract settings are not honored "
+            f"by it and were not written: {', '.join(required)} (partial "
+            f"projection recorded in {marker_path})",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"WARNING: {gate}; these contract settings are not verified "
+            f"to be honored and were not written: {', '.join(required)} "
+            f"(partial projection recorded in {marker_path})",
+            file=sys.stderr,
+        )
 
 # --- Merge into the target config ------------------------------------------
 
@@ -441,6 +646,8 @@ if dropped:
     marker = {
         "adapter": "hermes",
         "bundle": "agentteams-matrix",
+        "capabilities": capability or "unknown",
+        "capability_source": capability_source,
         "config": str(config_path),
         "dropped": sorted(dropped),
         "runtime_version": runtime_version or "unknown",
@@ -453,7 +660,8 @@ if dropped:
     print(
         f"agentteams-matrix hermes adapter: partial projection into "
         f"platforms.matrix in {config_path} (runtime "
-        f"{runtime_version or 'unknown'}; dropped {', '.join(sorted(dropped))})"
+        f"{runtime_version or 'unknown'}, capabilities {capability or 'unknown'} via "
+        f"{capability_source}; dropped {', '.join(sorted(dropped))})"
     )
 else:
     # A full projection supersedes any stale partial-projection marker.
@@ -465,6 +673,8 @@ else:
             pass
     print(
         f"agentteams-matrix hermes adapter: wrote platforms.matrix to "
-        f"{config_path} (runtime {runtime_version or 'unknown'}; full projection)"
+        f"{config_path} (runtime {runtime_version or 'unknown'}, "
+        f"capabilities {capability or 'unknown'} via {capability_source}; "
+        "full projection)"
     )
 PY

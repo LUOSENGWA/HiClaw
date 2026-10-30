@@ -30,7 +30,8 @@ Adapters:
              (options: --config, --dry-run, --with-credentials)
   hermes     project the matrix: block into ~/.hermes/config.yaml
              (options: --config, --dry-run, --with-credentials,
-             --hermes-version <version>, --allow-partial)
+             --hermes-version <version>, --hermes-root <path>,
+             --hermes-capabilities full|basic, --allow-partial)
 
 Without --adapter, the first detected runtime (search order: qwenpaw,
 openclaw, hermes) is installed.
