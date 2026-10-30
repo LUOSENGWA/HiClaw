@@ -76,9 +76,14 @@ def _guard_delegate_decision_class(payload: dict[str, Any]) -> str:
     return decision_class
 
 
-def _protocol_guard_for_accept(task: dict[str, Any]) -> None:
+def _protocol_guard_for_accept(task: dict[str, Any], accepted: bool) -> None:
     """W2 acceptance gates for projectflow accept_task_result (skipped
-    entirely with the protocol switch off):
+    entirely with the protocol switch off). The gate applies to a
+    POSITIVE acceptance only: a rejection / return-for-revision
+    (accepted=False) must always be possible, so it returns immediately
+    for those. With accepted=True:
+    - a missing or malformed review record blocks the acceptance
+      (review_missing);
     - a review record with a non-passing verdict blocks the acceptance
       (review_not_passed);
     - an r1 task result (task_result_acceptance class; an absent
@@ -87,8 +92,19 @@ def _protocol_guard_for_accept(task: dict[str, Any]) -> None:
     """
     if not _protocol_enforce_enabled():
         return
+    if not accepted:
+        return
     review = task.get("review")
-    if isinstance(review, dict) and str(review.get("verdict") or "") != "pass":
+    verdict = ""
+    if isinstance(review, dict):
+        verdict = str(review.get("verdict") or "").strip().lower()
+    if verdict not in {"pass", "fail"}:
+        raise ProtocolGuardError(
+            "review_missing",
+            "accept_task_result requires a review record before accepting a result "
+            "(missing or malformed)",
+        )
+    if verdict != "pass":
         raise ProtocolGuardError(
             "review_not_passed",
             f"accept_task_result requires a passing review verdict "
@@ -101,8 +117,33 @@ def _protocol_guard_for_accept(task: dict[str, Any]) -> None:
         )
 
 
+# The role prefix a transition actor can carry (see _transition_actor:
+# the canonical _normalize_role output, plus its "unknown" fallback).
+# The vocabulary is the union of this tree's role checks — taskflow
+# (worker / remote-member / leader), review_task (critic / leader) and
+# constants (worker / remote-member). Accounts may themselves contain a
+# colon (Matrix identities @user:server), so only a leading known role
+# prefix may be stripped — never the last colon segment.
+_ACTOR_ROLE_PREFIXES = {
+    "leader",
+    "worker",
+    "critic",
+    "remote-member",
+    "unknown",
+}
+
+
 def _account_of(actor: str) -> str:
-    return actor.rsplit(":", 1)[-1]
+    """The account identity behind a ``role:account`` actor string.
+
+    Strips only a leading known role prefix; everything after the first
+    colon is the account, including any further colons. An actor whose
+    prefix is not a known role is returned unchanged."""
+    text = str(actor)
+    prefix, sep, rest = text.partition(":")
+    if sep and rest and prefix in _ACTOR_ROLE_PREFIXES:
+        return rest
+    return text
 
 
 def _review_task_action(

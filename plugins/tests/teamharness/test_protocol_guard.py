@@ -445,7 +445,20 @@ def test_row4_r1_without_approval_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
 ) -> None:
     _enforce_on(monkeypatch)
-    _write_submitted_task(tmp_path, decision_class="r1")
+    # The review gate passes (a pass record is present); the gate under
+    # test here is the r1 approval requirement.
+    _write_submitted_task(
+        tmp_path,
+        decision_class="r1",
+        submitted_by="worker:alice",
+        review={
+            "verdict": "pass",
+            "reviewer": "critic:bob",
+            "reviewer_team": "",
+            "reviewed_at": "2026-10-29T00:00:00Z",
+            "note": "looks right",
+        },
+    )
 
     result = _accept(tmp_path)
 
@@ -464,9 +477,19 @@ def test_row5_r1_with_approval_accepted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
 ) -> None:
     _enforce_on(monkeypatch)
+    # Both W2 gates pass: a pass review record AND a resolved approval
+    # record — this row isolates the approval gate's success path.
     _write_submitted_task(
         tmp_path,
         decision_class="r1",
+        submitted_by="worker:alice",
+        review={
+            "verdict": "pass",
+            "reviewer": "critic:bob",
+            "reviewer_team": "",
+            "reviewed_at": "2026-10-29T00:00:00Z",
+            "note": "looks right",
+        },
         attention=[
             {
                 "kind": "approval",
@@ -561,6 +584,181 @@ def test_enforce_off_fail_verdict_does_not_block(
 
     assert result["ok"] is True
     assert result["nodeStatus"] == "completed"
+
+
+# --- Blocker 1: a missing / malformed review record refuses acceptance ----
+
+
+def test_accept_without_review_record_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
+) -> None:
+    """A submitted r4 task with NO review record must not be accepted:
+    the guard reports review_missing and leaves the task 'submitted'."""
+    _enforce_on(monkeypatch)
+    _write_submitted_task(tmp_path, submitted_by="worker:alice")
+
+    result = _accept(tmp_path)
+
+    assert result["ok"] is False
+    assert result["error_code"] == "review_missing"
+    assert result["message"] == (
+        "accept_task_result requires a review record before accepting a result "
+        "(missing or malformed)"
+    )
+    assert _task_meta(tmp_path)["status"] == "submitted"
+
+
+def test_accept_with_malformed_review_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
+) -> None:
+    """A review that is not a verdict-bearing record — a bare string, an
+    empty dict, or a dict without a verdict — is malformed:
+    review_missing, task left 'submitted'."""
+    _enforce_on(monkeypatch)
+    for malformed in ("fail", {}, {"reviewer": "critic:bob"}):
+        _write_submitted_task(
+            tmp_path, submitted_by="worker:alice", review=malformed
+        )
+
+        result = _accept(tmp_path)
+
+        assert result["ok"] is False
+        assert result["error_code"] == "review_missing"
+        assert _task_meta(tmp_path)["status"] == "submitted"
+
+
+def test_accept_with_pass_review_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
+) -> None:
+    """The positive path: a verdict-bearing pass record unblocks the
+    acceptance of a submitted r4 result."""
+    _enforce_on(monkeypatch)
+    _write_submitted_task(
+        tmp_path,
+        submitted_by="worker:alice",
+        review={
+            "verdict": "pass",
+            "reviewer": "critic:bob",
+            "reviewer_team": "",
+            "reviewed_at": "2026-10-29T00:00:00Z",
+            "note": "looks right",
+        },
+    )
+
+    result = _accept(tmp_path)
+
+    assert result["ok"] is True
+    assert result["nodeStatus"] == "completed"
+    assert result["accepted"] is True
+    assert _task_meta(tmp_path)["status"] == "completed"
+
+
+# --- Blocker 2: a fail verdict must not block rejection -------------------
+
+
+def test_rejection_with_fail_verdict_reaches_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
+) -> None:
+    """With a fail review record the leader's accepted=false must still
+    work: the result is REVISION_NEEDED / the node 'revision', no
+    review_not_passed, and the task is NOT left 'submitted'."""
+    _enforce_on(monkeypatch)
+    _write_submitted_task(tmp_path, submitted_by="worker:alice")
+    reviewed = _review(tmp_path, role="critic", account="bob", verdict="fail")
+    assert reviewed["ok"] is True
+
+    result = _call("projectflow", {
+        "role": "leader",
+        "action": "accept_task_result",
+        "workspaceDir": str(tmp_path),
+        "payload": {
+            "projectId": PROJECT_ID,
+            "taskId": TASK_ID,
+            "submissionId": SUBMISSION_ID,
+            "resultStatus": "SUCCESS",
+            "accepted": False,
+        },
+    })
+
+    assert result["ok"] is True
+    assert "error_code" not in result
+    assert result["nodeStatus"] == "revision"
+    assert result["accepted"] is False
+    task = _task_meta(tmp_path)
+    assert task["status"] == "revision"
+    # The node follows the task meta (accepted=false maps the submitted
+    # SUCCESS result to REVISION_NEEDED / node 'revision').
+    assert result["project"]["tasks"][0]["status"] == "revision"
+
+
+# --- Blocker 3: distinct colon-containing identities must not collide -----
+
+
+def test_account_of_strips_only_the_role_prefix() -> None:
+    account_of = server.review._account_of
+    # A known role prefix is stripped; the rest — colons included — is
+    # the account (Matrix identities @user:server).
+    assert account_of("worker:@alice:example.test") == "@alice:example.test"
+    assert account_of("critic:@bob:example.test") == "@bob:example.test"
+    assert account_of("remote-member:@carol:example.test") == "@carol:example.test"
+    assert account_of("unknown:@dave:example.test") == "@dave:example.test"
+    # A plain account (no colon) is unchanged.
+    assert account_of("alice") == "alice"
+    # An actor whose prefix is not a known role is returned unchanged —
+    # never split on the last colon ('example.test' collided every
+    # example.test account under the old rsplit).
+    assert account_of("observer:@alice:example.test") == "observer:@alice:example.test"
+
+
+def test_review_colon_identities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
+) -> None:
+    """worker:@alice:example.test submitting and critic:@alice:example.test
+    reviewing is still self-review (same full account); a distinct
+    full account (@bob) is allowed — under the old rsplit both reduced
+    to 'example.test' and were refused."""
+    _enforce_on(monkeypatch)
+    _write_project(tmp_path, task_status="assigned")
+    _write_task_meta(tmp_path, {
+        "task_id": TASK_ID,
+        "project_id": PROJECT_ID,
+        "status": "assigned",
+        "assigned_to": WORKER_A,
+    })
+
+    submitted = _submit(tmp_path, role="worker", account="@alice:example.test")
+    assert submitted["ok"] is True
+    assert submitted["task"]["submitted_by"] == "worker:@alice:example.test"
+
+    same = _review(tmp_path, role="critic", account="@alice:example.test", verdict="pass")
+    assert same["ok"] is False
+    assert same["error_code"] == "self_review_forbidden"
+    assert same["message"] == "reviewer must differ from submitted_by"
+    assert "review" not in _task_meta(tmp_path)
+
+    ok = _review(tmp_path, role="critic", account="@bob:example.test", verdict="pass")
+    assert ok["ok"] is True
+    review = _task_meta(tmp_path)["review"]
+    assert review["reviewer"] == "critic:@bob:example.test"
+    assert review["verdict"] == "pass"
+
+
+def test_review_identical_actor_string_forbidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
+) -> None:
+    """The identical actor string (same role and account) is refused by
+    the exact-identity branch of the self-review guard. (A worker cannot
+    be the reviewer — the role gate precedes the identity check — so the
+    identical-string case is exercised with the critic identity on both
+    sides.)"""
+    _enforce_on(monkeypatch)
+    _write_submitted_task(tmp_path, submitted_by="critic:@alice:example.test")
+
+    result = _review(tmp_path, role="critic", account="@alice:example.test", verdict="pass")
+
+    assert result["ok"] is False
+    assert result["error_code"] == "self_review_forbidden"
+    assert "review" not in _task_meta(tmp_path)
 
 
 # --- Row 8: the stall chain 0/1/2/3 ---------------------------------------

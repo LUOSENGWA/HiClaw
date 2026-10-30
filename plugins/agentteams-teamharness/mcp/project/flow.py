@@ -278,15 +278,16 @@ def _accept_task_result(arguments: dict[str, Any], payload: dict[str, Any]) -> d
                 )
             legacy_identity_persisted = True
     result_status_value = payload.get("resultStatus") or payload.get("result_status")
+    accepted = _payload_bool(payload.get("accepted"), True)
     if task_meta:
         persisted_result_status = str(task_meta.get("result_status") or "")
         if str(result_status_value or "SUCCESS").strip() != persisted_result_status:
             raise ValueError("resultStatus does not match the submitted task result")
         # W2 protocol gates (protocol.enforce switch, default off): a
-        # non-passing review verdict or a missing r1 approval record
-        # refuses the acceptance decision (error_code surface).
-        _protocol_guard_for_accept(task_meta)
-    accepted = _payload_bool(payload.get("accepted"), True)
+        # missing / non-passing review record or a missing r1 approval
+        # record refuses a POSITIVE acceptance (error_code surface); a
+        # rejection / return-for-revision (accepted=False) is never gated.
+        _protocol_guard_for_accept(task_meta, accepted)
     node_status = _accepted_node_status(result_status_value)
     if not accepted and node_status == "completed":
         result_status_value = "REVISION_NEEDED"
