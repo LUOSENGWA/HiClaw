@@ -7,8 +7,11 @@ truth; each adapter only projects it onto its runtime.
 | Runtime | Status |
 |---------|--------|
 | qwenpaw | P0 — present |
-| openclaw | later phase — intentionally absent in P0 |
-| hermes | later phase — intentionally absent in P0 |
+| hermes | PR1 — present (platform plugin, in-process core) |
+| openclaw | PR2 — absent until the sidecar protocol lands |
 
-The OpenClaw and Hermes adapters are deliberately not included in P0. They
-will land in later phases without changing the contract or the bundle layout.
+The Hermes adapter registers the `agentteams_matrix` platform with the
+Hermes gateway and drives the bundle's runtime-neutral core in-process
+(see `hermes/README.md`). The OpenClaw adapter lands in PR2 together
+with the sidecar protocol, without changing the contract or the bundle
+layout.

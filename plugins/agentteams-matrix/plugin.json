@@ -11,6 +11,11 @@
       "id": "qwenpaw",
       "path": "adapters/qwenpaw",
       "pluginId": "agentteams-matrix-channel"
+    },
+    {
+      "id": "hermes",
+      "path": "adapters/hermes",
+      "pluginId": "agentteams_matrix"
     }
   ]
 }
