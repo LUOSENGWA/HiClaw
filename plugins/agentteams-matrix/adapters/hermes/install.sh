@@ -14,15 +14,23 @@
 #                        (default: $HOME/.hermes/config.yaml)
 #   --dry-run            print the resulting YAML to stdout, write nothing
 #   --with-credentials   also write the access token read from
-#                        $AGENTTEAMS_MATRIX_ACCESS_TOKEN and chmod 600
-#                        the target file
+#                        $AGENTTEAMS_MATRIX_ACCESS_TOKEN; the config
+#                        file is written 0600 whenever it carries
+#                        credential values
 #
 # Only the keys this adapter owns are merged into the platforms.matrix
 # block; every other key in the config file is preserved, including
 # foreign keys already present inside the block. Re-running with an
-# unchanged contract produces a byte-identical file. The access token is
-# never printed: by default no credential material is written at all
-# (the contract's access_token_ref has no Hermes key — see README.md).
+# unchanged contract produces a byte-identical file.
+# Previews (--dry-run) always redact credential values in the rendered
+# document: any non-empty string under a key ending in token/secret/
+# password/passwd/apikey/credentials (case-insensitive) is printed as
+# <redacted>, including credentials in blocks this adapter does not own;
+# the file itself is written unredacted. The atomic write never loosens
+# permissions: a document that carries credential values lands at 0600,
+# and an existing restrictive mode survives every rewrite. By default no
+# credential material is written at all (the contract's
+# access_token_ref has no Hermes key — see README.md).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -80,7 +88,9 @@ fi
 
 python3 - "${CONFIG_PATH}" "${CONTRACT_PATH}" "${DRY_RUN}" "${WITH_CREDENTIALS}" <<'PY'
 import os
+import stat
 import sys
+import tempfile
 from pathlib import Path
 
 config_path = Path(sys.argv[1])
@@ -89,6 +99,66 @@ dry_run = sys.argv[3] == "1"
 with_credentials = sys.argv[4] == "1"
 
 TOKEN_KEY = "token"
+
+CREDENTIAL_SUFFIXES = ("token", "secret", "password", "passwd", "apikey", "credentials")
+REDACTED = "<redacted>"
+
+
+def _is_credential_key(key):
+    normalized = "".join(ch for ch in str(key).lower() if ch.isalnum())
+    return normalized.endswith(CREDENTIAL_SUFFIXES)
+
+
+def redact(document):
+    """Deep copy with credential values replaced by REDACTED (previews only)."""
+    if isinstance(document, dict):
+        out = {}
+        for key, value in document.items():
+            if _is_credential_key(key) and isinstance(value, str) and value:
+                out[key] = REDACTED
+            else:
+                out[key] = redact(value)
+        return out
+    if isinstance(document, list):
+        return [redact(item) for item in document]
+    return document
+
+
+def _document_has_credentials(document):
+    if isinstance(document, dict):
+        return any(
+            (_is_credential_key(key) and isinstance(value, str) and value)
+            or _document_has_credentials(value)
+            for key, value in document.items()
+        )
+    if isinstance(document, list):
+        return any(_document_has_credentials(item) for item in document)
+    return False
+
+
+def write_atomic(path, text, document):
+    """Atomic write. 0600 whenever the document carries credentials, otherwise
+    preserve the target's mode (0600 for a new file). The temp file is created
+    0600 by mkstemp and only then chmod-ed to the final mode."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if _document_has_credentials(document):
+        mode = 0o600
+    elif path.exists():
+        mode = stat.S_IMODE(path.stat().st_mode)
+    else:
+        mode = 0o600
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def fail(message):
@@ -202,16 +272,7 @@ platforms["matrix"] = merged
 config["platforms"] = platforms
 
 if dry_run:
-    if access_token:
-        shown = dict(config)
-        shown["platforms"] = dict(config["platforms"])
-        shown["platforms"]["matrix"] = {
-            **config["platforms"]["matrix"],
-            TOKEN_KEY: "<redacted>",
-        }
-        sys.stdout.write(render(shown))
-    else:
-        sys.stdout.write(render(config))
+    sys.stdout.write(render(redact(config)))
     print(
         f"agentteams-matrix hermes adapter: dry run, no files written "
         f"(target: {config_path})",
@@ -219,12 +280,7 @@ if dry_run:
     )
     sys.exit(0)
 
-config_path.parent.mkdir(parents=True, exist_ok=True)
-tmp = config_path.with_name(config_path.name + ".tmp")
-tmp.write_text(render(config), encoding="utf-8")
-tmp.replace(config_path)
-if access_token:
-    os.chmod(config_path, 0o600)
+write_atomic(config_path, render(config), config)
 print(
     f"agentteams-matrix hermes adapter: wrote {len(projected)} key(s) to "
     f"platforms.matrix in {config_path}"

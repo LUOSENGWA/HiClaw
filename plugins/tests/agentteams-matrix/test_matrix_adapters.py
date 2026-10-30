@@ -148,7 +148,16 @@ def _assert_openclaw_nested(block: dict) -> None:
         assert block["groups"][room]["requireMention"] == m["require_mention"]
 
 
-def _run(script: Path, args: list, env: dict) -> subprocess.CompletedProcess:
+def _run(
+    script: Path,
+    args: list,
+    env: dict,
+    umask: int | None = None,
+) -> subprocess.CompletedProcess:
+    kwargs = {}
+    if umask is not None:
+        # POSIX-only: the adapter scripts only run on POSIX.
+        kwargs["preexec_fn"] = lambda: os.umask(umask)
     return subprocess.run(
         ["bash", str(script), *args],
         env=env,
@@ -157,6 +166,7 @@ def _run(script: Path, args: list, env: dict) -> subprocess.CompletedProcess:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        **kwargs,
     )
 
 
@@ -211,6 +221,25 @@ def _seed_config(adapter: str, path: Path) -> None:
             "memory": {"memory_enabled": True},
             "platforms": {"matrix": {"reply_to_mode": "first"}},
         }
+        path.write_text(
+            yaml.safe_dump(
+                config,
+                sort_keys=False,
+                allow_unicode=True,
+                default_flow_style=False,
+            ),
+            encoding="utf-8",
+        )
+
+
+def _write_config(adapter: str, path: Path, config: dict) -> None:
+    """Write the config back in the adapter's on-disk format."""
+    if adapter == "openclaw":
+        path.write_text(
+            json.dumps(config, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    else:
         path.write_text(
             yaml.safe_dump(
                 config,
@@ -454,6 +483,129 @@ class TestMatrixAdapters:
         assert (
             _matrix_block(adapter, preview)[specs["token_key"]] == "<redacted>"
         )
+
+    def test_preview_redacts_existing_token_without_flag(self, tmp_path, adapter):
+        """A token already stored in the config file must never be
+        printed by a plain --dry-run (no flag, no env)."""
+        specs = ADAPTERS[adapter]
+        config_path = tmp_path / "runtime-config"
+        _seed_config(adapter, config_path)
+        # The "existing credential" state: a token already stored in the
+        # file, under a restrictive mode.
+        config = _load_file(adapter, config_path)
+        _matrix_block(adapter, config)[specs["token_key"]] = TOKEN
+        _write_config(adapter, config_path, config)
+        config_path.chmod(0o600)
+        before = config_path.read_bytes()
+
+        result = _run(
+            specs["install"],
+            ["--dry-run", "--config", str(config_path)],
+            _env(tmp_path),  # no AGENTTEAMS_MATRIX_ACCESS_TOKEN
+        )
+        assert result.returncode == 0, result.stderr
+        assert TOKEN not in result.stdout
+        assert TOKEN not in result.stderr
+        preview = _load(adapter, result.stdout)
+        assert _matrix_block(adapter, preview)[specs["token_key"]] == "<redacted>"
+        assert config_path.read_bytes() == before
+
+    def test_with_credentials_then_plain_preview_and_reinstall(self, tmp_path, adapter):
+        """The PR #1458 review sequence: --with-credentials install, then a
+        plain dry-run (defect: the stored token leaked into the preview),
+        then a plain reinstall under umask 022 (defect: the file came back
+        0644 even though it carries the token)."""
+        specs = ADAPTERS[adapter]
+        config_path = tmp_path / "runtime-config"
+        _seed_config(adapter, config_path)
+        env = _env(tmp_path)
+        env["AGENTTEAMS_MATRIX_ACCESS_TOKEN"] = TOKEN
+
+        result = _run(
+            specs["install"],
+            ["--with-credentials", "--config", str(config_path)],
+            env,
+        )
+        assert result.returncode == 0, result.stderr
+        assert (config_path.stat().st_mode & 0o777) == 0o600
+        assert TOKEN in config_path.read_text(encoding="utf-8")
+
+        # Plain preview, no flag, no env: the stored token must not be
+        # printed.
+        clean = _env(tmp_path)
+        dry = _run(
+            specs["install"],
+            ["--dry-run", "--config", str(config_path)],
+            clean,
+        )
+        assert dry.returncode == 0, dry.stderr
+        assert TOKEN not in dry.stdout
+        assert TOKEN not in dry.stderr
+
+        # Plain reinstall under umask 022: token retained, mode must stay
+        # 0600, and no temp-file leftovers.
+        result = _run(
+            specs["install"],
+            ["--config", str(config_path)],
+            clean,
+            umask=0o022,
+        )
+        assert result.returncode == 0, result.stderr
+        assert TOKEN in config_path.read_text(encoding="utf-8")
+        assert (config_path.stat().st_mode & 0o777) == 0o600
+        leftovers = [p for p in tmp_path.rglob("*") if p.name.endswith(".tmp")]
+        assert not leftovers
+
+    def test_uninstall_preview_redacts_foreign_credentials(self, tmp_path, adapter):
+        """The uninstall preview renders the whole document, so a
+        credential in a sibling block the adapter does not own must be
+        redacted there too."""
+        specs = ADAPTERS[adapter]
+        config_path = tmp_path / "runtime-config"
+        _seed_config(adapter, config_path)
+        _run(specs["install"], ["--config", str(config_path)], _env(tmp_path))
+        config = _load_file(adapter, config_path)
+        if adapter == "openclaw":
+            config["channels"]["telegram"] = {"botToken": TOKEN}
+        else:
+            config["platforms"]["slack"] = {"token": TOKEN}
+        _write_config(adapter, config_path, config)
+        before = config_path.read_bytes()
+
+        result = _run(
+            specs["uninstall"],
+            ["--dry-run", "--config", str(config_path)],
+            _env(tmp_path),
+        )
+        assert result.returncode == 0, result.stderr
+        assert TOKEN not in result.stdout
+        assert TOKEN not in result.stderr
+        assert config_path.read_bytes() == before
+
+    def test_uninstall_after_with_credentials_keeps_restrictive_mode(
+        self, tmp_path, adapter
+    ):
+        specs = ADAPTERS[adapter]
+        config_path = tmp_path / "runtime-config"
+        _seed_config(adapter, config_path)
+        env = _env(tmp_path)
+        env["AGENTTEAMS_MATRIX_ACCESS_TOKEN"] = TOKEN
+
+        result = _run(
+            specs["install"],
+            ["--with-credentials", "--config", str(config_path)],
+            env,
+        )
+        assert result.returncode == 0, result.stderr
+        assert (config_path.stat().st_mode & 0o777) == 0o600
+
+        result = _run(specs["uninstall"], ["--config", str(config_path)], _env(tmp_path))
+        assert result.returncode == 0, result.stderr
+        config = _load_file(adapter, config_path)
+        assert specs["token_key"] not in _matrix_block(adapter, config)
+        assert (config_path.stat().st_mode & 0o777) == 0o600
+        leftovers = [p for p in tmp_path.rglob("*") if p.name.endswith(".tmp")]
+        assert not leftovers
 
     def test_with_credentials_requires_env(self, tmp_path, adapter):
         specs = ADAPTERS[adapter]

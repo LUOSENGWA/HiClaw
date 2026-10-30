@@ -64,9 +64,17 @@ By default the installer writes **no credential material at all**: the
 contract's `access_token_ref` has no Hermes key (see the table above),
 and nothing is printed to stdout. With `--with-credentials` it writes the
 typed `token` field from the `AGENTTEAMS_MATRIX_ACCESS_TOKEN` environment
-variable (hard error if the variable is unset) and `chmod 600` the config
-file. The token value is never printed, including in `--dry-run` output
-(replaced by `<redacted>`).
+variable (hard error if the variable is unset). The config file is
+written at mode 0600 whenever the rendered document carries a credential
+value — written now or already present in the file — and the atomic
+rewrite never loosens an existing mode, so a config that still holds a
+credential after an uninstall stays 0600.
+
+`--dry-run` previews redact credential values in the rendered document:
+any non-empty string under a key ending in `token`, `secret`, `password`,
+`passwd`, `apikey` or `credentials` (case-insensitive) is printed as
+`<redacted>` — including credentials in sibling blocks this adapter does
+not own. The config file itself is always written unredacted.
 
 Where the env path is the established credential channel (as in the
 worker bridge), the env var `MATRIX_ACCESS_TOKEN` wins over the YAML
