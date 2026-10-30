@@ -461,6 +461,7 @@ jobs:
       - name: Start the embedded controller
         run: |
           AGENTTEAMS_KUBE_MODE=embedded \
+          AGENTTEAMS_MATRIX_APPSERVICE_ENABLED=0 \
           AGENTTEAMS_DATA_DIR=/tmp/at-e2e/data \
           AGENTTEAMS_CONFIG_DIR=/tmp/at-e2e/config \
           AGENTTEAMS_CRD_DIR="$GITHUB_WORKSPACE/agentteams-controller/config/crd" \
