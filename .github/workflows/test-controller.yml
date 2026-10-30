@@ -460,6 +460,10 @@ jobs:
 
       - name: Start the embedded controller
         run: |
+          # Point Matrix at MinIO: any HTTP answer counts as "ready" (the
+          # init loop only retries on connection errors), and admin
+          # registration then fails fast and non-fatally, so the CLI token
+          # is minted within seconds instead of after a 5-minute timeout.
           AGENTTEAMS_KUBE_MODE=embedded \
           AGENTTEAMS_MATRIX_APPSERVICE_ENABLED=0 \
           AGENTTEAMS_DATA_DIR=/tmp/at-e2e/data \
@@ -471,10 +475,6 @@ jobs:
           AGENTTEAMS_FS_SECRET_KEY="$MINIO_ROOT_PASSWORD" \
           AGENTTEAMS_FS_BUCKET=agentteams-storage \
           AGENTTEAMS_STORAGE_PREFIX=agentteams/agentteams-storage \
-          # Point Matrix at MinIO: any HTTP answer counts as "ready" (the
-          # init loop only retries on connection errors), and admin
-          # registration then fails fast and non-fatally, so the CLI token
-          # is minted within seconds instead of after a 5-minute timeout.
           AGENTTEAMS_MATRIX_URL=http://127.0.0.1:9000 \
           nohup /tmp/agentteams-controller > /tmp/at-e2e/controller.log 2>&1 &
           echo $! > /tmp/at-e2e/controller.pid
