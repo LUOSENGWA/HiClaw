@@ -89,7 +89,7 @@ dry_run = os.environ.get("TH_HM_DRY_RUN") == "1"
 
 MCP_SERVER_ID = "teamharness"
 ENV_VAR = "TEAMHARNESS_RUNTIME_CONFIG"
-PLUGIN_FILES = ("plugin.yaml", "register.py")
+PLUGIN_FILES = ("plugin.yaml", "register.py", "__init__.py")
 
 
 def dump_yaml(obj):

@@ -56,6 +56,8 @@ def register(ctx):
         return 0
     count = 0
     for name, skill_md in discover_skills():
-        register_skill(name, str(skill_md))
+        # PluginContext.register_skill expects a Path: it calls
+        # path.exists() and stores the path for skill_view().
+        register_skill(name, skill_md)
         count += 1
     return count
