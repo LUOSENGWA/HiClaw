@@ -1,11 +1,23 @@
 #!/usr/bin/env bash
 # Idempotent uninstall for the Hermes Matrix channel projection.
 #
-# Removes exactly the keys the installer writes from the platforms.matrix
-# block and nothing else: every other key in the config file (terminal,
-# memory, other platforms, ...) is preserved, as is the file itself.
-# When the platforms.matrix block ends up empty it is dropped, along with
-# the platforms key only if it is empty as well. Re-running is a no-op.
+# Removes exactly what the installer writes — in both config shapes it
+# has produced — and nothing else:
+#
+#   * the current nested shape: enabled and token (typed
+#     PlatformConfig fields) plus homeserver, user_id, allowed_users,
+#     allowed_rooms, require_mention inside the block's extra map;
+#   * the legacy flat shape written before the #1458 fix: the same
+#     non-typed keys at the top level of the platforms.matrix block.
+#
+# Foreign keys already present in the block (or in its extra map) are
+# preserved, as is the rest of the config file. When the extra map ends
+# up empty it is dropped; when the platforms.matrix block ends up empty
+# it is dropped, along with the platforms key only if it is empty as
+# well. A partial-projection marker left by the installer
+# (<config dir>/.agentteams-matrix/hermes-install.json) is removed as
+# well, including its directory when it becomes empty. Re-running is a
+# no-op.
 #
 # Previews (--dry-run) always redact credential values in the rendered
 # document: any non-empty string under a key ending in token/secret/
@@ -34,9 +46,12 @@ usage() {
   cat <<'EOF'
 Usage: uninstall.sh [--config <path>] [--dry-run]
 
-Removes the agentteams-matrix keys from the platforms.matrix block of the
-Hermes config file (default: $HOME/.hermes/config.yaml). Foreign keys and
-the config file itself are preserved.
+Removes the agentteams-matrix keys from the platforms.matrix block of
+the Hermes config file (default: $HOME/.hermes/config.yaml), in both
+the nested extra shape the installer writes and the legacy flat shape
+it wrote before the #1458 fix, and removes the partial-projection
+marker it may have left. Foreign keys and the config file itself are
+preserved.
 EOF
 }
 
@@ -147,20 +162,6 @@ try:
 except ImportError:
     fail("pyyaml is required to read the config file; install pyyaml>=6.0")
 
-# Exactly the keys the installer can write: enabled, homeserver, user_id,
-# allowed_users, allowed_rooms, require_mention, plus the credential key
-# that --with-credentials adds (token — the typed PlatformConfig field,
-# gateway/config.py:411).
-OWNED_KEYS = {
-    "enabled",
-    "homeserver",
-    "user_id",
-    "allowed_users",
-    "allowed_rooms",
-    "require_mention",
-    "token",
-}
-
 
 def render(document):
     return yaml.safe_dump(
@@ -171,49 +172,100 @@ def render(document):
     )
 
 
-if not config_path.is_file():
+# Exactly the keys the installer can write:
+#  - top level (typed fields, plus the legacy flat shape written by
+#    pre-#1458 installers): enabled, token, homeserver, user_id,
+#    allowed_users, allowed_rooms, require_mention
+#  - inside the block's extra map (the #1458 shape): homeserver,
+#    user_id, allowed_users, allowed_rooms, require_mention
+OWNED_KEYS = {
+    "enabled",
+    "homeserver",
+    "user_id",
+    "allowed_users",
+    "allowed_rooms",
+    "require_mention",
+    "token",
+}
+OWNED_EXTRA_KEYS = {
+    "homeserver",
+    "user_id",
+    "allowed_users",
+    "allowed_rooms",
+    "require_mention",
+}
+MARKER_PATH = config_path.parent / ".agentteams-matrix" / "hermes-install.json"
+
+if not config_path.is_file() and not MARKER_PATH.is_file():
     print("agentteams-matrix hermes adapter: nothing to uninstall (no config file)")
     sys.exit(0)
 
-try:
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-except yaml.YAMLError as exc:
-    fail(f"existing config {config_path} is not valid YAML: {exc}")
-if config is None:
-    config = {}
+config = {}
+if config_path.is_file():
+    try:
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        fail(f"existing config {config_path} is not valid YAML: {exc}")
+    if loaded is not None:
+        config = loaded
 if not isinstance(config, dict):
     fail(f"existing config {config_path} must be a YAML mapping at the top level")
 
 platforms = config.get("platforms")
 matrix_cfg = platforms.get("matrix") if isinstance(platforms, dict) else None
 if not isinstance(matrix_cfg, dict):
+    matrix_cfg = None
+
+removed = []
+if matrix_cfg is not None:
+    for key in [key for key in matrix_cfg if key in OWNED_KEYS]:
+        del matrix_cfg[key]
+        removed.append(key)
+    extra = matrix_cfg.get("extra")
+    if isinstance(extra, dict):
+        for key in [key for key in extra if key in OWNED_EXTRA_KEYS]:
+            del extra[key]
+            removed.append(f"extra.{key}")
+        if not extra:
+            del matrix_cfg["extra"]
+            removed.append("extra")
+    if not matrix_cfg:
+        del platforms["matrix"]
+        if not platforms:
+            del config["platforms"]
+
+marker_present = MARKER_PATH.is_file()
+if not removed and not marker_present:
     print("agentteams-matrix hermes adapter: nothing to uninstall")
     sys.exit(0)
-
-removed = [key for key in matrix_cfg if key in OWNED_KEYS]
-if not removed:
-    print("agentteams-matrix hermes adapter: nothing to uninstall")
-    sys.exit(0)
-
-for key in removed:
-    del matrix_cfg[key]
-if not matrix_cfg:
-    del platforms["matrix"]
-    if not platforms:
-        del config["platforms"]
 
 if dry_run:
+    parts = []
+    if removed:
+        parts.append(f"{len(removed)} key(s) from the platforms.matrix block")
+    if marker_present:
+        parts.append(f"the install marker {MARKER_PATH}")
     sys.stdout.write(render(redact(config)))
     print(
         f"agentteams-matrix hermes adapter: dry run, would remove "
-        f"{len(removed)} key(s) from the platforms.matrix block (target: {config_path})",
+        f"{' and '.join(parts)} (target: {config_path})",
         file=sys.stderr,
     )
     sys.exit(0)
 
-write_atomic(config_path, render(config), config)
-print(
-    f"agentteams-matrix hermes adapter: removed {len(removed)} key(s) "
-    f"from the platforms.matrix block in {config_path}"
-)
+if removed:
+    write_atomic(config_path, render(config), config)
+if marker_present:
+    MARKER_PATH.unlink()
+    try:
+        MARKER_PATH.parent.rmdir()
+    except OSError:
+        pass
+
+parts = []
+if removed:
+    parts.append(f"removed {len(removed)} key(s) from the platforms.matrix block in {config_path}")
+if marker_present:
+    parts.append(f"removed the install marker {MARKER_PATH}")
+print("agentteams-matrix hermes adapter: " + "; ".join(parts))
 PY

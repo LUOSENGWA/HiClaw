@@ -29,7 +29,8 @@ Adapters:
   openclaw   project channels.matrix into ~/.openclaw/openclaw.json
              (options: --config, --dry-run, --with-credentials)
   hermes     project the matrix: block into ~/.hermes/config.yaml
-             (options: --config, --dry-run, --with-credentials)
+             (options: --config, --dry-run, --with-credentials,
+             --hermes-version <version>, --allow-partial)
 
 Without --adapter, the first detected runtime (search order: qwenpaw,
 openclaw, hermes) is installed.

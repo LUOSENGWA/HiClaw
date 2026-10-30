@@ -2,9 +2,52 @@
 
 This adapter projects the bundle contract (`../../contract.yaml`) onto the
 Hermes runtime by merging its `matrix:` section into the `platforms.matrix`
-block of the Hermes config file. It is a pure file projector: it reads the
-contract, rewrites one config file, and nothing else — no `hermes` binary
-is invoked and no network access is performed.
+block of the Hermes config file, nested under the block's explicit `extra:`
+map (see [Config shape and runtime versions](#config-shape-and-runtime-versions)).
+It is a pure file projector: it reads the contract, rewrites one config
+file, and performs no network access. The only runtime interaction is an
+optional `hermes --version` probe, used when the target version is not
+declared via `--hermes-version` or `HERMES_VERSION`.
+
+## Config shape and runtime versions
+
+The two supported Hermes generations parse `platforms.matrix`
+differently, and the installer must target both:
+
+| Runtime | `enabled` / `token` | `extra.homeserver` / `extra.user_id` (also `device_id` / `password`) | `extra.allowed_users` / `extra.allowed_rooms` / `extra.require_mention` |
+|:--|:--|:--|:--|
+| **v2026.4.16** (the Worker pin, `hermes/Dockerfile` `HERMES_GIT_REF`, "Hermes Agent v0.10.0") | typed fields, consumed | consumed: `gateway/platforms/matrix.py:207,212` (also `:216,224` for `password` / `device_id`) | **not available** — the generation has no allowlist feature and `require_mention` is env-only (`MATRIX_REQUIRE_MENTION`) |
+| **>= 0.22.5** (e.g. v0.22.5, bf0203a7) | typed fields, consumed | consumed: `plugins/platforms/matrix/adapter.py:829,831` | consumed: `adapter.py:898` (`allowed_users`), `:863` (`allowed_rooms`), `:940` (`require_mention`) |
+
+Consequences:
+
+- **The full contract requires >= 0.22.5** (the allowlists and
+  `require_mention` are part of it).
+- **The current Worker pin is below that** (`v2026.4.16`). Bumping the
+  pinned runtime is tracked separately; until then, deploying the full
+  contract on the pinned runtime requires `--allow-partial` (see below).
+- **Settings are written only as `extra.<key>`, never as flat block keys.**
+  Pre-0.22.5 `PlatformConfig.from_dict` reads
+  `extra = data.get("extra", {})` and ignores every other non-typed block
+  key — flat settings are silently dropped (the #1458 defect). v0.22.5
+  promotes flat non-typed keys into `extra`, but an explicit `extra:` map
+  wins on a clash (`gateway/config.py:448-452`), so flat keys would add
+  nothing and create a contradiction risk. One nested shape therefore
+  serves both generations.
+- **Version detection order:** `--hermes-version <v>` → `HERMES_VERSION`
+  env → `hermes --version` → unknown. Unknown is treated as the
+  pre-0.22.5 runtime (safe default). Calendar tags (`v2026.x.y`, leading
+  component >= 1000) belong to the pre-0.x "Hermes Agent" series and
+  count as pre-0.22.5.
+- **Strict/partial gate.** When the resolved runtime is pre-0.22.5 and
+  the contract requires `allowed_users`, `allowed_rooms` or
+  `require_mention`, the installer exits non-zero naming exactly those
+  settings — it never exits 0 while dropping contract settings. With
+  `--allow-partial` it projects the settings the runtime can honor,
+  prints a warning naming the dropped ones, and records them in
+  `<config dir>/.agentteams-matrix/hermes-install.json`
+  (`{"adapter", "bundle", "config", "dropped", "runtime_version"}`).
+  A later full projection removes the stale marker.
 
 Key names and the target block follow the upstream Hermes gateway config
 (v0.22.5, commit bf0203a7):
@@ -13,11 +56,11 @@ Key names and the target block follow the upstream Hermes gateway config
   `GatewayConfig.from_dict`
   (`gateway/config.py:781` → `by_platform("platforms",
   PlatformConfig.from_dict, dicts_only=True)`).
-- `PlatformConfig.from_dict` promotes **every non-typed top-level key of a
-  platform block into `config.extra`** (`gateway/config.py:445`,
-  promotion at `config.py:448-452`, typed-key list at `config.py:439-442`).
-  This is where `config.extra` lands on disk: as plain keys directly under
-  `platforms.matrix:` in the YAML.
+- `PlatformConfig.from_dict` takes the typed fields (`enabled`, `token`,
+  ...) and everything else from the block's `extra:` map
+  (`gateway/config.py:439-452`); on v0.22.5 the promotion of flat
+  non-typed keys means a block written with flat keys would *still* be
+  consumed there — but not on the pinned runtime.
 - The matrix adapter reads its settings extra-first:
   `config.extra.get(key)` → `MATRIX_*` env → default
   (`gateway/platforms/_shared.py:106`, `plugins/platforms/matrix/adapter.py`).
@@ -30,12 +73,13 @@ Key names and the target block follow the upstream Hermes gateway config
 | Contract field (`matrix:`) | Hermes key (`platforms.matrix.`) | How it is consumed (file:line) |
 |:--|:--|:--|
 | — (constant `true`) | `enabled` | typed `PlatformConfig` field: `gateway/config.py:410,467` |
-| `homeserver` | `homeserver` | non-typed → `config.extra`; read at `plugins/platforms/matrix/adapter.py:829` (fallback env `MATRIX_HOMESERVER`) |
-| `user_id` | `user_id` | non-typed → `config.extra`; read at `adapter.py:831` (fallback env `MATRIX_USER_ID`) |
-| `allow_from[]` + `group_allow_from[]` | `allowed_users` (union, deduped, contract order) | the adapter has a **single** user allowlist for DMs and groups (no DM/group distinction): `adapter.py:898`, applied at `adapter.py:2611-2612` (fallback env `MATRIX_ALLOWED_USERS`); YAML lists are accepted by `_csv_set` (`adapter.py:546-548`) |
-| `rooms[]` | `allowed_rooms` | room-ID gate, DMs exempt: `adapter.py:863`, `adapter.py:1973-1981` (fallback env `MATRIX_ALLOWED_ROOMS`) |
-| `require_mention` | `require_mention` | non-typed → `config.extra`; read at `adapter.py:940` (fallback env `MATRIX_REQUIRE_MENTION`, default `true`) |
-| `access_token_ref` | — (not projected) | no secret-reference concept: credentials are the typed `token` field (`gateway/config.py:411,468`, read at `adapter.py:830`) or the `MATRIX_ACCESS_TOKEN` env var |
+| `homeserver` | `extra.homeserver` | read at `plugins/platforms/matrix/adapter.py:829` (fallback env `MATRIX_HOMESERVER`); on the pinned runtime at `gateway/platforms/matrix.py:207` |
+| `user_id` | `extra.user_id` | read at `adapter.py:831` (fallback env `MATRIX_USER_ID`); on the pinned runtime at `gateway/platforms/matrix.py:212` |
+| `allow_from[]` + `group_allow_from[]` | `extra.allowed_users` (union, deduped, contract order) | the adapter has a **single** user allowlist for DMs and groups (no DM/group distinction): `adapter.py:898`, applied at `adapter.py:2611-2612` (fallback env `MATRIX_ALLOWED_USERS`); YAML lists are accepted by `_csv_set` (`adapter.py:546-548`). **>= 0.22.5 only** |
+| `rooms[]` | `extra.allowed_rooms` | room-ID gate, DMs exempt: `adapter.py:863`, `adapter.py:1973-1981` (fallback env `MATRIX_ALLOWED_ROOMS`). **>= 0.22.5 only** |
+| `require_mention` | `extra.require_mention` | read at `adapter.py:940` (fallback env `MATRIX_REQUIRE_MENTION`, default `true`). **>= 0.22.5 only** |
+| — (`--with-credentials`) | `token` | typed `PlatformConfig` field (`gateway/config.py:411,468`, read at `adapter.py:830`) or the `MATRIX_ACCESS_TOKEN` env var |
+| `access_token_ref` | — (not projected) | no secret-reference concept: credentials are the typed `token` field or the `MATRIX_ACCESS_TOKEN` env var |
 | `history_limit` | — (not projected) | no equivalent key in the matrix adapter (zero matches) |
 | `history_mode` | — (not projected) | no equivalent key in the matrix adapter (zero matches) |
 
@@ -45,6 +89,7 @@ Key names and the target block follow the upstream Hermes gateway config
 plugins/agentteams-matrix/scripts/install.sh --adapter hermes
 # or directly:
 adapters/hermes/install.sh [--config <path>] [--dry-run] [--with-credentials]
+                  [--hermes-version <version>] [--allow-partial]
 ```
 
 The default config path is `$HOME/.hermes/config.yaml` (override with
@@ -52,11 +97,18 @@ The default config path is `$HOME/.hermes/config.yaml` (override with
 `hermes_constants.py:51-56`). `--dry-run` prints the resulting YAML to
 stdout and writes nothing.
 
+`--hermes-version <v>` declares the target runtime version (overrides
+`HERMES_VERSION` and the `hermes --version` probe). Without a declaration
+the installer falls back to `HERMES_VERSION`, then to a `hermes
+--version` probe, then to "unknown" — treated as pre-0.22.5, which
+triggers the strict gate described above. `--allow-partial` relaxes that
+gate to a warning plus the partial-projection marker.
+
 The installer merges only the keys it owns into the `platforms.matrix`
 block and preserves every other key in the file (`terminal`, `memory`,
 other platforms, ...), including foreign keys already present inside the
-block (e.g. `reply_to_mode`). Re-running with an unchanged contract
-produces a byte-identical file.
+block (e.g. `reply_to_mode`) or inside its existing `extra` map.
+Re-running with an unchanged contract produces a byte-identical file.
 
 ## Credentials
 
@@ -86,14 +138,28 @@ token (`adapter.py:830`).
 adapters/hermes/uninstall.sh [--config <path>] [--dry-run]
 ```
 
-Removes exactly the keys the installer can write (`enabled`, `homeserver`,
-`user_id`, `allowed_users`, `allowed_rooms`, `require_mention`, `token`)
-from the `platforms.matrix` block, keeps all foreign keys, and never
-deletes the config file. When the block ends up empty it is dropped, and
-the `platforms` key only if it is empty as well. Without anything to
-remove the uninstall is a no-op, so re-running is safe.
+Removes exactly what the installer writes, in **both** shapes it has
+produced:
+
+- typed top-level keys `enabled`, `token`, and the nested `extra.*` keys
+  `homeserver`, `user_id`, `allowed_users`, `allowed_rooms`,
+  `require_mention` (the current shape);
+- the legacy flat top-level keys `homeserver`, `user_id`,
+  `allowed_users`, `allowed_rooms`, `require_mention` written by
+  pre-#1458 installers.
+
+All other keys in the block (e.g. `reply_to_mode`, foreign `extra.*`
+keys) and the rest of the file are preserved. When the `extra` map ends
+up empty it is dropped; when the block ends up empty it is dropped, and
+the `platforms` key only if it is empty as well. A partial-projection
+marker left by the installer
+(`<config dir>/.agentteams-matrix/hermes-install.json`) is removed as
+well, including its directory once empty. The config file itself is
+never deleted. Without anything to remove the uninstall is a no-op, so
+re-running is safe.
 
 ## Requirements
 
 bash, python3 with pyyaml (to read the contract and the config). No
-runtime binary, no network.
+required runtime binary (the `hermes --version` probe is optional and
+only runs when the version is not declared), no network.

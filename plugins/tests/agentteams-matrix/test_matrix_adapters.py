@@ -30,19 +30,31 @@ src/channels/plugins/config-schema.ts:62; dm policy values
 (pairing|allowlist|open|disabled) at
 src/config/zod-schema.core.ts:436.
 
-Hermes (v0.22.5, bf0203a7) — the platforms: block of
-~/.hermes/config.yaml is parsed by PlatformConfig.from_dict
-(gateway/config.py:781,445), which promotes every non-typed key of
-a platform block into config.extra (gateway/config.py:448-452);
-the matrix adapter reads its settings extra-first
-(gateway/platforms/_shared.py:106): homeserver at
+Hermes — the installer writes its settings into the explicit
+`extra:` map of the platforms.matrix block (gateway/config.py:445),
+the one shape both supported runtime generations consume: the
+pinned pre-0.22.5 runtime (v2026.4.16) reads
+extra = data.get("extra", {}) verbatim and silently drops flat
+block keys (#1458), while v0.22.5 (bf0203a7) promotes flat
+non-typed keys but lets an explicit `extra:` win on a clash
+(gateway/config.py:448-452). The matrix adapter reads its settings
+extra-first (gateway/platforms/_shared.py:106): homeserver at
 plugins/platforms/matrix/adapter.py:829, user_id at :831,
 allowed_rooms at :863, allowed_users at :898 (applied at
 :2611-2612), require_mention at :940; the typed token field
-(gateway/config.py:411) is read at adapter.py:830.
+(gateway/config.py:411) is read at adapter.py:830. The installer
+gates on the target runtime version (--hermes-version /
+HERMES_VERSION / a `hermes --version` probe; unknown = pre-0.22.5):
+on a pre-0.22.5 runtime the allowlists and require_mention are
+refused or, with --allow-partial, dropped and recorded in a marker.
+The hermes installs below therefore declare --hermes-version
+0.22.5, except the bundle-dispatch test, which instead lets the
+version gate fall back to a fake `hermes --version` binary that
+prints 0.22.5.
 
-No network access and no runtime binaries are involved: the
-adapters are pure file projectors.
+No network access is involved and the adapters are pure file
+projectors; the only runtime interaction is the optional
+`hermes --version` probe in the hermes version gate.
 """
 
 import json
@@ -90,14 +102,19 @@ def _expected_projection(adapter: str) -> dict:
     src/channels/plugins/config-schema.ts:89-96; per-room
     requireMention: src/channels/plugins/config-schema.ts:62).
 
-    Hermes platforms.matrix (gateway/config.py:445 promotes every
-    non-typed platform-block key into config.extra, which the
-    matrix adapter reads extra-first): enabled — typed field,
-    gateway/config.py:410; homeserver — adapter.py:829;
-    user_id — adapter.py:831; allowed_users — adapter.py:898
-    (a single allowlist for DMs and groups, applied at
-    adapter.py:2611-2612); allowed_rooms — adapter.py:863;
-    require_mention — adapter.py:940.
+    Hermes platforms.matrix: `enabled` is a typed field
+    (gateway/config.py:410); the remaining settings live under the
+    block's explicit `extra:` map — the one shape both runtime
+    generations consume (the pinned v2026.4.16 runtime reads it
+    verbatim; v0.22.5, bf0203a7, promotes flat keys but lets an
+    explicit `extra:` win, gateway/config.py:448-452). The matrix
+    adapter reads extra-first (gateway/platforms/_shared.py:106):
+    extra.homeserver — adapter.py:829; extra.user_id —
+    adapter.py:831; extra.allowed_users — adapter.py:898 (a single
+    allowlist for DMs and groups, applied at adapter.py:2611-2612);
+    extra.allowed_rooms — adapter.py:863; extra.require_mention —
+    adapter.py:940. Flat block keys are deliberately not written:
+    the pinned runtime silently drops them (#1458).
 
     The contract's access_token_ref and history_limit /
     history_mode are deliberately NOT projected: no upstream key
@@ -117,13 +134,15 @@ def _expected_projection(adapter: str) -> dict:
         }
     return {
         "enabled": True,
-        "homeserver": m["homeserver"],
-        "user_id": m["user_id"],
-        "allowed_users": list(
-            dict.fromkeys(list(m["allow_from"]) + list(m["group_allow_from"]))
-        ),
-        "allowed_rooms": list(m["rooms"]),
-        "require_mention": bool(m["require_mention"]),
+        "extra": {
+            "homeserver": m["homeserver"],
+            "user_id": m["user_id"],
+            "allowed_users": list(
+                dict.fromkeys(list(m["allow_from"]) + list(m["group_allow_from"]))
+            ),
+            "allowed_rooms": list(m["rooms"]),
+            "require_mention": bool(m["require_mention"]),
+        },
     }
 
 
@@ -176,6 +195,7 @@ def _env(tmp_path: Path, bundle_dir: Path | None = None) -> dict:
     if bundle_dir is not None:
         env["AGENTTEAMS_BUNDLE_DIR"] = str(bundle_dir)
     env.pop("AGENTTEAMS_MATRIX_ACCESS_TOKEN", None)
+    env.pop("HERMES_VERSION", None)
     return env
 
 
@@ -187,6 +207,14 @@ def _load(adapter: str, text: str):
 
 def _load_file(adapter: str, path: Path):
     return _load(adapter, path.read_text(encoding="utf-8"))
+
+
+def _hv(adapter: str, version: str = "0.22.5") -> list:
+    """Version flags for the hermes install gate (its README,
+    "Config shape and runtime versions"); a no-op elsewhere."""
+    if adapter != "hermes":
+        return []
+    return ["--hermes-version", version]
 
 
 def _matrix_block(adapter: str, config: dict) -> dict:
@@ -281,7 +309,7 @@ class TestMatrixAdapters:
 
         result = _run(
             specs["install"],
-            ["--dry-run", "--config", str(config_path)],
+            ["--dry-run", "--config", str(config_path)] + _hv(adapter),
             _env(tmp_path),
         )
         assert result.returncode == 0, result.stderr
@@ -302,7 +330,7 @@ class TestMatrixAdapters:
 
         result = _run(
             specs["install"],
-            ["--dry-run", "--config", str(config_path)],
+            ["--dry-run", "--config", str(config_path)] + _hv(adapter),
             _env(tmp_path),
         )
         assert result.returncode == 0, result.stderr
@@ -321,7 +349,9 @@ class TestMatrixAdapters:
         config_path = tmp_path / "runtime-config"
         _seed_config(adapter, config_path)
 
-        result = _run(specs["install"], ["--config", str(config_path)], _env(tmp_path))
+        result = _run(
+            specs["install"], ["--config", str(config_path)] + _hv(adapter), _env(tmp_path)
+        )
         assert result.returncode == 0, result.stderr
 
         config = _load_file(adapter, config_path)
@@ -341,26 +371,28 @@ class TestMatrixAdapters:
         # Seeded config: merge path stays stable across runs.
         config_path = tmp_path / "runtime-config"
         _seed_config(adapter, config_path)
-        _run(specs["install"], ["--config", str(config_path)], _env(tmp_path))
+        _run(specs["install"], ["--config", str(config_path)] + _hv(adapter), _env(tmp_path))
         first = config_path.read_bytes()
         result = _run(
-            specs["install"], ["--config", str(config_path)], _env(tmp_path)
+            specs["install"],
+            ["--config", str(config_path)] + _hv(adapter),
+            _env(tmp_path),
         )
         assert result.returncode == 0, result.stderr
         assert config_path.read_bytes() == first
 
         # Fresh config (file does not exist yet): same guarantee.
         fresh = tmp_path / "fresh" / "runtime-config"
-        _run(specs["install"], ["--config", str(fresh)], _env(tmp_path))
+        _run(specs["install"], ["--config", str(fresh)] + _hv(adapter), _env(tmp_path))
         first_fresh = fresh.read_bytes()
-        _run(specs["install"], ["--config", str(fresh)], _env(tmp_path))
+        _run(specs["install"], ["--config", str(fresh)] + _hv(adapter), _env(tmp_path))
         assert fresh.read_bytes() == first_fresh
 
     def test_uninstall_removes_owned_keys_only(self, tmp_path, adapter):
         specs = ADAPTERS[adapter]
         config_path = tmp_path / "runtime-config"
         _seed_config(adapter, config_path)
-        _run(specs["install"], ["--config", str(config_path)], _env(tmp_path))
+        _run(specs["install"], ["--config", str(config_path)] + _hv(adapter), _env(tmp_path))
 
         result = _run(
             specs["uninstall"], ["--config", str(config_path)], _env(tmp_path)
@@ -394,7 +426,7 @@ class TestMatrixAdapters:
         specs = ADAPTERS[adapter]
         config_path = tmp_path / "runtime-config"
         _seed_config(adapter, config_path)
-        _run(specs["install"], ["--config", str(config_path)], _env(tmp_path))
+        _run(specs["install"], ["--config", str(config_path)] + _hv(adapter), _env(tmp_path))
         _run(specs["uninstall"], ["--config", str(config_path)], _env(tmp_path))
         after_first = config_path.read_bytes()
 
@@ -408,7 +440,7 @@ class TestMatrixAdapters:
         specs = ADAPTERS[adapter]
         config_path = tmp_path / "runtime-config"
 
-        _run(specs["install"], ["--config", str(config_path)], _env(tmp_path))
+        _run(specs["install"], ["--config", str(config_path)] + _hv(adapter), _env(tmp_path))
         _run(specs["uninstall"], ["--config", str(config_path)], _env(tmp_path))
 
         assert config_path.is_file(), "uninstall must not delete the config file"
@@ -426,7 +458,7 @@ class TestMatrixAdapters:
         env["AGENTTEAMS_MATRIX_ACCESS_TOKEN"] = TOKEN
 
         # Real install without the flag: no token in file or output.
-        result = _run(specs["install"], ["--config", str(config_path)], env)
+        result = _run(specs["install"], ["--config", str(config_path)] + _hv(adapter), env)
         assert result.returncode == 0, result.stderr
         assert TOKEN not in config_path.read_text(encoding="utf-8")
         assert specs["token_key"] not in _matrix_block(
@@ -438,7 +470,7 @@ class TestMatrixAdapters:
         # Dry run: stdout is the whole document, so it must be clean too.
         dry = _run(
             specs["install"],
-            ["--dry-run", "--config", str(config_path)],
+            ["--dry-run", "--config", str(config_path)] + _hv(adapter),
             env,
         )
         assert dry.returncode == 0, dry.stderr
@@ -454,7 +486,7 @@ class TestMatrixAdapters:
 
         result = _run(
             specs["install"],
-            ["--with-credentials", "--config", str(config_path)],
+            ["--with-credentials", "--config", str(config_path)] + _hv(adapter),
             env,
         )
         assert result.returncode == 0, result.stderr
@@ -473,7 +505,8 @@ class TestMatrixAdapters:
         # Dry run redacts the token instead of printing it.
         dry = _run(
             specs["install"],
-            ["--with-credentials", "--dry-run", "--config", str(config_path)],
+            ["--with-credentials", "--dry-run", "--config", str(config_path)]
+            + _hv(adapter),
             env,
         )
         assert dry.returncode == 0, dry.stderr
@@ -500,7 +533,7 @@ class TestMatrixAdapters:
 
         result = _run(
             specs["install"],
-            ["--dry-run", "--config", str(config_path)],
+            ["--dry-run", "--config", str(config_path)] + _hv(adapter),
             _env(tmp_path),  # no AGENTTEAMS_MATRIX_ACCESS_TOKEN
         )
         assert result.returncode == 0, result.stderr
@@ -523,7 +556,7 @@ class TestMatrixAdapters:
 
         result = _run(
             specs["install"],
-            ["--with-credentials", "--config", str(config_path)],
+            ["--with-credentials", "--config", str(config_path)] + _hv(adapter),
             env,
         )
         assert result.returncode == 0, result.stderr
@@ -535,7 +568,7 @@ class TestMatrixAdapters:
         clean = _env(tmp_path)
         dry = _run(
             specs["install"],
-            ["--dry-run", "--config", str(config_path)],
+            ["--dry-run", "--config", str(config_path)] + _hv(adapter),
             clean,
         )
         assert dry.returncode == 0, dry.stderr
@@ -546,7 +579,7 @@ class TestMatrixAdapters:
         # 0600, and no temp-file leftovers.
         result = _run(
             specs["install"],
-            ["--config", str(config_path)],
+            ["--config", str(config_path)] + _hv(adapter),
             clean,
             umask=0o022,
         )
@@ -563,7 +596,7 @@ class TestMatrixAdapters:
         specs = ADAPTERS[adapter]
         config_path = tmp_path / "runtime-config"
         _seed_config(adapter, config_path)
-        _run(specs["install"], ["--config", str(config_path)], _env(tmp_path))
+        _run(specs["install"], ["--config", str(config_path)] + _hv(adapter), _env(tmp_path))
         config = _load_file(adapter, config_path)
         if adapter == "openclaw":
             config["channels"]["telegram"] = {"botToken": TOKEN}
@@ -593,7 +626,7 @@ class TestMatrixAdapters:
 
         result = _run(
             specs["install"],
-            ["--with-credentials", "--config", str(config_path)],
+            ["--with-credentials", "--config", str(config_path)] + _hv(adapter),
             env,
         )
         assert result.returncode == 0, result.stderr
@@ -614,7 +647,7 @@ class TestMatrixAdapters:
 
         result = _run(
             specs["install"],
-            ["--with-credentials", "--config", str(config_path)],
+            ["--with-credentials", "--config", str(config_path)] + _hv(adapter),
             env,
         )
         assert result.returncode != 0
@@ -675,19 +708,27 @@ def test_openclaw_groups_entry_per_room(tmp_path):
 
 def test_hermes_projection_targets_platforms_matrix_block(tmp_path):
     """The projection must land in the platforms.matrix block, not a
-    top-level matrix: block.
+    top-level matrix: block, and — since the pinned pre-0.22.5 runtime
+    (v2026.4.16) reads only the block's explicit `extra:` map
+    (gateway/config.py, extra = data.get("extra", {}); #1458) — under
+    the block's `extra:` key, not as flat block keys.
 
     The platforms: block is parsed by PlatformConfig.from_dict
-    (gateway/config.py:781,445), which promotes non-typed keys into
-    config.extra (gateway/config.py:448-452); the matrix adapter reads
-    those extra-first (plugins/platforms/matrix/adapter.py:829,831,
-    863,898,940). A top-level matrix: block would only bridge its few
-    behavior keys (_YAML_BRIDGE, adapter.py:3235-3248) — homeserver,
-    user_id and the token would never reach the adapter from there.
+    (gateway/config.py:781,445); v0.22.5 (bf0203a7) additionally
+    promotes flat non-typed keys but lets an explicit `extra:` win
+    (gateway/config.py:448-452). The matrix adapter reads its settings
+    extra-first (plugins/platforms/matrix/adapter.py:829,831,863,898,
+    940). A top-level matrix: block would only bridge its few behavior
+    keys (_YAML_BRIDGE, adapter.py:3235-3248) — homeserver, user_id
+    and the token would never reach the adapter from there.
     """
     specs = ADAPTERS["hermes"]
     config_path = tmp_path / "config.yaml"
-    result = _run(specs["install"], ["--config", str(config_path)], _env(tmp_path))
+    result = _run(
+        specs["install"],
+        ["--config", str(config_path)] + _hv("hermes"),
+        _env(tmp_path),
+    )
     assert result.returncode == 0, result.stderr
 
     config = _load_file("hermes", config_path)
@@ -695,10 +736,13 @@ def test_hermes_projection_targets_platforms_matrix_block(tmp_path):
     block = config["platforms"]["matrix"]
     for key, value in _expected_projection("hermes").items():
         assert block[key] == value
+    # No flat keys: the pinned v2026.4.16 runtime silently drops them.
+    for flat in ("homeserver", "user_id", "allowed_users", "allowed_rooms", "require_mention"):
+        assert flat not in block
     # allow_from + group_allow_from merge into the single allowed_users
     # allowlist (adapter.py:898), deduped with contract order preserved.
     m = CONTRACT_MATRIX
-    assert block["allowed_users"] == list(
+    assert block["extra"]["allowed_users"] == list(
         dict.fromkeys(list(m["allow_from"]) + list(m["group_allow_from"]))
     )
 
@@ -723,9 +767,15 @@ def test_openclaw_uninstall_missing_contract_fails(tmp_path):
     }
 
 
-def _make_fake_runtime(bin_dir: Path, name: str) -> None:
+def _make_fake_runtime(bin_dir: Path, name: str, version: str = "") -> None:
+    script = "#!/usr/bin/env bash\n"
+    if version:
+        # The hermes version gate probes `hermes --version` when no
+        # --hermes-version flag or HERMES_VERSION env is given.
+        script += f'if [ "${{1:-}}" = "--version" ]; then echo "hermes {version}"; fi\n'
+    script += "exit 0\n"
     fake = bin_dir / name
-    fake.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    fake.write_text(script, encoding="utf-8")
     fake.chmod(0o755)
 
 
@@ -758,7 +808,10 @@ def test_bundle_installer_rejects_unknown_adapter(tmp_path):
 def test_bundle_uninstaller_dispatches_selected_adapter(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _make_fake_runtime(bin_dir, "hermes")
+    # No --hermes-version is passed to the adapter install below, so
+    # the version gate falls back to the `hermes --version` probe;
+    # the fake binary answers 0.22.5 (full projection).
+    _make_fake_runtime(bin_dir, "hermes", version="0.22.5")
     env = _env(tmp_path)
     env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
 
