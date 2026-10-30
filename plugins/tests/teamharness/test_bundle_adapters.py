@@ -9,6 +9,7 @@ conformance E2E is a separate, later gate).
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -298,3 +299,166 @@ def test_no_secret_value_in_output_or_configs(tmp_path):
         assert secret not in blob
     assert ENV_REF in oc_config.read_text()
     assert ENV_REF in hm_config.read_text()
+
+
+# ---------------------------------------------------------------------------
+# 7. dry-run previews redact pre-existing credential values; the config file
+#    on disk stays byte-identical
+# ---------------------------------------------------------------------------
+
+
+def test_previews_redact_seeded_runtime_credentials(tmp_path):
+    synthetic = "sk-synth-TOKEN-BBB"
+    oc_config = tmp_path / "openclaw.json"
+    oc_config.write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "matrix": {
+                        "homeserver": "https://hs.example.org",
+                        "userId": "@bot:hs.example.org",
+                        "accessToken": synthetic,
+                    }
+                }
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    oc_hash_before = hashlib.sha256(oc_config.read_bytes()).hexdigest()
+
+    hm_config = tmp_path / "config.yaml"
+    hm_plugin = tmp_path / "plugin-home"
+    hm_config.write_text(
+        yaml.safe_dump(
+            {"platforms": {"matrix": {"homeserver": "https://hs.example.org", "token": synthetic}}}
+        )
+    )
+    hm_hash_before = hashlib.sha256(hm_config.read_bytes()).hexdigest()
+
+    for script, args in (
+        (OPENCLAW_ADAPTER / "install.sh", ["--dry-run", "--config", str(oc_config)]),
+        (OPENCLAW_ADAPTER / "uninstall.sh", ["--dry-run", "--config", str(oc_config)]),
+        (
+            HERMES_ADAPTER / "install.sh",
+            ["--dry-run", "--config", str(hm_config), "--plugin-home", str(hm_plugin)],
+        ),
+        (
+            HERMES_ADAPTER / "uninstall.sh",
+            ["--dry-run", "--config", str(hm_config), "--plugin-home", str(hm_plugin)],
+        ),
+    ):
+        result = run_script(script, *args)
+        assert result.returncode == 0, result.stderr
+        assert synthetic not in result.stdout + result.stderr
+        assert "<redacted>" in result.stdout
+
+    assert hashlib.sha256(oc_config.read_bytes()).hexdigest() == oc_hash_before
+    assert hashlib.sha256(hm_config.read_bytes()).hexdigest() == hm_hash_before
+
+
+# ---------------------------------------------------------------------------
+# 8. redaction covers the whole rendered document, not only this adapter's
+#    owned keys (deeper foreign credentials are masked too)
+# ---------------------------------------------------------------------------
+
+
+def test_previews_redact_nested_foreign_credentials(tmp_path):
+    synthetic = "sk-synth-TOKEN-BBB"
+    foreign = "xoxb-synth-FOREIGN-998877"
+    oc_config = tmp_path / "openclaw.json"
+    oc_config.write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "matrix": {
+                        "homeserver": "https://hs.example.org",
+                        "accessToken": synthetic,
+                    },
+                    "telegram": {"botToken": foreign},
+                }
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    oc_hash_before = hashlib.sha256(oc_config.read_bytes()).hexdigest()
+
+    hm_config = tmp_path / "config.yaml"
+    hm_plugin = tmp_path / "plugin-home"
+    hm_config.write_text(
+        yaml.safe_dump(
+            {
+                "platforms": {
+                    "matrix": {"homeserver": "https://hs.example.org", "token": synthetic},
+                    "slack": {"token": foreign},
+                }
+            }
+        )
+    )
+    hm_hash_before = hashlib.sha256(hm_config.read_bytes()).hexdigest()
+
+    for script, args in (
+        (OPENCLAW_ADAPTER / "install.sh", ["--dry-run", "--config", str(oc_config)]),
+        (OPENCLAW_ADAPTER / "uninstall.sh", ["--dry-run", "--config", str(oc_config)]),
+        (
+            HERMES_ADAPTER / "install.sh",
+            ["--dry-run", "--config", str(hm_config), "--plugin-home", str(hm_plugin)],
+        ),
+        (
+            HERMES_ADAPTER / "uninstall.sh",
+            ["--dry-run", "--config", str(hm_config), "--plugin-home", str(hm_plugin)],
+        ),
+    ):
+        result = run_script(script, *args)
+        assert result.returncode == 0, result.stderr
+        for value in (synthetic, foreign):
+            assert value not in result.stdout + result.stderr
+
+    assert hashlib.sha256(oc_config.read_bytes()).hexdigest() == oc_hash_before
+    assert hashlib.sha256(hm_config.read_bytes()).hexdigest() == hm_hash_before
+
+
+# ---------------------------------------------------------------------------
+# 9. real install/uninstall keep an existing 0600 config's mode (write_atomic)
+# ---------------------------------------------------------------------------
+
+
+def test_real_install_uninstall_do_not_loosen_config_mode(tmp_path):
+    secret = "sk-synth-TOKEN-BBB"
+    oc_config = tmp_path / "openclaw.json"
+    oc_config.write_text(json.dumps({"channels": {"matrix": {"accessToken": secret}}}) + "\n")
+    oc_config.chmod(0o600)
+    assert oc_config.stat().st_mode & 0o777 == 0o600
+    result = run_script(OPENCLAW_ADAPTER / "install.sh", "--config", str(oc_config))
+    assert result.returncode == 0, result.stderr
+    assert oc_config.stat().st_mode & 0o777 == 0o600
+    result = run_script(OPENCLAW_ADAPTER / "uninstall.sh", "--config", str(oc_config))
+    assert result.returncode == 0, result.stderr
+    assert oc_config.stat().st_mode & 0o777 == 0o600
+    json.loads(oc_config.read_text())
+
+    hm_config = tmp_path / "config.yaml"
+    hm_plugin = tmp_path / "plugin-home"
+    hm_config.write_text(yaml.safe_dump({"platforms": {"matrix": {"token": secret}}}))
+    hm_config.chmod(0o600)
+    assert hm_config.stat().st_mode & 0o777 == 0o600
+    result = run_script(
+        HERMES_ADAPTER / "install.sh",
+        "--config",
+        str(hm_config),
+        "--plugin-home",
+        str(hm_plugin),
+    )
+    assert result.returncode == 0, result.stderr
+    assert hm_config.stat().st_mode & 0o777 == 0o600
+    result = run_script(
+        HERMES_ADAPTER / "uninstall.sh",
+        "--config",
+        str(hm_config),
+        "--plugin-home",
+        str(hm_plugin),
+    )
+    assert result.returncode == 0, result.stderr
+    assert hm_config.stat().st_mode & 0o777 == 0o600
+    yaml.safe_load(hm_config.read_text())

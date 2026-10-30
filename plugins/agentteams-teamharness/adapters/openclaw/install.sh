@@ -93,6 +93,30 @@ def load_json(path):
     return json.loads(text)
 
 
+CREDENTIAL_SUFFIXES = ("token", "secret", "password", "passwd", "apikey", "credentials")
+REDACTED = "<redacted>"
+
+
+def _is_credential_key(key):
+    normalized = "".join(ch for ch in str(key).lower() if ch.isalnum())
+    return normalized.endswith(CREDENTIAL_SUFFIXES)
+
+
+def redact(document):
+    """Deep copy with credential values replaced by REDACTED (previews only)."""
+    if isinstance(document, dict):
+        out = {}
+        for key, value in document.items():
+            if _is_credential_key(key) and isinstance(value, str) and value:
+                out[key] = REDACTED
+            else:
+                out[key] = redact(value)
+        return out
+    if isinstance(document, list):
+        return [redact(item) for item in document]
+    return document
+
+
 def write_atomic(path, text):
     """Atomic write; keeps the target's mode when it exists, 0600 for new files."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -167,7 +191,7 @@ project(config)
 result = dump_json(config)
 
 if dry_run:
-    sys.stdout.write(result)
+    sys.stdout.write(dump_json(redact(config)))
     sys.stderr.write("openclaw adapter: dry-run, no files changed\n")
 else:
     if config_path.is_file() and config_path.read_text(encoding="utf-8") == result:

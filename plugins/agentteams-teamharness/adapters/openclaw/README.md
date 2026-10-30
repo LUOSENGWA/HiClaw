@@ -39,7 +39,9 @@ Both scripts are idempotent: canonical serialization (sorted keys, 2-space
 indent) makes two consecutive runs byte-identical, and files are only
 rewritten when the bytes would change. A freshly created config file is
 written `0600`; an existing file's mode is preserved. No credentials are ever
-written.
+written. Dry-run previews redact existing credential values (string values
+under keys ending in `token`, `secret`, `password`, `passwd`, `apikey`, or
+`credentials`) as `<redacted>`; the written file itself is never redacted.
 
 ## Upstream key provenance (higress-group/openclaw @ 2f35b6fa, pinned in `openclaw-base/Dockerfile`)
 

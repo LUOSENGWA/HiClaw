@@ -39,9 +39,12 @@ uninstall.sh --dry-run
 Both scripts are idempotent: the YAML is dumped canonically (sorted keys) and
 files are only rewritten when the bytes would change, so two consecutive runs
 are byte-identical. A freshly created config file is written `0600`; an
-existing file's mode is preserved. No credentials are ever written.
-Uninstall removes the plugin directory only when its `plugin.yaml` identifies
-as `name: agentteams-teamharness`; anything else is left alone.
+existing file's mode is preserved. No credentials are ever written. Dry-run
+previews redact existing credential values (string values under keys ending in
+`token`, `secret`, `password`, `passwd`, `apikey`, or `credentials`) as
+`<redacted>`; the written file itself is never redacted. Uninstall removes
+the plugin directory only when its `plugin.yaml` identifies as
+`name: agentteams-teamharness`; anything else is left alone.
 
 Requires `python3` with PyYAML — hermes-worker itself declares
 `pyyaml>=6.0`, so any environment that runs the Hermes runtime has it.
