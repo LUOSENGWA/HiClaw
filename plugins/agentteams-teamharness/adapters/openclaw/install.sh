@@ -82,6 +82,7 @@ export TH_OC_DRY_RUN="$DRY_RUN"
 python3 - <<'PYEOF'
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -155,16 +156,45 @@ def write_atomic(path, text):
 
 def discover_skill_entries():
     """Skill directories (each containing a SKILL.md) as paths relative to the
-    plugin root, sorted. Empty when the bundle ships no skills."""
+    *staged* plugin root, sorted. Empty when the bundle ships no skills."""
     roots = bundle_dir / "skills"
     entries = []
     if roots.is_dir():
         for skill_md in roots.glob("*/*/SKILL.md"):
-            entries.append("../../" + skill_md.parent.relative_to(bundle_dir).as_posix())
+            entries.append(
+                "skills/" + skill_md.parent.relative_to(roots).as_posix()
+            )
     return sorted(entries)
 
 
+def stage_plugin(skills):
+    """Stage a self-contained plugin root next to the runtime config.
+
+    OpenClaw rejects a manifest skill path that escapes the plugin root, and
+    it refuses a plugin root whose ownership differs from the running user.
+    The repository adapter directory therefore cannot be the plugin root: copy
+    the entry, the manifest (with in-root skill paths) and the bundle skills
+    into a runtime-owned directory and register that instead.
+    """
+    plugin_dir = config_path.parent / "plugins" / PLUGIN_ID
+    if not dry_run:
+        plugin_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(adapter_dir / "index.mjs", plugin_dir / "index.mjs")
+        manifest = load_json(adapter_dir / MANIFEST_NAME)
+        manifest["skills"] = skills
+        write_atomic(plugin_dir / MANIFEST_NAME, dump_json(manifest))
+        staged_skills = plugin_dir / "skills"
+        if staged_skills.exists():
+            shutil.rmtree(staged_skills)
+        source_skills = bundle_dir / "skills"
+        if source_skills.is_dir():
+            shutil.copytree(source_skills, staged_skills)
+    return plugin_dir
+
+
 def project(config):
+    skills = discover_skill_entries()
+    plugin_dir = stage_plugin(skills)
     # 1. MCP server entry — upstream key: mcp.servers.<name> (McpServerConfig
     #    in higress-group/openclaw src/config/types.mcp.ts).
     mcp_entry = {
@@ -184,23 +214,20 @@ def project(config):
         allow.append(PLUGIN_ID)
     load = plugins.setdefault("load", {})
     paths = load.setdefault("paths", [])
-    if str(adapter_dir) not in paths:
-        paths.append(str(adapter_dir))
+    # The staged, self-contained plugin root (see stage_plugin). The bare
+    # repository adapter directory is never registered: its skills live
+    # outside the directory and discovery rejects them.
+    if str(adapter_dir) in paths:
+        paths.remove(str(adapter_dir))
+    if str(plugin_dir) not in paths:
+        paths.append(str(plugin_dir))
     entries = plugins.setdefault("entries", {})
     entries.setdefault(PLUGIN_ID, {})["enabled"] = True
 
-    # 3. Manifest skills sync — declarative, rewritten only when it drifts
-    #    from the bundle's actual skill roots.
-    manifest_path = adapter_dir / MANIFEST_NAME
-    manifest = load_json(manifest_path)
-    skills = discover_skill_entries()
-    if manifest.get("skills") != skills:
-        manifest["skills"] = skills
-        if not dry_run:
-            write_atomic(manifest_path, dump_json(manifest))
+    if not dry_run:
         sys.stderr.write(
-            "openclaw adapter: manifest skills synced to %d skill director%s\n"
-            % (len(skills), "y" if len(skills) == 1 else "ies")
+            "openclaw adapter: staged plugin root %s with %d skill director%s\n"
+            % (plugin_dir, len(skills), "y" if len(skills) == 1 else "ies")
         )
 
 

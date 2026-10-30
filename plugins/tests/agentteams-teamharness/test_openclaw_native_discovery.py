@@ -33,6 +33,24 @@ UNINSTALL = OPENCLAW_ADAPTER / "uninstall.sh"
 PLUGIN_ID = "agentteams-teamharness"
 NOT_FOUND = re.compile(r"plugin not found", re.IGNORECASE)
 EXPECTED_VERSION = os.environ.get("OPENCLAW_EXPECTED_VERSION", "")
+# OpenClaw prefixes a plugin skill with the slugified plugin name ("TeamHarness").
+# OpenClaw slugs a plugin skill as "<plugin-name>-<dir>". Two of our skills
+# collide with names OpenClaw already bundles ("find-skills", "mcporter"), and
+# the runtime de-duplicates by skill name, so those two surface under their
+# bare names; the other eight carry the "teamharness-" prefix. All ten must be
+# enumerated - that is the acceptance criterion.
+EXPECTED_SKILL_NAMES = sorted(
+    [f"teamharness-{name}" for name in (
+        "communication",
+        "file-sharing",
+        "organization",
+        "project-management",
+        "roomflow",
+        "team-coordination",
+        "task-delegation",
+        "task-execution",
+    )] + ["find-skills", "mcporter"]
+)
 OPENCLAW_BIN = os.environ.get("OPENCLAW_BIN") or shutil.which("openclaw")
 
 pytestmark = pytest.mark.skipif(
@@ -92,6 +110,12 @@ def _find_plugin(payload: dict) -> dict | None:
         if record.get("id") == PLUGIN_ID:
             return record
     return None
+
+
+def _skills(home: Path) -> dict:
+    result = _openclaw(home, "skills", "list", "--json")
+    assert result.returncode == 0, result.stderr
+    return _extract_json(result.stdout)
 
 
 def _assert_no_plugin_not_found(result: subprocess.CompletedProcess, payload: dict) -> None:
@@ -161,7 +185,11 @@ def test_install_registers_loadable_plugin(scratch_home, staged_bundle):
     # The registration install.sh wrote is the one native discovery resolves.
     cfg = json.loads(config.read_text())
     assert PLUGIN_ID in cfg["plugins"]["allow"]
-    assert str(adapter) in cfg["plugins"]["load"]["paths"]
+    staged_root = config.parent / "plugins" / PLUGIN_ID
+    assert str(staged_root) in cfg["plugins"]["load"]["paths"]
+    assert str(adapter) not in cfg["plugins"]["load"]["paths"], (
+        "the bare adapter directory must never be the plugin root"
+    )
     assert cfg["plugins"]["entries"][PLUGIN_ID]["enabled"] is True
     assert cfg["mcp"]["servers"]["teamharness"]["cwd"] == str(staged_bundle)
 
@@ -178,6 +206,17 @@ def test_install_registers_loadable_plugin(scratch_home, staged_bundle):
         f"{json.dumps(payload, indent=2)}"
     )
     _assert_no_plugin_not_found(result, payload)
+
+    # The manifest paths must be enumerated by the runtime, not merely exist
+    # on disk: an in-root staged plugin is what makes discovery accept them.
+    assert (staged_root / "skills").is_dir(), "staged plugin root has no skills"
+    listed = _skills(home)
+    names = {skill.get("name") for skill in listed.get("skills", [])}
+    missing = [name for name in EXPECTED_SKILL_NAMES if name not in names]
+    assert not missing, (
+        f"skills not enumerated by `openclaw skills list --json`: {missing}\n"
+        f"listed: {sorted(names)}"
+    )
 
 
 def test_uninstall_removes_plugin_and_warnings_do_not_return(scratch_home, staged_bundle):
@@ -204,3 +243,15 @@ def test_uninstall_removes_plugin_and_warnings_do_not_return(scratch_home, stage
         f"{PLUGIN_ID} still listed after uninstall:\n{json.dumps(payload, indent=2)}"
     )
     _assert_no_plugin_not_found(result, payload)
+
+    remaining = {skill.get("name") for skill in _skills(home).get("skills", [])}
+    # Only the prefixed names are unambiguously ours; the two colliding bare
+    # names belong to OpenClaw's own bundle and stay regardless.
+    leftovers = [
+        name for name in EXPECTED_SKILL_NAMES
+        if name.startswith("teamharness-") and name in remaining
+    ]
+    assert not leftovers, f"skills still enumerated after uninstall: {leftovers}"
+    assert not (config.parent / "plugins" / PLUGIN_ID).exists(), (
+        "staged plugin root survived uninstall"
+    )

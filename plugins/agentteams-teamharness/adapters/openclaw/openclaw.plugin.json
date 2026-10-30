@@ -9,16 +9,16 @@
   "id": "agentteams-teamharness",
   "name": "TeamHarness",
   "skills": [
-    "../../skills/agent/find-skills",
-    "../../skills/agent/mcporter",
-    "../../skills/team/communication",
-    "../../skills/team/file-sharing",
-    "../../skills/team/organization",
-    "../../skills/team/project-management",
-    "../../skills/team/roomflow",
-    "../../skills/team/task-delegation",
-    "../../skills/team/task-execution",
-    "../../skills/team/team-coordination"
+    "skills/agent/find-skills",
+    "skills/agent/mcporter",
+    "skills/team/communication",
+    "skills/team/file-sharing",
+    "skills/team/organization",
+    "skills/team/project-management",
+    "skills/team/roomflow",
+    "skills/team/task-delegation",
+    "skills/team/task-execution",
+    "skills/team/team-coordination"
   ],
   "version": "0.1.0"
 }

@@ -42,6 +42,7 @@ export TH_OC_DRY_RUN="$DRY_RUN"
 python3 - <<'PYEOF'
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -111,6 +112,7 @@ def write_atomic(path, text):
 
 config = load_json(config_path)
 removed = []
+staged_plugin_dir = config_path.parent / "plugins" / PLUGIN_ID
 
 mcp = config.get("mcp")
 if isinstance(mcp, dict):
@@ -132,9 +134,13 @@ if isinstance(plugins, dict):
     load = plugins.get("load")
     if isinstance(load, dict):
         paths = load.get("paths")
-        if isinstance(paths, list) and str(adapter_dir) in paths:
-            paths.remove(str(adapter_dir))
-            removed.append("plugins.load.paths[%s]" % adapter_dir)
+        if isinstance(paths, list):
+            # The staged plugin root is what install registers; the bare
+            # adapter directory is only cleaned up for older installs.
+            for stale in (str(staged_plugin_dir), str(adapter_dir)):
+                if stale in paths:
+                    paths.remove(stale)
+                    removed.append("plugins.load.paths[%s]" % stale)
     entries = plugins.get("entries")
     if isinstance(entries, dict) and PLUGIN_ID in entries:
         del entries[PLUGIN_ID]
@@ -146,6 +152,9 @@ if dry_run:
     sys.stdout.write(dump_json(redact(config)))
     sys.stderr.write("openclaw adapter: dry-run, no files changed\n")
 else:
+    if staged_plugin_dir.is_dir():
+        shutil.rmtree(staged_plugin_dir)
+        removed.append("staged plugin root %s" % staged_plugin_dir)
     if not config_path.is_file():
         sys.stderr.write("openclaw adapter: %s absent, nothing to uninstall\n" % config_path)
     elif config_path.read_text(encoding="utf-8") == result:

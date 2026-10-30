@@ -151,17 +151,36 @@ def test_install_twice_is_byte_identical(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_manifest_skills_resolve_from_staged_plugin_root():
-    manifest = json.loads((OPENCLAW_ADAPTER / "openclaw.plugin.json").read_text())
+def test_manifest_skills_resolve_from_staged_plugin_root(tmp_path):
+    """Manifest entries are in-root paths, materialised by the installer.
+
+    OpenClaw rejects a skill path that escapes the plugin root, so the entries
+    are relative to the plugin root itself; install.sh copies the bundle's
+    skills into the staged root, which is the only place they need to resolve.
+    """
+    config = tmp_path / ".openclaw" / "openclaw.json"
+    result = subprocess.run(
+        ["bash", str(OPENCLAW_ADAPTER / "install.sh"), "--config", str(config)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HOME": str(tmp_path)},
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    staged_root = config.parent / "plugins" / "agentteams-teamharness"
+    manifest = json.loads((staged_root / "openclaw.plugin.json").read_text())
     skills = manifest.get("skills")
     assert isinstance(skills, list) and skills, (
         "manifest must carry the bundle's skill entries"
     )
     for entry in skills:
-        skill_dir = (OPENCLAW_ADAPTER / entry).resolve()
+        assert not entry.startswith("../"), (
+            f"manifest skill path {entry!r} escapes the plugin root"
+        )
+        skill_dir = (staged_root / entry).resolve()
         assert (skill_dir / "SKILL.md").is_file(), (
             f"manifest skill path {entry!r} does not resolve to a SKILL.md "
-            "from the staged plugin root"
+            "in the staged plugin root"
         )
 
 
