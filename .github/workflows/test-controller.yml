@@ -379,3 +379,137 @@ jobs:
         run: |
           python -m pytest plugins/tests/agentteams-matrix/golden -q
           python -m pytest plugins/tests/agentteams-teamharness/golden -q
+
+  # #1431 closed loop: pause stops new delegations and downstream/next-round
+  # work, an in-flight task still saves its result under pause, and an
+  # authorized resume in a fresh process continues exactly once. The driver
+  # (plugins/tests/teamharness/e2e/loop_driver.py) runs the real
+  # plugins/teamharness/mcp taskflow in separate processes against the
+  # embedded controller + MinIO; only the Matrix notifier is stubbed.
+  loop-pause-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      minio:
+        image: minio/minio:latest
+        command: server /data --console-address ":9001"
+        ports:
+          - 9000:9000
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+
+    env:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agentteams-controller/go.mod
+          cache-dependency-path: agentteams-controller/go.sum
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install \
+            'PyYAML>=6.0,<7' \
+            'matrix-nio>=0.25,<0.27' \
+            'pytest>=8.3,<10' \
+            'pytest-asyncio>=0.23,<2'
+
+      - name: Wait for MinIO
+        run: |
+          curl --retry-connrefused --retry-delay 1 --retry 30 -f \
+            http://127.0.0.1:9000/minio/health/live
+
+      - name: Install mc and kube-apiserver
+        run: |
+          curl -fSL -o /usr/local/bin/mc \
+            https://dl.min.io/client/mc/release/linux-amd64/mc
+          sudo chmod +x /usr/local/bin/mc
+          # embedded mode execs kube-apiserver by name; it must be on PATH.
+          curl -fSL -o /usr/local/bin/kube-apiserver \
+            https://dl.k8s.io/release/v1.31.3/bin/linux/amd64/kube-apiserver
+          sudo chmod +x /usr/local/bin/kube-apiserver
+
+      - name: Create the object-store bucket
+        env:
+          MC_HOST_agentteams: http://minioadmin:minioadmin@127.0.0.1:9000
+        run: |
+          mc mb --ignore-existing agentteams/agentteams-storage
+
+      - name: Build the controller
+        working-directory: agentteams-controller
+        run: |
+          CGO_ENABLED=1 go build -o /tmp/agentteams-controller ./cmd/controller
+
+      - name: Prepare controller runtime directories
+        run: |
+          mkdir -p /tmp/at-e2e/data /tmp/at-e2e/config
+          # /var/run/agentteams is the fixed CLI-token path and root-owned on
+          # GitHub runners; the controller's MkdirAll must succeed.
+          sudo mkdir -p /var/run/agentteams
+          sudo chown "$USER" /var/run/agentteams
+
+      - name: Start the embedded controller
+        run: |
+          AGENTTEAMS_KUBE_MODE=embedded \
+          AGENTTEAMS_DATA_DIR=/tmp/at-e2e/data \
+          AGENTTEAMS_CONFIG_DIR=/tmp/at-e2e/config \
+          AGENTTEAMS_CRD_DIR="$GITHUB_WORKSPACE/agentteams-controller/config/crd" \
+          AGENTTEAMS_HTTP_ADDR=127.0.0.1:18090 \
+          AGENTTEAMS_FS_ENDPOINT=http://127.0.0.1:9000 \
+          AGENTTEAMS_FS_ACCESS_KEY="$MINIO_ROOT_USER" \
+          AGENTTEAMS_FS_SECRET_KEY="$MINIO_ROOT_PASSWORD" \
+          AGENTTEAMS_FS_BUCKET=agentteams-storage \
+          AGENTTEAMS_STORAGE_PREFIX=agentteams/agentteams-storage \
+          # Point Matrix at MinIO: any HTTP answer counts as "ready" (the
+          # init loop only retries on connection errors), and admin
+          # registration then fails fast and non-fatally, so the CLI token
+          # is minted within seconds instead of after a 5-minute timeout.
+          AGENTTEAMS_MATRIX_URL=http://127.0.0.1:9000 \
+          nohup /tmp/agentteams-controller > /tmp/at-e2e/controller.log 2>&1 &
+          echo $! > /tmp/at-e2e/controller.pid
+
+      - name: Wait for the controller and the CLI token
+        run: |
+          # /healthz is served from process start (before init), so wait for
+          # the CLI token separately: it is minted after the init loop runs.
+          curl --retry-connrefused --retry-delay 1 --retry 60 -f \
+            http://127.0.0.1:18090/healthz
+          for _ in $(seq 1 120); do
+            if [ -s /var/run/agentteams/cli-token ]; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "CLI token never appeared; controller log:" >&2
+          cat /tmp/at-e2e/controller.log >&2
+          exit 1
+
+      - name: Run the loop pause/resume e2e tests
+        env:
+          E2E_CONTROLLER_URL: http://127.0.0.1:18090
+          E2E_MINIO: '1'
+          AGENTTEAMS_FS_ENDPOINT: http://127.0.0.1:9000
+          AGENTTEAMS_FS_ACCESS_KEY: minioadmin
+          AGENTTEAMS_FS_SECRET_KEY: minioadmin
+          AGENTTEAMS_STORAGE_PREFIX: agentteams/agentteams-storage
+        run: |
+          export E2E_CONTROLLER_TOKEN="$(cat /var/run/agentteams/cli-token)"
+          python -m pytest plugins/tests/teamharness/e2e -q
+
+      - name: Stop the controller
+        if: always()
+        run: |
+          if [ -f /tmp/at-e2e/controller.pid ]; then
+            kill "$(cat /tmp/at-e2e/controller.pid)" 2>/dev/null || true
+          fi
+          cat /tmp/at-e2e/controller.log || true
