@@ -1,7 +1,7 @@
 # ============================================================
 # AgentTeams Hermes Worker Agent - Python-based Container
 # ============================================================
-# Lightweight Python container running hermes-agent v0.22.5 as a
+# Lightweight Python container running hermes-agent v2026.9.24 as a
 # AgentTeams Worker. Uses the same MinIO-backed config/sync model as the
 # OpenClaw / CoPaw workers, with hermes-agent providing the agent loop
 # and tools. The Matrix gateway adapter keeps hermes-agent's native
@@ -15,8 +15,8 @@
 #   PIP_INDEX_URL           - PyPI mirror (default: official PyPI)
 #   NPM_REGISTRY            - npm registry (default: official)
 #   HERMES_GIT_REF          - git ref of hermes-agent to install
-#                             (default: v0.22.5; keep in sync with
-#                             HERMES_TAG in hack/versions.env)
+#                             (default: v2026.9.24; keep in sync with
+#                             HERMES_GIT_REF in hack/versions.env)
 #   HERMES_REPO_URL         - hermes-agent git repo URL
 # ============================================================
 
@@ -36,8 +36,11 @@ ARG APT_MIRROR=
 ARG PIP_INDEX_URL=https://pypi.org/simple/
 ARG NPM_REGISTRY=https://registry.npmjs.org/
 # Pinned checkout ref. Docker cannot source env files, so this default
-# must stay in sync with HERMES_TAG in hack/versions.env.
-ARG HERMES_GIT_REF=v0.22.5
+# must stay in sync with HERMES_GIT_REF in hack/versions.env.
+# v2026.9.24 requires Python >=3.11,<3.14, so the python:3.11-slim base
+# stands; do NOT port the Oct-2026 upstream line's 3.14-only runtime
+# contract (that tag's core dependencies are marker-gated to >=3.14).
+ARG HERMES_GIT_REF=v2026.9.24
 ARG HERMES_REPO_URL=https://github.com/NousResearch/hermes-agent.git
 
 # python:3.11-slim is Debian-based, uses /etc/apt/sources.list.d/debian.sources
@@ -95,6 +98,12 @@ RUN mkdir -p /tmp/hermes-worker/src/hermes_worker \
 # when only hermes-worker source changes.
 RUN git clone --depth 1 --branch "${HERMES_GIT_REF}" "${HERMES_REPO_URL}" /opt/hermes-src
 
+# hermes-agent rejects wheel/sdist builds by design (setup.py guard) and its
+# pyproject pins every direct dependency exactly; an editable install is the
+# supported path and resolves those pins as-is. The ``matrix`` extra carries
+# the mautrix/aiosqlite/asyncpg/aiohttp-socks set the AgentTeams overlay needs,
+# so the hand-maintained transport pins are gone. ``typer`` is
+# for our own worker CLI (rich/httpx/pyyaml already come from hermes-agent).
 RUN python -m venv /opt/venv/hermes \
     && /opt/venv/hermes/bin/pip install --upgrade pip setuptools wheel \
         --index-url "${PIP_INDEX_URL}" \
@@ -102,22 +111,11 @@ RUN python -m venv /opt/venv/hermes \
     && /opt/venv/hermes/bin/pip install --no-cache-dir \
         --index-url "${PIP_INDEX_URL}" \
         --trusted-host "$(echo ${PIP_INDEX_URL} | sed 's|https\?://||;s|/.*||')" \
-        --editable /opt/hermes-src \
+        --editable "/opt/hermes-src[matrix]" \
     && /opt/venv/hermes/bin/pip install --no-cache-dir \
         --index-url "${PIP_INDEX_URL}" \
         --trusted-host "$(echo ${PIP_INDEX_URL} | sed 's|https\?://||;s|/.*||')" \
-        "mautrix[encryption]==0.21.1" \
-        "aiosqlite==0.22.1" \
-        "asyncpg==0.31.0" \
-        "aiohttp-socks==0.11.0" \
-        "matrix-nio[e2e]>=0.24.0" \
-        "markdown-it-py>=3.0" \
-        "linkify-it-py>=2.0" \
-        "Markdown>=3.6" \
         "typer>=0.9" \
-        "rich>=13.0" \
-        "httpx>=0.25" \
-        "pyyaml>=6.0" \
     && /opt/venv/hermes/bin/pip install --no-cache-dir \
         --index-url "${PIP_INDEX_URL}" \
         --trusted-host "$(echo ${PIP_INDEX_URL} | sed 's|https\?://||;s|/.*||')" \
@@ -133,7 +131,7 @@ RUN SITE=/opt/venv/hermes/lib/python3.11/site-packages \
     && rm -rf /tmp/hermes-worker/
 
 # --- AgentTeams Matrix platform plugin ---
-# hermes-agent v0.22.5 moved Matrix out of gateway/platforms/ into the
+# hermes-agent v2026.9.24 ships Matrix as plugins/platforms/matrix/ into the
 # plugins/platforms/matrix/ bundled plugin.  The image ships a user plugin
 # under the same path-derived key (platforms/matrix); Hermes gives user
 # plugins precedence, and its register() subclasses the bundled adapter with
