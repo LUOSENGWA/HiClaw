@@ -146,6 +146,26 @@ def test_install_twice_is_byte_identical(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 3b. manifest skills paths resolve to real SKILL.md dirs from the staged
+#     plugin root (the adapter dir registered in plugins.load.paths)
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_skills_resolve_from_staged_plugin_root():
+    manifest = json.loads((OPENCLAW_ADAPTER / "openclaw.plugin.json").read_text())
+    skills = manifest.get("skills")
+    assert isinstance(skills, list) and skills, (
+        "manifest must carry the bundle's skill entries"
+    )
+    for entry in skills:
+        skill_dir = (OPENCLAW_ADAPTER / entry).resolve()
+        assert (skill_dir / "SKILL.md").is_file(), (
+            f"manifest skill path {entry!r} does not resolve to a SKILL.md "
+            "from the staged plugin root"
+        )
+
+
+# ---------------------------------------------------------------------------
 # 4. uninstall removes exactly this adapter's keys, keeps the rest
 # ---------------------------------------------------------------------------
 

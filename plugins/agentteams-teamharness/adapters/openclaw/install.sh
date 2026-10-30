@@ -11,6 +11,11 @@ set -euo pipefail
 #      value; OpenClaw expands ${VAR} over the whole parsed config).
 #   2. plugins.allow / plugins.load.paths / plugins.entries -> registers this
 #      plugin directory (same shape the repo's openclaw-cms-plugin uses).
+#      The adapter directory itself is the staged plugin root: the pinned
+#      runtime discovers it through plugins.load.paths and loads its index.mjs
+#      entry (see that file for the discovery contract). install.sh
+#      pre-checks the entry's presence but never copies or generates plugin
+#      files — the manifest and the entry ship with the bundle.
 #   3. openclaw.plugin.json "skills" -> synced to the bundle's actual skill
 #      roots (skills/<root>/<skill>/SKILL.md), relative to the plugin root;
 #      an empty array when the bundle ships no skills.
@@ -19,23 +24,29 @@ set -euo pipefail
 # consecutive runs produce byte-identical output; the file is only rewritten
 # when the bytes would change. --dry-run prints the resulting configuration
 # on stdout and changes nothing. Uninstall removes exactly the keys written
-# here (see uninstall.sh).
+# here (see uninstall.sh); it never removes bundle source files.
 
 usage() {
   cat <<'EOF'
-Usage: install.sh [--config <path>] [--dry-run]
+Usage: install.sh [--config <path>] [--workspace <path>] [--dry-run]
 
   --config <path>  OpenClaw config file (default: $OPENCLAW_CONFIG or
                    $HOME/.openclaw/openclaw.json)
+  --workspace <path>
+                   OpenClaw workspace directory for isolated runs (created if
+                   absent). The plugin registration is absolute-path based
+                   (plugins.load.paths) and does not depend on it.
   --dry-run        Print the resulting configuration on stdout; change nothing
 EOF
 }
 
 CONFIG=""
+WORKSPACE=""
 DRY_RUN=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG="${2:?--config requires a value}"; shift 2 ;;
+    --workspace) WORKSPACE="${2:?--workspace requires a value}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -53,6 +64,13 @@ fi
 if [ ! -f "${BUNDLE_DIR}/mcp/server.py" ]; then
   echo "ERROR: MCP server entry not found at ${BUNDLE_DIR}/mcp/server.py" >&2
   exit 1
+fi
+if [ ! -f "${SCRIPT_DIR}/index.mjs" ]; then
+  echo "ERROR: loadable plugin entry not found at ${SCRIPT_DIR}/index.mjs" >&2
+  exit 1
+fi
+if [ -n "$WORKSPACE" ] && [ ! -d "$WORKSPACE" ]; then
+  mkdir -p "$WORKSPACE"
 fi
 [ -n "$CONFIG" ] || CONFIG="${OPENCLAW_CONFIG:-$HOME/.openclaw/openclaw.json}"
 
