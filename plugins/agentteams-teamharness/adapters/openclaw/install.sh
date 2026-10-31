@@ -20,6 +20,14 @@ set -euo pipefail
 #      staged root (plugins.load.paths carries it; an older install's bare
 #      adapter path is removed). Uninstall removes the staged root again.
 #
+# The effective config target is resolved in priority order:
+# --config > $OPENCLAW_CONFIG_PATH (the Worker export) > $OPENCLAW_CONFIG
+# (legacy) > $HOME/.openclaw/openclaw.json. When the selected path is a
+# symlink (the Worker links ~/.openclaw/openclaw.json to its canonical
+# $HOME/openclaw.json), the canonical target is read and written -- the
+# symlink itself is preserved, never atomically replaced by a regular file.
+# The target is derived from the runtime, never guessed from a variable name.
+#
 # Idempotent: canonical serialization (sorted keys, 2-space indent) means two
 # consecutive runs produce byte-identical output; the file is only rewritten
 # when the bytes would change. --dry-run prints the resulting configuration
@@ -30,8 +38,10 @@ usage() {
   cat <<'EOF'
 Usage: install.sh [--config <path>] [--workspace <path>] [--dry-run]
 
-  --config <path>  OpenClaw config file (default: $OPENCLAW_CONFIG or
-                   $HOME/.openclaw/openclaw.json)
+  --config <path>  OpenClaw config file (default: $OPENCLAW_CONFIG_PATH,
+                   then $OPENCLAW_CONFIG, then $HOME/.openclaw/openclaw.json).
+                   A symlink is honoured: its canonical target is read and
+                   written, the link itself is preserved.
   --workspace <path>
                    OpenClaw workspace directory for isolated runs (created if
                    absent). The plugin registration is absolute-path based
@@ -72,7 +82,8 @@ fi
 if [ -n "$WORKSPACE" ] && [ ! -d "$WORKSPACE" ]; then
   mkdir -p "$WORKSPACE"
 fi
-[ -n "$CONFIG" ] || CONFIG="${OPENCLAW_CONFIG:-$HOME/.openclaw/openclaw.json}"
+[ -n "$CONFIG" ] || \
+  CONFIG="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_CONFIG:-$HOME/.openclaw/openclaw.json}}"
 
 export TH_OC_ADAPTER_DIR="$SCRIPT_DIR"
 export TH_OC_BUNDLE_DIR="$BUNDLE_DIR"
@@ -91,6 +102,14 @@ from pathlib import Path
 adapter_dir = Path(os.environ["TH_OC_ADAPTER_DIR"]).resolve()
 bundle_dir = Path(os.environ["TH_OC_BUNDLE_DIR"]).resolve()
 config_path = Path(os.environ["TH_OC_CONFIG"]).expanduser()
+# Effective config target: when the selected path is a symlink (the Worker
+# links ~/.openclaw/openclaw.json to its canonical $HOME/openclaw.json),
+# operate on the canonical target — read from it, and let write_atomic's
+# temp file + os.replace land in the canonical directory — so the symlink
+# survives instead of being atomically replaced by a regular file.
+# strict=False: a dangling link resolves to its intended target, which the
+# write then creates.
+config_path = config_path.resolve(strict=False)
 dry_run = os.environ.get("TH_OC_DRY_RUN") == "1"
 
 PLUGIN_ID = "agentteams-teamharness"

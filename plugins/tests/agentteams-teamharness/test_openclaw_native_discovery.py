@@ -66,7 +66,7 @@ pytestmark = pytest.mark.skipif(
 def _isolated_env(home: Path) -> dict:
     env = dict(os.environ)
     env["HOME"] = str(home)
-    for key in ("OPENCLAW_CONFIG", "OPENCLAW_STATE_DIR", "OPENCLAW_HOME"):
+    for key in ("OPENCLAW_CONFIG", "OPENCLAW_CONFIG_PATH", "OPENCLAW_STATE_DIR", "OPENCLAW_HOME"):
         env.pop(key, None)
     return env
 
@@ -81,8 +81,8 @@ def _run_script(script: Path, *args: str, env: dict) -> subprocess.CompletedProc
     )
 
 
-def _openclaw(home: Path, *args: str) -> subprocess.CompletedProcess:
-    env = _isolated_env(home)
+def _openclaw(home: Path, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    env = _isolated_env(home) if env is None else env
     env["PATH"] = os.pathsep.join(
         part for part in (os.path.dirname(OPENCLAW_BIN), env.get("PATH", "")) if part
     )
@@ -158,6 +158,20 @@ def scratch_home(tmp_path_factory) -> tuple[Path, Path]:
     home = tmp_path_factory.mktemp("openclaw-home")
     (home / ".openclaw").mkdir()
     return home, home / ".openclaw" / "openclaw.json"
+
+
+@pytest.fixture(scope="module")
+def worker_home(tmp_path_factory) -> tuple[Path, Path, Path]:
+    """The Worker's layout: canonical $HOME/openclaw.json with
+    ~/.openclaw/openclaw.json a symlink to it. Returns
+    (home, canonical, link)."""
+    home = tmp_path_factory.mktemp("openclaw-worker-home")
+    (home / ".openclaw").mkdir()
+    canonical = home / "openclaw.json"
+    canonical.write_text("{}\n")
+    link = home / ".openclaw" / "openclaw.json"
+    link.symlink_to(canonical)
+    return home, canonical, link
 
 
 def test_openclaw_binary_reports_expected_version(scratch_home):
@@ -255,3 +269,38 @@ def test_uninstall_removes_plugin_and_warnings_do_not_return(scratch_home, stage
     assert not (config.parent / "plugins" / PLUGIN_ID).exists(), (
         "staged plugin root survived uninstall"
     )
+
+
+def test_install_through_default_symlink_is_seen_by_native_config_readback(worker_home, staged_bundle):
+    """Worker layout, no --config: install resolves OPENCLAW_CONFIG_PATH to
+    the canonical file and writes through the default-path symlink. The
+    native ``config get`` equivalent (the runtime's own readback) must see
+    the projected server in the config the Worker actually reads."""
+    home, canonical, link = worker_home
+    env = _isolated_env(home)
+    env["OPENCLAW_CONFIG_PATH"] = str(canonical)
+    adapter = staged_bundle / "adapters" / "openclaw"
+
+    result = _run_script(adapter / "install.sh", env=env)
+    assert result.returncode == 0, result.stderr
+    assert link.is_symlink(), "install must not replace the config symlink"
+    cfg = json.loads(canonical.read_text())
+    assert "teamharness" in cfg["mcp"]["servers"]
+
+    readback = _openclaw(home, "config", "get", "mcp.servers.teamharness", "--json", env=env)
+    combined = readback.stdout + readback.stderr
+    assert readback.returncode == 0, combined
+    assert "Config path not found" not in combined, combined
+    # The projected server (python3 -m mcp.server) is visible through the
+    # native readback of the canonical config.
+    assert "python3" in readback.stdout, combined
+
+    # Native discovery agrees: the plugin resolves in the same config.
+    result = _openclaw(home, "plugins", "list", "--json", env=env)
+    assert result.returncode == 0, result.stderr
+    payload = _extract_json(result.stdout)
+    assert _find_plugin(payload) is not None, (
+        f"{PLUGIN_ID} missing from `openclaw plugins list --json` "
+        f"with the Worker layout:\n{json.dumps(payload, indent=2)}"
+    )
+    _assert_no_plugin_not_found(result, payload)

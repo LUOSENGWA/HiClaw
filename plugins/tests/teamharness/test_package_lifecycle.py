@@ -87,6 +87,7 @@ INTERPRETER_IDS = [name for _, name in INTERPRETERS]
 # Variables the adapters read; the entrypoints must see a controlled env.
 SCRUBBED_VARS = (
     "OPENCLAW_CONFIG",
+    "OPENCLAW_CONFIG_PATH",
     "OPENCLAW_WORKSPACE",
     "HERMES_HOME",
     "HERMES_PLUGIN_HOME",
@@ -348,6 +349,120 @@ def test_uninstall_removes_residue_after_binary_disappears(tmp_path, bash_bin):
     data = json.loads(config.read_text(encoding="utf-8"))
     assert "teamharness" not in data.get("mcp", {}).get("servers", {})
     assert not (home / ".openclaw" / "plugins" / PLUGIN_ID).exists()
+
+
+def _worker_home(home: Path) -> tuple[Path, Path]:
+    """The Worker's layout under a temp HOME: canonical $HOME/openclaw.json
+    with $HOME/.openclaw/openclaw.json a symlink to it. Returns
+    (canonical, link)."""
+    (home / ".openclaw").mkdir(parents=True)
+    canonical = home / "openclaw.json"
+    canonical.write_text(json.dumps({"agent": {"displayName": "worker"}}) + "\n")
+    link = home / ".openclaw" / "openclaw.json"
+    link.symlink_to(canonical)
+    return canonical, link
+
+
+@pytest.mark.parametrize("bash_bin", INTERPRETER_NAMES, ids=INTERPRETER_IDS)
+def test_worker_layout_default_install_honours_effective_config(tmp_path, bash_bin):
+    home = tmp_path / "home"
+    canonical, link = _worker_home(home)
+    env = _clean_env(tmp_path, extra={"OPENCLAW_CONFIG_PATH": str(canonical)})
+    assert "OPENCLAW_CONFIG" not in env
+
+    result = run_entrypoint(INSTALL, env=env, bash_bin=bash_bin)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "openclaw: installed" in result.stdout
+    assert "qwenpaw: skipped (not detected)" in result.stdout
+    assert "hermes: skipped (not detected)" in result.stdout
+
+    # The canonical file the Worker actually reads gained the entry...
+    canonical_data = json.loads(canonical.read_text(encoding="utf-8"))
+    assert "teamharness" in canonical_data["mcp"]["servers"]
+    # ...the default-path symlink survived and reads the same entry, and
+    # the staged root resolves under the canonical config directory.
+    assert link.is_symlink(), "install must not replace the config symlink"
+    via_link = json.loads(link.read_text(encoding="utf-8"))
+    assert (
+        via_link["mcp"]["servers"]["teamharness"]
+        == canonical_data["mcp"]["servers"]["teamharness"]
+    )
+    staged_root = canonical.parent / "plugins" / PLUGIN_ID
+    assert staged_root.is_dir()
+    assert str(staged_root) in canonical_data["plugins"]["load"]["paths"]
+
+
+@pytest.mark.parametrize("bash_bin", INTERPRETER_NAMES, ids=INTERPRETER_IDS)
+def test_worker_layout_dry_run_writes_nothing_and_keeps_symlink(tmp_path, bash_bin):
+    home = tmp_path / "home"
+    canonical, link = _worker_home(home)
+    before = canonical.read_bytes()
+    env = _clean_env(tmp_path, extra={"OPENCLAW_CONFIG_PATH": str(canonical)})
+
+    result = run_entrypoint(
+        INSTALL, "--runtime", "openclaw", "--dry-run", env=env, bash_bin=bash_bin
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "openclaw: installed (dry-run)" in result.stdout
+
+    assert canonical.read_bytes() == before
+    assert link.is_symlink()
+    assert not (canonical.parent / "plugins").exists()
+    assert not (link.parent / "plugins").exists()
+
+
+@pytest.mark.parametrize("bash_bin", INTERPRETER_NAMES, ids=INTERPRETER_IDS)
+def test_worker_layout_default_uninstall_preserves_symlink(tmp_path, bash_bin):
+    home = tmp_path / "home"
+    canonical, link = _worker_home(home)
+    env = _clean_env(tmp_path, extra={"OPENCLAW_CONFIG_PATH": str(canonical)})
+
+    result = run_entrypoint(INSTALL, env=env, bash_bin=bash_bin)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "teamharness" in json.loads(canonical.read_text(encoding="utf-8"))["mcp"]["servers"]
+    staged_root = canonical.parent / "plugins" / PLUGIN_ID
+    assert staged_root.is_dir()
+
+    result = run_entrypoint(UNINSTALL, env=env, bash_bin=bash_bin)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "openclaw: uninstalled" in result.stdout
+
+    # The canonical side lost exactly this adapter's residue; the foreign
+    # key and the symlink survive.
+    data = json.loads(canonical.read_text(encoding="utf-8"))
+    assert "teamharness" not in data.get("mcp", {}).get("servers", {})
+    assert "agentteams-teamharness" not in data.get("plugins", {}).get("entries", {})
+    assert data["agent"] == {"displayName": "worker"}
+    assert not staged_root.exists()
+    assert link.is_symlink()
+
+
+@pytest.mark.parametrize("bash_bin", INTERPRETER_NAMES, ids=INTERPRETER_IDS)
+def test_uninstall_finds_staged_root_next_to_dangling_config_link(tmp_path, bash_bin):
+    """Artifact-driven detection with no runtime variables: the config
+    symlink survives with its target gone (dangling) — the staged root is
+    found next to the link's canonical target and removed."""
+    home = tmp_path / "home"
+    canonical, link = _worker_home(home)
+    env = _clean_env(tmp_path, extra={"OPENCLAW_CONFIG_PATH": str(canonical)})
+
+    result = run_entrypoint(INSTALL, env=env, bash_bin=bash_bin)
+    assert result.returncode == 0, result.stdout + result.stderr
+    staged_root = canonical.parent / "plugins" / PLUGIN_ID
+    assert staged_root.is_dir()
+
+    # The canonical file is gone; only the dangling link and the staged
+    # root remain, and every runtime variable is unset.
+    canonical.unlink()
+    env_uninstall = _clean_env(tmp_path)
+    assert "OPENCLAW_CONFIG_PATH" not in env_uninstall
+    assert "OPENCLAW_CONFIG" not in env_uninstall
+
+    result = run_entrypoint(UNINSTALL, env=env_uninstall, bash_bin=bash_bin)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "openclaw: uninstalled" in result.stdout
+    assert not staged_root.exists()
+    assert link.is_symlink(), "uninstall must not remove the config symlink"
 
 
 @pytest.mark.parametrize("bash_bin", INTERPRETER_NAMES, ids=INTERPRETER_IDS)

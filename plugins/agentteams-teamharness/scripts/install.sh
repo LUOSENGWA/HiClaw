@@ -10,8 +10,9 @@ set -euo pipefail
 # installed, so coexisting runtimes are all covered:
 #
 #   qwenpaw   qwenpaw on PATH
-#   openclaw  openclaw on PATH, $OPENCLAW_CONFIG set, or
-#             ~/.openclaw/openclaw.json present
+#   openclaw  openclaw on PATH, $OPENCLAW_CONFIG_PATH set, $OPENCLAW_CONFIG
+#             set, or the effective config path (default
+#             ~/.openclaw/openclaw.json) present — a symlink counts
 #   hermes    hermes on PATH, $HERMES_HOME set, or
 #             ~/.hermes/config.yaml present
 #
@@ -20,8 +21,11 @@ set -euo pipefail
 # nothing. Failures are collected per runtime; the exit code is 1 when no
 # runtime was selected or a selected adapter failed.
 #
-# The adapters read $OPENCLAW_CONFIG, $OPENCLAW_WORKSPACE, $HERMES_HOME and
-# $HERMES_PLUGIN_HOME themselves; this script never overrides them.
+# The adapters read $OPENCLAW_CONFIG_PATH, $OPENCLAW_CONFIG,
+# $OPENCLAW_WORKSPACE, $HERMES_HOME and $HERMES_PLUGIN_HOME themselves; this
+# script never overrides them. Detection and the adapters resolve the
+# effective OpenClaw config the same way: $OPENCLAW_CONFIG_PATH (the Worker
+# export), then $OPENCLAW_CONFIG (legacy), then ~/.openclaw/openclaw.json.
 #
 # With TEAMHARNESS_INSTALL_LOG set, one JSON line is appended per run that
 # installed at least one runtime:
@@ -93,10 +97,24 @@ detect_qwenpaw() {
   command -v qwenpaw >/dev/null 2>&1
 }
 
+# The effective OpenClaw config path, same priority the adapters use:
+# $OPENCLAW_CONFIG_PATH (the Worker export), then $OPENCLAW_CONFIG (legacy),
+# then the runtime default.
+openclaw_config_file() {
+  if [ -n "${OPENCLAW_CONFIG_PATH:-}" ]; then
+    printf '%s' "$OPENCLAW_CONFIG_PATH"
+  elif [ -n "${OPENCLAW_CONFIG:-}" ]; then
+    printf '%s' "$OPENCLAW_CONFIG"
+  else
+    printf '%s' "$HOME/.openclaw/openclaw.json"
+  fi
+}
+
 detect_openclaw() {
   command -v openclaw >/dev/null 2>&1 \
+    || [ -n "${OPENCLAW_CONFIG_PATH:-}" ] \
     || [ -n "${OPENCLAW_CONFIG:-}" ] \
-    || [ -f "$HOME/.openclaw/openclaw.json" ]
+    || [ -e "$(openclaw_config_file)" ]
 }
 
 detect_hermes() {

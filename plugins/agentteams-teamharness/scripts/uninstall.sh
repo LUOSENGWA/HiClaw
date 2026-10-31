@@ -9,9 +9,12 @@ set -euo pipefail
 # removed even after the runtime binary is gone:
 #
 #   qwenpaw   qwenpaw on PATH
-#   openclaw  the config file ($OPENCLAW_CONFIG or
-#             ~/.openclaw/openclaw.json) or the staged plugin root
-#             <config dir>/plugins/agentteams-teamharness exists
+#   openclaw  the effective config file ($OPENCLAW_CONFIG_PATH,
+#             $OPENCLAW_CONFIG, or ~/.openclaw/openclaw.json — a symlink
+#             counts) or the staged plugin root
+#             <config dir>/plugins/agentteams-teamharness exists, where
+#             <config dir> is the config's directory as resolved through
+#             the symlink (the canonical directory)
 #   hermes    $HERMES_HOME is set, or ~/.hermes/config.yaml, or
 #             ~/.hermes/plugins/agentteams-teamharness exists
 #
@@ -87,8 +90,37 @@ if [ "${#RUNTIME_SELECTIONS[@]}" -gt 0 ]; then
   done
 fi
 
+# The effective OpenClaw config path, same priority the adapters use:
+# $OPENCLAW_CONFIG_PATH (the Worker export), then $OPENCLAW_CONFIG (legacy),
+# then the runtime default.
 openclaw_config_file() {
-  printf '%s' "${OPENCLAW_CONFIG:-$HOME/.openclaw/openclaw.json}"
+  if [ -n "${OPENCLAW_CONFIG_PATH:-}" ]; then
+    printf '%s' "$OPENCLAW_CONFIG_PATH"
+  elif [ -n "${OPENCLAW_CONFIG:-}" ]; then
+    printf '%s' "$OPENCLAW_CONFIG"
+  else
+    printf '%s' "$HOME/.openclaw/openclaw.json"
+  fi
+}
+
+# The directory that actually holds the config: follow a symlink chain on
+# the config path itself (the Worker links ~/.openclaw/openclaw.json to its
+# canonical $HOME/openclaw.json, and install stages the plugin root next to
+# the canonical file). One readlink per hop keeps this portable to the
+# system shell (bash 3.2 on macOS has no realpath); a hop cap guards
+# against link cycles. Parent directories are taken as given — every
+# supported layout keeps them real.
+canonical_config_dir() {
+  local path="$1" hops=0 target
+  while [ -L "$path" ] && [ "$hops" -lt 10 ]; do
+    target="$(readlink "$path")"
+    case "$target" in
+      /*) path="$target" ;;
+      *)  path="$(dirname "$path")/$target" ;;
+    esac
+    hops=$((hops + 1))
+  done
+  printf '%s' "$(dirname "$path")"
 }
 
 detect_qwenpaw() {
@@ -97,7 +129,8 @@ detect_qwenpaw() {
 
 detect_openclaw() {
   config="$(openclaw_config_file)"
-  [ -f "$config" ] || [ -d "$(dirname "$config")/plugins/agentteams-teamharness" ]
+  [ -e "$config" ] \
+    || [ -d "$(canonical_config_dir "$config")/plugins/agentteams-teamharness" ]
 }
 
 detect_hermes() {

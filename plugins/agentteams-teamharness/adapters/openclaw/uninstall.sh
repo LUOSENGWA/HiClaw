@@ -10,13 +10,21 @@ set -euo pipefail
 # Every other key is preserved. Idempotent: a second run is a no-op that
 # leaves the file byte-identical. --dry-run prints the resulting
 # configuration on stdout and changes nothing.
+#
+# The effective config target is resolved with the same rule as install.sh:
+# --config > $OPENCLAW_CONFIG_PATH (the Worker export) > $OPENCLAW_CONFIG
+# (legacy) > $HOME/.openclaw/openclaw.json, and a symlink is read and
+# written through to its canonical target — the link itself is preserved,
+# never atomically replaced by a regular file.
 
 usage() {
   cat <<'EOF'
 Usage: uninstall.sh [--config <path>] [--dry-run]
 
-  --config <path>  OpenClaw config file (default: $OPENCLAW_CONFIG or
-                   $HOME/.openclaw/openclaw.json)
+  --config <path>  OpenClaw config file (default: $OPENCLAW_CONFIG_PATH,
+                   then $OPENCLAW_CONFIG, then $HOME/.openclaw/openclaw.json).
+                   A symlink is honoured: its canonical target is read and
+                   written, the link itself is preserved.
   --dry-run        Print the resulting configuration on stdout; change nothing
 EOF
 }
@@ -33,7 +41,8 @@ while [ $# -gt 0 ]; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[ -n "$CONFIG" ] || CONFIG="${OPENCLAW_CONFIG:-$HOME/.openclaw/openclaw.json}"
+[ -n "$CONFIG" ] || \
+  CONFIG="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_CONFIG:-$HOME/.openclaw/openclaw.json}}"
 
 export TH_OC_ADAPTER_DIR="$SCRIPT_DIR"
 export TH_OC_CONFIG="$CONFIG"
@@ -50,6 +59,12 @@ from pathlib import Path
 
 adapter_dir = Path(os.environ["TH_OC_ADAPTER_DIR"]).resolve()
 config_path = Path(os.environ["TH_OC_CONFIG"]).expanduser()
+# Effective config target: same rule as install.sh — a symlink (the Worker
+# links ~/.openclaw/openclaw.json to its canonical $HOME/openclaw.json) is
+# read and written through to its canonical target, so the link survives
+# and the staged root is found next to the canonical config. strict=False:
+# a dangling link resolves to its intended target.
+config_path = config_path.resolve(strict=False)
 dry_run = os.environ.get("TH_OC_DRY_RUN") == "1"
 
 PLUGIN_ID = "agentteams-teamharness"

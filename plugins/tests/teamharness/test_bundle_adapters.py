@@ -501,3 +501,146 @@ def test_real_install_uninstall_do_not_loosen_config_mode(tmp_path):
     assert result.returncode == 0, result.stderr
     assert hm_config.stat().st_mode & 0o777 == 0o600
     yaml.safe_load(hm_config.read_text())
+
+
+# ---------------------------------------------------------------------------
+# 10. Worker layout: the effective config target is honoured and the config
+#     symlink survives (maintainer P1 on 0614c92a)
+# ---------------------------------------------------------------------------
+
+
+def _worker_layout(tmp_path):
+    """The Worker's layout: canonical $HOME/openclaw.json with
+    $HOME/.openclaw/openclaw.json a symlink to it. Returns
+    (home, canonical, link)."""
+    home = tmp_path / "home"
+    (home / ".openclaw").mkdir(parents=True)
+    canonical = home / "openclaw.json"
+    canonical.write_text(json.dumps({"agent": {"displayName": "worker"}}) + "\n")
+    link = home / ".openclaw" / "openclaw.json"
+    link.symlink_to(canonical)
+    return home, canonical, link
+
+
+def run_worker_script(
+    script: Path, *args: str, home: Path, **worker_vars
+) -> subprocess.CompletedProcess:
+    """Adapter run against a Worker layout: HOME pinned, the OPENCLAW_*
+    resolution variables scrubbed, then the worker variables under test
+    applied."""
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    for key in ("OPENCLAW_CONFIG", "OPENCLAW_CONFIG_PATH", "OPENCLAW_WORKSPACE"):
+        env.pop(key, None)
+    env.update(worker_vars)
+    return subprocess.run(
+        ["bash", str(script), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+
+
+def test_openclaw_config_path_default_install_honours_symlink(tmp_path):
+    """OPENCLAW_CONFIG_PATH set (Worker export), OPENCLAW_CONFIG unset, no
+    --config: the canonical target gains the entry; the default-path
+    symlink survives; readback through the symlink and the canonical path
+    both show the entry; the staged root resolves under the canonical
+    config directory."""
+    home, canonical, link = _worker_layout(tmp_path)
+    result = run_worker_script(
+        OPENCLAW_ADAPTER / "install.sh", home=home, OPENCLAW_CONFIG_PATH=str(canonical)
+    )
+    assert result.returncode == 0, result.stderr
+    canonical_data = json.loads(canonical.read_text())
+    assert "teamharness" in canonical_data["mcp"]["servers"]
+    assert link.is_symlink(), "install must not replace the config symlink"
+    via_link = json.loads(link.read_text())
+    assert via_link["mcp"]["servers"]["teamharness"] == canonical_data["mcp"]["servers"]["teamharness"]
+    staged_root = canonical.parent / "plugins" / "agentteams-teamharness"
+    assert staged_root.is_dir(), "staged root must live under the canonical config directory"
+    assert str(staged_root) in canonical_data["plugins"]["load"]["paths"]
+    assert "agentteams-teamharness" in canonical_data["plugins"]["allow"]
+
+
+def test_default_fallback_without_worker_vars_writes_through_symlink(tmp_path):
+    """OPENCLAW_CONFIG_PATH and OPENCLAW_CONFIG both unset: the default
+    $HOME/.openclaw/openclaw.json (the symlink) is still written through
+    to the canonical target."""
+    home, canonical, link = _worker_layout(tmp_path)
+    result = run_worker_script(OPENCLAW_ADAPTER / "install.sh", home=home)
+    assert result.returncode == 0, result.stderr
+    assert "teamharness" in json.loads(canonical.read_text())["mcp"]["servers"]
+    assert link.is_symlink()
+
+
+def test_legacy_openclaw_config_alone_is_honoured(tmp_path):
+    """Legacy OPENCLAW_CONFIG alone (no OPENCLAW_CONFIG_PATH): honoured — a
+    symlink value is written through to its canonical target."""
+    home = tmp_path / "home"
+    home.mkdir()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    canonical = data_dir / "openclaw.json"
+    canonical.write_text("{}\n")
+    link_dir = tmp_path / "link"
+    link_dir.mkdir()
+    link = link_dir / "openclaw.json"
+    link.symlink_to(canonical)
+    result = run_worker_script(
+        OPENCLAW_ADAPTER / "install.sh", home=home, OPENCLAW_CONFIG=str(link)
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(canonical.read_text())
+    assert "teamharness" in data["mcp"]["servers"]
+    assert link.is_symlink()
+    assert str(canonical.parent / "plugins" / "agentteams-teamharness") in data["plugins"]["load"]["paths"]
+
+
+def test_openclaw_config_path_wins_over_legacy(tmp_path):
+    """Resolution priority: OPENCLAW_CONFIG_PATH beats legacy
+    OPENCLAW_CONFIG; the legacy path is left untouched."""
+    home = tmp_path / "home"
+    (home / ".openclaw").mkdir(parents=True)
+    preferred = home / "openclaw.json"
+    preferred.write_text("{}\n")
+    legacy = home / ".openclaw" / "openclaw.json"
+    legacy.write_text("{}\n")
+    result = run_worker_script(
+        OPENCLAW_ADAPTER / "install.sh",
+        home=home,
+        OPENCLAW_CONFIG_PATH=str(preferred),
+        OPENCLAW_CONFIG=str(legacy),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "teamharness" in json.loads(preferred.read_text())["mcp"]["servers"]
+    assert "mcp" not in json.loads(legacy.read_text())
+
+
+def test_uninstall_through_worker_layout_preserves_symlink(tmp_path):
+    """Install + uninstall in the Worker layout: the canonical file loses
+    exactly this adapter's keys (the seeded foreign key survives), the
+    staged root next to the canonical config is removed, and the symlink
+    survives the whole round trip."""
+    home, canonical, link = _worker_layout(tmp_path)
+    for script in (OPENCLAW_ADAPTER / "install.sh", OPENCLAW_ADAPTER / "uninstall.sh"):
+        result = run_worker_script(script, home=home, OPENCLAW_CONFIG_PATH=str(canonical))
+        assert result.returncode == 0, result.stderr
+    data = json.loads(canonical.read_text())
+    assert "teamharness" not in data.get("mcp", {}).get("servers", {})
+    assert "agentteams-teamharness" not in data.get("plugins", {}).get("entries", {})
+    assert data["agent"] == {"displayName": "worker"}
+    assert not (canonical.parent / "plugins" / "agentteams-teamharness").exists()
+    assert link.is_symlink()
+
+
+def test_adapter_scripts_pass_bash_syntax_check():
+    for script in (OPENCLAW_ADAPTER / "install.sh", OPENCLAW_ADAPTER / "uninstall.sh"):
+        result = subprocess.run(
+            ["bash", "-n", str(script)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, f"bash -n {script.name}: {result.stderr}"
