@@ -292,14 +292,28 @@ storage:
     endpoint: ""
   rustfs:
     image:
+      # Image source: the default is the upstream multi-arch image
+      # (docker.io/rustfs/rustfs), directly pullable. Deployments in
+      # China can override repository with
+      # higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/rustfs —
+      # that mirror is only pullable after `make mirror-images` has run
+      # for this release (the entry exists in hack/mirror-images.sh).
       tag: "1.0.4"
     resources: {}
     service:
       apiPort: 9000
     persistence:
+      # size sets the PVC capacity; an empty storageClassName uses the
+      # cluster's default StorageClass. The PVC is preserved across
+      # `helm upgrade` / `helm rollback`.
       enabled: true
       size: 10Gi
       storageClassName: ""
+    # PVC permissions: RustFS runs non-root (uid/gid 10001). The chart
+    # sets podSecurityContext.fsGroup (default 10001) so kubelet makes
+    # the PVC group-writable; override
+    # storage.rustfs.podSecurityContext.fsGroup when your StorageClass
+    # or backend needs a different group.
     auth:
       rootUser: rustfsadmin
       rootPassword: "<replace-with-a-strong-password>"
@@ -327,10 +341,24 @@ storage:
     # secretKey: "<your-secret-key>"
 ```
 
+预设 3 中 chart 不配置任何 PVC：外部服务的持久化、备份与保留由运维方负责。接入前的最小检查清单——bucket 已存在且凭据可管理用户与策略（controller 通过 MinIO 兼容管理 API 创建 per-worker IAM）；bucket 版本化/生命周期规则已配置；跨副本读一致性已确认；凭据有轮换计划。
+
 两个需要注意的边界：
 
-- 本地（embedded）安装固定使用内置 MinIO；本地安装选择 RustFS / 外部 S3 由配套 PR 提供，不属于本 Chart 改动。
-- 对存量安装修改这些 values 切换后端**不是数据迁移**：对象仍留在旧后端。先用 `mc mirror` 等工具搬完对象、停写，再升级——切换窗口内读写会中断。
+- **本地（embedded）安装固定使用内置 MinIO。** 本 PR 只覆盖 Helm chart。本地安装器今天没有 RustFS 或外部 S3 选项；本地外部 S3 由 #1464（open）承接，本地 RustFS 选择流程为提议中的后续 PR（见设计文档[本地安装器边界](../../design/storage-external-s3-backend.md#local-installer-boundary)）。本 PR 不使本地安装可选 RustFS。
+- **存量切换不是数据迁移。** 预设选择的是全新安装部署什么——见下方[新装选择与存量后端切换](#新装选择与存量后端切换)。
+
+#### 新装选择与存量后端切换
+
+上面的预设定义的是**全新安装**部署什么。对已运行的安装修改 `storage.provider`（或 `storage.engine`）**不是数据迁移**：对象仍留在旧后端，新后端从空开始，切换窗口内读写会中断。要切换就先自行搬完数据：
+
+1. 把每个 bucket 全量拷贝到后端（`mc mirror`，逐 bucket 执行）。
+2. 停写（缩容 Worker / 维护窗口）。
+3. 修改 values 并执行 `helm upgrade`。
+4. 验证：controller 日志显示新 provider，且一个 Worker 能通过新后端完成一次文件读写。
+5. 旧后端保留（停服、数据留存）度过回滚窗口，再退役。
+
+包含对账与目标端已写入后回滚的完整操作指南，见存储后端设计文档的[Migrating an embedded MinIO deployment to an external backend](../../design/storage-external-s3-backend.md#migrating-an-embedded-minio-deployment-to-an-external-backend)一节。
 
 ## 6. 安装 AgentTeams
 

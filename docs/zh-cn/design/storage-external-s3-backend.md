@@ -69,42 +69,54 @@ to an external backend」一节。
 
 ## 本地安装器边界
 
-本地（embedded）安装器目前固定内置 MinIO，没有 RustFS 或外部 S3 选项。
-本地安装选择 RustFS / 外部 S3 后端是配套 PR
-（`feat/install-managed-rustfs`，stack 在 #1464 之上）。本 PR 不改变
-本地安装行为。
+本地（embedded）安装器目前固定内置 MinIO，没有 RustFS 或外部 S3
+选项，本 PR（仅 chart / Helm）不改变这一点。本地外部 S3 由 #1464
+（open）承接：安装器将尊重 controller 本来就认的同一组
+`AGENTTEAMS_FS_*` 变量。本地 RustFS 选择流程（安装时可选内置
+RustFS 容器）是**提议中**的后续 PR——尚未实现，本地安装今天无法
+选择 RustFS。
 
 ## 验收
 
-对应 review 清单的证据，范围以实际执行过的为准（集群级 e2e 尚未做，
-见末尾遗留项）：
+对应 review 清单的证据，范围以本轮实际执行过的为准（2026-10-31，
+Raspberry Pi 5，aarch64，Docker，RustFS
+`docker.io/rustfs/rustfs:1.0.4`）：
 
-- **原 provider 兼容。** 默认 `minio + managed` 与 `s3`/`oss +
-  existing` 渲染路径未改动；`tests/check-helm-agentteams.sh` 既有场景
-  断言之（场景名："external S3 backend (inline credentials) renders
-  endpoint + secret, no MinIO StatefulSet, no sidecar"、"external S3
-  backend honours existingSecret + custom key names"、"s3 provider
-  failure modes fail the render with explicit errors"）。默认 values
-  的 `helm template` 输出与本 PR 前的 chart 逐字节一致。
-- **RustFS 卷权限。** chart 托管形态 = 单节点 StatefulSet + PVC
-  （`storage.rustfs.persistence.size`，默认 10Gi，`storageClassName`
-  可配）；RustFS 数据目录权限由 RustFS 自身处理。已在 Raspberry Pi 5
-  （aarch64）上对独立 RustFS 1.0.4 实例实测（2026-10-29）：controller
-  的 `mc cp/cat/rm` 全部通过，Worker FileSync 只写 RustFS，
-  Manager/Worker 重启回归通过。
-- **管理 API / 用户策略。** controller 经 `mc` 创建 bucket 与
-  per-worker 用户/策略；对 RustFS 1.0.3 验证过（既有事实，
-  `values.yaml` 注释）。per-worker 文件访问（FileSync 写/读）另在 Pi
-  实例的 1.0.4 上实测通过。
-- **文件访问。** Pi 实测：controller S3 读写 + FileSync 单写 RustFS
-  （split-brain 修复后）。
-- **重启 / 升级路径。** Pi 实测 Manager/Worker 重启回归；StatefulSet
-  PVC 跨 `helm upgrade` / `helm rollback` 保留（RustFS 数据目录不落
-  镜像）；升级前先查 RustFS 版本的数据目录兼容性（见上文升级说明）。
+- **原后端兼容。** 默认 `minio + managed` 渲染路径无 RustFS 资源
+  （`tests/check-helm-agentteams.sh` 断言），本轮 chart 改动不触及
+  默认 profile 渲染的任何模板；`oss + existing` 与 `s3 + existing`
+  渲染路径由同一 helm 测试覆盖——18 项场景断言全 PASS，含新增的
+  托管 RustFS 安全上下文断言（RustFS StatefulSet 上的
+  `fsGroup: 10001`、`fsGroupChangePolicy: OnRootMismatch`、
+  `runAsUser: 10001`、`runAsGroup: 10001`、`runAsNonRoot: true`、
+  `allowPrivilegeEscalation: false`）、默认上游镜像仓库断言与
+  fsGroup 覆盖透传断言。
+- **RustFS 卷权限。** RustFS 1.0.4 以 uid/gid 10001 运行
+  （`USER=rustfs`），镜像内 `/data` 为 `drwxr-x--- rustfs rustfs`。
+  Pi 实测：(i) 属主继承自镜像的新鲜卷正常启动——
+  `/minio/health/live` = 200，建桶与对象读写 OK；(ii) root 属主
+  `0755` 目录作数据卷（即未应用 `fsGroup` 时的默认 PVC 形态）
+  启动即 FATAL：`Server runtime failed: Io error: Permission denied
+  (os error 13)`。因此 chart 以非 root 运行 StatefulSet
+  （`runAsUser`/`runAsGroup` 10001、`runAsNonRoot: true`）并设
+  `podSecurityContext.fsGroup: 10001` +
+  `fsGroupChangePolicy: OnRootMismatch`，让 kubelet 对 PVC 应用组
+  属主（且不在每次启动递归 chown 大卷）。该修复在渲染层验证
+  （helm 断言）；真实集群 PVC 仍待 k8s 验收。
+- **管理 API / 用户策略。** Pi 实机（1.0.4）：`mc admin user add`、
+  `mc admin policy create`、`mc admin policy attach`、
+  `mc admin user list` 全部通过。
+- **文件访问。** Pi 实机（1.0.4）：`mc cp` / `mc cat` 15 字节对象
+  往返内容一致。controller 侧文件访问沿用既有 Pi 证据（controller
+  S3 读写 + Worker FileSync 单写 RustFS，1.0.4 上一轮）。
+- **重启持久化。** Pi 上 `docker restart` 后对象仍在（15 B，
+  STANDARD）。chart 形态下 StatefulSet PVC 跨 `helm upgrade` /
+  `helm rollback` 保留，RustFS 数据目录不落镜像（容器内 `/data`
+  即卷挂载）。
 
-**遗留项（如实列出）。**
+**未验（如实列出）。**
 
-- chart 托管 RustFS 的集群级 e2e（真实 `helm install` → PVC provision
-  → secret → controller wiring 全链路）待下一个集群维护窗口执行。
-- Pi 上 MinIO → RustFS 对象对账（5907 vs 5898 对象）未完成；对账
-  完成前 MinIO 不退役。
+- 真实 Kubernetes 集群端到端：`helm install` → PVC 供应 → Pod 调度
+  → controller wiring 全链路；上述卷权限修复仅在渲染层断言。
+- 多节点 RustFS。
+- NFS 生产形态下的 RustFS（见 RustFS 文档，按风险对待）。

@@ -292,14 +292,28 @@ storage:
     endpoint: ""
   rustfs:
     image:
+      # Image source: the default is the upstream multi-arch image
+      # (docker.io/rustfs/rustfs), directly pullable. Deployments in
+      # China can override repository with
+      # higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/rustfs —
+      # that mirror is only pullable after `make mirror-images` has run
+      # for this release (the entry exists in hack/mirror-images.sh).
       tag: "1.0.4"
     resources: {}
     service:
       apiPort: 9000
     persistence:
+      # size sets the PVC capacity; an empty storageClassName uses the
+      # cluster's default StorageClass. The PVC is preserved across
+      # `helm upgrade` / `helm rollback`.
       enabled: true
       size: 10Gi
       storageClassName: ""
+    # PVC permissions: RustFS runs non-root (uid/gid 10001). The chart
+    # sets podSecurityContext.fsGroup (default 10001) so kubelet makes
+    # the PVC group-writable; override
+    # storage.rustfs.podSecurityContext.fsGroup when your StorageClass
+    # or backend needs a different group.
     auth:
       rootUser: rustfsadmin
       rootPassword: "<replace-with-a-strong-password>"
@@ -327,10 +341,24 @@ storage:
     # secretKey: "<your-secret-key>"
 ```
 
+For preset 3 the chart configures no PVC: persistence, backup, and retention of the external service are operated by whoever runs the backend. Minimum checklist before pointing AgentTeams at it — the bucket exists and the credentials can manage users and policies (the controller creates per-worker IAM through the MinIO-compatible admin API); bucket versioning / lifecycle rules are configured; cross-replica read consistency is understood; a credential rotation plan exists.
+
 Two boundaries to keep in mind:
 
-- Local (embedded) installations are fixed to the built-in MinIO; the RustFS / external-S3 selection for local installs ships in a companion PR and is not part of this chart change.
-- Switching the backend of an existing installation by editing these values is **not a data migration**: the objects stay on the old backend. Copy them over first (e.g. `mc mirror`), stop the writes, then upgrade — read/write is interrupted for the switch window.
+- **Local (embedded) installs are fixed to the built-in MinIO.** This PR is chart (Helm) only. The local installer today has no RustFS or external-S3 selection; local external S3 is tracked in #1464 (open), and the local RustFS selection flow is a proposed follow-up PR (see [Local installer boundary](../../design/storage-external-s3-backend.md#local-installer-boundary) in the design doc). This PR does not make local installs able to select RustFS.
+- **Switching an existing backend is not a data migration.** The presets choose what a fresh installation deploys — see [Fresh installs vs. switching an existing backend](#fresh-installs-vs-switching-an-existing-backend) below.
+
+#### Fresh installs vs. switching an existing backend
+
+The presets above define what a **fresh** installation deploys. Changing `storage.provider` (or `storage.engine`) on a running installation is **not a data migration**: the objects stay on the old backend, the new backend starts empty, and reads/writes are interrupted for the switch window. If you need to switch, move the data yourself first:
+
+1. Bulk-copy every bucket to the new backend (`mc mirror`, one per bucket).
+2. Stop writes (scale the Workers down / maintenance window).
+3. Change the values and run `helm upgrade`.
+4. Verify: the controller log shows the new provider, and one Worker round-trips a file through it.
+5. Keep the old backend (stopped, data retained) for the rollback window before decommissioning it.
+
+The full operational guide, including reconciliation and rollback after writes have begun on the target, is [Migrating an embedded MinIO deployment to an external backend](../../design/storage-external-s3-backend.md#migrating-an-embedded-minio-deployment-to-an-external-backend) in the storage backend design doc.
 
 ## 6. Install AgentTeams
 
