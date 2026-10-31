@@ -13,9 +13,11 @@ set -euo pipefail
 #      unset). There is no cwd field in hermes's MCP entry shape, so the
 #      absolute script path is used; server.py imports its sibling modules
 #      from its own directory, which works from any cwd.
-#   2. The plugin (plugin.yaml + register.py + the bundle's skills tree) is
-#      synced into ~/.hermes/plugins/agentteams-teamharness/ — the upstream
-#      third-party plugin location (directory scan in hermes_cli/plugins.py).
+#   2. The plugin (__init__.py + plugin.yaml + register.py + the bundle's
+#      skills tree) is synced into ~/.hermes/plugins/agentteams-teamharness/ —
+#      the upstream third-party plugin location. __init__.py is required:
+#      hermes_cli/plugins.py's directory loader raises "No __init__.py" and
+#      disables the plugin without it.
 #
 # Idempotent: the YAML is dumped canonically (sorted keys), files are only
 # rewritten when the bytes would change, so two consecutive runs are

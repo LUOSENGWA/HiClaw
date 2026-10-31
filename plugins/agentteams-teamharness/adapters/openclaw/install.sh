@@ -9,16 +9,16 @@ set -euo pipefail
 #      (command: python3 -m mcp.server, cwd: <bundle root>, env carries a
 #      ${TEAMHARNESS_RUNTIME_CONFIG} reference — the variable name, never a
 #      value; OpenClaw expands ${VAR} over the whole parsed config).
-#   2. plugins.allow / plugins.load.paths / plugins.entries -> registers this
-#      plugin directory (same shape the repo's openclaw-cms-plugin uses).
-#      The adapter directory itself is the staged plugin root: the pinned
-#      runtime discovers it through plugins.load.paths and loads its index.mjs
-#      entry (see that file for the discovery contract). install.sh
-#      pre-checks the entry's presence but never copies or generates plugin
-#      files — the manifest and the entry ship with the bundle.
-#   3. openclaw.plugin.json "skills" -> synced to the bundle's actual skill
-#      roots (skills/<root>/<skill>/SKILL.md), relative to the plugin root;
-#      an empty array when the bundle ships no skills.
+#   2. A self-contained plugin root is staged next to the runtime config --
+#      <config dir>/plugins/agentteams-teamharness/ -- from the adapter
+#      directory: index.mjs, openclaw.plugin.json (skills rewritten to in-root
+#      paths) and a copy of the bundle's skills/ tree. The bare adapter
+#      directory is never registered: OpenClaw rejects a manifest skill path
+#      that escapes the plugin root, and it also expects the plugin root to be
+#      owned by the runtime user (staging satisfies both).
+#   3. plugins.allow / plugins.load.paths / plugins.entries -> register that
+#      staged root (plugins.load.paths carries it; an older install's bare
+#      adapter path is removed). Uninstall removes the staged root again.
 #
 # Idempotent: canonical serialization (sorted keys, 2-space indent) means two
 # consecutive runs produce byte-identical output; the file is only rewritten

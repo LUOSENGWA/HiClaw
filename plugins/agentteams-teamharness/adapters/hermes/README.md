@@ -14,7 +14,7 @@ Target: `~/.hermes/config.yaml` (or `$HERMES_HOME/config.yaml`; override with
 | Key | Value |
 |-----|-------|
 | `mcp_servers.teamharness` | `{command: python3, args: [<bundle root>/mcp/server.py], env: {TEAMHARNESS_RUNTIME_CONFIG: "${TEAMHARNESS_RUNTIME_CONFIG}"}}` |
-| `~/.hermes/plugins/agentteams-teamharness/` | `plugin.yaml` + `register.py` + the bundle's `skills/` tree, synced byte-for-byte |
+| `~/.hermes/plugins/agentteams-teamharness/` | `__init__.py` (the directory-plugin entry the loader requires) + `plugin.yaml` + `register.py` + the bundle's `skills/` tree, synced byte-for-byte |
 
 `register(ctx)` (called by the hermes plugin loader) registers the bundle's
 skills via `ctx.register_skill(name, path)` and does **not** register the MCP

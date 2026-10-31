@@ -2,18 +2,25 @@
 
 Projects the bundle contract (`../../contract.yaml`) onto the OpenClaw
 runtime, statically. After `install.sh`, the TeamHarness MCP server is
-declared in the OpenClaw runtime configuration and this plugin directory is
-registered as a loadable plugin; no runtime code executes at install time.
+declared in the OpenClaw runtime configuration and a **self-contained plugin
+root is staged next to that configuration** — `<config dir>/plugins/
+agentteams-teamharness/` — then registered via `plugins.load.paths`; no
+runtime code executes at install time. With the default config that is
+`~/.openclaw/plugins/agentteams-teamharness/`; with `--config <path>` it is
+`<path's parent>/plugins/agentteams-teamharness/`. The bundle's adapter
+directory itself is **not** registered: its `skills/` live outside it, and
+OpenClaw rejects a manifest skill path that escapes the plugin root.
 
-This directory **is** the OpenClaw plugin root (registered via
-`plugins.load.paths`):
+The staged root contains:
 
-- `index.mjs` — the loadable plugin entry that native discovery loads (see
-  below).
-- `openclaw.plugin.json` — plugin manifest (id, name, version, configSchema,
-  skills).
-- `install.sh` / `uninstall.sh` — black-box scripts that project the runtime
-  configuration and manage the plugin registration, respectively.
+- `index.mjs` — the loadable plugin entry that native discovery loads
+  (copied from the adapter directory).
+- `openclaw.plugin.json` — plugin manifest (id, name, version, configSchema)
+  with `skills` rewritten to **in-root** paths (`skills/<root>/<skill>`).
+- `skills/` — the bundle's skills tree, copied in, so every manifest entry
+  stays inside the plugin root.
+- `install.sh` / `uninstall.sh` — black-box scripts that stage/remove that
+  root and project the runtime configuration.
 
 ### Loadable entry (`index.mjs`)
 
@@ -41,18 +48,19 @@ Target: `~/.openclaw/openclaw.json` (override with `--config <path>` or
 |-----|-------|
 | `mcp.servers.teamharness` | `{command: python3, args: ["-m", "mcp.server"], cwd: <bundle root>, env: {TEAMHARNESS_RUNTIME_CONFIG: "${TEAMHARNESS_RUNTIME_CONFIG}"}}` |
 | `plugins.allow` | `+ "agentteams-teamharness"` (deduplicated) |
-| `plugins.load.paths` | `+ <this adapter directory>` (deduplicated) |
+| `plugins.load.paths` | `+ <config dir>/plugins/agentteams-teamharness` (the staged root; deduplicated, and the bare adapter directory is removed if an older install registered it) |
 | `plugins.entries.agentteams-teamharness.enabled` | `true` |
-| `openclaw.plugin.json` `skills` | synced to the bundle's actual skill roots (`skills/<root>/<skill>`, each a directory containing `SKILL.md`), relative to this plugin directory; `[]` when the bundle ships no skills |
+| `openclaw.plugin.json` `skills` (staged copy) | the bundle's actual skill roots as **in-root** paths (`skills/<root>/<skill>`, each a directory containing `SKILL.md`); `[]` when the bundle ships no skills |
 
-`install.sh` also pre-checks that `index.mjs` exists in this directory and
-fails fast when the bundle is incomplete. `--workspace <path>` is accepted
+`install.sh` pre-checks that `index.mjs` exists in the adapter directory,
+stages the root, and only then registers it. `--workspace <path>` is accepted
 for isolated runs (the directory is created if absent); the registration is
 absolute-path based and does not depend on the workspace.
 
 The MCP entry is a *static projection*: `python3 -m mcp.server` with
-`cwd` = bundle root (the `mcp/` package has no `__init__.py`, so the module
-path resolves from the bundle root). `TEAMHARNESS_RUNTIME_CONFIG` is written
+`cwd` = bundle root. The `mcp/` directory now carries an explicit
+`__init__.py` (a regular package, so `import mcp.server` can never resolve to
+the pip-installed MCP SDK instead of this bundle). `TEAMHARNESS_RUNTIME_CONFIG` is written
 as a `${VAR}` reference — the variable name, never a value. OpenClaw expands
 `${VAR}` over the whole parsed configuration; an unset variable degrades to a
 warning and keeps the placeholder, it does not crash the worker.
@@ -116,11 +124,11 @@ under keys ending in `token`, `secret`, `password`, `passwd`, `apikey`, or
    `unwrapDefaultModuleExport`); both the directory scan and
    `plugins.load.paths` resolve this same directory, so both register the
    same plugin id.
-3. **`skills` paths use `../../`** (plugin root is `adapters/openclaw`,
-   skills live at the bundle root). OpenClaw's path handling for out-of-root
-   skill directories is not documented at the pinned commit; install.sh
-   keeps the manifest in sync with the bundle so no fabricated entries
-   exist.
+3. **The plugin root is the staged directory, not the adapter directory.**
+   OpenClaw rejects a manifest skill path that escapes the plugin root, so
+   `install.sh` copies the skills into `<config dir>/plugins/
+   agentteams-teamharness/skills/` and rewrites the manifest to in-root
+   paths.
 4. **`commands.mcp` is not set** — it only enables the chat `/mcp` command;
    server availability does not depend on it.
 
@@ -149,12 +157,10 @@ otherwise.
 - **Install** — run `install.sh`; safe to re-run (byte-identical).
 - **Upgrade** — update the bundle, re-run `install.sh`; the MCP entry and
   manifest skills are re-projected, plugin registration is a no-op.
-- **Uninstall** — `uninstall.sh` removes only this adapter's configuration
-  keys (MCP entry, `plugins.allow` / `plugins.load.paths` /
-  `plugins.entries`); other entries in openclaw.json are preserved. Unlike
-  the Hermes adapter (which stages a copy into `~/.hermes/plugins/`), this
-  adapter registers its own directory in place, so there are no staged
-  copies to remove — the bundle source files (`index.mjs`,
-  `openclaw.plugin.json`) are never touched.
+- **Uninstall** — `uninstall.sh` removes this adapter's configuration keys
+  (MCP entry, `plugins.allow` / `plugins.load.paths` / `plugins.entries`) and
+  deletes the staged plugin root (`<config dir>/plugins/
+  agentteams-teamharness/`); other entries in openclaw.json are preserved,
+  and the bundle source files are never touched.
 - **Reload** — the OpenClaw worker picks up the configuration on its next
   start.
