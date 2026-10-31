@@ -53,15 +53,26 @@ StatefulSet PVC 上，升级保留（升级前确认 RustFS 版本的数据目�
 
 对已运行的安装修改 `storage.provider`（或 `storage.engine`）**不是数据
 迁移**：对象仍留在旧后端，新后端从空开始，切换窗口内的所有读写都会
-中断。切换前需要自行搬完对象，再改 values。最小步骤：
+中断。先冻结安装、再在冻结期间做全量复制（若无法为整个复制过程保持
+冻结，则下文的最终追平为必需）。最小步骤：
 
-1. 把每个 bucket 全量拷贝到目标（`mc mirror --overwrite --remove
-   src/<bucket> dst/<bucket>`，逐 bucket 执行）。
-2. 停写（缩容 Worker / 维护窗口）。
-3. 修改 values（`storage.provider`、`storage.engine`、endpoint、
-   凭据）并执行 `helm upgrade`。
-4. 验证：controller 日志显示新的 provider，且一个 Worker 能通过新
-   后端完成一次文件读写。
+1. 停写（冻结）：停**全部**写者——缩容 Worker（维护窗口）**并且**停
+   manager 文件同步（它将 `/root/manager-workspace/` mirror 到
+   `<prefix>manager/`）；记录冻结开始时间。
+2. 把每个 bucket 全量复制到目标（`mc mirror --overwrite --remove
+   src/<bucket> dst/<bucket>`，逐 bucket 执行），并记录基线（每
+   bucket 的对象数 + 总大小）。
+3. 在目标重放 IAM：重建 per-worker 用户与策略（精确的 `mc admin`
+   命令见英文版的 runbook 一节）。
+4. 切换（cutover）：修改 values（`storage.provider`、`storage.engine`、
+   endpoint、凭据）并执行 `helm upgrade`。
+5. 验证：controller 日志显示新的 provider，一个 Worker 通过新后端完成
+   一次文件读写，且每 bucket 的对象数/总大小与基线一致。
+6. 旧后端保留（停服、数据留存）作为回滚窗口，度过后再退役。
+
+若无法为全量复制全程维持冻结：可在冻结前先做一次全量复制，但**停写
+之后、切换之前必须重跑一次复制做最终追平，并与冻结后的源对账**——首
+次复制到停写之间新建/更新的对象只能靠这次最终追平保留。
 
 本 PR 不实现、也不测试切换本身——它不在本 PR 范围内。包含对账和回滚
 的完整操作指南见英文版下方的「Migrating an embedded MinIO deployment

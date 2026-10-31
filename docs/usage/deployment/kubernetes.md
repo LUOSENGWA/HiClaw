@@ -350,13 +350,16 @@ Two boundaries to keep in mind:
 
 #### Fresh installs vs. switching an existing backend
 
-The presets above define what a **fresh** installation deploys. Changing `storage.provider` (or `storage.engine`) on a running installation is **not a data migration**: the objects stay on the old backend, the new backend starts empty, and reads/writes are interrupted for the switch window. If you need to switch, move the data yourself first:
+The presets above define what a **fresh** installation deploys. Changing `storage.provider` (or `storage.engine`) on a running installation is **not a data migration**: the objects stay on the old backend, the new backend starts empty, and reads/writes are interrupted for the switch window. If you need to switch, freeze the installation first and bulk-copy while it is frozen (if you cannot hold the freeze for the whole copy, the final catch-up below is mandatory):
 
-1. Bulk-copy every bucket to the new backend (`mc mirror`, one per bucket).
-2. Stop writes (scale the Workers down / maintenance window).
-3. Change the values and run `helm upgrade`.
-4. Verify: the controller log shows the new provider, and one Worker round-trips a file through it.
-5. Keep the old backend (stopped, data retained) for the rollback window before decommissioning it.
+1. Freeze writes: stop **all** writers — scale the Workers down (maintenance window) **and** stop the manager's file sync (it mirrors `/root/manager-workspace/` to `<prefix>manager/`); record the freeze start time.
+2. Bulk-copy every bucket to the new backend (`mc mirror`, one per bucket) and record a baseline per bucket (object count + total size).
+3. Replay IAM on the new backend: recreate the per-worker users and policies (the runbook linked below has the exact `mc admin` commands).
+4. Cutover: change the values (`storage.provider` / `storage.engine`, endpoint, credentials) and run `helm upgrade`.
+5. Verify: the controller log shows the new provider, one Worker round-trips a file through the new backend, and the per-bucket counts/sizes match the baseline.
+6. Keep the old backend (stopped, data retained) as the rollback window before decommissioning it.
+
+If you cannot hold the freeze for the entire bulk copy, you may run an initial copy before the freeze — but you **must** then re-run the copy after writes stop and before cutover as a **final catch-up**, and reconcile it against the frozen source: objects created or updated between the first copy and the freeze are preserved only by that final catch-up.
 
 The full operational guide, including reconciliation and rollback after writes have begun on the target, is [Migrating an embedded MinIO deployment to an external backend](../../design/storage-external-s3-backend.md#migrating-an-embedded-minio-deployment-to-an-external-backend) in the storage backend design doc.
 

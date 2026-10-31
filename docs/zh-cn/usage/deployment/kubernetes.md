@@ -350,13 +350,16 @@ storage:
 
 #### 新装选择与存量后端切换
 
-上面的预设定义的是**全新安装**部署什么。对已运行的安装修改 `storage.provider`（或 `storage.engine`）**不是数据迁移**：对象仍留在旧后端，新后端从空开始，切换窗口内读写会中断。要切换就先自行搬完数据：
+上面的预设定义的是**全新安装**部署什么。对已运行的安装修改 `storage.provider`（或 `storage.engine`）**不是数据迁移**：对象仍留在旧后端，新后端从空开始，切换窗口内读写会中断。要切换就先冻结安装、再在冻结期间做全量复制（若无法为整个复制过程保持冻结，则下文的最终追平为必需）：
 
-1. 把每个 bucket 全量拷贝到后端（`mc mirror`，逐 bucket 执行）。
-2. 停写（缩容 Worker / 维护窗口）。
-3. 修改 values 并执行 `helm upgrade`。
-4. 验证：controller 日志显示新 provider，且一个 Worker 能通过新后端完成一次文件读写。
-5. 旧后端保留（停服、数据留存）度过回滚窗口，再退役。
+1. 停写（冻结）：停**全部**写者——缩容 Worker（维护窗口）**并且**停 manager 文件同步（它将 `/root/manager-workspace/` mirror 到 `<prefix>manager/`）；记录冻结开始时间。
+2. 把每个 bucket 全量复制到新后端（`mc mirror`，逐 bucket 执行），并记录基线（每 bucket 的对象数 + 总大小）。
+3. 在新后端重放 IAM：重建 per-worker 用户与策略（精确的 `mc admin` 命令见下方链接的 runbook）。
+4. 切换（cutover）：修改 values（`storage.provider` / `storage.engine`、endpoint、凭据）并执行 `helm upgrade`。
+5. 验证：controller 日志显示新 provider，一个 Worker 通过新后端完成一次文件读写，且每 bucket 的对象数/总大小与基线一致。
+6. 旧后端保留（停服、数据留存）作为回滚窗口，度过后再退役。
+
+若无法为全量复制全程维持冻结：可在冻结前先做一次全量复制，但**停写之后、切换之前必须重跑一次复制做最终追平，并与冻结后的源对账**——首次复制到停写之间新建/更新的对象只能靠这次最终追平保留。
 
 包含对账与目标端已写入后回滚的完整操作指南，见存储后端设计文档的[Migrating an embedded MinIO deployment to an external backend](../../design/storage-external-s3-backend.md#migrating-an-embedded-minio-deployment-to-an-external-backend)一节。
 

@@ -119,16 +119,34 @@ not a migration mechanism.
 Changing `storage.provider` (or `storage.engine`) on an already running
 installation is **not a data migration**: the objects stay on the old
 backend, the new backend starts empty, and every read and write is
-interrupted for the duration of the switch window. Move the objects
-yourself before flipping the values, then switch. Minimal sequence:
+interrupted for the duration of the switch window. Freeze the
+installation first, then bulk-copy while it is frozen (if you cannot
+hold the freeze for the whole copy, the final catch-up below is
+mandatory). Minimal sequence:
 
-1. Bulk-copy every bucket to the target (`mc mirror --overwrite
-   --remove src/<bucket> dst/<bucket>`, one per bucket).
-2. Stop writes (scale the Workers down / maintenance window).
-3. Change the values (`storage.provider`, `storage.engine`, endpoint,
-   credentials) and run `helm upgrade`.
-4. Verify: the controller log shows the new provider, and one Worker
-   round-trips a file through the new backend.
+1. Freeze writes: stop **all** writers — scale the Workers down
+   (maintenance window) **and** stop the manager's file sync (it
+   mirrors `/root/manager-workspace/` to `<prefix>manager/`); record the
+   freeze start time.
+2. Bulk-copy every bucket to the target (`mc mirror --overwrite
+   --remove src/<bucket> dst/<bucket>`, one per bucket) and record a
+   baseline per bucket (object count + total size).
+3. Replay IAM on the target: recreate the per-worker users and
+   policies (the runbook below has the exact `mc admin` commands).
+4. Cutover: change the values (`storage.provider`, `storage.engine`,
+   endpoint, credentials) and run `helm upgrade`.
+5. Verify: the controller log shows the new provider, one Worker
+   round-trips a file through the new backend, and the per-bucket
+   counts/sizes match the baseline.
+6. Keep the old backend (stopped, data retained) as the rollback
+   window before decommissioning it.
+
+If you cannot hold the freeze for the entire bulk copy, you may run an
+initial copy before the freeze — but you **must** then re-run the copy
+after writes stop and before cutover as a **final catch-up**, and
+reconcile it against the frozen source: objects created or updated
+between the first copy and the freeze are preserved only by that final
+catch-up.
 
 This PR does not implement or test the switch itself — it is out of
 scope for this PR. The full operational guide with reconciliation and
@@ -236,7 +254,7 @@ Two reproducible layers:
 ### Phase overview
 
 ```
-0. freeze window         stop worker writes (scale down workers / maintenance mode)
+0. freeze window         stop ALL writers: scale down workers AND stop the manager file sync
 1. bulk copy             copy all objects source → target (mc mirror); capture the baseline manifest
 2. IAM replay            recreate users/policies on target (mc admin)
 3. shadow                re-enable workers pointed at target; source stays read-only
@@ -244,6 +262,13 @@ Two reproducible layers:
 5. cutover               flip AgentTeams to provider=s3 — no blanket source → target copy
 6. (if broken)           rollback — see below
 ```
+
+Phase 0 must freeze **all** writers to the bucket: scale the workers
+down **and** stop the manager's file sync (it mirrors
+`/root/manager-workspace/` to `<prefix>manager/`). Any writer left
+running will surface as a baseline drift in phase 4 — treat a diff
+there as a freeze breach that must be reconciled per key before
+cutover.
 
 **The one rule that matters:** once shadow starts, the target is the write
 authority and the source is read-only. A blanket `mc mirror --overwrite
