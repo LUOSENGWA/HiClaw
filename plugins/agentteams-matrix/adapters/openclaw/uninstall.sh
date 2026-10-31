@@ -23,8 +23,15 @@
 # Usage:
 #   uninstall.sh [--config <path>] [--dry-run]
 #
-#   --config <path>   target config file
-#                     (default: $HOME/.openclaw/openclaw.json)
+#   --config <path>   target config file. Without it, the runtime's
+#                     effective config is resolved in order:
+#                     $OPENCLAW_CONFIG_PATH (exported by the Worker
+#                     entrypoint), then the legacy $OPENCLAW_CONFIG,
+#                     then $HOME/.openclaw/openclaw.json. A selected
+#                     path that is a symlink is followed to its
+#                     canonical target, which the read and the atomic
+#                     write both operate on — the link itself is never
+#                     replaced by a regular file.
 #   --dry-run         print the resulting JSON to stdout, write nothing
 set -euo pipefail
 
@@ -32,7 +39,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUNDLE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export AGENTTEAMS_BUNDLE_DIR="${AGENTTEAMS_BUNDLE_DIR:-$BUNDLE_DIR}"
 
-CONFIG_PATH="${HOME}/.openclaw/openclaw.json"
+CONFIG_PATH=""
 DRY_RUN=0
 
 usage() {
@@ -40,8 +47,12 @@ usage() {
 Usage: uninstall.sh [--config <path>] [--dry-run]
 
 Removes the agentteams-matrix keys from channels.matrix in the OpenClaw
-config file (default: $HOME/.openclaw/openclaw.json). Foreign keys and
-the config file itself are preserved.
+config file. Without --config the effective config is resolved in
+order: $OPENCLAW_CONFIG_PATH (exported by the Worker entrypoint), then
+the legacy $OPENCLAW_CONFIG, then $HOME/.openclaw/openclaw.json. A
+selected path that is a symlink is followed to its canonical target;
+the link itself is never replaced. Foreign keys and the config file
+itself are preserved.
 EOF
 }
 
@@ -71,6 +82,21 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Effective config target: explicit --config wins, then the runtime's
+# config-path environment (the real Worker entrypoint exports
+# OPENCLAW_CONFIG_PATH pointing at the canonical $HOME/openclaw.json,
+# leaving $HOME/.openclaw/openclaw.json as a symlink to it), then the
+# legacy variable, then the normal default.
+if [ -z "${CONFIG_PATH}" ]; then
+  if [ -n "${OPENCLAW_CONFIG_PATH:-}" ]; then
+    CONFIG_PATH="${OPENCLAW_CONFIG_PATH}"
+  elif [ -n "${OPENCLAW_CONFIG:-}" ]; then
+    CONFIG_PATH="${OPENCLAW_CONFIG}"
+  else
+    CONFIG_PATH="${HOME}/.openclaw/openclaw.json"
+  fi
+fi
+
 CONTRACT_PATH="${AGENTTEAMS_BUNDLE_DIR}/contract.yaml"
 if [ ! -f "${CONTRACT_PATH}" ]; then
   echo "ERROR: bundle contract not found at ${CONTRACT_PATH}; set AGENTTEAMS_BUNDLE_DIR to the agentteams-matrix bundle directory" >&2
@@ -88,6 +114,15 @@ from pathlib import Path
 config_path = Path(sys.argv[1])
 contract_path = Path(sys.argv[2])
 dry_run = sys.argv[3] == "1"
+
+# The selected path may itself be a symlink (the Worker entrypoint
+# ships $HOME/.openclaw/openclaw.json as a link to the canonical
+# $HOME/openclaw.json): operate on the canonical target so the owned
+# keys are removed from the target and the link itself is never
+# replaced. strict=False also resolves a dangling link to its
+# intended target.
+if config_path.is_symlink():
+    config_path = config_path.resolve()
 
 CREDENTIAL_SUFFIXES = ("token", "secret", "password", "passwd", "apikey", "credentials")
 REDACTED = "<redacted>"

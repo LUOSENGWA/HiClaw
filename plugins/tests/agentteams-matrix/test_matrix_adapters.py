@@ -63,7 +63,9 @@ capability gate.
 
 import json
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -770,6 +772,220 @@ def test_openclaw_uninstall_missing_contract_fails(tmp_path):
     assert json.loads(config_path.read_text(encoding="utf-8")) == {
         "channels": {"matrix": {"enabled": True}}
     }
+
+
+OLD_HOMESERVER = "https://matrix.stale.example"
+
+
+class TestOpenclawEffectiveConfig:
+    """The real Worker entrypoint layout: the canonical config is
+    $HOME/openclaw.json and $HOME/.openclaw/openclaw.json is a symlink
+    to it, with OPENCLAW_CONFIG_PATH=$HOME/openclaw.json exported. The
+    adapter must operate on the runtime's *effective* config target
+    (explicit --config, then OPENCLAW_CONFIG_PATH, then the legacy
+    OPENCLAW_CONFIG, then the normal default) and must never replace a
+    symlink with a regular file — the write goes through the link to
+    the canonical target.
+    """
+
+    def _worker_layout(self, tmp_path: Path) -> tuple[Path, Path]:
+        """Canonical $HOME/openclaw.json holding a stale homeserver,
+        plus the $HOME/.openclaw/openclaw.json symlink to it. Returns
+        (canonical, link)."""
+        canonical = tmp_path / "openclaw.json"
+        canonical.write_text(
+            json.dumps(
+                {"channels": {"matrix": {"homeserver": OLD_HOMESERVER}}},
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        link_dir = tmp_path / ".openclaw"
+        link_dir.mkdir()
+        link = link_dir / "openclaw.json"
+        link.symlink_to(canonical)
+        return canonical, link
+
+    def _worker_env(self, tmp_path: Path, canonical: Path) -> dict:
+        """The Worker's environment: OPENCLAW_CONFIG_PATH at the
+        canonical file, legacy OPENCLAW_CONFIG unset."""
+        env = _env(tmp_path)
+        env["OPENCLAW_CONFIG_PATH"] = str(canonical)
+        env.pop("OPENCLAW_CONFIG", None)
+        return env
+
+    def test_default_call_writes_through_worker_symlink(self, tmp_path):
+        """Default call (no --config): OPENCLAW_CONFIG_PATH selects the
+        canonical file; the projection lands there, the symlink
+        survives, and reading through the link (the native readback)
+        returns the new value."""
+        specs = ADAPTERS["openclaw"]
+        canonical, link = self._worker_layout(tmp_path)
+        env = self._worker_env(tmp_path, canonical)
+
+        result = _run(specs["install"], [], env)
+        assert result.returncode == 0, result.stderr
+
+        block = _load_file("openclaw", canonical)["channels"]["matrix"]
+        for key, value in _expected_projection("openclaw").items():
+            assert block[key] == value
+        assert block["homeserver"] == CONTRACT_MATRIX["homeserver"]
+
+        # The link was written through, not replaced by a regular file.
+        assert link.is_symlink()
+        assert os.readlink(link) == str(canonical)
+        assert (
+            _load_file("openclaw", link)["channels"]["matrix"]["homeserver"]
+            == CONTRACT_MATRIX["homeserver"]
+        )
+
+    def test_default_symlink_path_written_through_when_env_unset(self, tmp_path):
+        """Same layout with OPENCLAW_CONFIG_PATH unset: the normal
+        default ($HOME/.openclaw/openclaw.json) is selected — it is the
+        symlink — and the write still goes through it."""
+        specs = ADAPTERS["openclaw"]
+        canonical, link = self._worker_layout(tmp_path)
+        env = _env(tmp_path)
+        env.pop("OPENCLAW_CONFIG_PATH", None)
+        env.pop("OPENCLAW_CONFIG", None)
+
+        result = _run(specs["install"], [], env)
+        assert result.returncode == 0, result.stderr
+
+        assert (
+            _load_file("openclaw", canonical)["channels"]["matrix"]["homeserver"]
+            == CONTRACT_MATRIX["homeserver"]
+        )
+        assert link.is_symlink()
+        assert os.readlink(link) == str(canonical)
+        assert (
+            _load_file("openclaw", link)["channels"]["matrix"]["homeserver"]
+            == CONTRACT_MATRIX["homeserver"]
+        )
+
+    def test_explicit_config_symlink_preserved(self, tmp_path):
+        """Explicit --config pointing at the symlink wins over the
+        environment: written through, link intact."""
+        specs = ADAPTERS["openclaw"]
+        canonical, link = self._worker_layout(tmp_path)
+        env = self._worker_env(tmp_path, canonical)
+
+        result = _run(specs["install"], ["--config", str(link)], env)
+        assert result.returncode == 0, result.stderr
+
+        assert (
+            _load_file("openclaw", canonical)["channels"]["matrix"]["homeserver"]
+            == CONTRACT_MATRIX["homeserver"]
+        )
+        assert link.is_symlink()
+        assert os.readlink(link) == str(canonical)
+
+    def test_legacy_openclaw_config_env_honoured(self, tmp_path):
+        """Legacy OPENCLAW_CONFIG alone (no OPENCLAW_CONFIG_PATH) still
+        selects its path (backward compatibility)."""
+        specs = ADAPTERS["openclaw"]
+        legacy = tmp_path / "legacy-openclaw.json"
+        legacy.write_text(
+            json.dumps(
+                {"channels": {"matrix": {"homeserver": OLD_HOMESERVER}}},
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        env = _env(tmp_path)
+        env.pop("OPENCLAW_CONFIG_PATH", None)
+        env["OPENCLAW_CONFIG"] = str(legacy)
+
+        result = _run(specs["install"], [], env)
+        assert result.returncode == 0, result.stderr
+
+        assert (
+            _load_file("openclaw", legacy)["channels"]["matrix"]["homeserver"]
+            == CONTRACT_MATRIX["homeserver"]
+        )
+        # The normal default was not touched.
+        assert not (tmp_path / ".openclaw" / "openclaw.json").exists()
+
+    def test_uninstall_with_worker_layout(self, tmp_path):
+        """Install then uninstall under the Worker layout: the owned
+        keys are removed from the canonical file, the symlink stays
+        intact."""
+        specs = ADAPTERS["openclaw"]
+        canonical, link = self._worker_layout(tmp_path)
+        env = self._worker_env(tmp_path, canonical)
+
+        result = _run(specs["install"], [], env)
+        assert result.returncode == 0, result.stderr
+        result = _run(specs["uninstall"], [], env)
+        assert result.returncode == 0, result.stderr
+
+        config = _load_file("openclaw", canonical)
+        assert "channels" not in config
+        assert link.is_symlink()
+        assert os.readlink(link) == str(canonical)
+
+    def test_dry_run_changes_nothing(self, tmp_path):
+        """--dry-run under the Worker layout: the canonical bytes are
+        unchanged and the symlink is intact, while stdout still carries
+        the projection."""
+        specs = ADAPTERS["openclaw"]
+        canonical, link = self._worker_layout(tmp_path)
+        env = self._worker_env(tmp_path, canonical)
+        before = canonical.read_bytes()
+
+        result = _run(specs["install"], ["--dry-run"], env)
+        assert result.returncode == 0, result.stderr
+
+        preview = json.loads(result.stdout)
+        assert (
+            preview["channels"]["matrix"]["homeserver"]
+            == CONTRACT_MATRIX["homeserver"]
+        )
+        assert canonical.read_bytes() == before
+        assert link.is_symlink()
+        assert os.readlink(link) == str(canonical)
+
+    def test_bundle_installer_detects_openclaw_via_config(self, tmp_path):
+        """Entrypoint: no runtime binary on PATH and no config at the
+        normal default — only the Worker's OPENCLAW_CONFIG_PATH is
+        set, so the package installer must detect OpenClaw through its
+        effective config and project the canonical file."""
+        canonical = tmp_path / "openclaw.json"
+        canonical.write_text(
+            json.dumps(
+                {"channels": {"matrix": {"homeserver": OLD_HOMESERVER}}},
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        env = self._worker_env(tmp_path, canonical)
+        # The adapter payload runs `python3` with pyyaml. Wrap this very
+        # interpreter (which has pyyaml) in a private bin dir, keeping
+        # its own directory — which may hold runtime binaries such as
+        # qwenpaw — off PATH.
+        interpreter = sys.executable or shutil.which("python3")
+        assert interpreter, "no python3 interpreter for the subprocess PATH"
+        wrapper = bin_dir / "python3"
+        wrapper.write_text(f"#!/bin/sh\nexec {interpreter} \"$@\"\n", encoding="utf-8")
+        wrapper.chmod(0o755)
+        env["PATH"] = f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin"
+        for name in ("qwenpaw", "openclaw", "hermes"):
+            assert shutil.which(name, path=env["PATH"]) is None
+
+        result = _run(BUNDLE_INSTALL, [], env)
+        assert result.returncode == 0, result.stderr
+
+        block = _load_file("openclaw", canonical)["channels"]["matrix"]
+        for key, value in _expected_projection("openclaw").items():
+            assert block[key] == value
 
 
 def _make_fake_runtime(bin_dir: Path, name: str, version: str = "") -> None:
