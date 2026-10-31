@@ -91,10 +91,14 @@ storage:
 
 The controller is wired to the in-chart RustFS automatically
 (`AGENTTEAMS_FS_ENDPOINT=http://<release>-rustfs:9000`, credentials via
-secretKeyRef). `storage.engine=rustfs` fails the render when combined
-with `storage.provider=minio`/`oss` or `storage.mode=existing`;
-explicitly setting `storage.s3.endpoint` switches the endpoint back to
-that external value.
+secretKeyRef). `storage.engine=rustfs` is mutually exclusive with an
+external endpoint: the render fails when the engine is combined with
+`storage.provider=minio`/`oss`, with `storage.mode=existing`, or with a
+non-empty `storage.s3.endpoint` — the managed engine deploys its own
+in-cluster RustFS and the endpoint is always derived from the in-chart
+StatefulSet. To point the controller at an external S3/RustFS instead,
+use `storage.engine=external` (the default) + `storage.mode=existing` +
+`storage.s3.endpoint=<your endpoint>`.
 
 **Version pinning.** Like MinIO, the RustFS image tag is pinned per
 AgentTeams release.
@@ -105,6 +109,81 @@ Data lives on the StatefulSet PVC and is preserved across upgrades
 
 **Rollback.** `helm rollback <release> <revision>` restores the
 previous revision, including the previous RustFS image tag.
+
+## Fresh install vs. switching an existing installation
+
+The backend choices above (`minio` / `oss` / `s3` external / `s3` +
+`engine=rustfs`) define what a **fresh** installation deploys. They are
+not a migration mechanism.
+
+Changing `storage.provider` (or `storage.engine`) on an already running
+installation is **not a data migration**: the objects stay on the old
+backend, the new backend starts empty, and every read and write is
+interrupted for the duration of the switch window. Move the objects
+yourself before flipping the values, then switch. Minimal sequence:
+
+1. Bulk-copy every bucket to the target (`mc mirror --overwrite
+   --remove src/<bucket> dst/<bucket>`, one per bucket).
+2. Stop writes (scale the Workers down / maintenance window).
+3. Change the values (`storage.provider`, `storage.engine`, endpoint,
+   credentials) and run `helm upgrade`.
+4. Verify: the controller log shows the new provider, and one Worker
+   round-trips a file through the new backend.
+
+This PR does not implement or test the switch itself — it is out of
+scope for this PR. The full operational guide with reconciliation and
+rollback is the [Migrating an embedded MinIO deployment to an external
+backend](#migrating-an-embedded-minio-deployment-to-an-external-backend)
+section below.
+
+## Local installer boundary
+
+The local (embedded) installer currently always ships the embedded
+MinIO; it has no RustFS or external-S3 selection. Choosing RustFS or an
+external S3 backend for local installations is a companion PR
+(`feat/install-managed-rustfs`, stacked on #1464). This PR does not
+change local installation behaviour.
+
+## Acceptance
+
+Evidence for the review checklist, scoped to what was actually
+exercised (no cluster-level e2e yet — see the open items at the end):
+
+- **Original provider compatibility.** The default `minio + managed`
+  and the `s3`/`oss + existing` render paths are untouched;
+  `tests/check-helm-agentteams.sh` asserts them (scenarios:
+  "external S3 backend (inline credentials) renders endpoint + secret,
+  no MinIO StatefulSet, no sidecar", "external S3 backend honours
+  existingSecret + custom key names", "s3 provider failure modes fail
+  the render with explicit errors"). The default-values `helm template`
+  output is byte-identical to the pre-PR chart.
+- **RustFS volume permissions.** The chart-managed form is a
+  single-node StatefulSet + PVC (`storage.rustfs.persistence.size`,
+  default 10Gi, `storageClassName` configurable); the RustFS data-dir
+  permissions are handled by RustFS itself. Verified on a Raspberry Pi
+  5 (aarch64) against a standalone RustFS 1.0.4 instance (2026-10-29):
+  the controller's `mc cp/cat/rm` all passed, Worker FileSync wrote
+  only to RustFS, and the Manager/Worker restart regression passed.
+- **Admin API / user policies.** The controller creates the bucket and
+  the per-worker users/policies via `mc`; verified against RustFS 1.0.3
+  (existing fact, `values.yaml` comment). Per-worker file access
+  (FileSync write/read) additionally verified against 1.0.4 on the Pi
+  instance.
+- **File access.** Pi verification: controller S3 read/write plus
+  FileSync single-write to RustFS (after the split-brain fix).
+- **Restart / upgrade path.** Pi verification of the Manager/Worker
+  restart regression; the StatefulSet PVC survives `helm upgrade` /
+  `helm rollback` (the RustFS data dir is not baked into the image);
+  check the RustFS version's data-dir compatibility before upgrading
+  (see the Upgrade notes above).
+
+**Open items (listed as-is).**
+
+- Cluster-level e2e for the chart-managed RustFS (real `helm install`
+  → PVC provision → secret → controller wiring, end to end) is pending
+  the next cluster maintenance window.
+- MinIO → RustFS object reconciliation on the Pi (5907 vs 5898
+  objects) is incomplete; MinIO is not retired until it closes.
 
 ## Tests
 

@@ -7,7 +7,7 @@ Validate public values at render time. Supported combinations:
   storage.provider=minio      storage.mode=managed    → deploy MinIO StatefulSet
   storage.provider=oss        storage.mode=existing   → external OSS bucket
   storage.provider=s3         storage.mode=existing   → external S3 backend (e.g. RustFS)
-  storage.provider=s3         storage.engine=rustfs   → chart-managed single-node RustFS
+  storage.provider=s3         storage.engine=rustfs   → chart-managed single-node RustFS (storage.s3.endpoint must stay empty)
 */ -}}
 
 {{- $matrixProvider := .Values.matrix.provider | default "" -}}
@@ -49,7 +49,10 @@ Validate public values at render time. Supported combinations:
   {{- fail (printf "storage.engine=rustfs requires storage.provider=s3 (got %q)" $storageProvider) -}}
   {{- end -}}
   {{- if eq $storageMode "existing" -}}
-  {{- fail "storage.engine=rustfs cannot be combined with storage.mode=existing (the managed engine is always chart-deployed)" -}}
+  {{- fail "storage.engine=rustfs cannot be combined with storage.mode=existing. Legal combinations: (1) storage.provider=s3 + storage.engine=rustfs + storage.mode=managed (chart-managed RustFS; leave storage.s3.endpoint empty), or (2) storage.provider=s3 + storage.engine=external + storage.mode=existing (external S3/RustFS; set storage.s3.endpoint)" -}}
+  {{- end -}}
+  {{- if .Values.storage.s3.endpoint | default "" -}}
+  {{- fail "storage.engine=rustfs deploys its own in-cluster RustFS; storage.s3.endpoint must be empty. To use an external S3/RustFS instead, set storage.engine=external (the default), storage.mode=existing, and storage.s3.endpoint=<your endpoint>." -}}
   {{- end -}}
 {{- end -}}
 {{- if eq $storageProvider "minio" -}}
@@ -66,7 +69,7 @@ Validate public values at render time. Supported combinations:
 {{- else if eq $storageProvider "s3" -}}
   {{- if ne $storageEngine "rustfs" -}}
   {{- if ne $storageMode "existing" -}}
-  {{- fail (printf "storage.provider=s3 requires storage.mode=existing (got %q)" $storageMode) -}}
+  {{- fail (printf "storage.provider=s3 requires storage.mode=existing when storage.engine=external (got %q). Legal combinations: (1) storage.provider=s3 + storage.engine=external (the default) + storage.mode=existing + storage.s3.endpoint, or (2) storage.provider=s3 + storage.engine=rustfs + storage.mode=managed (chart-managed RustFS; leave storage.s3.endpoint empty)" $storageMode) -}}
   {{- end -}}
   {{- if not (.Values.storage.s3.endpoint | default "") -}}
   {{- fail "storage.s3.endpoint is required when storage.provider=s3" -}}

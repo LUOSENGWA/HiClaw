@@ -54,7 +54,7 @@ helm version
 |---|---|---|
 | Matrix | `tuwunel` + `managed` | 当前 Chart 仍只接受托管 Tuwunel |
 | Gateway | `higress` + `managed` | `ai-gateway` + `existing` |
-| Storage | `minio` + `managed` | `oss` + `existing` |
+| Storage | `minio` + `managed` | `oss` + `existing`；`s3` + `existing`（外部 S3/RustFS）；`s3` + `engine=rustfs`（chart 托管 RustFS） |
 
 第一次部署建议全部使用默认的托管组合。外部 AI Gateway 或 OSS 需要额外部署 `credentialProvider` sidecar，用于签发受限的临时凭证；它不是一个只填写外部地址即可完成的通用接入模式。
 
@@ -65,6 +65,9 @@ helm version
 - `gateway.provider=ai-gateway` 与非 `existing` 模式组合。
 - `storage.provider=minio` 与非 `managed` 模式组合。
 - `storage.provider=oss` 与非 `existing` 模式组合。
+- `storage.provider=s3` 在 `storage.engine=external`（默认）下与非 `existing` 模式组合。
+- `storage.engine=rustfs` 与 `storage.mode=existing` 组合。
+- `storage.engine=rustfs` 且设置了 `storage.s3.endpoint`（chart 托管 RustFS 使用集群内端点）。
 - 使用 AI Gateway 或 OSS，却没有启用并配置 `credentialProvider`。
 
 ### 3.2 访问方式
@@ -253,6 +256,81 @@ chmod 600 agentteams-values.yaml
 不要把真实密钥提交到 Git。生产环境可以结合 Secret 管理工具生成或注入 values；无论采用哪种方式，最终的 `credentials.llmApiKey` 都必须在 Helm 渲染时可用。
 
 如果 `credentials.adminPassword` 留空，Chart 会生成密码，并在后续升级时复用已有 Secret 中的值。生产环境更建议显式管理一个强密码。
+
+### 选择对象存储后端
+
+默认是内置 MinIO。下面三个完整预设覆盖当前支持的后端；渲染前请把 `<...>` 占位符替换为自己的值。
+
+预设 1 — 默认内置 MinIO（当前默认）：
+
+```yaml
+storage:
+  provider: minio
+  mode: managed
+  bucket: agentteams-storage
+  minio:
+    persistence:
+      enabled: true
+      size: 10Gi
+      storageClassName: ""
+    auth:
+      rootUser: minioadmin
+      rootPassword: "<replace-with-a-strong-password>"
+```
+
+预设 2 — chart 托管 RustFS（单节点，镜像随发布 pin）：
+
+```yaml
+storage:
+  provider: s3
+  engine: rustfs
+  mode: managed
+  bucket: agentteams-storage
+  # Must stay empty for the managed engine; the controller points at the
+  # in-cluster http://<release>-rustfs:9000 automatically.
+  s3:
+    endpoint: ""
+  rustfs:
+    image:
+      tag: "1.0.4"
+    resources: {}
+    service:
+      apiPort: 9000
+    persistence:
+      enabled: true
+      size: 10Gi
+      storageClassName: ""
+    auth:
+      rootUser: rustfsadmin
+      rootPassword: "<replace-with-a-strong-password>"
+      # Optional: reference an existing Secret with RUSTFS_ACCESS_KEY /
+      # RUSTFS_SECRET_KEY instead of the inline values:
+      # existingSecret: my-rustfs-creds
+```
+
+预设 3 — 已有的外部 S3/RustFS（自行运维）：
+
+```yaml
+storage:
+  provider: s3
+  engine: external
+  mode: existing
+  bucket: agentteams-storage
+  s3:
+    endpoint: "http://<your-s3-endpoint>:9000"   # reachable from the controller pod
+    # Preferred: reference an existing Secret:
+    existingSecret: my-rustfs-creds
+    accessKeySecretKey: accesskey
+    secretKeySecretKey: secretkey
+    # Alternative (dev only): inline credentials; the chart renders the secret:
+    # accessKey: "<your-access-key>"
+    # secretKey: "<your-secret-key>"
+```
+
+两个需要注意的边界：
+
+- 本地（embedded）安装固定使用内置 MinIO；本地安装选择 RustFS / 外部 S3 由配套 PR 提供，不属于本 Chart 改动。
+- 对存量安装修改这些 values 切换后端**不是数据迁移**：对象仍留在旧后端。先用 `mc mirror` 等工具搬完对象、停写，再升级——切换窗口内读写会中断。
 
 ## 6. 安装 AgentTeams
 

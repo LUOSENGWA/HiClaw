@@ -54,7 +54,7 @@ The current chart supports these combinations:
 |---|---|---|
 | Matrix | `tuwunel` + `managed` | The current chart still accepts only managed Tuwunel |
 | Gateway | `higress` + `managed` | `ai-gateway` + `existing` |
-| Storage | `minio` + `managed` | `oss` + `existing` |
+| Storage | `minio` + `managed` | `oss` + `existing`; `s3` + `existing` (external S3/RustFS); `s3` + `engine=rustfs` (chart-managed RustFS) |
 
 Use the fully managed defaults for a first deployment. External AI Gateway or OSS requires an additional `credentialProvider` sidecar that issues scoped temporary credentials. It is not a general external-service mode that works by supplying only an endpoint.
 
@@ -65,6 +65,9 @@ The chart fails during Helm rendering for these combinations:
 - `gateway.provider=ai-gateway` with a mode other than `existing`.
 - `storage.provider=minio` with a mode other than `managed`.
 - `storage.provider=oss` with a mode other than `existing`.
+- `storage.provider=s3` with a mode other than `existing` while `storage.engine=external` (the default).
+- `storage.engine=rustfs` combined with `storage.mode=existing`.
+- `storage.engine=rustfs` with `storage.s3.endpoint` set (a chart-managed RustFS uses the in-cluster endpoint).
 - AI Gateway or OSS without an enabled and configured `credentialProvider`.
 
 ### 3.2 Access method
@@ -253,6 +256,81 @@ chmod 600 agentteams-values.yaml
 Do not commit real secrets to Git. Production environments can use a Secret management tool to generate or inject values. Regardless of the mechanism, `credentials.llmApiKey` must be available when Helm renders the release.
 
 When `credentials.adminPassword` is empty, the chart generates a password and reuses the existing Secret value on later upgrades. Explicitly managing a strong password is preferable in production.
+
+### Choosing an object storage backend
+
+The default is the embedded MinIO. The three complete presets below cover the supported backends; replace the `<...>` placeholders with your own values before rendering.
+
+Preset 1 — default embedded MinIO (the current default):
+
+```yaml
+storage:
+  provider: minio
+  mode: managed
+  bucket: agentteams-storage
+  minio:
+    persistence:
+      enabled: true
+      size: 10Gi
+      storageClassName: ""
+    auth:
+      rootUser: minioadmin
+      rootPassword: "<replace-with-a-strong-password>"
+```
+
+Preset 2 — chart-managed RustFS (single node, image pinned with the release):
+
+```yaml
+storage:
+  provider: s3
+  engine: rustfs
+  mode: managed
+  bucket: agentteams-storage
+  # Must stay empty for the managed engine; the controller points at the
+  # in-cluster http://<release>-rustfs:9000 automatically.
+  s3:
+    endpoint: ""
+  rustfs:
+    image:
+      tag: "1.0.4"
+    resources: {}
+    service:
+      apiPort: 9000
+    persistence:
+      enabled: true
+      size: 10Gi
+      storageClassName: ""
+    auth:
+      rootUser: rustfsadmin
+      rootPassword: "<replace-with-a-strong-password>"
+      # Optional: reference an existing Secret with RUSTFS_ACCESS_KEY /
+      # RUSTFS_SECRET_KEY instead of the inline values:
+      # existingSecret: my-rustfs-creds
+```
+
+Preset 3 — an existing external S3/RustFS you operate:
+
+```yaml
+storage:
+  provider: s3
+  engine: external
+  mode: existing
+  bucket: agentteams-storage
+  s3:
+    endpoint: "http://<your-s3-endpoint>:9000"   # reachable from the controller pod
+    # Preferred: reference an existing Secret:
+    existingSecret: my-rustfs-creds
+    accessKeySecretKey: accesskey
+    secretKeySecretKey: secretkey
+    # Alternative (dev only): inline credentials; the chart renders the secret:
+    # accessKey: "<your-access-key>"
+    # secretKey: "<your-secret-key>"
+```
+
+Two boundaries to keep in mind:
+
+- Local (embedded) installations are fixed to the built-in MinIO; the RustFS / external-S3 selection for local installs ships in a companion PR and is not part of this chart change.
+- Switching the backend of an existing installation by editing these values is **not a data migration**: the objects stay on the old backend. Copy them over first (e.g. `mc mirror`), stop the writes, then upgrade — read/write is interrupted for the switch window.
 
 ## 6. Install AgentTeams
 

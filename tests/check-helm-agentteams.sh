@@ -381,3 +381,55 @@ grep -qF "higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/rustfs:1.1.1" "${
     exit 1
 }
 echo "PASS: storage.rustfs.image.tag override renders the pinned image"
+
+# 6. engine=rustfs + a non-empty storage.s3.endpoint must fail the render:
+#    the managed engine deploys its own in-cluster RustFS and the endpoint
+#    is derived from it — the old "endpoint still wins" override semantics
+#    is gone. 00-validate fails before any manifest is emitted, so no RustFS
+#    StatefulSet can render either.
+rustfs_bad_render="$(mktemp)"
+trap 'rm -f "${render}" "${copaw_render}" "${upg_render}" "${drift_err}" "${s3_render}" "${rustfs_render}" "${rustfs_ext_render}" "${rustfs_bad_render}"' EXIT
+if helm template agentteams "${CHART}" "${RUSTFS_ARGS[@]}" \
+    --set storage.s3.endpoint=http://external.example:9000 > "${rustfs_bad_render}" 2> "${drift_err}"; then
+    echo "FAIL: engine=rustfs with a non-empty storage.s3.endpoint must not render"
+    exit 1
+fi
+if ! grep -qF "storage.engine=rustfs deploys its own in-cluster RustFS; storage.s3.endpoint must be empty" "${drift_err}"; then
+    echo "FAIL: engine=rustfs + s3.endpoint error is not explicit:"
+    cat "${drift_err}" || true
+    exit 1
+fi
+if ! grep -qF "storage.engine=external (the default), storage.mode=existing" "${drift_err}"; then
+    echo "FAIL: engine=rustfs + s3.endpoint error does not point at the external fix:"
+    cat "${drift_err}" || true
+    exit 1
+fi
+if [ "$(awk 'BEGIN{RS="---"} /kind: StatefulSet/ && /-rustfs/ {n++} END{print n+0}' "${rustfs_bad_render}")" -ne 0 ]; then
+    echo "FAIL: the failed render must not emit the RustFS StatefulSet"
+    exit 1
+fi
+echo "PASS: engine=rustfs rejects a non-empty storage.s3.endpoint (external fix in the error, no RustFS manifests)"
+
+# 7. engine=rustfs + storage.mode=existing must fail the render and name
+#    both legal combinations in the error.
+if helm template agentteams "${CHART}" "${RUSTFS_ARGS[@]}" \
+    --set storage.mode=existing > /dev/null 2> "${drift_err}"; then
+    echo "FAIL: engine=rustfs with storage.mode=existing must not render"
+    exit 1
+fi
+if ! grep -qF "storage.engine=rustfs cannot be combined with storage.mode=existing" "${drift_err}"; then
+    echo "FAIL: engine=rustfs + mode=existing error is not explicit:"
+    cat "${drift_err}" || true
+    exit 1
+fi
+if ! grep -qF "storage.engine=rustfs + storage.mode=managed" "${drift_err}"; then
+    echo "FAIL: engine=rustfs + mode=existing error does not name the managed combination:"
+    cat "${drift_err}" || true
+    exit 1
+fi
+if ! grep -qF "storage.engine=external + storage.mode=existing" "${drift_err}"; then
+    echo "FAIL: engine=rustfs + mode=existing error does not name the external combination:"
+    cat "${drift_err}" || true
+    exit 1
+fi
+echo "PASS: engine=rustfs + mode=existing fails the render naming both legal combinations"

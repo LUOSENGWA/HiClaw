@@ -104,7 +104,7 @@ gateway:
 #   StatefulSet (image pinned with the release, same policy as MinIO).
 storage:
   provider: minio             # minio | oss | s3
-  engine: external            # external (default; user-managed backend) | rustfs (chart-managed; requires provider=s3)
+  engine: external            # external (default; user-managed backend: mode=existing + s3.endpoint) | rustfs (chart-managed; requires provider=s3; storage.s3.endpoint must stay empty)
   mode: managed               # managed | existing
   bucket: "agentteams-storage"
   # Required when provider=oss:
@@ -115,7 +115,7 @@ storage:
     endpoint: ""
   # Required when provider=s3:
   s3:
-    endpoint: ""              # e.g. "http://rustfs:9000"
+    endpoint: ""              # e.g. "http://rustfs:9000" — engine=external (mode=existing) only; must stay empty when engine=rustfs
     # Root/admin credentials of the external backend. Provide either
     # existingSecret (preferred) or inline accessKey/secretKey (dev only).
     existingSecret: ""        # Secret name holding the keys below
@@ -150,6 +150,10 @@ storage:
   # The image tag is pinned with the AgentTeams release, same policy as
   # minio.image.tag. Upgrade by bumping the tag + `helm upgrade` (the
   # StatefulSet PVC is preserved); rollback with `helm rollback`.
+  # Mutually exclusive with an external endpoint: for this engine
+  # storage.s3.endpoint must stay empty (the controller always points at
+  # the in-chart StatefulSet). For an external S3/RustFS use
+  # engine=external (the default) + mode=existing instead.
   rustfs:
     image:
       repository: higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/rustfs
