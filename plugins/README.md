@@ -90,10 +90,19 @@ teamharness.tar.gz
 
 The lifecycle entrypoints are the shared contract:
 
-- `scripts/install.sh`: detects supported local runtimes and dispatches to the
-  matching TeamHarness adapter.
-- `scripts/uninstall.sh`: removes the runtime-specific installation through the
-  matching adapter when available.
+- `scripts/install.sh`: detects the supported local runtimes — `qwenpaw` on
+  PATH; `openclaw` on PATH or via `$OPENCLAW_CONFIG` /
+  `~/.openclaw/openclaw.json`; `hermes` on PATH or via `$HERMES_HOME` /
+  `~/.hermes/config.yaml` — and dispatches to the matching adapter for every
+  detected runtime, so coexisting runtimes are all installed.
+  `--runtime <name>` (repeatable) selects runtimes explicitly and bypasses
+  detection; `--dry-run` previews through every adapter without writing.
+- `scripts/uninstall.sh`: removes the runtime-specific installation through
+  the matching adapter. Detection is artifact-driven (config files and staged
+  plugin roots, not just the runtime binary), so residue is removed even
+  after the runtime binary is gone; the adapters are idempotent, so an
+  uninstall with nothing installed is a no-op. `--runtime` and `--dry-run`
+  behave as in install.
 
 Both the AgentTeams CLI and LoongSuite `plugin-probe` path call the same lifecycle
 scripts. Runtime-specific details stay inside TeamHarness adapters.
