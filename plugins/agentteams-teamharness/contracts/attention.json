@@ -27,9 +27,9 @@
       "source": "attention:<kind>",
       "actor": "role:account of the resolving call (when known)"
     },
-    "history_written": "on entering blocked/frozen and on leaving them back to open",
+    "history_written": "on entering blocked/frozen, on leaving them back to open, and on a refused attempt to leave frozen (a refused entry carries from='frozen', to='frozen', refused=<attempted status>)",
     "blocked_writer": "protocol layer only: the attention stall chain is the single convergence point",
-    "frozen_release": "a resolved attention record of kind=approval (the approval channel); any other resolve kind is refused while the task is frozen"
+    "frozen_release": "frozen is an absorbing state (issue #1467): it is left only by the authorized approval close — a resolved attention record of kind=approval through the trusted-human path (the only _set_decision_status call that carries unfreeze_authority='approval'). Every other writer — a stall escalation, a non-approval resolve, a tool close, any future writer — is refused at the single decision_status writer: the state stays frozen and the attempt is audited as a refused decision_status_history entry (from='frozen', to='frozen', refused=<attempted status>). The refusal is a state invariant, not a policy gate — it holds with the protocol switch off too"
   },
   "constants_ref": "mcp/common/constants.py: ATTENTION_STALL_BLOCKED / ATTENTION_STALL_FROZEN / DECISION_STATUS_VALUES / DEFAULT_DECISION_STATUS (test_protocol_guard.py asserts the two agree)"
 }

@@ -1,4 +1,18 @@
-# task state transitions, history append and transition errors (W1-a2: real module)
+"""Task state transitions, history append and transition errors
+(W1-a2: real module), plus the W2 protocol sub-state (issue #1451 W2):
+decision_status overlays the nine runtime states and is written only by
+the protocol layer, through the single writer _set_decision_status.
+
+Frozen is an absorbing state (issue #1467): it is left only by an
+authorized approval close (frozen -> open through the kind=approval,
+trusted-human path — the only call that carries
+unfreeze_authority='approval'). Every other writer — a stall
+escalation, a non-approval resolve, a tool close, any future writer —
+is refused at that single writer: the state stays frozen and the
+attempt is audited as a refused decision_status_history entry
+(from='frozen', to='frozen', refused=<attempted status>). The refusal
+is a state invariant, not a policy gate: it holds with the protocol
+switch off too."""
 from __future__ import annotations
 
 from typing import Any
@@ -284,8 +298,10 @@ def _append_transition_history(
 # W2 protocol sub-state (issue #1451 W2): decision_status overlays the
 # nine runtime states; only the protocol layer writes it. The attention
 # stall chain is the convergence point that writes "blocked"; "frozen"
-# is released only through the approval channel (review.py / the
-# resolved kind=approval attention record).
+# is an absorbing state (issue #1467) — released only through the
+# approval channel (the resolved kind=approval attention record, the
+# trusted-human path), and every other writer is refused at the single
+# writer below, with the refusal audited in decision_status_history.
 def _decision_status_of(task: dict[str, Any]) -> str:
     """Read the decision_status sub-state, defaulting to 'open' for tasks
     written before the W2 protocol layer existed."""
@@ -300,16 +316,53 @@ def _set_decision_status(
     reason: str,
     source: str,
     actor: str = "",
-) -> None:
-    """Write the decision_status sub-state. A history entry is appended
-    when the task enters blocked/frozen, or leaves them back to open
-    (decision_status_history: ts / from / to / reason / source, plus
-    actor when known). Mutates in place; the caller persists the task."""
+    unfreeze_authority: str = "",
+) -> str:
+    """Write the decision_status sub-state; 'frozen' is absorbing.
+
+    A history entry is appended when the task enters blocked/frozen, or
+    leaves them back to open (decision_status_history: ts / from / to /
+    reason / source, plus actor when known).
+
+    Frozen is an absorbing state (#1467): the only exit is an authorized
+    approval close — new_status 'open' with unfreeze_authority
+    'approval'. Every other attempt to leave or demote a frozen task
+    (a stall re-escalation, a non-approval resolve, a tool close, any
+    future writer) is refused here, at the single writer: the state
+    stays 'frozen' and the attempt is audited as a refused history
+    entry (from='frozen', to='frozen', refused=<the attempted status>).
+    The refusal is a state invariant, not a policy gate — it holds with
+    the protocol switch off too.
+
+    Returns the effective status ('frozen' on a refusal) so callers can
+    report what actually happened. Mutates in place; the caller
+    persists the task."""
     if new_status not in DECISION_STATUS_VALUES:
         raise ValueError(f"unknown decision_status: {new_status}")
     current = _decision_status_of(task)
     if current == new_status:
-        return
+        return current
+    if current == "frozen" and (
+        new_status != "open" or unfreeze_authority != "approval"
+    ):
+        # Refuse the exit/demotion: keep the state and audit the
+        # attempt — no phantom transition enters the history.
+        history = task.get("decision_status_history")
+        if not isinstance(history, list):
+            history = []
+        entry: dict[str, Any] = {
+            "ts": _utc_timestamp(),
+            "from": current,
+            "to": current,
+            "refused": new_status,
+            "reason": reason,
+            "source": source,
+        }
+        if actor:
+            entry["actor"] = actor
+        history.append(entry)
+        task["decision_status_history"] = history
+        return current
     task["decision_status"] = new_status
     if new_status in ("blocked", "frozen") or (
         current in ("blocked", "frozen") and new_status == "open"
@@ -328,6 +381,7 @@ def _set_decision_status(
             entry["actor"] = actor
         history.append(entry)
         task["decision_status_history"] = history
+    return _decision_status_of(task)
 
 
 def _attention_stall_escalate(task: dict[str, Any], record: dict[str, Any]) -> str:
@@ -335,11 +389,20 @@ def _attention_stall_escalate(task: dict[str, Any], record: dict[str, Any]) -> s
     ATTENTION_STALL_FROZEN -> frozen, >= ATTENTION_STALL_BLOCKED ->
     blocked (monotonic: frozen never demotes to blocked). Only the
     protocol layer's stall chain writes these values; sub-states set by
-    other writers (paused / spec_conflict) are left alone."""
-    stall = int(record.get("stall_count") or 0)
+    other writers (paused / spec_conflict) are left alone.
+
+    Frozen is absorbing (#1467): a stalled record on a frozen task
+    short-circuits — it can neither demote it (frozen -> blocked) nor
+    change anything else. The choke point in _set_decision_status is
+    the real guard for any other writer; the short-circuit keeps the
+    intent explicit and the history clean (no refusal entry from the
+    stall path, which is expected to fire on every retry)."""
     current = _decision_status_of(task)
     if current not in ("open", "blocked", "frozen"):
         return current
+    if current == "frozen":
+        return "frozen"
+    stall = int(record.get("stall_count") or 0)
     if stall >= ATTENTION_STALL_FROZEN:
         target = "frozen"
     elif stall >= ATTENTION_STALL_BLOCKED:
@@ -362,11 +425,20 @@ def _attention_resolved_status(
     record: dict[str, Any],
     *,
     actor: str = "",
+    unfreeze_authority: str = "",
 ) -> None:
     """Zero the stall counter when the attention answer arrives and
     return a stall-driven blocked/frozen sub-state to open (with a
     history entry, so an unfreeze is audited). Non-stall sub-states are
-    left alone."""
+    left alone.
+
+    Frozen is absorbing (#1467): unfreeze_authority='approval' is
+    carried only by the authorized kind=approval close; any other
+    resolve on a frozen task is refused and audited by the choke point
+    instead of opening the task — belt and braces with the
+    frozen_unfreeze_requires_approval policy guard, and it also holds
+    with the protocol switch off (the state invariant is not a policy
+    gate)."""
     record["stall_count"] = 0
     current = _decision_status_of(task)
     if current not in ("blocked", "frozen"):
@@ -378,4 +450,5 @@ def _attention_resolved_status(
         reason=reason,
         source=f"attention:{str(record.get('kind') or 'unknown')}",
         actor=actor,
+        unfreeze_authority=unfreeze_authority,
     )

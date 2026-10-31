@@ -39,6 +39,17 @@ approval gate reads: the gate requires the marker (never inferred from
 the decider strings), the human channel, and a decider account that
 differs from the task's assignee (self-approval never counts; record
 presence alone is not an approval).
+
+Round 5 (issue #1467) — frozen is absorbing: the only exit from
+frozen is the authorized approval close (the kind=approval, trusted
+human path — the single _set_decision_status call carrying
+unfreeze_authority='approval'). Every other writer — a stall
+re-escalation on a second record, a non-approval resolve, a tool
+close — is refused at the single decision_status writer and audited
+as a refused history entry (from='frozen', to='frozen',
+refused=<attempted status>). The regressions: the maintainer's exact
+chain, the per-kind absorbing matrix, and the choke-point refusal
+audit.
 """
 
 from __future__ import annotations
@@ -1474,6 +1485,223 @@ def test_r3_record_counting_matrix() -> None:
     # Self-approval (decider account == submitter account) never counts.
     assert has({"attention": [record()]}, submitter_account="@luo:example.test") is False
     assert has({"attention": [record()]}, submitter_account="@alice:example.test") is True
+
+
+# --- Round 5 (#1467): frozen is absorbing ----------------------------------
+
+
+def _history_pairs(task: dict[str, Any]) -> list[tuple[str, str]]:
+    """The (from, to) sequence of a task's decision_status_history."""
+    return [(e["from"], e["to"]) for e in task.get("decision_status_history") or []]
+
+
+def test_r5_maintainer_chain_frozen_absorbing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    storage: None, attention_env: None,
+) -> None:
+    """The maintainer's exact chain: an approval record stalls to
+    frozen; a separate decision record then stalls again (it must not
+    demote the task to blocked) and is resolved (it must not open the
+    task). Frozen stays until the trusted human closes the approval
+    record — the single authorized exit."""
+    _enforce_on(monkeypatch)
+    monkeypatch.setattr(server, "_runtime_role", lambda: "worker")
+    _write_in_progress_task(tmp_path)
+
+    # The approval chain drives the task to frozen.
+    created = _request_attention(tmp_path, kind="approval", question="Approve?")
+    assert created["ok"] is True
+    assert created["task"].get("decision_status", constants.DEFAULT_DECISION_STATUS) == "open"
+    assert _history_pairs(_task_meta(tmp_path)) == []
+    _request_attention(tmp_path, kind="approval")  # stall 1 -> open
+    assert _history_pairs(_task_meta(tmp_path)) == []
+    _request_attention(tmp_path, kind="approval")  # stall 2 -> blocked
+    assert _history_pairs(_task_meta(tmp_path)) == [("open", "blocked")]
+    frozen = _request_attention(tmp_path, kind="approval")  # stall 3 -> frozen
+    assert frozen["ok"] is True
+    assert frozen["task"]["decision_status"] == "frozen"
+    assert _history_pairs(_task_meta(tmp_path)) == [
+        ("open", "blocked"), ("blocked", "frozen")
+    ]
+
+    # A second record stalls on the frozen task: the escalation
+    # short-circuits — no demotion to blocked, no history churn.
+    _request_attention(tmp_path, kind="decision", question="Side decision.")
+    assert _task_meta(tmp_path)["decision_status"] == "frozen"
+    _request_attention(tmp_path, kind="decision")  # stall 1
+    assert _task_meta(tmp_path)["decision_status"] == "frozen"
+    _request_attention(tmp_path, kind="decision")  # stall 2: would target blocked
+    assert _task_meta(tmp_path)["decision_status"] == "frozen"
+    assert _history_pairs(_task_meta(tmp_path)) == [
+        ("open", "blocked"), ("blocked", "frozen")
+    ]
+
+    # Resolving the ordinary record cannot leave frozen (the policy
+    # guard refuses it before any write); the approval stays open.
+    refused = _request_attention(tmp_path, kind="decision", resolved=True)
+    assert refused["ok"] is False
+    assert refused["error_code"] == "frozen_unfreeze_requires_approval"
+    task = _task_meta(tmp_path)
+    assert task["decision_status"] == "frozen"
+    assert _history_pairs(task) == [("open", "blocked"), ("blocked", "frozen")]
+    assert task["attention"][0]["resolved"] is False
+
+    # The trusted human closes the approval record: the one authorized
+    # exit — a single frozen -> open entry.
+    monkeypatch.setattr(server, "_runtime_role", lambda: "human")
+    answered = _request_attention(
+        tmp_path,
+        kind="approval",
+        resolved=True,
+        role="human",
+        account="@luo:example.test",
+        resolved_via="im_reply",
+    )
+    assert answered["ok"] is True
+    task = _task_meta(tmp_path)
+    assert task["decision_status"] == "open"
+    assert _history_pairs(task) == [
+        ("open", "blocked"), ("blocked", "frozen"), ("frozen", "open")
+    ]
+    assert task["decision_status_history"][-1]["reason"] == "unfrozen by approval record"
+    assert task["decision_status_history"][-1]["source"] == "attention:approval"
+    assert task["attention"][0]["resolved"] is True
+
+
+@pytest.mark.parametrize("kind", ("approval", "decision", "escalation", "other"))
+def test_r5_absorbing_matrix(
+    kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    storage: None, attention_env: None,
+) -> None:
+    """Every schema kind, every other writer, from frozen: raise the
+    same kind again, retry past both thresholds, resolve the ordinary
+    record, tool close — the task stays frozen after every step and
+    the history never grows past the two entry/exit pairs."""
+    _enforce_on(monkeypatch)
+    monkeypatch.setattr(server, "_runtime_role", lambda: "worker")
+    _write_in_progress_task(tmp_path)
+
+    def assert_frozen_clean() -> None:
+        assert _task_meta(tmp_path)["decision_status"] == "frozen"
+        assert _history_pairs(_task_meta(tmp_path)) == [
+            ("open", "blocked"), ("blocked", "frozen")
+        ]
+
+    # Drive the task to frozen through this kind's own chain:
+    # create (stall 0) + re-requests 1, 2, 3.
+    created = _request_attention(tmp_path, kind=kind, question="Ask?")
+    assert created["ok"] is True
+    _request_attention(tmp_path, kind=kind)
+    _request_attention(tmp_path, kind=kind)
+    frozen = _request_attention(tmp_path, kind=kind)
+    assert frozen["ok"] is True
+    assert_frozen_clean()
+    assert _task_meta(tmp_path)["attention"][0]["stall_count"] == 3
+
+    # Raise the same kind again (reuse path, stall 4).
+    raised = _request_attention(tmp_path, kind=kind)
+    assert raised["ok"] is True
+    assert raised["attention"]["reused"] is True
+    assert _task_meta(tmp_path)["attention"][0]["stall_count"] == 4
+    assert_frozen_clean()
+
+    # Retry past both thresholds (stall 5, 6).
+    for expected in (5, 6):
+        retried = _request_attention(tmp_path, kind=kind)
+        assert retried["ok"] is True
+        assert _task_meta(tmp_path)["attention"][0]["stall_count"] == expected
+        assert_frozen_clean()
+
+    # Resolve the ordinary record: refused, frozen stays.
+    if kind == "approval":
+        _request_attention(tmp_path, kind="decision", question="Side decision.")
+        resolved = _request_attention(tmp_path, kind="decision", resolved=True)
+    else:
+        resolved = _request_attention(tmp_path, kind=kind, resolved=True)
+    assert resolved["ok"] is False
+    assert resolved["error_code"] == "frozen_unfreeze_requires_approval"
+    assert_frozen_clean()
+
+    # A tool close: the approval channel needs a trusted human.
+    if kind != "approval":
+        _request_attention(tmp_path, kind="approval", question="Tool close?")
+    closed = _request_attention(
+        tmp_path, kind="approval", resolved=True, resolved_via="tool"
+    )
+    assert closed["ok"] is False
+    assert closed["error_code"] == "approval_requires_human"
+    assert_frozen_clean()
+
+
+def test_r5_refusal_is_audited_at_the_choke_point() -> None:
+    """The choke point itself (unit level, no protocol switch): a
+    frozen task refuses frozen -> blocked and frozen -> open without
+    approval authority, auditing each attempt as a from='frozen',
+    to='frozen', refused=<attempted status> entry — and the authorized
+    approval close is the only writer of frozen -> open."""
+    task: dict[str, Any] = {
+        "task_id": "w2-task-unit",
+        "status": "in_progress",
+        "decision_status": "frozen",
+        "decision_status_history": [
+            {"ts": "2026-10-31T00:00:00Z", "from": "open", "to": "blocked"},
+            {"ts": "2026-10-31T00:00:01Z", "from": "blocked", "to": "frozen"},
+        ],
+    }
+
+    refused = server.transitions._set_decision_status(
+        task,
+        "blocked",
+        reason="attention stalled 2 times without an answer",
+        source="attention:decision",
+        actor="worker:@alice:example.test",
+    )
+    assert refused == "frozen"
+    assert task["decision_status"] == "frozen"
+    entry = task["decision_status_history"][-1]
+    assert entry["from"] == "frozen"
+    assert entry["to"] == "frozen"
+    assert entry["refused"] == "blocked"
+    assert entry["reason"] == "attention stalled 2 times without an answer"
+    assert entry["source"] == "attention:decision"
+    assert entry["actor"] == "worker:@alice:example.test"
+
+    refused = server.transitions._set_decision_status(
+        task,
+        "open",
+        reason="attention answer received",
+        source="attention:decision",
+        actor="worker:@alice:example.test",
+    )
+    assert refused == "frozen"
+    assert task["decision_status"] == "frozen"
+    entry = task["decision_status_history"][-1]
+    assert entry["from"] == "frozen"
+    assert entry["to"] == "frozen"
+    assert entry["refused"] == "open"
+    assert "actor" in entry
+
+    # No phantom transition has entered the history.
+    assert _history_pairs(task) == [
+        ("open", "blocked"), ("blocked", "frozen"),
+        ("frozen", "frozen"), ("frozen", "frozen"),
+    ]
+
+    # The authorized approval close is the only exit.
+    effective = server.transitions._set_decision_status(
+        task,
+        "open",
+        reason="unfrozen by approval record",
+        source="attention:approval",
+        actor="human:@luo:example.test",
+        unfreeze_authority="approval",
+    )
+    assert effective == "open"
+    assert task["decision_status"] == "open"
+    entry = task["decision_status_history"][-1]
+    assert entry["from"] == "frozen"
+    assert entry["to"] == "open"
+    assert "refused" not in entry
 
 
 # --- review_task gate edges -------------------------------------------------

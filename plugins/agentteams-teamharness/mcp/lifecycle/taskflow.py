@@ -1240,7 +1240,19 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         # carries the closing actor so the loop close is
                         # auditable on the record itself.
                         target["resolvedActor"] = resolver
-                    _attention_resolved_status(task, target, actor=resolver)
+                    _attention_resolved_status(
+                        task,
+                        target,
+                        actor=resolver,
+                        # Frozen is absorbing (#1467 round 5): only the
+                        # authorized kind=approval close — the branch
+                        # that passed the approval-authority check
+                        # above — may leave a frozen task; every other
+                        # resolve kind is refused and audited by the
+                        # choke point (belt and braces with the
+                        # frozen_unfreeze_requires_approval guard).
+                        unfreeze_authority="approval" if kind == "approval" else "",
+                    )
                 _write_task(arguments, task)
                 synced = _sync_task(arguments, task_id, exclude=["spec.md", "base/"])
                 event_id = str(target.get("eventId") or "") or None
