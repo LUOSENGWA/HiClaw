@@ -18,6 +18,10 @@ spec:
       labels:
         {{- include "agentteams.component.selectorLabels" $comp | nindent 8 }}
     spec:
+      {{- with .Values.storage.rustfs.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -26,6 +30,10 @@ spec:
         - name: rustfs
           image: "{{ .Values.storage.rustfs.image.repository }}:{{ .Values.storage.rustfs.image.tag }}"
           imagePullPolicy: {{ .Values.storage.rustfs.image.pullPolicy }}
+          {{- with .Values.storage.rustfs.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           args:
             - /data
           ports:

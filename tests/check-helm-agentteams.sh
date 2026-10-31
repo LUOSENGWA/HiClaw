@@ -376,7 +376,7 @@ if ! helm template agentteams "${CHART}" "${RUSTFS_ARGS[@]}"     --set storage.r
     echo "FAIL: helm template (engine=rustfs, tag override) failed"
     exit 1
 fi
-grep -qF "higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/rustfs:1.1.1" "${rustfs_ext_render}" || {
+grep -qF "docker.io/rustfs/rustfs:1.1.1" "${rustfs_ext_render}" || {
     echo "FAIL: storage.rustfs.image.tag override not rendered into the RustFS image"
     exit 1
 }
@@ -433,3 +433,62 @@ if ! grep -qF "storage.engine=external + storage.mode=existing" "${drift_err}"; 
     exit 1
 fi
 echo "PASS: engine=rustfs + mode=existing fails the render naming both legal combinations"
+
+# 8. Security context: the RustFS 1.0.4 image runs as uid/gid 10001
+#    (USER=rustfs) and a default (root-owned) PVC is unwritable for it —
+#    the server FATALs with "Permission denied". The StatefulSet must run
+#    non-root and let kubelet apply fsGroup to the PVC. Asserted on the
+#    RustFS StatefulSet document only (a whole-render grep would false-
+#    positive on other components' security contexts).
+rustfs_sts="$(awk 'BEGIN{RS="---"} /kind: StatefulSet/ && /-rustfs/ {print}' "${rustfs_render}")"
+if [ -z "${rustfs_sts}" ]; then
+    echo "FAIL: no RustFS StatefulSet document found in the engine=rustfs render"
+    exit 1
+fi
+for needle in \
+    "fsGroup: 10001" \
+    "fsGroupChangePolicy: OnRootMismatch" \
+    "runAsUser: 10001" \
+    "runAsGroup: 10001" \
+    "runAsNonRoot: true" \
+    "allowPrivilegeEscalation: false"
+do
+    if ! grep -qF "${needle}" <<<"${rustfs_sts}"; then
+        echo "FAIL: managed RustFS StatefulSet is missing ${needle}"
+        exit 1
+    fi
+done
+echo "PASS: managed RustFS StatefulSet runs non-root (uid/gid 10001) with fsGroup on the PVC"
+
+# 9. Image repository: the default is the upstream multi-arch image
+#    (docker.io/rustfs/rustfs), directly pullable; the higress mirror is
+#    an override (pullable only after `make mirror-images` has run).
+grep -qF "image: \"docker.io/rustfs/rustfs:1.0.4\"" "${rustfs_render}" || {
+    echo "FAIL: default storage.rustfs.image.repository is not the upstream docker.io/rustfs/rustfs"
+    exit 1
+}
+if ! helm template agentteams "${CHART}" "${RUSTFS_ARGS[@]}"     --set storage.rustfs.image.repository=higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/rustfs > "${rustfs_ext_render}"; then
+    echo "FAIL: helm template (engine=rustfs, mirror repository override) failed"
+    exit 1
+fi
+grep -qF "image: \"higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/rustfs:1.0.4\"" "${rustfs_ext_render}" || {
+    echo "FAIL: higress mirror repository override not rendered into the RustFS image"
+    exit 1
+}
+echo "PASS: default RustFS image is the upstream repository; the higress mirror override renders"
+
+# 10. podSecurityContext must be user-overridable (fsGroup pass-through).
+if ! helm template agentteams "${CHART}" "${RUSTFS_ARGS[@]}"     --set storage.rustfs.podSecurityContext.fsGroup=2000 > "${rustfs_ext_render}"; then
+    echo "FAIL: helm template (engine=rustfs, fsGroup override) failed"
+    exit 1
+fi
+rustfs_sts="$(awk 'BEGIN{RS="---"} /kind: StatefulSet/ && /-rustfs/ {print}' "${rustfs_ext_render}")"
+if ! grep -qF "fsGroup: 2000" <<<"${rustfs_sts}"; then
+    echo "FAIL: storage.rustfs.podSecurityContext.fsGroup override not rendered into the StatefulSet"
+    exit 1
+fi
+if grep -qF "fsGroup: 10001" <<<"${rustfs_sts}"; then
+    echo "FAIL: fsGroup override must replace the default, not coexist with it"
+    exit 1
+fi
+echo "PASS: podSecurityContext.fsGroup override passes through to the StatefulSet"

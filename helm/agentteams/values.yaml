@@ -156,9 +156,28 @@ storage:
   # engine=external (the default) + mode=existing instead.
   rustfs:
     image:
-      repository: higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/rustfs
+      # Upstream multi-arch image (amd64/arm64), directly pullable.
+      # For deployments in China or on offline/internal networks override
+      # repository with
+      # higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/rustfs — the
+      # entry exists in hack/mirror-images.sh, but the mirror is only
+      # pullable after `make mirror-images` has run for this release.
+      repository: docker.io/rustfs/rustfs
       tag: "1.0.4"
       pullPolicy: IfNotPresent
+    # The RustFS image runs as uid/gid 10001 (USER=rustfs). fsGroup lets
+    # kubelet apply group ownership to the PVC so the non-root data dir
+    # is writable — a default (root-owned) PVC FATALs the server with
+    # "Permission denied" at startup. fsGroupChangePolicy OnRootMismatch
+    # avoids a recursive chown of a large volume at every start.
+    podSecurityContext:
+      fsGroup: 10001
+      fsGroupChangePolicy: OnRootMismatch
+    securityContext:
+      runAsUser: 10001
+      runAsGroup: 10001
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
     resources: {}
     service:
       type: ClusterIP
@@ -166,6 +185,10 @@ storage:
     persistence:
       enabled: true
       size: 10Gi
+      # Empty storageClassName uses the cluster's default StorageClass.
+      # The volume is written by RustFS (uid 10001);
+      # podSecurityContext.fsGroup keeps the group writable.
+      # NFS/root_squash-type backends need the RustFS docs' handling.
       storageClassName: ""
     auth:
       rootUser: "rustfsadmin"
