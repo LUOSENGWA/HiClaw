@@ -49,6 +49,19 @@ the runtime binary is gone:
   runtime appends one JSON line:
   `{"event":"install","runtimes":[...],"pluginDir":"..."}` (or
   `"event":"uninstall"`).
+- **Interpreter contract**: the entrypoints and every adapter script run on
+  the system shell — **bash 3.2 or later, macOS system bash included**. They
+  deliberately avoid bash-4-only constructs (associative arrays,
+  `mapfile`/`readarray`, case-modifying expansions such as `${var^^}`,
+  `[[ -v ]]`, `wait -n`, `&>>`, `|&`, `coproc`, nameref declarations); the
+  per-runtime status state in the entrypoints is plain variables plus
+  `set_status`/`get_status` helpers.
+  `plugins/tests/teamharness/test_shell_portability.py` pins the contract:
+  a static denylist scan over every lifecycle script, plus a real-interpreter
+  dry-run of the OpenClaw install/uninstall when a bash 3.2 is resolvable
+  (`TEAMHARNESS_BASH32` path, or `bash3.2` / `bash-3.2` on PATH); the full
+  lifecycle suite is parametrized over the same interpreter. On macOS the
+  system `/bin/bash` is 3.2.57, so macOS CI exercises this automatically.
 
 The experimental deepseek-harness adapter remains in the `plugins/teamharness`
 compatibility path and is not part of this portable bundle.

@@ -107,6 +107,19 @@ The lifecycle entrypoints are the shared contract:
 Both the AgentTeams CLI and LoongSuite `plugin-probe` path call the same lifecycle
 scripts. Runtime-specific details stay inside TeamHarness adapters.
 
+Interpreter contract: the lifecycle scripts (and every per-runtime adapter
+script) run on the system shell — **bash 3.2 or later, macOS system bash
+included**. They deliberately avoid bash-4-only constructs (associative
+arrays, `mapfile`/`readarray`, case-modifying expansions such as `${var^^}`,
+`[[ -v ]]`, `wait -n`, `&>>`, `|&`, `coproc`, nameref declarations); the
+per-runtime status state is plain variables plus `set_status`/`get_status`
+helpers. `plugins/tests/teamharness/test_shell_portability.py` enforces the
+contract with a static denylist scan over every lifecycle script and a
+real-interpreter dry-run when a bash 3.2 is resolvable: set
+`TEAMHARNESS_BASH32` to a bash 3.2 path (or provide `bash3.2` / `bash-3.2`
+on PATH) and the whole lifecycle suite runs under it. On macOS the system
+`/bin/bash` is 3.2.57, so macOS CI exercises this automatically.
+
 ## Boundaries
 
 - `desired.agentPackage` in the runtime config contract is an AgentTeams AgentSpec

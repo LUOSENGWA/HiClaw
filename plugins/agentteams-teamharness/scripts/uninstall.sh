@@ -135,10 +135,27 @@ for runtime in "${SUPPORTED_RUNTIMES[@]}"; do
   fi
 done
 
-declare -A STATUS=()
-for runtime in "${SUPPORTED_RUNTIMES[@]}"; do
-  STATUS["$runtime"]="skipped (not detected)"
-done
+# Per-runtime status as plain variables (this entrypoint must run on the
+# system shell, bash 3.2 on macOS; the portability test pins that).
+STATUS_QWENPAW="skipped (not detected)"
+STATUS_OPENCLAW="skipped (not detected)"
+STATUS_HERMES="skipped (not detected)"
+
+set_status() {  # $1=runtime $2=status
+  case "$1" in
+    qwenpaw)  STATUS_QWENPAW="$2" ;;
+    openclaw) STATUS_OPENCLAW="$2" ;;
+    hermes)   STATUS_HERMES="$2" ;;
+  esac
+}
+
+get_status() {  # $1=runtime
+  case "$1" in
+    qwenpaw)  printf '%s' "$STATUS_QWENPAW" ;;
+    openclaw) printf '%s' "$STATUS_OPENCLAW" ;;
+    hermes)   printf '%s' "$STATUS_HERMES" ;;
+  esac
+}
 
 ADAPTER_ARGS=()
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -152,18 +169,18 @@ for runtime in ${SELECTED_RUNTIMES[@]+"${SELECTED_RUNTIMES[@]}"}; do
   bash "$script" ${ADAPTER_ARGS[@]+"${ADAPTER_ARGS[@]}"} || rc=$?
   if [ "$rc" -eq 0 ]; then
     if [ "$DRY_RUN" -eq 1 ]; then
-      STATUS["$runtime"]="uninstalled (dry-run)"
+      set_status "$runtime" "uninstalled (dry-run)"
     else
-      STATUS["$runtime"]="uninstalled"
+      set_status "$runtime" "uninstalled"
     fi
   else
-    STATUS["$runtime"]="failed (exit $rc)"
+    set_status "$runtime" "failed (exit $rc)"
     OVERALL_RC=1
   fi
 done
 
 for runtime in "${SUPPORTED_RUNTIMES[@]}"; do
-  echo "${runtime}: ${STATUS[$runtime]}"
+  echo "${runtime}: $(get_status "$runtime")"
 done
 
 if [ "${#SELECTED_RUNTIMES[@]}" -eq 0 ]; then
@@ -174,12 +191,12 @@ fi
 if [ "$OVERALL_RC" -ne 0 ]; then
   failed=()
   for runtime in "${SUPPORTED_RUNTIMES[@]}"; do
-    case "${STATUS[$runtime]}" in
+    case "$(get_status "$runtime")" in
       "failed (exit"*) failed+=("$runtime") ;;
     esac
   done
   {
-    echo "ERROR: TeamHarness uninstall failed for: ${failed[*]}."
+    echo "ERROR: TeamHarness uninstall failed for: ${failed[*]+"${failed[*]}"}."
     echo "Supported runtimes: ${SUPPORTED_RUNTIMES[*]}. Select explicitly: uninstall.sh --runtime <qwenpaw|openclaw|hermes>"
   } >&2
   exit 1
@@ -189,7 +206,7 @@ LOG_FILE="${TEAMHARNESS_INSTALL_LOG:-}"
 if [ -n "$LOG_FILE" ] && [ "$DRY_RUN" -eq 0 ]; then
   runtimes_json=""
   for runtime in "${SUPPORTED_RUNTIMES[@]}"; do
-    if [ "${STATUS[$runtime]}" = "uninstalled" ]; then
+    if [ "$(get_status "$runtime")" = "uninstalled" ]; then
       if [ -n "$runtimes_json" ]; then
         runtimes_json="${runtimes_json},"
       fi
