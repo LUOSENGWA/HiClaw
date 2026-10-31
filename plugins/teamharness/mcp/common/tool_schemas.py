@@ -507,7 +507,13 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "(r1..r6) and unanswered attention re-requests stall "
                         "the task (2 -> decision_status blocked, 3 -> frozen; "
                         "only a resolved approval record unfreezes a frozen "
-                        "task)."
+                        "task). Operator contract: closing a kind=approval "
+                        "record (and unfreezing a frozen task) requires a "
+                        "trusted human runtime role (AGENTTEAMS_AGENT_ROLE=human "
+                        "or member.role=human in the runtime config); a caller "
+                        "without a trusted role is denied by design — payload "
+                        "role / channel / decider / evidence strings are "
+                        "provenance, never authority."
                     ),
                 },
                 "projectId": {

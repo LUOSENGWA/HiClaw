@@ -7,8 +7,9 @@ three-blocker fixes — the review gate applies to a positive acceptance
 only (missing/malformed record -> review_missing), a fail verdict never
 blocks a rejection/return-for-revision, and identity comparison uses the
 full account after the role prefix — therefore must hold in the COPY as
-well. The round-3 approval-authority fix (#1467) landed in
-``mcp/lifecycle/taskflow.py`` as well, so it is part of the comparison
+well. The round-3/4 approval-authority fix (#1467; round 4: trusted
+authority only) landed in ``mcp/lifecycle/taskflow.py`` and
+``mcp/lifecycle/review.py`` as well, so it is part of the comparison
 set. This module:
 
 (a) asserts the three guard files (``mcp/lifecycle/review.py``,
@@ -17,10 +18,16 @@ set. This module:
 (b) re-runs the blocker regression cases against the copy's own
     ``mcp/server.py`` — loaded in this suite's own process (this file is
     the only one here that imports ``mcp``), so the ``mcp`` package
-    resolves to the ``agentteams-teamharness`` tree — plus the round-3
-    approval-authority cases (worker tool close of a frozen approval
-    denied; a worker's self-closed approval never satisfies the r1
-    gate; a distinct human account's approval is accepted).
+    resolves to the ``agentteams-teamharness`` tree — plus the round-3/4
+    approval-authority cases. Round 4 (#1467) is trusted authority only:
+    the close requires the trusted runtime role 'human' (fail closed
+    without it; a forged provenance payload — role=human + im_reply +
+    resolvedBy + resolveEvidence, or an injected resolvedRole /
+    resolvedActor — is never copied into the record), so the key
+    regressions are re-run here: the forged provenance on a frozen
+    approval is denied with nothing written (case 1), and the r1 forged
+    approval -> approval_required -> trusted human approval ->
+    accepted flow (case 5).
 """
 
 from __future__ import annotations
@@ -494,15 +501,15 @@ def test_review_identical_actor_string_forbidden(
     assert "review" not in _task_meta(tmp_path)
 
 
-# --- (c) round 3: approval authority (#1467) against the bundle tree ------
+# --- (c) round 3/4: approval authority (#1467) against the bundle tree ----
 
 
 def test_r3_parity_worker_tool_close_denied_keeps_frozen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     storage: None, attention_env: None,
 ) -> None:
-    """Case 1 (bundle tree): a worker drives the approval loop to frozen
-    and closes it (resolvedVia=tool) -> denied
+    """Case 2 (bundle tree): a worker drives the approval loop to frozen
+    and closes it (resolvedVia=tool, no trusted runtime role) -> denied
     approval_requires_human; the task stays frozen and the record stays
     open."""
     _enforce_on(monkeypatch)
@@ -570,8 +577,9 @@ def test_r3_parity_worker_self_closed_approval_does_not_satisfy_r1(
 def test_r3_parity_human_approval_from_distinct_account_accepted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
 ) -> None:
-    """Case 8 (bundle tree): critic pass + a human approval from an
-    account that differs from the assignee -> accepted (completed)."""
+    """Case 8 (bundle tree): critic pass + a human approval (carrying
+    the trusted-authority marker) from an account that differs from the
+    assignee -> accepted (completed)."""
     _enforce_on(monkeypatch)
     _write_submitted_task(
         tmp_path,
@@ -596,11 +604,135 @@ def test_r3_parity_human_approval_from_distinct_account_accepted(
                 "resolvedVia": "im_command",
                 "resolvedBy": "human:@luo:example.test",
                 "resolveEvidence": {"messageId": "$m2", "note": "approved"},
+                "resolvedRole": "human",
                 "resolvedActor": "human:@luo:example.test",
             }
         ],
     )
 
+    result = _accept(tmp_path)
+    assert result["ok"] is True
+    assert result["nodeStatus"] == "completed"
+    assert _task_meta(tmp_path)["status"] == "completed"
+
+
+def test_r4_parity_forged_provenance_denied_keeps_frozen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    storage: None, attention_env: None,
+) -> None:
+    """Case 1 (bundle tree): the maintainer's exact forged payload — no
+    trusted runtime role, and the caller claims role=human + im_reply +
+    resolvedBy=human:@luo:… + an invented resolveEvidence on a frozen
+    approval -> denied approval_requires_human; decision_status stays
+    frozen and nothing was written to the record."""
+    _enforce_on(monkeypatch)
+    _write_in_progress_task(tmp_path)
+    _request_attention(tmp_path, kind="approval", question="Approve?")
+    _request_attention(tmp_path, kind="approval")
+    _request_attention(tmp_path, kind="approval")
+    frozen = _request_attention(tmp_path, kind="approval")
+    assert frozen["task"]["decision_status"] == "frozen"
+
+    denied = _request_attention(
+        tmp_path,
+        kind="approval",
+        resolved=True,
+        role="human",
+        account="@luo:example.test",
+        resolved_via="im_reply",
+        resolved_by="human:@luo:example.test",
+        resolve_evidence={"messageId": "$forged-1", "note": "approved in room"},
+    )
+    assert denied["ok"] is False
+    assert denied["error_code"] == "approval_requires_human"
+    task = _task_meta(tmp_path)
+    assert task["decision_status"] == "frozen"
+    record = task["attention"][0]
+    assert record["resolved"] is False
+    for field in (
+        "resolvedVia",
+        "resolvedBy",
+        "resolveEvidence",
+        "resolvedActor",
+        "resolvedRole",
+    ):
+        assert field not in record
+
+
+def test_r4_parity_r1_forged_approval_then_trusted_human(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
+) -> None:
+    """Case 5 (bundle tree, the maintainer's r1 attack, end to end):
+    after a genuine critic pass, the forged approval (payload claims
+    human, no trusted runtime role) cannot be closed and
+    accept_task_result still returns approval_required; the same close
+    under the trusted runtime role 'human' then resolves — the record
+    carries the server-written marker — and the acceptance succeeds
+    (completed)."""
+    _enforce_on(monkeypatch)
+    _write_submitted_task(
+        tmp_path,
+        decision_class="r1",
+        assigned_to=WORKER_A,
+        submitted_by="worker:alice",
+        review={
+            "verdict": "pass",
+            "reviewer": "critic:bob",
+            "reviewer_team": "",
+            "reviewed_at": "2026-10-29T00:00:00Z",
+            "note": "looks right",
+        },
+        attention=[
+            {
+                "kind": "approval",
+                "question": "Approve the result?",
+                "attempt": 1,
+                "resolved": False,
+                "eventId": "$att-approval-1",
+                "stall_count": 0,
+            }
+        ],
+    )
+
+    forged = _request_attention(
+        tmp_path,
+        kind="approval",
+        resolved=True,
+        role="human",
+        account="@luo:example.test",
+        resolved_via="im_reply",
+        resolved_by="human:@luo:example.test",
+        resolve_evidence={"messageId": "$forged-1", "note": "approved in room"},
+    )
+    assert forged["ok"] is False
+    assert forged["error_code"] == "approval_requires_human"
+
+    result = _accept(tmp_path)
+    assert result["ok"] is False
+    assert result["error_code"] == "approval_required"
+    assert _task_meta(tmp_path)["status"] == "submitted"
+
+    monkeypatch.setattr(server, "_runtime_role", lambda: "human")
+    answered = _request_attention(
+        tmp_path,
+        kind="approval",
+        resolved=True,
+        role="human",
+        account="@luo:example.test",
+        resolved_via="im_reply",
+        resolved_by="human:@luo:example.test",
+        resolve_evidence={"messageId": "$m2", "note": "approved in room"},
+    )
+    assert answered["ok"] is True
+    record = answered["task"]["attention"][0]
+    assert record["resolved"] is True
+    assert record["resolvedRole"] == "human"
+    assert record["resolvedActor"].startswith("human:")
+
+    # The human integration's close is done; the acceptance runs under
+    # the leader's own payload role (the authority already lives in the
+    # server-written marker on the record).
+    monkeypatch.setattr(server, "_runtime_role", lambda: "")
     result = _accept(tmp_path)
     assert result["ok"] is True
     assert result["nodeStatus"] == "completed"

@@ -34,6 +34,7 @@ from mcp.room.matrix import _team_human_matrix_ids, _team_leader_matrix_id
 from mcp.room.notify import _send_attention_notification, _task_completion_notification
 from .review import (
     ProtocolGuardError,
+    _account_of,
     _approval_authorized,
     _guard_delegate_decision_class,
     _review_task_action,
@@ -75,6 +76,10 @@ _validate_assignee_membership = refs.proxy("_validate_assignee_membership")
 _write_json = refs.proxy("_write_json")
 _role = refs.proxy("_role")
 _transition_task = refs.proxy("_transition_task")
+# The trusted runtime role (server.py): operator-set env / runtime config,
+# never the tool payload — the only authority an approval close may rely
+# on (#1467 round 4).
+_runtime_role = refs.proxy("_runtime_role")
 
 
 _TASKFLOW_MUTATING_ACTIONS = frozenset({
@@ -1158,11 +1163,17 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 ):
                     # W2 stall chain: a frozen task is released only
                     # through the approval channel (the resolved
-                    # kind=approval record), never by any other answer.
+                    # kind=approval record), never by any other answer —
+                    # and that close itself needs the trusted human role.
                     raise ProtocolGuardError(
                         "frozen_unfreeze_requires_approval",
                         "task is frozen; only a resolved approval record "
-                        "(kind=approval) can unfreeze it",
+                        "(kind=approval) can unfreeze it, and that close "
+                        "requires a trusted human runtime role: enable a "
+                        "human integration with AGENTTEAMS_AGENT_ROLE=human "
+                        "(or member.role=human in the runtime config); a "
+                        "tool caller without a trusted role cannot approve "
+                        "or unfreeze",
                     )
                 if (
                     _protocol_enforce_enabled()
@@ -1174,22 +1185,31 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         resolve_evidence=resolve_evidence,
                     )
                 ):
-                    # W2 approval authority (#1467 round 3): closing an
+                    # W2 trusted authority (#1467 round 4): closing an
                     # approval record is an authorized human decision,
-                    # not a mere loop close. A tool / api close — or any
-                    # caller without verifiable human decision authority
-                    # — is refused, and the task keeps its current
-                    # decision_status (a frozen task stays frozen).
+                    # and the only authority is the trusted runtime role
+                    # (operator-set env / runtime config). Every payload
+                    # field — role, channel, decider, evidence — is
+                    # provenance, never authorization: with no trusted
+                    # 'human' role the close is refused, and the task
+                    # keeps its current decision_status (a frozen task
+                    # stays frozen).
                     raise ProtocolGuardError(
                         "approval_requires_human",
-                        "closing an approval record requires verifiable human "
-                        "decision authority (a tool or api close never "
-                        "authorizes an approval)",
+                        "closing an approval record (and unfreezing a "
+                        "frozen task) requires a trusted human runtime "
+                        "role: enable a human integration with "
+                        "AGENTTEAMS_AGENT_ROLE=human (or member.role=human "
+                        "in the runtime config); a tool caller without a "
+                        "trusted role cannot approve or unfreeze",
                     )
                 target["resolved"] = True
                 # S0 resolve provenance (#1394): who closed the loop and
                 # how. A human reply in a room is recorded as im_reply with
                 # the evidence cited, never conflated with a tool flip.
+                # resolvedVia / resolvedBy / resolveEvidence are display
+                # provenance only — authority is the server-written marker
+                # below (#1467 round 4).
                 target["resolvedVia"] = resolve_via
                 if resolve_by:
                     target["resolvedBy"] = resolve_by
@@ -1197,15 +1217,29 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     target["resolveEvidence"] = resolve_evidence
                 target["resolvedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 if _protocol_enforce_enabled():
-                    # W2 approval authority (#1467 round 3): the record
-                    # carries the close provenance (resolvedActor) so
-                    # the r1 gate verifies the decider on the record
-                    # itself — the history entry alone is not enough.
                     # The answer arrived: zero the stall counter and
                     # return a stall-driven blocked/frozen sub-state to
                     # open (audited in decision_status_history).
                     resolver = _transition_actor(arguments)
-                    target["resolvedActor"] = resolver
+                    if kind == "approval":
+                        # W2 trusted authority (#1467 round 4): the
+                        # server writes the authority marker itself — the
+                        # trusted runtime role (the authorization above
+                        # guarantees "human" when reached) plus the
+                        # account behind the transition actor. A
+                        # payload-supplied resolvedRole / resolvedActor
+                        # is never copied: the r1 gate reads this marker,
+                        # not the caller's strings.
+                        trusted_role = _runtime_role()
+                        target["resolvedRole"] = trusted_role
+                        target["resolvedActor"] = (
+                            f"{trusted_role}:{_account_of(resolver)}"
+                        )
+                    else:
+                        # Non-approval close provenance: the record
+                        # carries the closing actor so the loop close is
+                        # auditable on the record itself.
+                        target["resolvedActor"] = resolver
                     _attention_resolved_status(task, target, actor=resolver)
                 _write_task(arguments, task)
                 synced = _sync_task(arguments, task_id, exclude=["spec.md", "base/"])

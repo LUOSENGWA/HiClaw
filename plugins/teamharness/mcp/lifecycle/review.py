@@ -62,13 +62,16 @@ def _decider_identity(decider: str) -> tuple[str, str]:
 
 def _has_approval_record(task: dict[str, Any], submitter_account: str = "") -> bool:
     """An approval record is a RESOLVED attention record of kind
-    'approval' that shows verifiable human decision authority: the close
-    went through a human channel (im_reply / im_command / dashboard —
-    never tool or api) and the recorded decider (resolvedBy, else
-    resolvedActor) parses to the human role with an account. When the
-    submitter's account is known, the decider's account must differ from
-    it: self-approval never counts. Record presence alone is not an
-    approval (#1467 round 3)."""
+    'approval' that carries the trusted-authority marker: the
+    server-written resolvedRole must be "human" (only the authorized
+    close path writes it — a payload-supplied resolvedRole is never
+    copied), the close went through a human channel (im_reply /
+    im_command / dashboard — never tool or api), and the recorded
+    decider (resolvedBy, else resolvedActor) carries an account that,
+    when the submitter's account is known, differs from it:
+    self-approval never counts. The role is read from the marker only —
+    never inferred from the decider strings (#1467 round 4: the marker
+    is the authority; record presence alone is not an approval)."""
     attention = task.get("attention")
     if not isinstance(attention, list):
         return False
@@ -79,11 +82,14 @@ def _has_approval_record(task: dict[str, Any], submitter_account: str = "") -> b
             continue
         if not record.get("resolved"):
             continue
+        if record.get("resolvedRole") != "human":
+            continue
         if str(record.get("resolvedVia") or "") not in _HUMAN_RESOLVE_CHANNELS:
             continue
-        decider = str(record.get("resolvedBy") or record.get("resolvedActor") or "")
-        role, account = _decider_identity(decider)
-        if role != "human" or not account:
+        _decider_role, account = _decider_identity(
+            str(record.get("resolvedBy") or record.get("resolvedActor") or "")
+        )
+        if not account:
             continue
         if submitter_account and account == submitter_account:
             continue
@@ -97,27 +103,18 @@ def _approval_authorized(
     resolved_by: str = "",
     resolve_evidence: Any = None,
 ) -> bool:
-    """Whether this close of a kind=approval record is an authorized
-    human decision (protocol-enforced path only).
+    """Only the trusted runtime role can authorize an approval close.
 
-    A non-empty trusted runtime role is decisive — it comes from the
-    operator-set environment / runtime config, never the tool payload,
-    so a Worker runtime can never present itself as anything else: only
-    'human' authorizes. With no trusted role (a dashboard-style client)
-    the payload must show two independent human-provenance signals: a
-    human role on a human resolve channel, plus a decider identity
-    (resolvedBy) and decision evidence (resolveEvidence). A bare role
-    claim — or a tool / api close — is never enough."""
-    trusted_role = _runtime_role()
-    if trusted_role:
-        return trusted_role == "human"
-    role, _account = _decider_identity(actor)
-    return (
-        role == "human"
-        and resolve_via in _HUMAN_RESOLVE_CHANNELS
-        and bool(str(resolved_by or "").strip())
-        and bool(resolve_evidence)
-    )
+    Every field a tool caller controls (role, account, channel, decider,
+    evidence) is provenance, never authority: with no trusted role there
+    is no verified human identity, so the close fails closed. The
+    parameters are accepted for call-site compatibility and are
+    deliberately ignored by the decision. A human integration
+    (dashboard / API bridge) must run with the runtime role 'human'
+    (AGENTTEAMS_AGENT_ROLE=human or member.role in the runtime config);
+    that value comes from the operator, not the payload (#1467 round 4:
+    trusted authority only)."""
+    return _runtime_role() == "human"
 
 
 def _guard_delegate_decision_class(payload: dict[str, Any]) -> str:
@@ -152,11 +149,14 @@ def _protocol_guard_for_accept(task: dict[str, Any], accepted: bool) -> None:
     - a review record with a non-passing verdict blocks the acceptance
       (review_not_passed);
     - an r1 task result (task_result_acceptance class; an absent
-      decision_class reads as r4) cannot be decided without a resolved,
-      human-authorized approval record (approval_required): the record
-      must have been closed through a human channel by a human decider
-      whose account differs from the task's assignee (self-approval
-      never counts; record presence alone is not an approval).
+      decision_class reads as r4) cannot be decided without a resolved
+      approval record carrying the trusted-authority marker
+      (approval_required): the record must have been closed by the
+      authorized path (server-written resolvedRole "human") through a
+      human channel by a decider whose account differs from the task's
+      assignee (self-approval never counts; the role is never inferred
+      from the decider strings, and record presence alone is not an
+      approval).
     """
     if not _protocol_enforce_enabled():
         return
@@ -190,15 +190,18 @@ def _protocol_guard_for_accept(task: dict[str, Any], accepted: bool) -> None:
 # The role prefix a transition actor can carry (see _transition_actor:
 # the canonical _normalize_role output, plus its "unknown" fallback).
 # The vocabulary is the union of this tree's role checks — taskflow
-# (worker / remote-member / leader), review_task (critic / leader) and
-# constants (worker / remote-member). Accounts may themselves contain a
-# colon (Matrix identities @user:server), so only a leading known role
-# prefix may be stripped — never the last colon segment.
+# (worker / remote-member / leader), review_task (critic / leader), the
+# trusted runtime role (human — a human integration's runtime role
+# surfaces in the actor, #1467 round 4) and constants (worker /
+# remote-member). Accounts may themselves contain a colon (Matrix
+# identities @user:server), so only a leading known role prefix may be
+# stripped — never the last colon segment.
 _ACTOR_ROLE_PREFIXES = {
     "leader",
     "worker",
     "critic",
     "remote-member",
+    "human",
     "unknown",
 }
 

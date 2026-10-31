@@ -19,21 +19,26 @@ Rows 1-3 also assert the off-switch byte identity: with the switch off no
 protocol field (decision_class / decision_status / stall_count /
 submitted_by) is written at all.
 
-Round 3 (issue #1467) — approval authority: closing a kind=approval
+Round 3/4 (issue #1467) — approval authority: closing a kind=approval
 record is an authorized human decision, not a mere loop close. The
-authority matrix (protocol-enforced only):
+authority rule (protocol-enforced only; round 4: trusted authority
+only, fail closed):
 
-  trusted runtime role non-empty -> only "human" authorizes (the env /
-      runtime config is operator-set; a Worker runtime can never claim
-      another role);
-  trusted runtime role empty     -> payload human role + a human resolve
-      channel (im_reply / im_command / dashboard — never tool or api) +
-      resolvedBy + resolveEvidence (a bare role claim is never enough).
+  only the trusted runtime role can authorize — "human" authorizes,
+  anything else (worker / leader / no role) fails closed;
+  every field a tool caller controls (role, account, channel, decider,
+  evidence) is provenance, never authority: the payload's human claim
+  (role=human + a human channel + resolvedBy + resolveEvidence) is
+  denied without the trusted role. A human integration (dashboard /
+  API bridge) must run with AGENTTEAMS_AGENT_ROLE=human (or
+  member.role in the runtime config).
 
-The r1 approval gate counts a record only when it was closed through a
-human channel by a human decider whose account differs from the task's
-assignee (self-approval never counts; record presence alone is not an
-approval). The record itself carries the close provenance (resolvedActor).
+The authorized close writes the server-derived marker
+(resolvedRole="human" + resolvedActor="human:<account>") that the r1
+approval gate reads: the gate requires the marker (never inferred from
+the decider strings), the human channel, and a decider account that
+differs from the task's assignee (self-approval never counts; record
+presence alone is not an approval).
 """
 
 from __future__ import annotations
@@ -507,10 +512,12 @@ def test_row5_r1_with_approval_accepted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
 ) -> None:
     _enforce_on(monkeypatch)
-    # Both W2 gates pass: a pass review record AND a resolved,
-    # human-authorized approval record (round 3: closed through a human
-    # channel by a human decider whose account differs from the
-    # assignee) — this row isolates the approval gate's success path.
+    # Both W2 gates pass: a pass review record AND a resolved approval
+    # record carrying the server-written trusted-authority marker
+    # (round 4: resolvedRole="human" — written only by the authorized
+    # close path — plus a human channel and a decider account that
+    # differs from the assignee) — this row isolates the approval
+    # gate's success path.
     _write_submitted_task(
         tmp_path,
         decision_class="r1",
@@ -534,6 +541,7 @@ def test_row5_r1_with_approval_accepted(
                 "resolvedVia": "im_reply",
                 "resolvedBy": "human:@luo:example.test",
                 "resolveEvidence": {"messageId": "$m1", "note": "approved in room"},
+                "resolvedRole": "human",
                 "resolvedActor": "human:@luo:example.test",
             }
         ],
@@ -867,13 +875,18 @@ def test_row9_frozen_unfreeze_requires_approval(
     frozen = _request_attention(tmp_path)
     assert frozen["task"]["decision_status"] == "frozen"
 
-    # A non-approval answer cannot unfreeze a frozen task.
+    # A non-approval answer cannot unfreeze a frozen task; the refusal
+    # names the operator contract (round 4: the approval close itself
+    # needs the trusted human role).
     refused = _request_attention(tmp_path, kind="decision", resolved=True)
     assert refused["ok"] is False
     assert refused["error_code"] == "frozen_unfreeze_requires_approval"
     assert refused["message"] == (
         "task is frozen; only a resolved approval record (kind=approval) "
-        "can unfreeze it"
+        "can unfreeze it, and that close requires a trusted human runtime "
+        "role: enable a human integration with AGENTTEAMS_AGENT_ROLE=human "
+        "(or member.role=human in the runtime config); a tool caller "
+        "without a trusted role cannot approve or unfreeze"
     )
     task = _task_meta(tmp_path)
     assert task["decision_status"] == "frozen"
@@ -885,7 +898,8 @@ def test_row9_frozen_unfreeze_requires_approval(
     assert opened["ok"] is True
 
     # A worker close of the approval record is not an authorized human
-    # decision (round 3): refused, and the task stays frozen.
+    # decision (round 4: no trusted role, fail closed): refused, and
+    # the task stays frozen.
     worker_close = _request_attention(
         tmp_path, kind="approval", resolved=True, resolved_via="tool"
     )
@@ -908,6 +922,9 @@ def test_row9_frozen_unfreeze_requires_approval(
     assert approval["resolved"] is True
     assert approval["stall_count"] == 0
     assert approval["resolvedVia"] == "im_reply"
+    # The server-derived authority marker (round 4): written by the
+    # authorized close path, not taken from the payload.
+    assert approval["resolvedRole"] == "human"
     assert approval["resolvedActor"] == "human:default"
     history = task["decision_status_history"]
     assert history[-1]["to"] == "open"
@@ -942,15 +959,15 @@ def test_row10_contracts_match_constants() -> None:
     assert attention["switch"]["default"] is False
 
 
-# --- Round 3: approval authority (#1467) ----------------------------------
+# --- Round 3/4: approval authority (#1467) ---------------------------------
 
 
 def test_r3_worker_tool_close_denied_keeps_frozen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     storage: None, attention_env: None,
 ) -> None:
-    """Case 1: a worker raises the approval loop, drives it to frozen,
-    then closes it (resolvedVia=tool) -> denied
+    """Case 2: a worker raises the approval loop, drives it to frozen,
+    then closes it (resolvedVia=tool, no trusted runtime role) -> denied
     approval_requires_human; the task stays frozen and the record stays
     open with no provenance written."""
     _enforce_on(monkeypatch)
@@ -967,15 +984,18 @@ def test_r3_worker_tool_close_denied_keeps_frozen(
     assert denied["ok"] is False
     assert denied["error_code"] == "approval_requires_human"
     assert denied["message"] == (
-        "closing an approval record requires verifiable human "
-        "decision authority (a tool or api close never "
-        "authorizes an approval)"
+        "closing an approval record (and unfreezing a frozen task) "
+        "requires a trusted human runtime role: enable a human "
+        "integration with AGENTTEAMS_AGENT_ROLE=human (or "
+        "member.role=human in the runtime config); a tool caller "
+        "without a trusted role cannot approve or unfreeze"
     )
     task = _task_meta(tmp_path)
     assert task["decision_status"] == "frozen"
     record = task["attention"][0]
     assert record["resolved"] is False
     assert "resolvedActor" not in record
+    assert "resolvedRole" not in record
     assert "resolvedVia" not in record
 
 
@@ -983,9 +1003,11 @@ def test_r3_trusted_worker_beats_payload_human_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     storage: None, attention_env: None,
 ) -> None:
-    """Case 2: the trusted runtime role is 'worker' — a payload claim of
-    resolvedVia=im_reply + resolvedBy=human:… is ignored (the trusted
-    role is decisive) -> denied approval_requires_human."""
+    """Case 3: the trusted runtime role is 'worker' while the payload
+    claims resolvedVia=im_reply + resolvedBy=human:… -> denied
+    approval_requires_human: without the trusted human runtime role the
+    close fails closed, whatever the payload claims; the record stays
+    open with no provenance written."""
     _enforce_on(monkeypatch)
     monkeypatch.setattr(server, "_runtime_role", lambda: "worker")
     _write_in_progress_task(tmp_path)
@@ -1010,9 +1032,11 @@ def test_r3_trusted_human_im_reply_unfreezes_and_records_provenance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     storage: None, attention_env: None,
 ) -> None:
-    """Case 3: trusted role 'human' + resolvedVia=im_reply + evidence ->
-    resolves; frozen -> open; the record carries the provenance fields
-    (resolvedVia / resolveEvidence / resolvedActor)."""
+    """Case 4: the trusted runtime role is 'human' + resolvedVia=im_reply
+    + evidence -> resolves; frozen -> open; the record carries the
+    provenance fields (resolvedVia / resolveEvidence) plus the
+    server-written trusted-authority marker (resolvedRole="human",
+    resolvedActor="human:<account>")."""
     _enforce_on(monkeypatch)
     monkeypatch.setattr(server, "_runtime_role", lambda: "human")
     _write_in_progress_task(tmp_path)
@@ -1039,6 +1063,10 @@ def test_r3_trusted_human_im_reply_unfreezes_and_records_provenance(
         "messageId": "$m1",
         "note": "approved in room",
     }
+    # The trusted-authority marker is server-written: the trusted
+    # runtime role plus the account behind the transition actor.
+    assert record["resolvedRole"] == "human"
+    assert record["resolvedActor"].startswith("human:")
     assert record["resolvedActor"] == "human:default"
     assert record["resolvedAt"]
     last = task["decision_status_history"][-1]
@@ -1049,18 +1077,65 @@ def test_r3_trusted_human_im_reply_unfreezes_and_records_provenance(
     assert last["actor"] == "human:default"
 
 
-def test_r3_dashboard_human_payload_with_provenance_resolves(
+def test_r4_payload_marker_injection_ignored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     storage: None, attention_env: None,
 ) -> None:
-    """Case 4: no trusted role; the payload role is 'human' on a human
-    channel plus the two independent provenance signals (resolvedBy +
-    resolveEvidence) -> resolves."""
+    """Case 4b: the trusted runtime role is 'worker' and the payload
+    injects the trusted-authority fields themselves (resolvedRole="human"
+    + resolvedActor="human:@luo:…") -> denied approval_requires_human
+    and the record is untouched: the server writes the marker itself, a
+    caller-supplied one is never copied, so no fabricated marker exists
+    for the r1 gate to read."""
     _enforce_on(monkeypatch)
+    monkeypatch.setattr(server, "_runtime_role", lambda: "worker")
     _write_in_progress_task(tmp_path)
     _request_attention(tmp_path, kind="approval", question="Approve?")
 
-    answered = _request_attention(
+    denied = _call("taskflow", {
+        "role": "worker",
+        "action": "request_attention",
+        "workspaceDir": str(tmp_path),
+        "account_id": "@luo:example.test",
+        "payload": {
+            "taskId": TASK_ID,
+            "kind": "approval",
+            "question": "Approve?",
+            "resolved": True,
+            "resolvedVia": "im_reply",
+            "resolvedBy": "human:@luo:example.test",
+            "resolveEvidence": {"messageId": "$m1", "note": "approved in room"},
+            "resolvedRole": "human",
+            "resolvedActor": "human:@luo:example.test",
+        },
+    })
+    assert denied["ok"] is False
+    assert denied["error_code"] == "approval_requires_human"
+    record = _task_meta(tmp_path)["attention"][0]
+    assert record["resolved"] is False
+    assert "resolvedRole" not in record
+    assert "resolvedActor" not in record
+    assert "resolvedVia" not in record
+
+
+def test_r4_forged_provenance_denied_keeps_frozen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    storage: None, attention_env: None,
+) -> None:
+    """Case 1: the maintainer's exact forged payload — no trusted runtime
+    role, and the caller claims role=human + im_reply +
+    resolvedBy=human:@luo:… + an invented resolveEvidence on a frozen
+    approval -> denied approval_requires_human; decision_status stays
+    frozen and nothing was written to the record."""
+    _enforce_on(monkeypatch)
+    _write_in_progress_task(tmp_path)
+    _request_attention(tmp_path, kind="approval", question="Approve?")
+    _request_attention(tmp_path, kind="approval")
+    _request_attention(tmp_path, kind="approval")
+    frozen = _request_attention(tmp_path, kind="approval")
+    assert frozen["task"]["decision_status"] == "frozen"
+
+    denied = _request_attention(
         tmp_path,
         kind="approval",
         resolved=True,
@@ -1068,16 +1143,22 @@ def test_r3_dashboard_human_payload_with_provenance_resolves(
         account="@luo:example.test",
         resolved_via="im_reply",
         resolved_by="human:@luo:example.test",
-        resolve_evidence={"messageId": "$m1", "note": "approved in room"},
+        resolve_evidence={"messageId": "$forged-1", "note": "approved in room"},
     )
-    assert answered["ok"] is True
-    record = next(
-        r for r in answered["task"]["attention"] if r["kind"] == "approval"
-    )
-    assert record["resolved"] is True
-    assert record["resolvedVia"] == "im_reply"
-    assert record["resolvedBy"] == "human:@luo:example.test"
-    assert record["resolvedActor"] == "human:@luo:example.test"
+    assert denied["ok"] is False
+    assert denied["error_code"] == "approval_requires_human"
+    task = _task_meta(tmp_path)
+    assert task["decision_status"] == "frozen"
+    record = task["attention"][0]
+    assert record["resolved"] is False
+    for field in (
+        "resolvedVia",
+        "resolvedBy",
+        "resolveEvidence",
+        "resolvedActor",
+        "resolvedRole",
+    ):
+        assert field not in record
 
 
 @pytest.mark.parametrize("channel", ["tool", "api"])
@@ -1085,9 +1166,11 @@ def test_r3_payload_human_on_agent_channel_denied(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     storage: None, attention_env: None, channel: str,
 ) -> None:
-    """Case 5: no trusted role; the payload role is 'human' but the close
-    goes through an agent channel (tool / api) -> denied even with a
-    decider identity and evidence."""
+    """Case 5: no trusted runtime role; the payload claims role=human on
+    an agent channel (tool / api) -> denied approval_requires_human:
+    with trusted authority only, the channel is irrelevant — without the
+    trusted human runtime role the close fails closed, whatever the
+    payload claims."""
     _enforce_on(monkeypatch)
     _write_in_progress_task(tmp_path)
     _request_attention(tmp_path, kind="approval", question="Approve?")
@@ -1112,9 +1195,10 @@ def test_r3_worker_self_closed_approval_does_not_satisfy_r1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
 ) -> None:
     """Case 6: after a genuine critic pass, the worker tries to close
-    its own approval record (tool) -> the close is denied and the
-    leader's accept_task_result still returns approval_required (the
-    self-closed record must not satisfy the r1 gate)."""
+    its own approval record (tool, no trusted runtime role) -> the close
+    is denied and the leader's accept_task_result still returns
+    approval_required (the self-closed record must not satisfy the r1
+    gate)."""
     _enforce_on(monkeypatch)
     _write_submitted_task(
         tmp_path,
@@ -1152,6 +1236,86 @@ def test_r3_worker_self_closed_approval_does_not_satisfy_r1(
     assert _task_meta(tmp_path)["status"] == "submitted"
 
 
+def test_r4_r1_forged_approval_then_trusted_human(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
+) -> None:
+    """Case 5 (the maintainer's r1 attack, end to end): after a genuine
+    critic pass, the forged approval (payload claims human, no trusted
+    runtime role) cannot be closed and accept_task_result still returns
+    approval_required; the same close under the trusted runtime role
+    'human' then resolves — the record carries the server-written
+    marker — and the acceptance succeeds (completed)."""
+    _enforce_on(monkeypatch)
+    _write_submitted_task(
+        tmp_path,
+        decision_class="r1",
+        assigned_to=WORKER_A,
+        submitted_by="worker:alice",
+        review={
+            "verdict": "pass",
+            "reviewer": "critic:bob",
+            "reviewer_team": "",
+            "reviewed_at": "2026-10-29T00:00:00Z",
+            "note": "looks right",
+        },
+        attention=[
+            {
+                "kind": "approval",
+                "question": "Approve the result?",
+                "attempt": 1,
+                "resolved": False,
+                "eventId": "$att-approval-1",
+                "stall_count": 0,
+            }
+        ],
+    )
+
+    forged = _request_attention(
+        tmp_path,
+        kind="approval",
+        resolved=True,
+        role="human",
+        account="@luo:example.test",
+        resolved_via="im_reply",
+        resolved_by="human:@luo:example.test",
+        resolve_evidence={"messageId": "$forged-1", "note": "approved in room"},
+    )
+    assert forged["ok"] is False
+    assert forged["error_code"] == "approval_requires_human"
+
+    result = _accept(tmp_path)
+    assert result["ok"] is False
+    assert result["error_code"] == "approval_required"
+    assert _task_meta(tmp_path)["status"] == "submitted"
+
+    monkeypatch.setattr(server, "_runtime_role", lambda: "human")
+    answered = _request_attention(
+        tmp_path,
+        kind="approval",
+        resolved=True,
+        role="human",
+        account="@luo:example.test",
+        resolved_via="im_reply",
+        resolved_by="human:@luo:example.test",
+        resolve_evidence={"messageId": "$m2", "note": "approved in room"},
+    )
+    assert answered["ok"] is True
+    record = answered["task"]["attention"][0]
+    assert record["resolved"] is True
+    assert record["resolvedRole"] == "human"
+    assert record["resolvedActor"].startswith("human:")
+
+    # The human integration's close is done; the acceptance runs under
+    # the leader's own payload role (the trusted role is gone — the
+    # authority already lives in the server-written marker on the
+    # record, not in the runtime of the accept call).
+    monkeypatch.setattr(server, "_runtime_role", lambda: "")
+    result = _accept(tmp_path)
+    assert result["ok"] is True, result
+    assert result["nodeStatus"] == "completed"
+    assert _task_meta(tmp_path)["status"] == "completed"
+
+
 def test_r3_human_self_approval_does_not_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
 ) -> None:
@@ -1182,6 +1346,7 @@ def test_r3_human_self_approval_does_not_count(
                 "resolvedVia": "im_reply",
                 "resolvedBy": "human:@luo:example.test",
                 "resolveEvidence": {"messageId": "$m1", "note": "approved"},
+                "resolvedRole": "human",
                 "resolvedActor": "human:@luo:example.test",
             }
         ],
@@ -1222,6 +1387,7 @@ def test_r3_human_approval_from_distinct_account_accepted(
                 "resolvedVia": "im_command",
                 "resolvedBy": "human:@luo:example.test",
                 "resolveEvidence": {"messageId": "$m2", "note": "approved"},
+                "resolvedRole": "human",
                 "resolvedActor": "human:@luo:example.test",
             }
         ],
@@ -1237,10 +1403,10 @@ def test_r3_off_switch_worker_close_behaves_as_before(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     storage: None, attention_env: None,
 ) -> None:
-    """Case 10: with the switch off the worker flow is byte-identical —
+    """Case 9: with the switch off the worker flow is byte-identical —
     the worker may close its own approval record via the tool, and no
     new protocol field is written (decision_status / stall_count /
-    resolvedActor)."""
+    resolvedActor / resolvedRole)."""
     _write_in_progress_task(tmp_path)
 
     created = _request_attention(tmp_path, kind="approval", question="Approve?")
@@ -1253,29 +1419,32 @@ def test_r3_off_switch_worker_close_behaves_as_before(
     assert record["resolved"] is True
     assert record["resolvedVia"] == "tool"
     assert "resolvedActor" not in record
+    assert "resolvedRole" not in record
     assert "stall_count" not in record
     assert "decision_status" not in closed["task"]
 
 
 def test_r3_record_counting_matrix() -> None:
-    """The r1 gate's record counting, pinned at unit level: the human
-    channel set, the human-decider requirement (a bare 'human' claim
-    parses to no account and never counts; a non-human role never
-    counts), and the self-approval exclusion."""
+    """The r1 gate's record counting, pinned at unit level: the
+    trusted-authority marker (the server-written resolvedRole="human" —
+    never inferred from the decider strings), the human channel set, the
+    decider-account requirement (a bare 'human' claim parses to no
+    account and never counts), and the self-approval exclusion."""
     has = server.review._has_approval_record
 
     def record(**overrides: Any) -> dict[str, Any]:
         base: dict[str, Any] = {
             "kind": "approval",
             "resolved": True,
+            "resolvedRole": "human",
             "resolvedVia": "im_reply",
             "resolvedBy": "human:@luo:example.test",
         }
         base.update(overrides)
         return base
 
-    # A human-channel close by a human decider counts — on any human
-    # channel.
+    # A human-channel close with the trusted marker and a decider
+    # account counts — on any human channel.
     assert has({"attention": [record()]}) is True
     assert has({"attention": [record(resolvedVia="im_command")]}) is True
     assert has({"attention": [record(resolvedVia="dashboard")]}) is True
@@ -1284,15 +1453,21 @@ def test_r3_record_counting_matrix() -> None:
     assert has({"attention": [record(resolvedVia="api")]}) is False
     assert has({"attention": [record(resolved=False)]}) is False
     assert has({"attention": [record(kind="decision")]}) is False
-    # A non-human decider role — or a bare "human" claim with no
-    # account — is not a human decider.
-    assert has({"attention": [record(resolvedBy="worker:@luo:example.test")]}) is False
+    # The marker is the authority: a wrong, empty, or missing
+    # resolvedRole never counts, whatever the decider strings claim.
+    assert has({"attention": [record(resolvedRole="worker")]}) is False
+    assert has({"attention": [record(resolvedRole="")]}) is False
+    stripped = {k: v for k, v in record().items() if k != "resolvedRole"}
+    assert has({"attention": [stripped]}) is False
+    # A decider without an account (a bare "human" claim, or empty)
+    # never counts, even with the marker.
     assert has({"attention": [record(resolvedBy="human")]}) is False
-    assert has({"attention": [record(resolvedBy="") ]}) is False
+    assert has({"attention": [record(resolvedBy="")]}) is False
     # resolvedActor is the fallback decider when resolvedBy is absent.
     assert has({"attention": [{
         "kind": "approval",
         "resolved": True,
+        "resolvedRole": "human",
         "resolvedVia": "im_reply",
         "resolvedActor": "human:@luo:example.test",
     }]}) is True
