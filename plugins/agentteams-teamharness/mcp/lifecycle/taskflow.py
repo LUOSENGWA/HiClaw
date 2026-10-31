@@ -34,6 +34,7 @@ from mcp.room.matrix import _team_human_matrix_ids, _team_leader_matrix_id
 from mcp.room.notify import _send_attention_notification, _task_completion_notification
 from .review import (
     ProtocolGuardError,
+    _approval_authorized,
     _guard_delegate_decision_class,
     _review_task_action,
 )
@@ -1000,7 +1001,15 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             }
 
         if action == "request_attention":
-            if role not in {"worker", "leader", "remote-member"}:
+            # Human decision channel (#1467 round 3): with the protocol
+            # switch on a 'human' caller (trusted runtime role or payload
+            # role) may also reach request_attention — it is the channel
+            # that closes an approval record. With the switch off the
+            # gate is the pre-W2 one, byte for byte.
+            attention_roles = {"worker", "leader", "remote-member"}
+            if _protocol_enforce_enabled():
+                attention_roles.add("human")
+            if role not in attention_roles:
                 raise ValueError(
                     "request_attention requires worker, leader, or remote-member role"
                 )
@@ -1155,6 +1164,28 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                         "task is frozen; only a resolved approval record "
                         "(kind=approval) can unfreeze it",
                     )
+                if (
+                    _protocol_enforce_enabled()
+                    and kind == "approval"
+                    and not _approval_authorized(
+                        _transition_actor(arguments),
+                        resolve_via,
+                        resolved_by=resolve_by,
+                        resolve_evidence=resolve_evidence,
+                    )
+                ):
+                    # W2 approval authority (#1467 round 3): closing an
+                    # approval record is an authorized human decision,
+                    # not a mere loop close. A tool / api close — or any
+                    # caller without verifiable human decision authority
+                    # — is refused, and the task keeps its current
+                    # decision_status (a frozen task stays frozen).
+                    raise ProtocolGuardError(
+                        "approval_requires_human",
+                        "closing an approval record requires verifiable human "
+                        "decision authority (a tool or api close never "
+                        "authorizes an approval)",
+                    )
                 target["resolved"] = True
                 # S0 resolve provenance (#1394): who closed the loop and
                 # how. A human reply in a room is recorded as im_reply with
@@ -1166,10 +1197,16 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     target["resolveEvidence"] = resolve_evidence
                 target["resolvedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 if _protocol_enforce_enabled():
+                    # W2 approval authority (#1467 round 3): the record
+                    # carries the close provenance (resolvedActor) so
+                    # the r1 gate verifies the decider on the record
+                    # itself — the history entry alone is not enough.
                     # The answer arrived: zero the stall counter and
                     # return a stall-driven blocked/frozen sub-state to
                     # open (audited in decision_status_history).
-                    _attention_resolved_status(task, target, actor=_transition_actor(arguments))
+                    resolver = _transition_actor(arguments)
+                    target["resolvedActor"] = resolver
+                    _attention_resolved_status(task, target, actor=resolver)
                 _write_task(arguments, task)
                 synced = _sync_task(arguments, task_id, exclude=["spec.md", "base/"])
                 event_id = str(target.get("eventId") or "") or None

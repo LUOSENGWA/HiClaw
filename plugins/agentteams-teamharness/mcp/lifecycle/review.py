@@ -18,6 +18,16 @@ from .transitions import _reject_task_transition, _require_task_mutable, _transi
 # visible to this module.
 _write_task = refs.proxy("_write_task")
 _sync_task = refs.proxy("_sync_task")
+# The trusted runtime role (server.py): it reads the operator-set
+# environment / runtime config, never the tool payload, so a caller cannot
+# spoof it. Call-time proxy so tests can monkeypatch it.
+_runtime_role = refs.proxy("_runtime_role")
+
+# Resolve channels that carry a human decision: a reply or a command in
+# the IM room, or the dashboard. "tool" and "api" are agent/automation
+# channels — they may close an attention loop, but they can never
+# authorize an approval (#1467 round 3: verifiable decision authority).
+_HUMAN_RESOLVE_CHANNELS = {"im_reply", "im_command", "dashboard"}
 
 
 class ProtocolGuardError(Exception):
@@ -38,21 +48,76 @@ def _decision_class_of(task: dict[str, Any]) -> str:
     return _first_text(task.get("decision_class"), task.get("decisionClass")) or DEFAULT_DECISION_CLASS
 
 
-def _has_approval_record(task: dict[str, Any]) -> bool:
+def _decider_identity(decider: str) -> tuple[str, str]:
+    """Parse a recorded decider into (role, account): the leading role
+    prefix up to the first colon, plus the account behind it (colons
+    preserved — Matrix identities @user:server). A decider without a
+    colon is a bare claim with no identity and parses to (text, "")."""
+    text = str(decider or "").strip()
+    role, sep, account = text.partition(":")
+    if not sep or not account:
+        return (text, "")
+    return (role, account)
+
+
+def _has_approval_record(task: dict[str, Any], submitter_account: str = "") -> bool:
     """An approval record is a RESOLVED attention record of kind
-    'approval' — the existing attention mechanism is the approval channel
-    (no parallel mechanism is introduced)."""
+    'approval' that shows verifiable human decision authority: the close
+    went through a human channel (im_reply / im_command / dashboard —
+    never tool or api) and the recorded decider (resolvedBy, else
+    resolvedActor) parses to the human role with an account. When the
+    submitter's account is known, the decider's account must differ from
+    it: self-approval never counts. Record presence alone is not an
+    approval (#1467 round 3)."""
     attention = task.get("attention")
     if not isinstance(attention, list):
         return False
     for record in attention:
-        if (
-            isinstance(record, dict)
-            and str(record.get("kind") or "") == "approval"
-            and record.get("resolved")
-        ):
-            return True
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("kind") or "") != "approval":
+            continue
+        if not record.get("resolved"):
+            continue
+        if str(record.get("resolvedVia") or "") not in _HUMAN_RESOLVE_CHANNELS:
+            continue
+        decider = str(record.get("resolvedBy") or record.get("resolvedActor") or "")
+        role, account = _decider_identity(decider)
+        if role != "human" or not account:
+            continue
+        if submitter_account and account == submitter_account:
+            continue
+        return True
     return False
+
+
+def _approval_authorized(
+    actor: str,
+    resolve_via: str,
+    resolved_by: str = "",
+    resolve_evidence: Any = None,
+) -> bool:
+    """Whether this close of a kind=approval record is an authorized
+    human decision (protocol-enforced path only).
+
+    A non-empty trusted runtime role is decisive — it comes from the
+    operator-set environment / runtime config, never the tool payload,
+    so a Worker runtime can never present itself as anything else: only
+    'human' authorizes. With no trusted role (a dashboard-style client)
+    the payload must show two independent human-provenance signals: a
+    human role on a human resolve channel, plus a decider identity
+    (resolvedBy) and decision evidence (resolveEvidence). A bare role
+    claim — or a tool / api close — is never enough."""
+    trusted_role = _runtime_role()
+    if trusted_role:
+        return trusted_role == "human"
+    role, _account = _decider_identity(actor)
+    return (
+        role == "human"
+        and resolve_via in _HUMAN_RESOLVE_CHANNELS
+        and bool(str(resolved_by or "").strip())
+        and bool(resolve_evidence)
+    )
 
 
 def _guard_delegate_decision_class(payload: dict[str, Any]) -> str:
@@ -87,8 +152,11 @@ def _protocol_guard_for_accept(task: dict[str, Any], accepted: bool) -> None:
     - a review record with a non-passing verdict blocks the acceptance
       (review_not_passed);
     - an r1 task result (task_result_acceptance class; an absent
-      decision_class reads as r4) cannot be decided without a resolved
-      approval record (approval_required).
+      decision_class reads as r4) cannot be decided without a resolved,
+      human-authorized approval record (approval_required): the record
+      must have been closed through a human channel by a human decider
+      whose account differs from the task's assignee (self-approval
+      never counts; record presence alone is not an approval).
     """
     if not _protocol_enforce_enabled():
         return
@@ -110,7 +178,9 @@ def _protocol_guard_for_accept(task: dict[str, Any], accepted: bool) -> None:
             f"accept_task_result requires a passing review verdict "
             f"(current verdict: '{review.get('verdict')}')",
         )
-    if _decision_class_of(task) == "r1" and not _has_approval_record(task):
+    if _decision_class_of(task) == "r1" and not _has_approval_record(
+        task, submitter_account=_account_of(task.get("assigned_to") or "")
+    ):
         raise ProtocolGuardError(
             "approval_required",
             "r1 task result requires a resolved approval record before it can be decided",

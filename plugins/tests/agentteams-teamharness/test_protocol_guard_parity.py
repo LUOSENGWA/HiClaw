@@ -7,14 +7,20 @@ three-blocker fixes — the review gate applies to a positive acceptance
 only (missing/malformed record -> review_missing), a fail verdict never
 blocks a rejection/return-for-revision, and identity comparison uses the
 full account after the role prefix — therefore must hold in the COPY as
-well. This module:
+well. The round-3 approval-authority fix (#1467) landed in
+``mcp/lifecycle/taskflow.py`` as well, so it is part of the comparison
+set. This module:
 
-(a) asserts the two guard files (``mcp/lifecycle/review.py``,
-    ``mcp/project/flow.py``) stay byte-identical between the trees;
+(a) asserts the three guard files (``mcp/lifecycle/review.py``,
+    ``mcp/lifecycle/taskflow.py``, ``mcp/project/flow.py``) stay
+    byte-identical between the trees;
 (b) re-runs the blocker regression cases against the copy's own
     ``mcp/server.py`` — loaded in this suite's own process (this file is
     the only one here that imports ``mcp``), so the ``mcp`` package
-    resolves to the ``agentteams-teamharness`` tree.
+    resolves to the ``agentteams-teamharness`` tree — plus the round-3
+    approval-authority cases (worker tool close of a frozen approval
+    denied; a worker's self-closed approval never satisfies the r1
+    gate; a distinct human account's approval is accepted).
 """
 
 from __future__ import annotations
@@ -248,10 +254,72 @@ def storage(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server.flow, "_emit_signal_event", lambda *_a, **_k: True)
 
 
+@pytest.fixture
+def attention_env(monkeypatch: pytest.MonkeyPatch, storage: None) -> None:
+    monkeypatch.setattr(
+        server.taskflow,
+        "_send_attention_notification",
+        lambda *_a, **_k: {
+            "sent": True,
+            "eventId": f"$att-{_k.get('kind')}-{_k.get('attempt')}",
+        },
+    )
+    monkeypatch.setattr(server.taskflow, "_team_leader_matrix_id", lambda: "@leader:example.test")
+    monkeypatch.setattr(server.taskflow, "_team_human_matrix_ids", lambda: [])
+    monkeypatch.setattr(
+        server, "_validate_assignee_membership", lambda *_a, **_k: {"ok": True}
+    )
+
+
+def _write_in_progress_task(workspace: Path) -> None:
+    _write_project(workspace, task_status="in_progress")
+    _write_task_meta(workspace, {
+        "task_id": TASK_ID,
+        "project_id": PROJECT_ID,
+        "status": "in_progress",
+        "room_id": ROOM,
+        "assigned_to": WORKER_A,
+    })
+
+
+def _request_attention(
+    workspace: Path,
+    *,
+    kind: str = "decision",
+    question: str = "Need a decision.",
+    resolved: bool | None = None,
+    role: str = "worker",
+    account: str | None = None,
+    resolved_via: str | None = None,
+    resolved_by: str | None = None,
+    resolve_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"taskId": TASK_ID, "kind": kind, "question": question}
+    if resolved is not None:
+        payload["resolved"] = resolved
+    if resolved_via is not None:
+        payload["resolvedVia"] = resolved_via
+    if resolved_by is not None:
+        payload["resolvedBy"] = resolved_by
+    if resolve_evidence is not None:
+        payload["resolveEvidence"] = resolve_evidence
+    arguments: dict[str, Any] = {
+        "role": role,
+        "action": "request_attention",
+        "workspaceDir": str(workspace),
+        "payload": payload,
+    }
+    if account is not None:
+        arguments["account_id"] = account
+    return _call("taskflow", arguments)
+
+
 # --- (a) the guard files stay byte-identical between the trees -----------
 
 
-@pytest.mark.parametrize("relpath", ["lifecycle/review.py", "project/flow.py"])
+@pytest.mark.parametrize(
+    "relpath", ["lifecycle/review.py", "lifecycle/taskflow.py", "project/flow.py"]
+)
 def test_guard_files_byte_identical_between_trees(relpath: str) -> None:
     legacy = (LEGACY_MCP_DIR / relpath).read_bytes()
     bundle = (MCP_DIR / relpath).read_bytes()
@@ -424,3 +492,116 @@ def test_review_identical_actor_string_forbidden(
     assert result["ok"] is False
     assert result["error_code"] == "self_review_forbidden"
     assert "review" not in _task_meta(tmp_path)
+
+
+# --- (c) round 3: approval authority (#1467) against the bundle tree ------
+
+
+def test_r3_parity_worker_tool_close_denied_keeps_frozen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    storage: None, attention_env: None,
+) -> None:
+    """Case 1 (bundle tree): a worker drives the approval loop to frozen
+    and closes it (resolvedVia=tool) -> denied
+    approval_requires_human; the task stays frozen and the record stays
+    open."""
+    _enforce_on(monkeypatch)
+    _write_in_progress_task(tmp_path)
+    _request_attention(tmp_path, kind="approval", question="Approve?")
+    _request_attention(tmp_path, kind="approval")
+    _request_attention(tmp_path, kind="approval")
+    frozen = _request_attention(tmp_path, kind="approval")
+    assert frozen["task"]["decision_status"] == "frozen"
+
+    denied = _request_attention(
+        tmp_path, kind="approval", resolved=True, resolved_via="tool"
+    )
+    assert denied["ok"] is False
+    assert denied["error_code"] == "approval_requires_human"
+    task = _task_meta(tmp_path)
+    assert task["decision_status"] == "frozen"
+    assert task["attention"][0]["resolved"] is False
+
+
+def test_r3_parity_worker_self_closed_approval_does_not_satisfy_r1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
+) -> None:
+    """Case 6 (bundle tree): after a genuine critic pass, the worker's
+    tool close of its own approval record is denied, and
+    accept_task_result still returns approval_required (the self-closed
+    record must not satisfy the r1 gate)."""
+    _enforce_on(monkeypatch)
+    _write_submitted_task(
+        tmp_path,
+        decision_class="r1",
+        assigned_to=WORKER_A,
+        submitted_by="worker:alice",
+        review={
+            "verdict": "pass",
+            "reviewer": "critic:bob",
+            "reviewer_team": "",
+            "reviewed_at": "2026-10-29T00:00:00Z",
+            "note": "looks right",
+        },
+        attention=[
+            {
+                "kind": "approval",
+                "question": "Approve the result?",
+                "attempt": 1,
+                "resolved": False,
+                "eventId": "$att-approval-1",
+                "stall_count": 0,
+            }
+        ],
+    )
+
+    denied = _request_attention(
+        tmp_path, kind="approval", resolved=True, resolved_via="tool"
+    )
+    assert denied["ok"] is False
+    assert denied["error_code"] == "approval_requires_human"
+
+    result = _accept(tmp_path)
+    assert result["ok"] is False
+    assert result["error_code"] == "approval_required"
+    assert _task_meta(tmp_path)["status"] == "submitted"
+
+
+def test_r3_parity_human_approval_from_distinct_account_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
+) -> None:
+    """Case 8 (bundle tree): critic pass + a human approval from an
+    account that differs from the assignee -> accepted (completed)."""
+    _enforce_on(monkeypatch)
+    _write_submitted_task(
+        tmp_path,
+        decision_class="r1",
+        assigned_to="@alice:example.test",
+        submitted_by="worker:alice",
+        review={
+            "verdict": "pass",
+            "reviewer": "critic:bob",
+            "reviewer_team": "",
+            "reviewed_at": "2026-10-29T00:00:00Z",
+            "note": "looks right",
+        },
+        attention=[
+            {
+                "kind": "approval",
+                "question": "Approve the result?",
+                "attempt": 1,
+                "resolved": True,
+                "eventId": "$att-approval-1",
+                "stall_count": 0,
+                "resolvedVia": "im_command",
+                "resolvedBy": "human:@luo:example.test",
+                "resolveEvidence": {"messageId": "$m2", "note": "approved"},
+                "resolvedActor": "human:@luo:example.test",
+            }
+        ],
+    )
+
+    result = _accept(tmp_path)
+    assert result["ok"] is True
+    assert result["nodeStatus"] == "completed"
+    assert _task_meta(tmp_path)["status"] == "completed"
