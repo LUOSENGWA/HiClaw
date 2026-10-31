@@ -14,8 +14,21 @@ Design
 * Every failed wake is **persisted** to ``<state>/wake-queue.json``
   (atomic tmp+rename), deduplicated by ``task_id``.
 * A background loop drains due records with exponential backoff
-  (5s → 10min cap) for up to ``MAX_AGE_S`` (24h).  A busy session
-  simply means "not due yet"; the wake lands on the first idle window.
+  (5s → 10min cap) for real send failures.  A busy chat — the
+  ``/status`` probe or a 409 — simply means "not idle yet": the wake
+  is rescheduled every ``BUSY_RETRY_S`` and lands on the first idle
+  window.  No busy count ever drops a pending wake, so a busy session
+  is bounded only by the 24h contract (``MAX_AGE_S``), well inside the
+  documented tens-of-minutes runs.
+* Duplicates are suppressed by the **durable sent state**, not by
+  retry counts: ``is_delivered`` (``dispatch.wake_is_delivered``)
+  reads ``wake_status == "sent"`` from the task file, and a record
+  that already reports sent is dropped without a send.
+* Exactly three end conditions terminate a record: **delivered**
+  (durable sent state — dropped without sending), **stale**
+  (``now - created_at > MAX_AGE_S``, 24h), and **hard failure**
+  (``attempts >= MAX_ATTEMPTS``, incremented only by real send
+  exceptions; busy and 409 never touch ``attempts``).
 * Delivery calls the same ``default_wake_sender`` used inline, so the
   payload/approval-level/room-bell semantics are unchanged.
 * On success the task file's ``wake_status`` flips to ``sent`` via the
@@ -179,13 +192,11 @@ def chat_is_busy(base_url: str, agent_id: str, chat_id: str) -> bool:
         return False
 
 
-#: A wake that still cannot be delivered after this many attempts is dropped:
-#: an unbounded retry loop re-injects the same text (the 2026-10-30 duplicate
-#: wake reports) and never converges.
+#: A wake that still cannot be delivered after this many real send
+#: failures is dropped (a permanently broken endpoint must not retry
+#: forever).  Duplicate suppression is the durable sent state's job,
+#: not this cap's — busy/409 never increments ``attempts``.
 MAX_ATTEMPTS = 10
-#: 409 means the chat accepted a run already; retry briefly and bounded, do
-#: not burn the failure backoff.
-MAX_BUSY_RETRIES = 20
 
 
 def _due(now: float) -> list[dict[str, Any]]:
@@ -281,15 +292,9 @@ async def drain_once(
                 str(record.get("chat_id") or ""),
             )
             if busy:
-                if int(record.get("busy_retries") or 0) >= MAX_BUSY_RETRIES:
-                    _remove(task_id)
-                    stats["dropped"] += 1
-                    logger.warning(
-                        "wake dropped after %s busy retries: task=%s",
-                        MAX_BUSY_RETRIES,
-                        task_id,
-                    )
-                    continue
+                # "Running right now", not "never deliverable": reschedule on
+                # the busy cadence and keep the record — bounded only by the
+                # 24h contract, deduped by the durable sent state.
                 _reschedule_busy(record, time.time())
                 stats["busy"] += 1
                 logger.debug(
@@ -311,18 +316,10 @@ async def drain_once(
                     approval_level=str(record.get("approval_level") or ""),
                 )
             except Exception as exc:
-                # A 409 means a chat run is already in progress: retry soon
-                # and bounded, not with the failure backoff.
+                # A 409 means a chat run is already in progress: same
+                # contract as the probe — retry on the busy cadence, never
+                # with the failure backoff, never drop the record.
                 if "409" in str(exc):
-                    if int(record.get("busy_retries") or 0) >= MAX_BUSY_RETRIES:
-                        _remove(task_id)
-                        stats["dropped"] += 1
-                        logger.warning(
-                            "wake dropped after %s busy retries: task=%s",
-                            MAX_BUSY_RETRIES,
-                            task_id,
-                        )
-                        continue
                     _reschedule_busy(record, time.time())
                     stats["busy"] += 1
                     logger.info("wake deferred (409): task=%s", task_id)
@@ -401,7 +398,6 @@ def stop() -> None:
 __all__ = [
     "BACKOFF_S",
     "MAX_ATTEMPTS",
-    "MAX_BUSY_RETRIES",
     "MAX_AGE_S",
     "QUEUE_FILE",
     "discard",
