@@ -247,6 +247,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "TEAMHARNESS_RUNTIME_CONFIG",
         "AGENTTEAMS_AGENT_ROLE",
         "AGENTTEAMS_WORKER_ROLE",
+        "AGENTTEAMS_WORKER_NAME",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -328,7 +329,16 @@ def _request_attention(
 
 
 @pytest.mark.parametrize(
-    "relpath", ["lifecycle/review.py", "lifecycle/taskflow.py", "project/flow.py"]
+    "relpath",
+    [
+        "lifecycle/review.py",
+        "lifecycle/taskflow.py",
+        # Round 6 (#1467): the trusted-identity change landed in the
+        # transition-actor and server modules as well.
+        "lifecycle/transitions.py",
+        "server.py",
+        "project/flow.py",
+    ],
 )
 def test_guard_files_byte_identical_between_trees(relpath: str) -> None:
     legacy = (LEGACY_MCP_DIR / relpath).read_bytes()
@@ -958,3 +968,99 @@ def test_r5_parity_refusal_is_audited_at_the_choke_point() -> None:
     assert entry["from"] == "frozen"
     assert entry["to"] == "open"
     assert "refused" not in entry
+
+
+# --- Round 6 (#1467): trusted review identity (bundle tree) -----------------
+
+
+def _set_runtime_member(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    member: dict[str, Any],
+    filename: str,
+) -> None:
+    """Point TEAMHARNESS_RUNTIME_CONFIG at a config file carrying only
+    the given member block (the shape the DeepSeek-harness adapter
+    writes — fixtures/runtime.yaml). Each call stands in for a
+    different process's runtime identity."""
+    config_path = tmp_path / filename
+    config_path.write_text(json.dumps({"member": member}), encoding="utf-8")
+    monkeypatch.setenv("TEAMHARNESS_RUNTIME_CONFIG", str(config_path))
+
+
+def test_r6_parity_distinct_members_without_account_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
+) -> None:
+    """Case 1 (bundle tree): a Worker process (runtime
+    member.name=worker) submits, then a Leader process
+    (member.name=leader) reviews, neither supplying account_id. The
+    review succeeds and both sides carry the runtime member identity,
+    not the shared 'default' fallback."""
+    _enforce_on(monkeypatch)
+    _write_project(tmp_path, task_status="assigned")
+    _write_task_meta(tmp_path, {
+        "task_id": TASK_ID,
+        "project_id": PROJECT_ID,
+        "status": "assigned",
+        "assigned_to": WORKER_A,
+    })
+
+    _set_runtime_member(monkeypatch, tmp_path, {"name": "worker"}, "worker-config.json")
+    submitted = _submit(tmp_path, role="worker")
+    assert submitted["ok"] is True
+    assert submitted["task"]["submitted_by"] == "worker:worker"
+
+    # The second process: a different runtime config, the leader.
+    _set_runtime_member(monkeypatch, tmp_path, {"name": "leader"}, "leader-config.json")
+    result = _review(tmp_path, role="leader", verdict="pass")
+    assert result["ok"] is True, result
+    review = _task_meta(tmp_path)["review"]
+    assert review["reviewer"] == "leader:leader"
+    assert review["verdict"] == "pass"
+    assert _task_meta(tmp_path)["submitted_by"] == "worker:worker"
+
+
+def test_r6_parity_trusted_identity_beats_payload_evasion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
+) -> None:
+    """Case 2 (bundle tree): the submitter's runtime member is
+    'worker'; the SAME member (same runtime config) attempts the review
+    carrying account_id=leader in the payload. The trusted identity
+    wins: the reviewer resolves to 'leader:worker' and
+    self_review_forbidden holds."""
+    _enforce_on(monkeypatch)
+    _write_project(tmp_path, task_status="assigned")
+    _write_task_meta(tmp_path, {
+        "task_id": TASK_ID,
+        "project_id": PROJECT_ID,
+        "status": "assigned",
+        "assigned_to": WORKER_A,
+    })
+
+    _set_runtime_member(monkeypatch, tmp_path, {"name": "worker"}, "worker-config.json")
+    submitted = _submit(tmp_path, role="worker")
+    assert submitted["ok"] is True
+    assert submitted["task"]["submitted_by"] == "worker:worker"
+
+    result = _review(tmp_path, role="leader", account="leader", verdict="pass")
+    assert result["ok"] is False
+    assert result["error_code"] == "self_review_forbidden"
+    assert "review" not in _task_meta(tmp_path)
+
+
+def test_r6_parity_legacy_default_submitter_not_self_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
+) -> None:
+    """Case 3 (bundle tree): a record written by an older build
+    (submitted_by='worker:default') is reviewed by a trusted runtime
+    member 'leader' -> allowed: an unknown submitter account is not a
+    self-review match, and the review record carries the trusted
+    identity."""
+    _enforce_on(monkeypatch)
+    _write_submitted_task(tmp_path, submitted_by="worker:default")
+
+    _set_runtime_member(monkeypatch, tmp_path, {"name": "leader"}, "leader-config.json")
+    result = _review(tmp_path, role="leader", verdict="pass")
+    assert result["ok"] is True, result
+    review = _task_meta(tmp_path)["review"]
+    assert review["reviewer"] == "leader:leader"

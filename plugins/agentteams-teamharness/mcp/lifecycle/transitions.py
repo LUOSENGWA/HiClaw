@@ -43,6 +43,10 @@ _sync_project = refs.proxy("_sync_project")
 _write_json = refs.proxy("_write_json")
 _write_project_plan = refs.proxy("_write_project_plan")
 _role = refs.proxy("_role")
+# The trusted runtime member identity (server.py): it reads the
+# operator-set environment / runtime config, never the tool payload, so
+# a caller cannot spoof it. Call-time proxy so tests can monkeypatch it.
+_runtime_identity = refs.proxy("_runtime_identity")
 
 
 def _terminal_task_status(arguments: dict[str, Any], task: dict[str, Any], task_id: str) -> str:
@@ -118,9 +122,20 @@ refs.define("_update_project_task", _update_project_task)
 
 
 def _transition_actor(arguments: dict[str, Any]) -> str:
-    """history actor: ``role:account_id`` (precedent: ``_ack_`` role stamping)."""
+    """history actor: ``role:account`` (precedent: ``_ack_`` role stamping).
+
+    The account is the trusted runtime member identity
+    (server._runtime_identity: the operator-set AGENTTEAMS_WORKER_NAME
+    env / runtime config member block), never a payload field. The
+    payload's ``account_id`` is provenance only: it is used when no
+    trusted identity exists (local / test runs) and can never override
+    one (#1467 round 6: the identity used for an authorization decision
+    comes from the runtime, and two different members must never
+    collapse into one identity)."""
     role = _role(arguments) or "unknown"
-    account = str(arguments.get("account_id") or "default").strip() or "default"
+    account = _runtime_identity()
+    if not account:
+        account = str(arguments.get("account_id") or "default").strip() or "default"
     return f"{role}:{account}"
 
 

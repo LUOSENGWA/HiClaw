@@ -174,6 +174,35 @@ def _runtime_role() -> str:
         role = str(_section(_load_runtime_config(), "member").get("role") or "").strip()
     return _normalize_role(role)
 
+def _runtime_identity() -> str:
+    """The trusted runtime member identity (the account part of the
+    transition actor). Read from operator-set runtime data only, never
+    from a tool payload field (#1467 round 6: the identity used for an
+    authorization decision comes from the runtime, and two different
+    members must never collapse into one identity).
+
+    Resolution order (first non-empty wins): the AGENTTEAMS_WORKER_NAME
+    env var (the name env the message/trace layers already use), then
+    the runtime config member block: member.name, member.runtimeName,
+    then the matrixUserId localpart ('@user:server' -> 'user').
+    Normalized (strip, lowercase); '' when unknown — only then may the
+    payload's account_id carry the account (provenance for local /
+    test runs), and it can never override a trusted identity."""
+    identity = os.getenv("AGENTTEAMS_WORKER_NAME", "").strip()
+    if not identity:
+        member = _section(_load_runtime_config(), "member")
+        identity = (
+            str(member.get("name") or "").strip()
+            or str(member.get("runtimeName") or member.get("runtime_name") or "").strip()
+        )
+        if not identity:
+            user_id = str(
+                member.get("matrixUserId") or member.get("matrix_user_id") or ""
+            ).strip()
+            if user_id:
+                identity = user_id.lstrip("@").split(":", 1)[0].strip()
+    return identity.lower()
+
 def _visible_tool_names() -> list[str]:
     if _message_tool_blocked_for_runtime_role():
         return [name for name in TOOL_NAMES if name != "message"]

@@ -1,6 +1,19 @@
 # W2 review gate and protocol guards (issue #1451 W2): the review_task
 # record, the accept_task_result acceptance gates, and the structured
 # rejection type shared by the taskflow / projectflow dispatch layers.
+#
+# Round 6 (issue #1467) — trusted review identity: the account part of
+# a transition actor is the trusted runtime member identity (the
+# operator-set AGENTTEAMS_WORKER_NAME env / runtime config member block:
+# member.name -> member.runtimeName -> matrixUserId localpart), never a
+# tool payload field. The payload's account_id is provenance only: it
+# is used when no trusted identity exists (local / test runs) and can
+# never override one — two different members must never collapse into
+# one identity. The self-review comparison therefore normalizes the
+# accounts and treats "default" / "unknown" / empty as UNKNOWN: an
+# unknown (legacy) submitter account is not a self-review match, while
+# a concrete trusted identity on both sides that matches — or a full
+# reviewer == submitted_by — is still self_review_forbidden.
 from __future__ import annotations
 
 from typing import Any
@@ -219,6 +232,28 @@ def _account_of(actor: str) -> str:
     return text
 
 
+# Accounts that mean "the caller did not (or could not) identify
+# itself": the shared 'default' fallback, an explicit 'unknown', or
+# empty. Records written by older builds (pre trusted-identity, every
+# member collapsed to 'default') carry such accounts; they are unknown,
+# not an identity (#1467 round 6: unknown is unknown — no false
+# positive — and a concrete identity can never collide with one).
+_UNKNOWN_ACCOUNTS = {"", "default", "unknown"}
+
+
+def _known_account_of(actor: str) -> str:
+    """The normalized account behind a ``role:account`` actor string, or
+    '' when the account is unknown (empty / 'default' / 'unknown').
+
+    Normalized (strip, lowercase) so only real identity matches count;
+    an unknown account returns '' and can never match — a legacy
+    'worker:default' submission must not block review by a distinct
+    trusted member, and two unknown accounts must not read as the same
+    identity."""
+    account = _account_of(actor).strip().lower()
+    return "" if account in _UNKNOWN_ACCOUNTS else account
+
+
 def _review_task_action(
     arguments: dict[str, Any],
     payload: dict[str, Any],
@@ -259,8 +294,16 @@ def _review_task_action(
         raise ValueError("scorecard must be an object")
     reviewer = _transition_actor(arguments)
     submitted_by = _first_text(task.get("submitted_by"), task.get("submittedBy"))
+    # Self-review: the identical actor string, or the same KNOWN
+    # (normalized) account on both sides. Unknown accounts — the
+    # 'default' fallback of older builds, 'unknown', empty — never
+    # match: a legacy submission must not read as self-review by a
+    # distinct trusted member, and two unidentifiable actors must not
+    # read as one (#1467 round 6).
     if submitted_by and (
-        reviewer == submitted_by or _account_of(reviewer) == _account_of(submitted_by)
+        reviewer == submitted_by
+        or _known_account_of(reviewer)
+        and _known_account_of(reviewer) == _known_account_of(submitted_by)
     ):
         raise ProtocolGuardError(
             "self_review_forbidden",
